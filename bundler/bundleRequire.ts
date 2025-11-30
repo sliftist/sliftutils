@@ -12,6 +12,8 @@ export function bundleRequire(config: BundleRequireConfig) {
         versions: {},
         on: () => { },
     };
+    // Use production, for consistency (and so mobx doesn't break)
+    globalThis.process.env.NODE_ENV = globalThis.process.env.NODE_ENV || "production";
     (globalThis as any).window = (globalThis as any).window || globalThis;
     (globalThis as any).global = (globalThis as any).global || globalThis;
     (globalThis as any).setImmediate = (globalThis as any).setImmediate || globalThis.setTimeout;
@@ -45,25 +47,27 @@ export function bundleRequire(config: BundleRequireConfig) {
         child_process: {},
         events: class EventEmitter { },
     };
-    // If is nodeJs
-    let allBuiltInModules = new Set<string>();
-    // Electron 
-    allBuiltInModules.add("electron");
-    allBuiltInModules.add("original-fs");
-    allBuiltInModules.add("vscode");
-    if (typeof document === "undefined" && typeof require !== "undefined") {
-        // Change the builts ins to use the actual built ins!
-        let { builtinModules } = require("node:module");
-        for (let key of builtinModules) {
-            allBuiltInModules.add(key);
+    if (typeof require !== "undefined") {
+        const builtInRequire = require;
+        let allBuiltInModules = new Set<string>();
+        allBuiltInModules.add("electron");
+        allBuiltInModules.add("original-fs");
+        allBuiltInModules.add("vscode");
+        try {
+            // Change the builts ins to use the actual built ins!
+            let { builtinModules } = require("node:module");
+            for (let key of builtinModules) {
+                allBuiltInModules.add(key);
+            }
+        } catch { }
+
+        for (let key of allBuiltInModules) {
+            Object.defineProperty(builtInModuleExports, key, {
+                get() {
+                    return builtInRequire(key);
+                },
+            });
         }
-    }
-    for (let key of allBuiltInModules) {
-        Object.defineProperty(builtInModuleExports, key, {
-            get() {
-                return require(key);
-            },
-        });
     }
 
     // Just path.resolve (but needs to be reimplemented, because we can't use imports)
@@ -159,7 +163,7 @@ export function bundleRequire(config: BundleRequireConfig) {
             loaded: false,
             path: dirname(resolveAbsolutePath),
             paths: serialized?.paths || [],
-            require,
+            require: requireFnc,
             load,
         } as any;
         newModule.exports.default = newModule.exports;
@@ -173,10 +177,10 @@ export function bundleRequire(config: BundleRequireConfig) {
         resolve.paths = (request: string) => [];
 
         requireCache[newModule.id] = newModule;
-        require.resolve = resolve;
-        require.cache = requireCache;
-        require.main = newModule;
-        require.extensions = "extension not implemented yet" as any;
+        requireFnc.resolve = resolve;
+        requireFnc.cache = requireCache;
+        requireFnc.main = newModule;
+        requireFnc.extensions = "extension not implemented yet" as any;
 
         // Resolves file extensions
         function innerResolve(path: string): string {
@@ -214,7 +218,7 @@ export function bundleRequire(config: BundleRequireConfig) {
             // throw new Error(`Module ${path} not found`);
         }
 
-        function require(path: string) {
+        function requireFnc(path: string) {
             if (path in builtInModuleExports) {
                 return builtInModuleExports[path as keyof typeof builtInModuleExports];
             }
@@ -233,7 +237,7 @@ export function bundleRequire(config: BundleRequireConfig) {
             newModule.loaded = true;
 
             if (serialized) {
-                serialized.moduleFnc(newModule.exports, require, newModule, newModule.filename, newModule.path);
+                serialized.moduleFnc(newModule.exports, requireFnc, newModule, newModule.filename, newModule.path);
             } else {
                 // If we are being imported by the root module, we need to throw an error
                 if (!config.parentModule?.parent) {
