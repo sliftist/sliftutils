@@ -1,16 +1,11 @@
 import path from "path";
 import { bundle } from "./bundler";
 import fs from "fs";
-import yargs from "yargs";
 
 async function main() {
-    let yargObj = yargs(process.argv)
-        .option("entryPoint", { type: "string", desc: `Path to the entry point file` })
-        .option("outputFolder", { type: "string", desc: `Path to the output folder` })
-        .argv || {}
-        ;
-    let entryPoint = yargObj.entryPoint;
-    let outputFolder = yargObj.outputFolder;
+    // NOTE: Using yargs added ~0.5s to the time to run this, and considering we run in ~1s... that's just too much 
+    let entryPoint = process.argv[2];
+    let outputFolder = process.argv[3];
     if (!entryPoint) {
         throw new Error("No entry point provided. Please use the --entryPoint option.");
     }
@@ -34,6 +29,17 @@ async function main() {
         rootPath: path.resolve("."),
         entryPoints: [entryPoint],
     });
-    await fs.promises.writeFile(`${yargObj.outputFolder}/${name}`, bundled.bundle);
+
+    let finalPath = `${outputFolder}/${name}`;
+    let tempPath = `${finalPath}.tmp`;
+
+    try {
+        await fs.promises.writeFile(tempPath, bundled.bundle);
+        await fs.promises.rename(tempPath, finalPath);
+    } finally {
+        try {
+            await fs.promises.unlink(tempPath);
+        } catch { }
+    }
 }
 main().catch(console.error).finally(() => process.exit());

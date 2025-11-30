@@ -16,7 +16,13 @@
             ]
         }
     ],
-    "permissions": [],
+    "permissions": [
+        "tabs",
+        "storage"
+    ],
+    "host_permissions": [
+        "*://*.wikipedia.org/*"
+    ],
     "icons": {
         "16": "assets/icon16.png"
     }

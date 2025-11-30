@@ -39,19 +39,25 @@ async function main() {
 
     await fs.promises.mkdir("./build-extension", { recursive: true });
 
+    // Build background and content scripts in parallel
+    let bundlePromises: Promise<void>[] = [];
     if (hasBackgroundEntry) {
-        await bundleEntryCaller({
+        bundlePromises.push(bundleEntryCaller({
             entryPoint: yargObj.backgroundEntry,
             outputFolder: yargObj.outputFolder,
-        });
+        }));
     }
     if (hasContentEntry) {
-        await bundleEntryCaller({
+        bundlePromises.push(bundleEntryCaller({
             entryPoint: yargObj.contentEntry,
             outputFolder: yargObj.outputFolder,
-        });
+        }));
     }
-    await fs.promises.cp(yargObj.manifestPath, path.join(yargObj.outputFolder, "manifest.json"));
+
+    await Promise.all([
+        ...bundlePromises,
+        fs.promises.cp(yargObj.manifestPath, path.join(yargObj.outputFolder, "manifest.json"))
+    ]);
 
     // Parse manifest and collect referenced files
     let manifestContent = await fs.promises.readFile(yargObj.manifestPath, "utf-8");
@@ -133,6 +139,6 @@ async function main() {
     }
 
     let duration = Date.now() - time;
-    console.log(`NodeJS build completed in ${formatTime(duration)}`);
+    console.log(`Extension build completed in ${formatTime(duration)}`);
 }
 main().catch(console.error).finally(() => process.exit());

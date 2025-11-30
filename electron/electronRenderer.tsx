@@ -2,6 +2,7 @@ import * as preact from "preact";
 import { observable } from "mobx";
 import { observer } from "../render-utils/observer";
 import { isNode } from "typesafecss";
+import { enableHotReloading } from "../builders/hotReload";
 
 @observer
 class App extends preact.Component {
@@ -24,6 +25,7 @@ class App extends preact.Component {
 
 async function main() {
     if (isNode()) return;
+    await enableHotReloading({ port: 9879 });
     preact.render(<App />, document.getElementById("app")!);
 }
 

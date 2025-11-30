@@ -35,17 +35,17 @@ async function main() {
 
     await fs.promises.mkdir(yargObj.outputFolder, { recursive: true });
 
-    // Build main process
-    await bundleEntryCaller({
-        entryPoint: yargObj.mainEntry,
-        outputFolder: yargObj.outputFolder,
-    });
-
-    // Build renderer process
-    await bundleEntryCaller({
-        entryPoint: yargObj.rendererEntry,
-        outputFolder: yargObj.outputFolder,
-    });
+    // Build main and renderer processes in parallel
+    await Promise.all([
+        bundleEntryCaller({
+            entryPoint: yargObj.mainEntry,
+            outputFolder: yargObj.outputFolder,
+        }),
+        bundleEntryCaller({
+            entryPoint: yargObj.rendererEntry,
+            outputFolder: yargObj.outputFolder,
+        })
+    ]);
 
     // Collect all files to copy
     let filesToCopy: string[] = [];

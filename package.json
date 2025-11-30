@@ -5,6 +5,7 @@
     "license": "MIT",
     "scripts": {
         "type": "yarn tsc --noEmit",
+        "emit-dts": "tsc --project tsconfig.declarations.json",
         "run-nodejs": "node ./build-nodejs/server.js",
         "run-nodejs-dev": "typenode ./nodejs/server.ts",
         "run-web": "node ./builders/webRun.js",
@@ -21,11 +22,17 @@
     },
     "bin": {
         "build-nodejs": "./builders/nodeJSBuildRun.js",
+        "buildnodejs": "./builders/nodeJSBuildRun.js",
         "build-extension": "./builders/extensionBuildRun.js",
+        "buildextension": "./builders/extensionBuildRun.js",
         "build-web": "./builders/webBuildRun.js",
+        "buildweb": "./builders/webBuildRun.js",
         "build-electron": "./builders/electronBuildRun.js",
+        "buildelectron": "./builders/electronBuildRun.js",
         "slift-watch": "./builders/watchRun.js",
-        "slift-setup": "./builders/setupRun.js"
+        "sliftwatch": "./builders/watchRun.js",
+        "slift-setup": "./builders/setupRun.js",
+        "sliftsetup": "./builders/setupRun.js"
     },
     "dependencies": {
         "@types/shell-quote": "^1.7.5",

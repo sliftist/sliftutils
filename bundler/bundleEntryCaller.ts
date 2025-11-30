@@ -10,5 +10,5 @@ export async function bundleEntryCaller(config: {
     entryPoint = path.resolve(entryPoint).replace(/\\/g, "/");
     outputFolder = path.resolve(outputFolder).replace(/\\/g, "/");
     let bundleEntryPath = path.resolve(__dirname, "bundleEntry.ts").replace(/\\/g, "/");
-    await runPromise(`yarn typenode ${JSON.stringify(bundleEntryPath)} --entryPoint ${JSON.stringify(entryPoint)} --outputFolder ${JSON.stringify(outputFolder)}`);
+    await runPromise(`node -r ./node_modules/typenode/index.js ${JSON.stringify(bundleEntryPath)} ${JSON.stringify(entryPoint)} ${JSON.stringify(outputFolder)}`);
 }
