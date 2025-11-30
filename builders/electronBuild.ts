@@ -14,11 +14,8 @@ async function main() {
     } catch (error) {
         console.error("ERROR: Electron is not installed.");
         console.error("");
-        console.error("Electron is too heavy to be included by default for non-electron projects.");
-        console.error("Please manually add Electron to your package.json dependencies:");
-        console.error("");
+        console.error("Electron is too heavy to be included by default for non-electron projects. Please run:");
         console.error(green("yarn add electron"));
-        console.error("");
         process.exit(1);
     }
 
