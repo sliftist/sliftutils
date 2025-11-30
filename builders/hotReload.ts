@@ -1,3 +1,4 @@
+import { watchFilesAndTriggerHotReloading } from "socket-function/hot/HotReloadController";
 import { isInBrowser, isInChromeExtension, isInChromeExtensionBackground, isInChromeExtensionContentScript } from "../misc/environment";
 
 const DEFAULT_WATCH_PORT = 9876;
@@ -14,6 +15,8 @@ export async function enableHotReloading(config?: {
         watchPortHotReload(config?.port, () => {
             window.location.reload();
         });
+    } else {
+        watchFilesAndTriggerHotReloading();
     }
 }
 

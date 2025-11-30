@@ -1,6 +1,3 @@
-Okay Omit our typings, and then I guess we have to merge them all into one file. Although, if they reference each other, that's going to be difficult. 
-
-Fix our typings. 
 ALSO, go fix our typings in socket-function as well
 
 TODO:
