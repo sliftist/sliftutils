@@ -1,28 +1,31 @@
 {
     "name": "sliftutils",
-    "version": "0.6.6",
+    "version": "0.7.0",
     "main": "index.js",
     "license": "MIT",
     "scripts": {
         "type": "yarn tsc --noEmit",
-        "run-nodejs": "node ./build-nodejs/nodejs/server.js",
+        "run-nodejs": "node ./build-nodejs/server.js",
+        "run-nodejs-dev": "typenode ./nodejs/server.ts",
         "run-web": "node ./builders/webRun.js",
-        "run-electron": "node ./node_modules/electron/cli.js ./build-electron/electron/electronMain.js",
+        "run-electron": "node ./node_modules/electron/cli.js ./build-electron/electronMain.js",
         "build-nodejs": "node ./builders/nodeJSBuildRun.js",
         "build-web": "node ./builders/webBuildRun.js",
         "build-extension": "node ./builders/extensionBuildRun.js",
         "build-electron": "node ./builders/electronBuildRun.js",
-        "watch-nodejs": "node ./builders/watchRun.js \"nodejs/*.ts\" \"nodejs/*.tsx\" \"yarn build-nodejs\"",
-        "watch-web": "node ./builders/watchRun.js \"web/*.ts\" \"web/*.tsx\" \"yarn build-web\"",
-        "watch-extension": "node ./builders/watchRun.js \"extension/*.ts\" \"extension/*.tsx\" \"yarn build-extension\"",
-        "watch-electron": "node ./builders/watchRun.js \"electron/*.ts\" \"electron/*.tsx\" \"yarn build-electron\"",
+        "watch-nodejs": "node ./builders/watchRun.js --port 9876 \"nodejs/*.ts\" \"nodejs/*.tsx\" \"yarn build-nodejs\"",
+        "watch-web": "node ./builders/watchRun.js --port 9877 \"web/*.ts\" \"web/*.tsx\" \"yarn build-web\"",
+        "watch-extension": "node ./builders/watchRun.js --port 9878 \"extension/*.ts\" \"extension/*.tsx\" \"yarn build-extension\"",
+        "watch-electron": "node ./builders/watchRun.js --port 9879 \"electron/*.ts\" \"electron/*.tsx\" \"yarn build-electron\"",
         "notes": "mobx, preact, socket-function, typenode SHOULD be peerDependencies. But we want to use yarn (better dependency deduplication), so we can't use peerDependencies (as they aren't installed by default, which makes them a nightmare to use). If you want to override the versions, feel free to use overrides/resolutions."
     },
     "bin": {
         "build-nodejs": "./builders/nodeJSBuildRun.js",
         "build-extension": "./builders/extensionBuildRun.js",
         "build-web": "./builders/webBuildRun.js",
-        "build-electron": "./builders/electronBuildRun.js"
+        "build-electron": "./builders/electronBuildRun.js",
+        "slift-watch": "./builders/watchRun.js",
+        "slift-setup": "./builders/setupRun.js"
     },
     "dependencies": {
         "@types/shell-quote": "^1.7.5",
@@ -33,6 +36,7 @@
         "socket-function": "^0.155.0",
         "typenode": "^6.0.0",
         "typesafecss": "^0.26.0",
+        "ws": "^8.18.3",
         "yargs": "15.4.1"
     },
     "devDependencies": {
