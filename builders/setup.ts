@@ -1,8 +1,9 @@
 import fs from "fs";
 import path from "path";
+import { execSync } from "child_process";
 
 async function main() {
-    let targetDir = process.cwd();
+    let targetDir = path.resolve(".");
     let sourceDir = path.join(__dirname, "..");
 
     console.log("Setting up sliftutils project...");
@@ -80,6 +81,16 @@ async function main() {
         updatePackageJson(packageJsonPath);
     } else {
         console.warn("\nNo package.json found in target directory");
+    }
+
+    // Run yarn install
+    console.log("\nRunning yarn install...");
+    try {
+        execSync("yarn install", { cwd: targetDir, stdio: "inherit" });
+        console.log("Yarn install completed successfully");
+    } catch (error) {
+        console.error("Failed to run yarn install:", error);
+        process.exit(1);
     }
 
     console.log("\nSetup complete!");
