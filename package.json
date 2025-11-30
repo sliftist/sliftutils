@@ -1,11 +1,12 @@
 {
     "name": "sliftutils",
-    "version": "0.7.0",
+    "version": "0.7.1",
     "main": "index.js",
     "license": "MIT",
     "scripts": {
         "type": "yarn tsc --noEmit",
-        "emit-dts": "tsc --project tsconfig.declarations.json",
+        "emit-dts": "yarn tsc --project tsconfig.declarations.json",
+        "generate-index-dts": "node ./builders/generateIndexDts.js",
         "run-nodejs": "node ./build-nodejs/server.js",
         "run-nodejs-dev": "typenode ./nodejs/server.ts",
         "run-web": "node ./builders/webRun.js",
