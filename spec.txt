@@ -1,0 +1,59 @@
+
+
+watch helper script in bin
+    - And have it automatically ignore .gitignored files
+    - And have it also watch .watchignore
+    - accepts port argument to broadcast when the build changes
+
+watcher port, and helper function for hot reloading (watchHotReload)
+    - accepts port argument
+    - if in the browser, refreshes
+        - warns if it can't connect to the socket, specifying the watch script that should be used
+    - in nodejs, instead use socket-function hot reloading
+        - import { onHotReload, watchFilesAndTriggerHotReloading } from "socket-function/hot/HotReloadController";
+        - Which then means we would have to run it just via type node and not via our build script, which means this is in a really weird place, but it's probably fine. And I think it's still useful. 
+    - in electron watches and refreshes (no per file reloading)
+    - in chrome extension
+        - errors if called in content script (must be called in background script)
+        - reloads extension
+        - option to refresh content script pages in overall watch function
+            - On load, if reloaded in the last 10s, tells any pages which loaded content script to refresh their page
+
+
+1) Copy command (setup-proj?, copy-proj?), to copy all default files
+    - I think we will have to do some renaming so that when it references our lib files, it actually references our package instead of relative. 
+
+- HELPER bin to setup the project with:
+    (Only if the files don't exist)
+    tsconfig.json
+    .gitignore
+    .vscode (for format on save)
+    .eslintrc.js
+    .cursorrules
+    Add dependencies to package.json
+        (Any dependencies our helper project has should be dev dependencies)
+        - typenode
+        - socket-function
+        - typesafecss
+        - typedev
+    add the basic entry points for Node.js, the browser, the browser HTML file, and even some files for a Chrome extension, and even for an Electron app. 
+        - We'll make Electron optional though, and so they'll have to manually install Electron if they want to make an Electron app. We can check for this and warn if they try to build electron without having electron installed. 
+    Add build and type commands to package.json
+        - We have the binaries for the build commands, but adding them to packs.json makes it a lot more discoverable. 
+        - And it's just very good practice to add the type command to package.json. That way you could just say, what does this command do to the AI? and it'll tell you exactly what it does, instead of nesting 
+
+EXPOSE our helpers in our main export, in an index.ts file?
+- Will this let us just import them? Hmm...
+5) Test it in a new test repo
+- Test it with:
+    single html browser site
+    nodejs bundled running
+    electron
+    chrome extension
+- Make sure sourcemaps are preserved and work
+5.1) Use the new project and bundler in voice-cloner
+
+
+
+TODO:
+- vscode extension as well

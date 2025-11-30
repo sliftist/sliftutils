@@ -1,0 +1,23 @@
+{
+    "manifest_version": 3,
+    "name": "Example Extension",
+    "version": "1.0.0",
+    "description": "Example Chrome extension",
+    "background": {
+        "service_worker": "extBackground.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.wikipedia.org/*"
+            ],
+            "js": [
+                "extContentScript.js"
+            ]
+        }
+    ],
+    "permissions": [],
+    "icons": {
+        "16": "assets/icon16.png"
+    }
+}

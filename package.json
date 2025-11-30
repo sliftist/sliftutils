@@ -1,0 +1,46 @@
+{
+    "name": "sliftutils",
+    "version": "0.6.6",
+    "main": "index.js",
+    "license": "MIT",
+    "scripts": {
+        "type": "yarn tsc --noEmit",
+        "run-nodejs": "node ./build-nodejs/nodejs/server.js",
+        "run-web": "node ./builders/webRun.js",
+        "run-electron": "node ./node_modules/electron/cli.js ./build-electron/electron/electronMain.js",
+        "build-nodejs": "node ./builders/nodeJSBuildRun.js",
+        "build-web": "node ./builders/webBuildRun.js",
+        "build-extension": "node ./builders/extensionBuildRun.js",
+        "build-electron": "node ./builders/electronBuildRun.js",
+        "watch-nodejs": "node ./builders/watchRun.js \"nodejs/*.ts\" \"nodejs/*.tsx\" \"yarn build-nodejs\"",
+        "watch-web": "node ./builders/watchRun.js \"web/*.ts\" \"web/*.tsx\" \"yarn build-web\"",
+        "watch-extension": "node ./builders/watchRun.js \"extension/*.ts\" \"extension/*.tsx\" \"yarn build-extension\"",
+        "watch-electron": "node ./builders/watchRun.js \"electron/*.ts\" \"electron/*.tsx\" \"yarn build-electron\"",
+        "notes": "mobx, preact, socket-function, typenode SHOULD be peerDependencies. But we want to use yarn (better dependency deduplication), so we can't use peerDependencies (as they aren't installed by default, which makes them a nightmare to use). If you want to override the versions, feel free to use overrides/resolutions."
+    },
+    "bin": {
+        "build-nodejs": "./builders/nodeJSBuildRun.js",
+        "build-extension": "./builders/extensionBuildRun.js",
+        "build-web": "./builders/webBuildRun.js",
+        "build-electron": "./builders/electronBuildRun.js"
+    },
+    "dependencies": {
+        "@types/shell-quote": "^1.7.5",
+        "js-sha256": "^0.11.1",
+        "mobx": "^6.13.3",
+        "preact": "10.24.3",
+        "shell-quote": "^1.8.3",
+        "socket-function": "^0.155.0",
+        "typenode": "^6.0.0",
+        "typesafecss": "^0.26.0",
+        "yargs": "15.4.1"
+    },
+    "devDependencies": {
+        "@types/chrome": "^0.0.237",
+        "@types/yargs": "15.0.19",
+        "debugbreak": "^0.9.9",
+        "electron": "^33.2.1",
+        "open": "^8.4.0",
+        "typedev": "^0.1.1"
+    }
+}

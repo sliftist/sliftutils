@@ -1,0 +1,161 @@
+The code automatically updates on save, so do not ever run commands to rerun the site.
+
+We use MobX for state management. Components should use a variable called synced that is an observable for their state, and never Component.state. All components need the @observer decorator. For example:
+    import preact from "preact";
+    import { observable } from "mobx";
+
+    @observer
+    class Example extends preact.Component {
+        synced = observable({
+            x: 0,
+        });
+
+        render() {
+            return <div>
+                <button onClick={() => this.synced.x++}>
+                    Click me
+                </button>
+                <p>
+                    {this.synced.x}
+                </p>
+            </div>;
+        }
+    }
+
+Coding Styles
+    Try not to use "null", and instead always use "undefined".
+
+    He used double quotes, not single quotes. 
+
+    Never use the ternary operator. Instead, do this: "x ? y : z" => "x && y || z".
+
+    Never use non-null assertion operator, instead check the value, and if necessary (because it is accessed in nested functions), use a const variable to preserve the type.
+
+    Errors should almost always use a template string to include the expected value, and the actual value, as in: "throw new Error(`Expected X, was ${Y}`);"
+
+    Don't use switch statements. Use if/else statements instead.
+    
+    Don't use ! when accessing a value from a map. Use the get / if undefined initialize and set, and then use style. It's faster, and more type safe.
+
+    Sort with this function, which takes a single function to map each object to a sortable value
+        import { sort } from "socket-function/src/misc";
+        export function sort<T>(arr: T[], sortKey: (obj: T) => unknown);
+
+    Prefer to return, instead of using else statements. Handle error cases, warn/throw, and then return. Your main case should be below, not in an if statement, just in the main code.
+
+    Use template strings for error messages, which include the exact value that triggered the error, and the exact expectation it failed.
+
+    Use functions to prevent code duplication only when something is actually duplicated. 
+
+    Don't recreate collections or URL parameters, import them instead. 
+
+    Do not redefine types. Import the types correctly. 
+
+    Do not use types when they can be inferred. 
+
+
+General Styling
+    Never use em or rem. Only use px or vw/vh/%.
+
+    Don't add font colors unless asked to add styling. Don't add any aethetics beyond hbox/vbox/pad2 unless asked to add styling. Don't add fontSize unless asked to add styling. If you believe styling is possible, just tell the user, I can add styling, but won't do it unless you ask me to. 
+
+    Never use h1/h2/h3 etc. These classes have extremely large built-in margins and paddings, instead set the font size explicitly. 
+
+    Make sure to not use fillWidth, where flexGrow(1) would suffice. 
+
+Components
+    Anchor (<a> tag), for linking using URLParam
+        <Anchor
+            params={[[todolistURL, listKey]]}
+        >
+            {list.name}
+        </Anchor>
+    URLParam, Parameters which are stored in the URL. The second argument is the default, which can be a number, string, or an object. Set and get with .value
+        const todolistURL = new URLParam("todolist", "");
+
+API Calls
+    When in an event callback (which must be async)
+        APIController(getExtNodeId()).getModels.promise()
+    When in a render function/context
+        APIController(getExtNodeId()).getModels()
+
+
+
+css
+    css should be set using className={css.cssPropertyName(cssPropertyValue).anotherPropertyName...}
+    Always use the "css" helper for styling. For example:
+        <div className={css.width(100).height(50)}>My width is 100px, my height is 50px</div>
+    All css fields can be set in this way, with the function being the field name and the argument being the value.
+    Generally speaking, the CSS helpers are on two lines. Wrapping is fine. 
+        className={css.size(100, 100).hbox(4)
+            .hsl(0, 50, 50).borderRadius(4)
+        }
+        position
+            - Position, size, font size, layout, hints, etc. 
+            - The cursor, color, font color, border radius, pointer, bold. 
+
+        Conditionals come after, and should use this style:
+            className={css
+                ...
+                + (conditionalExample && css.opacity(0.5))
+            }
+            Specifically, it should be a value that you check for, and then the value. Don't use ternary, don't do `|| ""`
+                - If you have multiple values, chain them with || and &&
+    Keep the CSS simple, don't add too much, because it's easier to add than to remove.
+
+However, there are some helper functions that will directly map to commonly used styles. 
+
+    If you want to make a NON-Button feel like a button, you can use "css.button", which makes the background color change on hover, and make the cursor a pointer. Only use this if the background color is set, otherwise you need to message it's a button in another way. And never use it for <Button> which already does this.
+
+    Generally use hbox/vbox to set the spacing between elements, instead of using margins.
+
+
+    There are also some special aliases, some of which take parameters, some of which don't (which allows them to be chained like so: css.vbox0.wrap):
+    let nonCallAliases = {
+        relative: (c: CSSHelperTypeBase) => c.position("relative"),
+        absolute: (c: CSSHelperTypeBase) => c.position("absolute"),
+        fixed: (c: CSSHelperTypeBase) => c.position("fixed"),
+        wrap: (c: CSSHelperTypeBase) => c.flexWrap("wrap").display("flex", "soft").alignItems("center", "soft"),
+        marginAuto: (c: CSSHelperTypeBase) => c.margin("auto"),
+        fillBoth: (c: CSSHelperTypeBase) => c.width("100%").height("100%"),
+        fillWidth: (c: CSSHelperTypeBase) => c.width("100%"),
+        fillHeight: (c: CSSHelperTypeBase) => c.height("100%"),
+        flexShrink0: (c: CSSHelperTypeBase) => c.flexShrink(0),
+        ellipsis: (c: CSSHelperTypeBase) => c.overflow("hidden").textOverflow("ellipsis").whiteSpace("nowrap").display("inline-block"),
+        overflowAuto: (c: CSSHelperTypeBase) => c.overflow("auto"),
+        overflowHidden: (c: CSSHelperTypeBase) => c.overflow("hidden"),
+    };
+    let callAliases = {
+        hbox: (c: CSSHelperTypeBase, gap: number, rowGap?: number) => c.display("flex").flexDirection("row").rowGap(rowGap ?? gap).columnGap(gap).alignItems("center", "soft"),
+        vbox: (c: CSSHelperTypeBase, gap: number, columnGap?: number) => c.display("flex").flexDirection("column").rowGap(gap).columnGap(columnGap ?? gap).alignItems("start", "soft"),
+        pad2: (c: CSSHelperTypeBase, value: number, verticalValue?: number): CSSHelperTypeBase => {
+            if (verticalValue !== undefined) return c.padding(`${verticalValue}px ${value}px` as any);
+            return c.padding(value);
+        },
+        hsl: (c: CSSHelperTypeBase, h: number, s: number, l: number): CSSHelperTypeBase => c.background(`hsl(${h}, ${s}%, ${l}%)`),
+        hslhover: (c: CSSHelperTypeBase, h: number, s: number, l: number): CSSHelperTypeBase => c.background(`hsl(${h}, ${s}%, ${l}%)`, "hover"),
+        hsla: (c: CSSHelperTypeBase, h: number, s: number, l: number, a: number): CSSHelperTypeBase => c.background(`hsla(${h}, ${s}%, ${l}%, ${a})`),
+        hslahover: (c: CSSHelperTypeBase, h: number, s: number, l: number, a: number): CSSHelperTypeBase => c.background(`hsla(${h}, ${s}%, ${l}%, ${a})`, "hover"),
+        bord: (c: CSSHelperTypeBase, width: number, color: string | { h: number; s: number; l: number; a?: number; }, style = "solid"): CSSHelperTypeBase => {
+            let colorStr = typeof color === "string" ? color : `hsla(${color.h}, ${color.s}%, ${color.l}%, ${color.a ?? 1})`;
+            return c.border(`${width}px ${style} ${colorStr}`);
+        },
+        bord2: (c: CSSHelperTypeBase, h: number, s: number, l: number, width = 1, style = "solid"): CSSHelperTypeBase => {
+            return c.border(`${width}px ${style} hsla(${h}, ${s}%, ${l}%, 1)`);
+        },
+        hslcolor: (c: CSSHelperTypeBase, h: number, s: number, l: number): CSSHelperTypeBase => c.color(`hsl(${h}, ${s}%, ${l}%)`),
+        colorhsl: (c: CSSHelperTypeBase, h: number, s: number, l: number): CSSHelperTypeBase => c.color(`hsl(${h}, ${s}%, ${l}%)`),
+        hslacolor: (c: CSSHelperTypeBase, h: number, s: number, l: number, a: number): CSSHelperTypeBase => c.color(`hsla(${h}, ${s}%, ${l}%, ${a})`),
+        colorhsla: (c: CSSHelperTypeBase, h: number, s: number, l: number, a: number): CSSHelperTypeBase => c.color(`hsla(${h}, ${s}%, ${l}%, ${a})`),
+        size: (c: CSSHelperTypeBase, width: LengthOrPercentage, height: LengthOrPercentage) => c.width(width).height(height),
+        pos: (c: CSSHelperTypeBase, x: LengthOrPercentage, y: LengthOrPercentage) => c.left(x).top(y),
+    };
+
+
+For animation keyframes, a style tag is required. 
+    <style>{`
+        @keyframes spinner-ring {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    `}</style>
