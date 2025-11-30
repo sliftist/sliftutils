@@ -7,6 +7,22 @@ import path from "path";
 import { getAllFiles } from "../misc/fs";
 
 async function main() {
+    // Check if Electron is installed
+    let electronPath = path.resolve("./node_modules/electron");
+    if (!fs.existsSync(electronPath)) {
+        console.error("ERROR: Electron is not installed.");
+        console.error("");
+        console.error("Electron is too heavy to be included by default for non-electron projects.");
+        console.error("Please manually add Electron to your package.json dependencies:");
+        console.error("");
+        console.error("  \"devDependencies\": {");
+        console.error("    \"electron\": \"^33.2.1\"");
+        console.error("  }");
+        console.error("");
+        console.error("Then run: yarn install");
+        process.exit(1);
+    }
+
     let time = Date.now();
     let yargObj = yargs(process.argv)
         .option("mainEntry", { type: "string", default: "./electron/electronMain.ts", desc: `Path to the main process entry point` })
