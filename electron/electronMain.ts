@@ -17,7 +17,7 @@ async function main() {
         },
     });
 
-    await mainWindow.loadFile("./electronIndex.html");
+    await mainWindow.loadFile("./electron/electronIndex.html");
     mainWindow.webContents.openDevTools();
 
     app.on("window-all-closed", () => {
