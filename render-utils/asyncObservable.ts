@@ -21,7 +21,7 @@ export function asyncCache<Args, T>(getValue: (args: Args) => Promise<T>): {
             result: observable({
                 value: undefined,
                 error: undefined,
-            }),
+            }, undefined, { deep: false }),
         };
         cache.set(key, result);
 
