@@ -1,5 +1,7 @@
 The code automatically updates on save, so do not ever run commands to rerun the site.
 
+Don't run shell commands when you need to create or move small code files. You should use tool calls to do this. You should also use tool calls to make files within folders. You don't need to make the folder, just make the file. The folder will automatically be created.
+
 We use MobX for state management. Components should use a variable called synced that is an observable for their state, and never Component.state. All components need the @observer decorator. For example:
     import preact from "preact";
     import { observable } from "mobx";
@@ -22,8 +24,28 @@ We use MobX for state management. Components should use a variable called synced
         }
     }
 
+The code automatically updates on save, so do not ever run commands to rerun the site.
+
+In the implementation for every type of API, there should be a companion file to manage the session (ex smsSession.ts). This should export a function which makes calling the API functions simple by automatically managing the session. Because the session helper will be making the function calls, it can try catch them and appropriately handle the session errors that require regenerating the session. Of course, if it's not a session error, it should just rethrow it.
+
+Use createPersistentObject for persistent things like session states. It's accessed synchronously and the key will have an undefined value if it the value isn't set. 
+
+    let persistent = createPersistentObject<{
+        token: string;
+    }>("sms");
+
+    persistent.token = "...";
+    persistent.token;
+
+
 Coding Styles
     Try not to use "null", and instead always use "undefined".
+
+    Almost never check for undefined or null, just check for falsey.
+
+    When functions have more than one primitive parameter, such that you could confuse them, even something as simple as start time and end time, you should put them inside of an object and call that object config, so the function only has a single parameter.
+
+    Never use return codes, always prefer to throw on error. Include a lot of context information in the error. If any values might be extremely large, such as parsing a file, limit them (ex, to 500 characters).
 
     He used double quotes, not single quotes. 
 
@@ -52,6 +74,10 @@ Coding Styles
     Do not redefine types. Import the types correctly. 
 
     Do not use types when they can be inferred. 
+
+    Constants that are arbitrary and that we might to reconfigure should be near the top of the file under the imports, not buried within functions. 
+
+    Never use environment variables. All configuration should be on the disk, or, if specific to a current run, passed as command line parameters. 
 
 
 General Styling

@@ -8,7 +8,9 @@
     },
     "include": [
         "render-utils/**/*.ts",
-        "render-utils/**/*.tsx"
+        "render-utils/**/*.tsx",
+        "misc/**/*.ts",
+        "misc/**/*.tsx"
     ],
     "exclude": [
         "node_modules",
