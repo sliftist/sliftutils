@@ -1,8 +1,12 @@
 {
     "name": "sliftutils",
-    "version": "0.10.0",
+    "version": "0.11.0",
     "main": "index.js",
     "license": "MIT",
+    "files": [
+        "**/*",
+        ".gitignore"
+    ],
     "scripts": {
         "type": "yarn tsc --noEmit",
         "update-types": "yarn emit-dts && yarn generate-index-dts",
