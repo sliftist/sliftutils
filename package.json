@@ -1,6 +1,6 @@
 {
     "name": "sliftutils",
-    "version": "0.12.0",
+    "version": "0.13.0",
     "main": "index.js",
     "license": "MIT",
     "files": [
@@ -12,6 +12,7 @@
         "update-types": "yarn emit-dts && yarn generate-index-dts",
         "emit-dts": "yarn tsc --project tsconfig.declarations.json || true",
         "generate-index-dts": "typenode ./builders/generateIndexDts.ts",
+        "prepublishOnly": "yarn update-types",
         "run-nodejs": "node ./build-nodejs/server.js",
         "run-nodejs-dev": "typenode ./nodejs/server.ts",
         "run-web": "node ./builders/webRun.js",
