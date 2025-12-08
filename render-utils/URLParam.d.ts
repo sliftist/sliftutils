@@ -1,13 +1,17 @@
-export declare class URLParamStr {
-    readonly urlKey: string;
-    private state;
-    lastSetValue: string;
-    constructor(urlKey: string);
-    forceUpdate(): void;
-    get(): string;
-    set(value: string): void;
-    get value(): string;
-    set value(value: string);
+export declare class URLParam<T = unknown> {
+    readonly key: string;
+    private defaultValue;
+    constructor(key: string, defaultValue?: T);
+    valueSeqNum: {
+        value: number;
+    };
+    get(): T;
+    set(value: T): void;
+    reset(): void;
+    getOverride(value: T): [string, string];
+    get value(): T;
+    set value(value: T);
 }
-export declare function batchUrlUpdate<T>(code: () => T): T;
-export declare function createLink(params: [URLParamStr, string][]): string;
+export declare function getResolvedParam(param: [URLParam, unknown] | [string, string]): [string, string];
+export declare function batchURLParamUpdate(params: ([URLParam, unknown] | [string, string])[]): void;
+export declare function getCurrentUrl(): string;

@@ -1,3 +1,4 @@
+export declare function resetSecret(key: string): void;
 export declare const getSecret: {
     (key: string): Promise<string>;
     clear(key: string): void;

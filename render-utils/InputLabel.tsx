@@ -1,7 +1,6 @@
 import preact from "preact";
 import { Input, InputProps } from "./Input";
 import { css } from "typesafecss";
-import { URLParamStr } from "./URLParam";
 import { lazy } from "socket-function/src/caching";
 import { observer } from "./observer";
 import { observable } from "mobx";
@@ -83,29 +82,21 @@ export class InputLabel extends preact.Component<InputLabelProps> {
 
         if ((!props.type || props.type === "number") && props.useDateUI) {
             let value = String(props.value);
-            if (
-                value === "date-1be2200d-9742-4e90-a6c2-e8a790277414"
-                || isJSNumber(value) && startGuessDateRange < +value && +value < endGuessDateRange
-                // NOTE: Showing the date selector is a problem, as there is not an easy way to undo this. So if the
-                //      user typed in "2020", it would return the input into a selector and not let them keeping type.
-                // || startGuessDateRange < +new Date(String(value)) && +new Date(String(value)) < endGuessDateRange
-            ) {
-                props.type = "datetime-local";
-                props.edit = false;
-                props.textarea = false;
-                props.number = false;
-                props.forceInputValueUpdatesWhenFocused = true;
-                // NOTE: When using forceInputValueUpdatesWhenFocused we need hot, otherwise the user's updates
-                //  won't be visible.
-                props.hot = true;
-                if (isJSNumber(value)) {
-                    value = formatDateTimeForInput(+value);
-                } else {
-                    value = "";
-                }
-                props.value = value;
-                addValueMapping(value => (+new Date(value).getTime() || "") + "");
+            props.type = "datetime-local";
+            props.edit = false;
+            props.textarea = false;
+            props.number = false;
+            props.forceInputValueUpdatesWhenFocused = true;
+            // NOTE: When using forceInputValueUpdatesWhenFocused we need hot, otherwise the user's updates
+            //  won't be visible.
+            props.hot = true;
+            if (isJSNumber(value)) {
+                value = formatDateTimeForInput(+value);
+            } else {
+                value = "";
             }
+            props.value = value;
+            addValueMapping(value => (+new Date(value).getTime() || "") + "");
         }
         if (props.fontSize !== undefined) {
             props.style = { ...props.style as any, fontSize: props.fontSize };
@@ -209,7 +200,7 @@ export class InputLabel extends preact.Component<InputLabelProps> {
         }
         return (
             <label onClick={onClick} className={
-                css.hbox(0).relative
+                css.hbox(5).relative
                 + " trigger-hover "
                 + props.outerClass
                 + (props.flavor === "large" && css.fontSize(18, "soft"))
@@ -260,7 +251,7 @@ const pencilSVG = lazy(() => {
 
 @observer
 export class InputLabelURL extends preact.Component<InputLabelProps & {
-    persisted: URLParamStr;
+    persisted: { value: unknown };
 }> {
     render() {
         this.props.persisted.value;

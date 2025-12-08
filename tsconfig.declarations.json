@@ -10,7 +10,9 @@
         "render-utils/**/*.ts",
         "render-utils/**/*.tsx",
         "misc/**/*.ts",
-        "misc/**/*.tsx"
+        "misc/**/*.tsx",
+        "storage/**/*.ts",
+        "storage/**/*.tsx"
     ],
     "exclude": [
         "node_modules",

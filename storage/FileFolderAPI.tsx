@@ -46,7 +46,14 @@ let displayData = observable({
     ui: undefined as undefined | preact.ComponentChildren,
 }, undefined, { deep: false });
 
-const storageKey = "syncFileSystemCamera3";
+let fileAPIKey = "";
+function getFileAPIKey() {
+    if (!fileAPIKey) throw new Error("Must call setFileAPIKey before using file system. Just pass any key. This prevents reusing the file system api that other development apps might be using.");
+    return fileAPIKey;
+}
+export function setFileAPIKey(key: string) {
+    fileAPIKey = key;
+}
 
 @observer
 class DirectoryPrompter extends preact.Component {
@@ -206,7 +213,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
 
         let handle: DirectoryWrapper | undefined;
 
-        let storedId = localStorage.getItem(storageKey);
+        const storedId = localStorage.getItem(getFileAPIKey());
         if (storedId) {
             let doneLoad = false;
             setTimeout(() => {
@@ -216,7 +223,45 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
             }, 500);
             try {
                 handle = await tryToLoadPointer(storedId);
-            } catch { }
+            } catch (e) {
+                console.error(e);
+                // Check if the error is due to user activation being required
+                const errorMessage = e instanceof Error ? e.message : String(e);
+                if (errorMessage.includes("user activation") || errorMessage.includes("User activation")) {
+                    doneLoad = true;
+                    // Show UI to get user to click and retry
+                    let retryCallback: (success: boolean) => void;
+                    let retryPromise = new Promise<boolean>(resolve => {
+                        retryCallback = resolve;
+                    });
+                    displayData.ui = (
+                        <button
+                            className={css.fontSize(40).pad2(80, 40)}
+                            onClick={async () => {
+                                displayData.ui = "Loading...";
+                                try {
+                                    const retryHandle = await tryToLoadPointer(storedId);
+                                    if (retryHandle) {
+                                        handle = retryHandle;
+                                        retryCallback(true);
+                                    } else {
+                                        retryCallback(false);
+                                    }
+                                } catch (retryError) {
+                                    console.error("Retry failed:", retryError);
+                                    retryCallback(false);
+                                }
+                            }}
+                        >
+                            Click to restore file system access
+                        </button>
+                    );
+                    const success = await retryPromise;
+                    if (handle) {
+                        return handle;
+                    }
+                }
+            }
             doneLoad = true;
             if (handle) {
                 return handle;
@@ -234,7 +279,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                     const handle = await window.showDirectoryPicker();
                     await handle.requestPermission({ mode: "readwrite" });
                     let storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
-                    localStorage.setItem(storageKey, storedId);
+                    localStorage.setItem(getFileAPIKey(), storedId);
                     fileCallback(handle as any);
                 }}
             >
@@ -265,7 +310,7 @@ export const getFileStorage = lazy(async function getFileStorage(): Promise<File
     return wrapHandle(handle);
 });
 export function resetStorageLocation() {
-    localStorage.removeItem(storageKey);
+    localStorage.removeItem(getFileAPIKey());
     window.location.reload();
 }
 
@@ -273,7 +318,7 @@ export type NestedFileStorage = {
     hasKey(key: string): Promise<boolean>;
     getStorage(key: string): Promise<FileStorage>;
     removeStorage(key: string): Promise<void>;
-    getKeys(): Promise<string[]>;
+    getKeys(includeFolders?: boolean): Promise<string[]>;
 };
 
 export type FileStorage = IStorageRaw & {
@@ -361,10 +406,10 @@ function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
             await handle.removeEntry(key);
         },
 
-        async getKeys(): Promise<string[]> {
+        async getKeys(includeFolders: boolean = false): Promise<string[]> {
             const keys: string[] = [];
             for await (const [name, entry] of handle) {
-                if (entry.kind === "file") {
+                if (entry.kind === "file" || includeFolders) {
                     keys.push(entry.name);
                 }
             }

@@ -1,6 +1,5 @@
 import preact from "preact";
 import { InputProps } from "./Input";
-import { URLParamStr } from "./URLParam";
 export type InputLabelProps = Omit<InputProps, "label" | "title"> & {
     label?: preact.ComponentChild;
     number?: boolean;
@@ -29,7 +28,9 @@ export declare class InputLabel extends preact.Component<InputLabelProps> {
     render(): preact.JSX.Element;
 }
 export declare class InputLabelURL extends preact.Component<InputLabelProps & {
-    persisted: URLParamStr;
+    persisted: {
+        value: unknown;
+    };
 }> {
     render(): preact.JSX.Element;
 }

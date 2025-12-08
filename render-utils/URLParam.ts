@@ -1,84 +1,101 @@
 import { isNode } from "typesafecss";
 import { observable } from "mobx";
+import { throttleFunction } from "socket-function/src/misc";
+import { niceParse, niceStringify } from "./niceStringify";
 
-let allParams: URLParamStr[] = [];
+let urlParamLookup = new Map<string, URLParam<unknown>>();
+let pauseUpdate = false;
 
-let updated: URLParamStr[] = [];
-
-export class URLParamStr {
-    private state = observable({
-        seqNum: 0
-    });
-    public lastSetValue = "";
-    constructor(public readonly urlKey: string) {
-        allParams.push(this);
+export class URLParam<T = unknown> {
+    constructor(public readonly key: string, private defaultValue: T = "" as any) {
+        urlParamLookup.set(key, this);
     }
-    public forceUpdate() {
-        this.state.seqNum++;
+    valueSeqNum = observable({ value: 1 });
+    public get(): T {
+        urlBackSeqNum.value;
+        this.valueSeqNum.value;
+        let value = new URL(getCurrentUrl()).searchParams.get(this.key);
+        if (value === null) {
+            return this.defaultValue;
+        }
+        return niceParse(value) as T;
+    }
+    public set(value: T) {
+        let url = new URL(getCurrentUrl());
+        if (value === this.defaultValue) {
+            url.searchParams.delete(this.key);
+        } else {
+            url.searchParams.set(this.key, niceStringify(value));
+        }
+        if (!pauseUpdate) {
+            void throttledUrlPush(url.toString());
+            this.valueSeqNum.value++;
+        }
+    }
+    public reset() {
+        let url = new URL(getCurrentUrl());
+        url.searchParams.delete(this.key);
+        if (!pauseUpdate) {
+            void throttledUrlPush(url.toString());
+            this.valueSeqNum.value++;
+        }
     }
 
-    public get() {
-        this.state.seqNum;
-        return new URLSearchParams(window.location.search).get(this.urlKey) || "";
-    }
-    public set(value: string) {
-        if (value === this.get()) return;
-        this.lastSetValue = value;
-        batchUrlUpdate(() => {
-            updated.push(this);
-        });
-        this.state.seqNum++;
+    public getOverride(value: T): [string, string] {
+        return [this.key, value as any];
     }
 
     public get value() {
         return this.get();
     }
-    public set value(value: string) {
+    public set value(value: T) {
         this.set(value);
     }
 }
 
-let inBatchUpdate = false;
-export function batchUrlUpdate<T>(code: () => T): T {
-    if (inBatchUpdate) return code();
-    inBatchUpdate = true;
+export function getResolvedParam(param: [URLParam, unknown] | [string, string]): [string, string] {
+    if (typeof param[0] === "string") {
+        return [param[0], niceStringify(param[1])];
+    }
+    return [param[0].key, niceStringify(param[1])];
+}
+export function batchURLParamUpdate(params: ([URLParam, unknown] | [string, string])[]) {
+    let resolvedParams = params.map(getResolvedParam);
+    pauseUpdate = true;
+    let url = new URL(location.href);
     try {
-        return code();
+        for (let [key, value] of resolvedParams) {
+            url.searchParams.set(key, value);
+            let urlParam = urlParamLookup.get(key);
+            urlParam?.set(niceParse(value));
+        }
     } finally {
-        inBatchUpdate = false;
-
-        let prevUpdated = updated;
-        updated = [];
-        let searchParams = new URLSearchParams(window.location.search);
-        for (let obj of prevUpdated) {
-            searchParams.set(obj.urlKey, obj.lastSetValue);
-        }
-        let newURL = "?" + searchParams.toString();
-        if (window.location.hash) {
-            newURL += window.location.hash;
-        }
-        window.history.pushState({}, "", newURL);
+        pauseUpdate = false;
     }
+    urlBackSeqNum.value++;
+    void throttledUrlPush(url.toString());
 }
 
-export function createLink(params: [URLParamStr, string][]) {
-    let searchParams = new URLSearchParams(window.location.search);
-    for (let [param, value] of params) {
-        searchParams.set(param.urlKey, value);
-    }
-    let newURL = "?" + searchParams.toString();
-    if (window.location.hash) {
-        newURL += window.location.hash;
-    }
-    return newURL;
+export function getCurrentUrl() {
+    return currentBatchedUrl ?? location.href;
 }
 
+
+let currentBatchedUrl: string | undefined;
+function throttledUrlPush(url: string) {
+    history.pushState({}, "", url);
+    //currentBatchedUrl = url;
+    // NOTE: Stopped throttling, so when you click on links, it immediately updates the selected state. 
+    //void throttledUrlPushBase(url);
+}
+const throttledUrlPushBase = throttleFunction(1000, (url: string) => {
+    currentBatchedUrl = undefined;
+    history.pushState({}, "", url);
+});
+
+let urlBackSeqNum = observable({ value: 1 });
 if (!isNode()) {
-    // Watch for url push states
     window.addEventListener("popstate", () => {
-        // Force all to update, in case their param changed
-        for (let param of allParams) {
-            param.forceUpdate();
-        }
+        urlBackSeqNum.value++;
     });
 }

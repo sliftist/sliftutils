@@ -24,6 +24,7 @@ export declare class Table<RowT extends RowType> extends preact.Component<TableT
     lineLimit?: number;
     characterLimit?: number;
     excludeEmptyColumns?: boolean;
+    getRowFields?: (row: RowT) => preact.JSX.HTMLAttributes<HTMLTableRowElement>;
 }> {
     state: {
         limit: number;

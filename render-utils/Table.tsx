@@ -4,6 +4,7 @@ import { formatValue, JSXFormatter, toSpaceCase } from "./GenericFormat";
 import { observer } from "./observer";
 import { canHaveChildren } from "socket-function/src/types";
 import { showFullscreenModal } from "./FullscreenModal";
+import { observable } from "mobx";
 
 // Null means the column is removed
 export type ColumnType<T = unknown, Row extends RowType = RowType> = undefined | null | {
@@ -32,10 +33,12 @@ export class Table<RowT extends RowType> extends preact.Component<TableType<RowT
     characterLimit?: number;
 
     excludeEmptyColumns?: boolean;
+
+    getRowFields?: (row: RowT) => preact.JSX.HTMLAttributes<HTMLTableRowElement>;
 }> {
-    state = {
+    state = observable({
         limit: this.props.initialLimit || 100,
-    };
+    });
     render() {
         let { columns, rows, excludeEmptyColumns } = this.props;
 
@@ -63,9 +66,11 @@ export class Table<RowT extends RowType> extends preact.Component<TableType<RowT
                         <th className={css.pad2(8, 4) + cellClass}>{column?.title || toSpaceCase(columnName)}</th>
                     )}
                 </tr>
-                {rows.map((row, index) => (
-                    <tr
-                        className={(index % 2 === 1 && css.hsla(0, 0, 100, 0.25) || "")}
+                {rows.map((row, index) => {
+                    let rowFields = this.props.getRowFields?.(row) || {};
+                    return <tr
+                        {...rowFields}
+                        className={rowFields.className + " " + (index % 2 === 1 && css.hsla(0, 0, 100, 0.25) || "")}
                     >
                         <td className={css.center}>{index + 1}</td>
                         {Object.entries(columns).filter(x => x[1] !== null).map(([columnName, column]: [string, ColumnType]) => {
@@ -114,8 +119,8 @@ export class Table<RowT extends RowType> extends preact.Component<TableType<RowT
                                 {innerContent}
                             </td>;
                         })}
-                    </tr>
-                ))}
+                    </tr>;
+                })}
                 {allRows.length > rows.length && <tr>
                     <td
                         colSpan={1 + Object.keys(columns).length}

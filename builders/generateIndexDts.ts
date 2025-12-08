@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 
-const FOLDERS_TO_INCLUDE = ["render-utils", "misc"];
+const FOLDERS_TO_INCLUDE = ["render-utils", "misc", "storage"];
 
 function getAllDtsFiles(dir: string, fileList: string[] = []): string[] {
     const files = fs.readdirSync(dir);

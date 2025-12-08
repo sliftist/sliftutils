@@ -1494,10 +1494,10 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^0.156.0:
-  version "0.156.0"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-0.156.0.tgz#7f53c83453e7e451efc85fb6d7d6fd9d8e2cd855"
-  integrity sha512-9YN2Juvg5tFy4W8kkkeFtARbS2PPvj5Gm4gCrT1t37bIn5aDXVVsh+R074tPm7lg/I0kj4o/Qc5YH2n3NMn+lQ==
+socket-function@^0.159.0:
+  version "0.159.0"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-0.159.0.tgz#a847e26840461cbb9355cb84ec801975c5e0bd07"
+  integrity sha512-CmNF6PRjHqEzb82Fyu4PEuAqoaTR0HZJzZr2lzhzlq215vXrIh/X0m68EI0G+OlSVGrUt0Ntf2AO68svpih7fw==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"
@@ -1635,10 +1635,10 @@ typenode@^6.0.0:
     source-map-support "https://github.com/7rulnik/node-source-map-support"
     typescript "5.3.3"
 
-typesafecss@^0.26.0:
-  version "0.26.0"
-  resolved "https://registry.yarnpkg.com/typesafecss/-/typesafecss-0.26.0.tgz#184cf3e11e769626ae33a95ccb9b6bc3a18054c7"
-  integrity sha512-6gwQ0V7fut8Dq4C693NoDGAvGdaamRS/l4+6frWYy1r5Qg+Q/bhJkTDI33EU1LR9LMHOG9XinIBYS+CEt2YHTA==
+typesafecss@*:
+  version "0.27.0"
+  resolved "https://registry.yarnpkg.com/typesafecss/-/typesafecss-0.27.0.tgz#b88df162f13abd7a0da8758f92ec4996170fe39a"
+  integrity sha512-YkcOw9eUv6VhBZ9d9MfVkHlCB1P6zqIw3DTp1PqEmfLZcFr72ZkSmQrnrRP/9wxbOJNhUK8/OvnpuYB2fcD5UQ==
 
 typescript@5.3.3:
   version "5.3.3"

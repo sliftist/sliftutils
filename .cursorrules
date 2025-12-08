@@ -79,6 +79,14 @@ Coding Styles
 
     Never use environment variables. All configuration should be on the disk, or, if specific to a current run, passed as command line parameters. 
 
+    Never use inline styles, always use the CSS helper. 
+
+    Don't use as any.
+    
+    DO NOT redeclare constants and copy their value. JUST IMPORT THEM!
+
+    DO NOT redeclare types. JUST IMPORT THEM!
+
 
 General Styling
     Never use em or rem. Only use px or vw/vh/%.

@@ -19,6 +19,7 @@ declare module "sliftutils/misc/fs" {
 }
 
 declare module "sliftutils/misc/getSecret" {
+    export declare function resetSecret(key: string): void;
     export declare const getSecret: {
         (key: string): Promise<string>;
         clear(key: string): void;
@@ -27,6 +28,13 @@ declare module "sliftutils/misc/getSecret" {
         getAllKeys(): string[];
         get(key: string): Promise<string> | undefined;
     };
+
+}
+
+declare module "sliftutils/misc/matchFilter" {
+    export declare function matchFilter(filter: {
+        value: string;
+    }, value: string): boolean;
 
 }
 
@@ -135,7 +143,6 @@ declare module "sliftutils/render-utils/Input" {
 declare module "sliftutils/render-utils/InputLabel" {
     import preact from "preact";
     import { InputProps } from "./Input";
-    import { URLParamStr } from "./URLParam";
     export type InputLabelProps = Omit<InputProps, "label" | "title"> & {
         label?: preact.ComponentChild;
         number?: boolean;
@@ -164,7 +171,9 @@ declare module "sliftutils/render-utils/InputLabel" {
         render(): preact.JSX.Element;
     }
     export declare class InputLabelURL extends preact.Component<InputLabelProps & {
-        persisted: URLParamStr;
+        persisted: {
+            value: unknown;
+        };
     }> {
         render(): preact.JSX.Element;
     }
@@ -308,6 +317,7 @@ declare module "sliftutils/render-utils/Table" {
         lineLimit?: number;
         characterLimit?: number;
         excludeEmptyColumns?: boolean;
+        getRowFields?: (row: RowT) => preact.JSX.HTMLAttributes<HTMLTableRowElement>;
     }> {
         state: {
             limit: number;
@@ -318,19 +328,23 @@ declare module "sliftutils/render-utils/Table" {
 }
 
 declare module "sliftutils/render-utils/URLParam" {
-    export declare class URLParamStr {
-        readonly urlKey: string;
-        private state;
-        lastSetValue: string;
-        constructor(urlKey: string);
-        forceUpdate(): void;
-        get(): string;
-        set(value: string): void;
-        get value(): string;
-        set value(value: string);
+    export declare class URLParam<T = unknown> {
+        readonly key: string;
+        private defaultValue;
+        constructor(key: string, defaultValue?: T);
+        valueSeqNum: {
+            value: number;
+        };
+        get(): T;
+        set(value: T): void;
+        reset(): void;
+        getOverride(value: T): [string, string];
+        get value(): T;
+        set value(value: T);
     }
-    export declare function batchUrlUpdate<T>(code: () => T): T;
-    export declare function createLink(params: [URLParamStr, string][]): string;
+    export declare function getResolvedParam(param: [URLParam, unknown] | [string, string]): [string, string];
+    export declare function batchURLParamUpdate(params: ([URLParam, unknown] | [string, string])[]): void;
+    export declare function getCurrentUrl(): string;
 
 }
 
@@ -356,6 +370,15 @@ declare module "sliftutils/render-utils/modal" {
 
 }
 
+declare module "sliftutils/render-utils/niceStringify" {
+    export declare const niceStringifyTrue = "";
+    export declare const niceStringifyNan = "{NaN}";
+    export declare const niceStringifyUndefined = "{Undefined}";
+    export declare function niceStringify(value: unknown): string;
+    export declare function niceParse(str: string | undefined, noSpecialTrue?: boolean): unknown;
+
+}
+
 declare module "sliftutils/render-utils/observer" {
     import * as preact from "preact";
     import { Reaction } from "mobx";
@@ -375,4 +398,483 @@ declare module "sliftutils/render-utils/observer" {
         readonly name: string;
     } & T;
 
+}
+
+declare module "sliftutils/storage/CachedStorage" {
+    import { StorageSync } from "./StorageObservable";
+    export declare function newCachedStrStorage<T>(folder: string, getValue: (key: string) => Promise<T>): StorageSync<T>;
+
+}
+
+declare module "sliftutils/storage/DelayedStorage" {
+    import { IStorage } from "./IStorage";
+    export declare class DelayedStorage<T> implements IStorage<T> {
+        private storage;
+        constructor(storage: Promise<IStorage<T>>);
+        get(key: string): Promise<T | undefined>;
+        set(key: string, value: T): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<{
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        reset(): Promise<void>;
+    }
+
+}
+
+declare module "sliftutils/storage/DiskCollection" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IStorage, IStorageSync } from "./IStorage";
+    import { StorageSync } from "./StorageObservable";
+    import { TransactionStorage } from "./TransactionStorage";
+    export declare class DiskCollection<T> implements IStorageSync<T> {
+        private collectionName;
+        private writeDelay?;
+        constructor(collectionName: string, writeDelay?: number | undefined);
+        transactionStorage: TransactionStorage | undefined;
+        initStorage(): Promise<IStorage<T>>;
+        baseStorage: Promise<IStorage<T>>;
+        private synced;
+        get(key: string): T | undefined;
+        getPromise(key: string): Promise<T | undefined>;
+        set(key: string, value: T): void;
+        remove(key: string): void;
+        getKeys(): string[];
+        getKeysPromise(): Promise<string[]>;
+        getEntries(): [string, T][];
+        getValues(): T[];
+        getValuesPromise(): Promise<T[]>;
+        getInfo(key: string): {
+            size: number;
+            lastModified: number;
+        } | undefined;
+        reset(): Promise<void>;
+    }
+    export declare class DiskCollectionBrowser<T> implements IStorageSync<T> {
+        private collectionName;
+        private writeDelay?;
+        constructor(collectionName: string, writeDelay?: number | undefined);
+        transactionStorage: TransactionStorage | undefined;
+        initStorage(): Promise<IStorage<T>>;
+        baseStorage: Promise<IStorage<T>>;
+        private synced;
+        get(key: string): T | undefined;
+        getPromise(key: string): Promise<T | undefined>;
+        set(key: string, value: T): void;
+        remove(key: string): void;
+        getKeys(): string[];
+        getKeysPromise(): Promise<string[]>;
+        getEntries(): [string, T][];
+        getValues(): T[];
+        getValuesPromise(): Promise<T[]>;
+        getInfo(key: string): {
+            size: number;
+            lastModified: number;
+        } | undefined;
+        reset(): Promise<void>;
+    }
+    export declare class DiskCollectionPromise<T> implements IStorage<T> {
+        private collectionName;
+        private writeDelay?;
+        constructor(collectionName: string, writeDelay?: number | undefined);
+        initStorage(): Promise<IStorage<T>>;
+        private synced;
+        get(key: string): Promise<T | undefined>;
+        set(key: string, value: T): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<{
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        reset(): Promise<void>;
+    }
+    export declare class DiskCollectionRaw implements IStorage<Buffer> {
+        private collectionName;
+        constructor(collectionName: string);
+        initStorage(): Promise<IStorage<Buffer>>;
+        private synced;
+        get(key: string): Promise<Buffer | undefined>;
+        set(key: string, value: Buffer): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<{
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        reset(): Promise<void>;
+    }
+    export declare class DiskCollectionRawBrowser {
+        private collectionName;
+        constructor(collectionName: string);
+        initStorage(): Promise<IStorage<Buffer>>;
+        private synced;
+        get(key: string): Buffer | undefined;
+        getPromise(key: string): Promise<Buffer | undefined>;
+        set(key: string, value: Buffer): void;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<{
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        reset(): Promise<void>;
+    }
+    export declare function newFileStorageBufferSyncer(folder?: string): StorageSync<Buffer>;
+    export declare function newFileStorageJSONSyncer<T>(folder?: string): StorageSync<T>;
+
+}
+
+declare module "sliftutils/storage/FileFolderAPI" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IStorageRaw } from "./IStorage";
+    type FileWrapper = {
+        getFile(): Promise<{
+            size: number;
+            lastModified: number;
+            arrayBuffer(): Promise<ArrayBuffer>;
+        }>;
+        createWritable(config?: {
+            keepExistingData?: boolean;
+        }): Promise<{
+            seek(offset: number): Promise<void>;
+            write(value: Buffer): Promise<void>;
+            close(): Promise<void>;
+        }>;
+    };
+    type DirectoryWrapper = {
+        removeEntry(key: string, options?: {
+            recursive?: boolean;
+        }): Promise<void>;
+        getFileHandle(key: string, options?: {
+            create?: boolean;
+        }): Promise<FileWrapper>;
+        getDirectoryHandle(key: string, options?: {
+            create?: boolean;
+        }): Promise<DirectoryWrapper>;
+        [Symbol.asyncIterator](): AsyncIterableIterator<[
+            string,
+            {
+                kind: "file";
+                name: string;
+                getFile(): Promise<FileWrapper>;
+            } | {
+                kind: "directory";
+                name: string;
+                getDirectoryHandle(key: string, options?: {
+                    create?: boolean;
+                }): Promise<DirectoryWrapper>;
+            }
+        ]>;
+    };
+    export declare function setFileAPIKey(key: string): void;
+    export declare const getDirectoryHandle: {
+        (): Promise<DirectoryWrapper>;
+        reset(): void;
+        set(newValue: Promise<DirectoryWrapper>): void;
+    };
+    export declare const getFileStorageNested: {
+        (key: string): Promise<FileStorage>;
+        clear(key: string): void;
+        clearAll(): void;
+        forceSet(key: string, value: Promise<FileStorage>): void;
+        getAllKeys(): string[];
+        get(key: string): Promise<FileStorage> | undefined;
+    };
+    export declare const getFileStorage: {
+        (): Promise<FileStorage>;
+        reset(): void;
+        set(newValue: Promise<FileStorage>): void;
+    };
+    export declare function resetStorageLocation(): void;
+    export type NestedFileStorage = {
+        hasKey(key: string): Promise<boolean>;
+        getStorage(key: string): Promise<FileStorage>;
+        removeStorage(key: string): Promise<void>;
+        getKeys(includeFolders?: boolean): Promise<string[]>;
+    };
+    export type FileStorage = IStorageRaw & {
+        folder: NestedFileStorage;
+    };
+    export {};
+
+}
+
+declare module "sliftutils/storage/IStorage" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    export type IStorageSync<T> = {
+        get(key: string): T | undefined;
+        set(key: string, value: T): void;
+        remove(key: string): void;
+        getKeys(): string[];
+        getValues(): T[];
+        getEntries(): [string, T][];
+        getInfo(key: string): {
+            size: number;
+            lastModified: number;
+        } | undefined;
+        reset(): Promise<void>;
+    };
+    export type IStorage<T> = {
+        get(key: string): Promise<T | undefined>;
+        set(key: string, value: T): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<undefined | {
+            size: number;
+            lastModified: number;
+        }>;
+        reset(): Promise<void>;
+    };
+    export type IStorageRaw = {
+        get(key: string): Promise<Buffer | undefined>;
+        append(key: string, value: Buffer): Promise<void>;
+        set(key: string, value: Buffer): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(includeFolders?: boolean): Promise<string[]>;
+        getInfo(key: string): Promise<undefined | {
+            size: number;
+            lastModified: number;
+        }>;
+        reset(): Promise<void>;
+    };
+
+}
+
+declare module "sliftutils/storage/IndexedDBFileFolderAPI" {
+    import { FileStorage } from "./FileFolderAPI";
+    export declare const getFileStorageIndexDB: {
+        (): Promise<FileStorage>;
+        reset(): void;
+        set(newValue: Promise<FileStorage>): void;
+    };
+
+}
+
+declare module "sliftutils/storage/JSONStorage" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IStorage } from "./IStorage";
+    export declare class JSONStorage<T> implements IStorage<T> {
+        private storage;
+        constructor(storage: IStorage<Buffer>);
+        get(key: string): Promise<T | undefined>;
+        set(key: string, value: T): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<{
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        reset(): Promise<void>;
+    }
+
+}
+
+declare module "sliftutils/storage/PendingManager" {
+    import preact from "preact";
+    export declare function setPending(group: string, message: string): void;
+    export declare function hasPending(): boolean;
+    export declare class PendingDisplay extends preact.Component {
+        render(): preact.JSX.Element;
+    }
+
+}
+
+declare module "sliftutils/storage/PendingStorage" {
+    import { IStorage } from "./IStorage";
+    export declare class PendingStorage<T> implements IStorage<T> {
+        private pendingGroup;
+        private storage;
+        pending: Map<string, number>;
+        constructor(pendingGroup: string, storage: IStorage<T>);
+        get(key: string): Promise<T | undefined>;
+        set(key: string, value: T): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<{
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        private watchPending;
+        private updatePending;
+        reset(): Promise<void>;
+    }
+
+}
+
+declare module "sliftutils/storage/PrivateFileSystemStorage" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IStorageRaw } from "./IStorage";
+    export declare class PrivateFileSystemStorage implements IStorageRaw {
+        private path;
+        private rootHandle;
+        constructor(path: string);
+        private ensureInitialized;
+        private directoryExists;
+        private getDirectoryHandle;
+        private getFileHandle;
+        private fileExists;
+        get(key: string): Promise<Buffer | undefined>;
+        set(key: string, value: Buffer): Promise<void>;
+        append(key: string, value: Buffer): Promise<void>;
+        remove(key: string): Promise<void>;
+        getKeys(): Promise<string[]>;
+        getInfo(key: string): Promise<undefined | {
+            size: number;
+            lastModified: number;
+        }>;
+        reset(): Promise<void>;
+    }
+
+}
+
+declare module "sliftutils/storage/StorageObservable" {
+    import { IStorage, IStorageSync } from "./IStorage";
+    export declare class StorageSync<T> implements IStorageSync<T> {
+        storage: IStorage<T>;
+        cached: import("mobx").ObservableMap<string, T | undefined>;
+        infoCached: import("mobx").ObservableMap<string, {
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        keys: Set<string>;
+        synced: {
+            keySeqNum: number;
+        };
+        constructor(storage: IStorage<T>);
+        get(key: string): T | undefined;
+        set(key: string, value: T): void;
+        remove(key: string): void;
+        private loadedKeys;
+        getKeys(): string[];
+        getInfo(key: string): {
+            size: number;
+            lastModified: number;
+        } | undefined;
+        getValues(): T[];
+        getEntries(): [string, T][];
+        getPromise(key: string): Promise<T | undefined>;
+        private pendingGetKeys;
+        getKeysPromise(): Promise<string[]>;
+        reload(): void;
+        reloadKeys(): void;
+        reloadKey(key: string): void;
+        reset(): Promise<void>;
+    }
+
+}
+
+declare module "sliftutils/storage/TransactionStorage" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IStorage, IStorageRaw } from "./IStorage";
+    interface TransactionEntry {
+        key: string;
+        value: Buffer | undefined;
+        isZipped: boolean;
+        time: number;
+    }
+    export declare class TransactionStorage implements IStorage<Buffer> {
+        private rawStorage;
+        private debugName;
+        private writeDelay;
+        cache: Map<string, TransactionEntry>;
+        private currentChunk;
+        private currentChunkSize;
+        private entryCount;
+        private static allStorage;
+        constructor(rawStorage: IStorageRaw, debugName: string, writeDelay?: number);
+        static compressAll(): Promise<void>;
+        private init;
+        private getChunk;
+        get(key: string): Promise<Buffer | undefined>;
+        set(key: string, value: Buffer): Promise<void>;
+        remove(key: string): Promise<void>;
+        getInfo(key: string): Promise<{
+            size: number;
+            lastModified: number;
+        } | undefined>;
+        private pendingAppends;
+        private extraAppends;
+        private pendingWrite;
+        pushAppend(entry: TransactionEntry): Promise<void>;
+        private updatePendingAppends;
+        getKeys(): Promise<string[]>;
+        private loadAllTransactions;
+        private loadTransactionFile;
+        private readTransactionEntry;
+        private serializeTransactionEntry;
+        private getHeader;
+        private chunkBuffers;
+        private compressing;
+        private compressTransactionLog;
+        reset(): Promise<void>;
+    }
+    export {};
+
+}
+
+declare module "sliftutils/storage/fileSystemPointer" {
+    export type FileSystemPointer = string;
+    export declare function storeFileSystemPointer(config: {
+        mode: "read" | "readwrite";
+        handle: FileSystemFileHandle | FileSystemDirectoryHandle;
+    }): Promise<FileSystemPointer>;
+    export declare function deleteFileSystemPointer(pointer: FileSystemPointer): Promise<void>;
+    export declare function getFileSystemPointer(config: {
+        pointer: FileSystemPointer;
+    }): Promise<{
+        onUserActivation(modeOverride?: "read" | "readwrite"): Promise<FileSystemFileHandle | FileSystemDirectoryHandle>;
+    } | undefined>;
+
+}
+
+declare module "sliftutils/storage/storage" {
+
+
+    declare module "node-forge" {
+        declare type Ed25519PublicKey = {
+            publicKeyBytes: Buffer;
+        } & Buffer;
+        declare type Ed25519PrivateKey = {
+            privateKeyBytes: Buffer;
+        } & Buffer;
+        class ed25519 {
+            static generateKeyPair(): { publicKey: Ed25519PublicKey, privateKey: Ed25519PrivateKey };
+            static privateKeyToPem(key: Ed25519PrivateKey): string;
+            static privateKeyFromPem(pem: string): Ed25519PrivateKey;
+            static publicKeyToPem(key: Ed25519PublicKey): string;
+            static publicKeyFromPem(pem: string): Ed25519PublicKey;
+        }
+    }
+
+
+    interface FileSystemDirectoryHandle {
+        [Symbol.asyncIterator](): AsyncIterator<[string, FileSystemFileHandle | FileSystemDirectoryHandle]>;
+        requestPermission(config: { mode: "read" | "readwrite" }): Promise<void>;
+    }
+    interface FileSystemFileHandle {
+        getFile(): File;
+        createWritable(): FileSystemWritableFileStream;
+    }
+
+    interface Window {
+        showSaveFilePicker(config?: {
+            types: {
+                description: string; accept: { [mimeType: string]: string[] }
+            }[];
+        }): Promise<FileSystemFileHandle>;
+        showDirectoryPicker(): Promise<FileSystemDirectoryHandle>;
+        showOpenFilePicker(config?: {
+            types: {
+                description: string; accept: { [mimeType: string]: string[] }
+            }[];
+        }): Promise<FileSystemFileHandle[]>;
+    }
 }
