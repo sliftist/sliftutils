@@ -1,5 +1,8 @@
 import preact from "preact";
-export declare function showFullscreenModal(contents: preact.ComponentChildren): void;
+export declare function showFullscreenModal(config: {
+    contents: preact.ComponentChildren;
+    onClose?: () => void;
+}): void;
 export declare class FullscreenModal extends preact.Component<{
     parentState?: {
         open: boolean;

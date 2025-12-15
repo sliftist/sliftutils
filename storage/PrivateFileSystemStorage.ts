@@ -10,14 +10,17 @@ export class PrivateFileSystemStorage implements IStorageRaw {
             if (!navigator.storage?.getDirectory) {
                 throw new Error("Private File System Access API not supported in this browser");
             }
+            if (location.protocol === "file:") {
+                throw new Error(`Private File System API is disallowed in file:// type locations. Either use the File System API (the use gives you access to their file system), or host on an actual domain`);
+            }
             this.rootHandle = await navigator.storage.getDirectory();
         }
         return this.rootHandle;
     }
 
     private async directoryExists(): Promise<boolean> {
+        const root = await this.ensureInitialized();
         try {
-            const root = await this.ensureInitialized();
 
             if (!this.path || this.path === "" || this.path === "/") {
                 return true; // Root always exists
@@ -65,6 +68,7 @@ export class PrivateFileSystemStorage implements IStorageRaw {
     }
 
     private async getFileHandle(key: string, create: boolean = false): Promise<FileSystemFileHandle | undefined> {
+        await this.ensureInitialized();
         try {
             const dirHandle = await this.getDirectoryHandle(create);
             return await dirHandle.getFileHandle(key, { create });
@@ -74,6 +78,7 @@ export class PrivateFileSystemStorage implements IStorageRaw {
     }
 
     private async fileExists(key: string): Promise<boolean> {
+        await this.ensureInitialized();
         try {
             // First check if directory exists
             if (!(await this.directoryExists())) {

@@ -10,6 +10,26 @@ import { getFileStorageIndexDB } from "./IndexedDBFileFolderAPI";
 import fs from "fs";
 import path from "path";
 
+declare global {
+    interface Window {
+        showSaveFilePicker(config?: {
+            types: {
+                description: string; accept: { [mimeType: string]: string[] }
+            }[];
+        }): Promise<FileSystemFileHandle>;
+        showDirectoryPicker(): Promise<FileSystemDirectoryHandle>;
+        showOpenFilePicker(config?: {
+            types: {
+                description: string; accept: { [mimeType: string]: string[] }
+            }[];
+        }): Promise<FileSystemFileHandle[]>;
+    }
+    interface FileSystemDirectoryHandle {
+        requestPermission(config?: { mode: "read" | "readwrite" }): Promise<PermissionState>;
+    }
+}
+
+
 // NOTE: IndexedDB is required for iOS, at least. We MIGHT want to make
 //  this a user supported toggle too, so they can choose during runtime if they want it.
 // DO NOT enable this is isNode
@@ -283,7 +303,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                     fileCallback(handle as any);
                 }}
             >
-                Pick Media Directory
+                Pick Data Directory
             </button>
         );
         return await promise;

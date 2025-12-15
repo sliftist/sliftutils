@@ -38,8 +38,8 @@ async function main() {
     // Collect all files to copy
     let filesToCopy: string[] = [];
 
+    filesToCopy.push(yargObj.indexHtml);
     if (hasIndexHtml) {
-        filesToCopy.push(yargObj.indexHtml);
     }
 
     // Add assets folder files if it exists
@@ -59,6 +59,8 @@ async function main() {
         }
     }
 
+    let indexHtmlOutput = "";
+
     let filesCopied = 0;
     let root = path.resolve(".");
     for (const file of filesToCopy) {
@@ -69,6 +71,10 @@ async function main() {
         }
         let relativePath = path.relative(root, sourcePath);
         let destPath = path.join(yargObj.outputFolder, relativePath);
+
+        if (file === yargObj.indexHtml) {
+            indexHtmlOutput = destPath;
+        }
 
         let sourceTimestamp = await getTimestamp(sourcePath);
         let destTimestamp = await getTimestamp(destPath);
@@ -84,6 +90,7 @@ async function main() {
 
     let duration = Date.now() - time;
     console.log(`Web build completed in ${formatTime(duration)}`);
+    console.log(`file://${path.resolve(indexHtmlOutput).replaceAll("\\", "/")}`);
 }
 main().catch(console.error).finally(() => process.exit());
 

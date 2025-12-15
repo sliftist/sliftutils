@@ -13,13 +13,13 @@ export declare class TransactionStorage implements IStorage<Buffer> {
     private writeDelay;
     cache: Map<string, TransactionEntry>;
     private currentChunk;
-    private currentChunkSize;
     private entryCount;
     private static allStorage;
     constructor(rawStorage: IStorageRaw, debugName: string, writeDelay?: number);
     static compressAll(): Promise<void>;
     private init;
-    private getChunk;
+    private getCurrentChunk;
+    private onAddToChunk;
     get(key: string): Promise<Buffer | undefined>;
     set(key: string, value: Buffer): Promise<void>;
     remove(key: string): Promise<void>;

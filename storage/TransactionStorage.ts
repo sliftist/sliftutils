@@ -1,10 +1,11 @@
-import { PromiseObj, sort, throttleFunction } from "socket-function/src/misc";
+import { PromiseObj, compareArray, sort, throttleFunction, timeInMinute } from "socket-function/src/misc";
 import { IStorage, IStorageRaw } from "./IStorage";
 import { Zip } from "../misc/zip";
-import { runInSerial } from "socket-function/src/batching";
+import { delay, runInSerial } from "socket-function/src/batching";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import { setPending } from "./PendingManager";
 import { isInBuild } from "../misc/environment";
+import { isNode } from "typesafecss";
 
 /*
 // Spec:
@@ -40,6 +41,7 @@ IMPORTANT! If there are multiple writers, we clobber writes from other writers w
 
 
 const FILE_CHUNK_SIZE = 1024 * 1024;
+const FILE_MAX_LIFETIME = timeInMinute * 30;
 
 const FILE_ZIP_THRESHOLD = 16 * 1024 * 1024;
 
@@ -66,11 +68,26 @@ const fileLockSection = runInSerial(async (fnc: () => Promise<void>) => {
 
 const CHUNK_EXT = ".chunk";
 const ourId = Date.now() + Math.random();
+let seqNum = 0;
+
+function getNextChunkPath(): string {
+    return `${Date.now()}_${seqNum++}_${ourId}.chunk`;
+}
+function sortChunks(chunks: string[]): string[] {
+    function getChunkParts(chunk: string): unknown[] {
+        const parts = chunk.split("_");
+        return parts.map(part => +part);
+    }
+    return chunks.sort((a, b) => compareArray(getChunkParts(a), getChunkParts(b)));
+}
 
 export class TransactionStorage implements IStorage<Buffer> {
     public cache: Map<string, TransactionEntry> = new Map();
-    private currentChunk = 0;
-    private currentChunkSize = 0;
+    private currentChunk: {
+        path: string;
+        size: number;
+        timeCreated: number;
+    } | undefined = undefined;
     private entryCount = 0;
 
     private static allStorage: TransactionStorage[] = [];
@@ -91,7 +108,26 @@ export class TransactionStorage implements IStorage<Buffer> {
 
     private init: Promise<void> | undefined = this.loadAllTransactions();
 
-    private getChunk(chunk: number) { return `${chunk}_${ourId}${CHUNK_EXT}`; }
+    private getCurrentChunk(): string {
+        if (this.currentChunk && this.currentChunk.timeCreated < Date.now() - FILE_MAX_LIFETIME) {
+            this.currentChunk = undefined;
+        }
+        if (!this.currentChunk) {
+            this.currentChunk = {
+                path: getNextChunkPath(),
+                size: 0,
+                timeCreated: Date.now()
+            };
+        }
+        return this.currentChunk.path;
+    }
+    private onAddToChunk(size: number): void {
+        if (!this.currentChunk) return;
+        this.currentChunk.size += size;
+        if (this.currentChunk.size >= FILE_CHUNK_SIZE) {
+            this.currentChunk = undefined;
+        }
+    }
 
     public async get(key: string): Promise<Buffer | undefined> {
         await this.init;
@@ -173,18 +209,14 @@ export class TransactionStorage implements IStorage<Buffer> {
 
                 let newChunks = this.chunkBuffers(buffers);
                 for (let chunk of newChunks) {
-                    let file = this.getChunk(this.currentChunk);
+                    let file = this.getCurrentChunk();
                     if (!await this.rawStorage.get(file)) {
                         let { header, headerBuffer } = this.getHeader(false);
                         await this.rawStorage.set(file, headerBuffer);
                     }
                     let content = chunk.buffer;
                     await this.rawStorage.append(file, content);
-                    this.currentChunkSize += content.length;
-                    if (this.currentChunkSize >= FILE_CHUNK_SIZE) {
-                        this.currentChunk++;
-                        this.currentChunkSize = 0;
-                    }
+                    this.onAddToChunk(content.length);
                 }
 
                 await this.compressTransactionLog();
@@ -219,21 +251,16 @@ export class TransactionStorage implements IStorage<Buffer> {
         const keys = await this.rawStorage.getKeys();
         const transactionFiles = keys.filter(key => key.endsWith(CHUNK_EXT));
 
-        sort(transactionFiles, x => parseInt(x));
+        sortChunks(transactionFiles);
 
         let size = 0;
         for (const file of transactionFiles) {
-            let chunk = parseInt(file);
             let curSize = await this.loadTransactionFile(file);
-            if (chunk >= this.currentChunk) {
-                this.currentChunk = chunk;
-                this.currentChunkSize = curSize;
-            }
             size += curSize;
         }
         time = Date.now() - time;
         if (time > 50) {
-            console.log(`Loaded ${this.debugName} in ${formatTime(time)}, ${formatNumber(this.cache.size)} keys, ${formatNumber(size)}B`);
+            console.log(`Loaded ${this.debugName} in ${formatTime(time)}, ${formatNumber(this.cache.size)} keys, from ${formatNumber(transactionFiles.length)} files, ${formatNumber(size)}B`, transactionFiles);
         }
 
         this.init = undefined;
@@ -424,14 +451,13 @@ export class TransactionStorage implements IStorage<Buffer> {
         // Load off disk, in case there are other writes. We still race with them, but at least
         //  this reduces the race condition considerably
 
-        sort(existingDiskEntries, x => parseInt(x));
+        sortChunks(existingDiskEntries);
         for (let entry of existingDiskEntries) {
             await this.loadTransactionFile(entry);
         }
 
         this.entryCount = this.cache.size;
 
-        let nextStart = Math.max(...existingDiskEntries.map(x => parseInt(x))) + 1;
 
         let buffers: Buffer[] = [];
         for (const entry of this.cache.values()) {
@@ -441,9 +467,11 @@ export class TransactionStorage implements IStorage<Buffer> {
 
         let newChunks = this.chunkBuffers(buffers);
 
-        let curChunk = nextStart;
+        let newFiles: string[] = [];
         for (let chunk of newChunks) {
-            let file = this.getChunk(curChunk++);
+            let file = this.getCurrentChunk();
+            newFiles.push(file);
+            this.currentChunk = undefined;
             let content = chunk.buffer;
             let { header, headerBuffer } = this.getHeader(
                 // AND, never compress the last one, otherwise we can't append to it!
@@ -454,6 +482,22 @@ export class TransactionStorage implements IStorage<Buffer> {
             }
             let buffer = Buffer.concat([headerBuffer, content]);
             await this.rawStorage.set(file, buffer);
+            let verified = await this.rawStorage.get(file);
+            if (!verified?.equals(buffer)) {
+                console.error(`Failed to verify transaction file ${file} in ${this.debugName}`);
+                throw new Error(`Failed to verify transaction file ${file} in ${this.debugName}`);
+            }
+        }
+        // Delay, because we want to be absolutely certain that all the writes have finished before deleting the old files.
+        await delay(5000);
+        if (!isNode()) {
+            localStorage.setItem(`${this.debugName}-last-compress`, JSON.stringify({
+                time: Date.now(),
+                entryCount: this.entryCount,
+                cacheSize: this.cache.size,
+                newFiles,
+                existingDiskEntries,
+            }));
         }
 
         // This is the ONLY time we can delete old files, as we know for sure the new file has all of our data.
@@ -462,8 +506,6 @@ export class TransactionStorage implements IStorage<Buffer> {
         for (const file of existingDiskEntries) {
             await this.rawStorage.remove(file);
         }
-
-        this.currentChunk = curChunk;
     }
 
     public async reset() {
@@ -477,8 +519,7 @@ export class TransactionStorage implements IStorage<Buffer> {
 
             this.pendingAppends = [];
             this.cache.clear();
-            this.currentChunk = 0;
-            this.currentChunkSize = 0;
+            this.currentChunk = undefined;
             this.entryCount = 0;
         });
     }

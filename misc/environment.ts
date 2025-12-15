@@ -1,4 +1,4 @@
-/// <reference path="../node_modules/@types/chrome/index.d.ts" />
+/// <reference types="@types/chrome/index.d.ts" />
 export function isInChromeExtension() {
     return typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id;
 }

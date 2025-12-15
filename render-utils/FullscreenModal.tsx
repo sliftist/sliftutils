@@ -3,11 +3,15 @@ import { showModal } from "./modal";
 import { observable } from "mobx";
 import { observer } from "./observer";
 
-export function showFullscreenModal(contents: preact.ComponentChildren) {
+export function showFullscreenModal(config: {
+    contents: preact.ComponentChildren;
+    onClose?: () => void;
+}) {
     let { close } = showModal({
         contents: <FullscreenModal onCancel={() => close()}>
-            {contents}
-        </FullscreenModal>
+            {config.contents}
+        </FullscreenModal>,
+        onClose: config.onClose
     });
 }
 

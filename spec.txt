@@ -1,3 +1,6 @@
+TODO: Take the half finished apiServer code in vidfrontend, finish the todos, and move it here.
+    - Having an alternate version, where we run a server that does watching is nice, it's heavier and does require setting up certificates. but it makes hot reloading faster. And... It can be used to run an actual site that's public.  
+
 ALSO, go fix our typings in socket-function as well
 
 TODO:

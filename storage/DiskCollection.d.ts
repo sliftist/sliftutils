@@ -5,31 +5,12 @@ import { StorageSync } from "./StorageObservable";
 import { TransactionStorage } from "./TransactionStorage";
 export declare class DiskCollection<T> implements IStorageSync<T> {
     private collectionName;
-    private writeDelay?;
-    constructor(collectionName: string, writeDelay?: number | undefined);
-    transactionStorage: TransactionStorage | undefined;
-    initStorage(): Promise<IStorage<T>>;
-    baseStorage: Promise<IStorage<T>>;
-    private synced;
-    get(key: string): T | undefined;
-    getPromise(key: string): Promise<T | undefined>;
-    set(key: string, value: T): void;
-    remove(key: string): void;
-    getKeys(): string[];
-    getKeysPromise(): Promise<string[]>;
-    getEntries(): [string, T][];
-    getValues(): T[];
-    getValuesPromise(): Promise<T[]>;
-    getInfo(key: string): {
-        size: number;
-        lastModified: number;
-    } | undefined;
-    reset(): Promise<void>;
-}
-export declare class DiskCollectionBrowser<T> implements IStorageSync<T> {
-    private collectionName;
-    private writeDelay?;
-    constructor(collectionName: string, writeDelay?: number | undefined);
+    private config?;
+    constructor(collectionName: string, config?: {
+        writeDelay?: number | undefined;
+        cbor?: boolean | undefined;
+        noPrompt?: boolean | undefined;
+    } | undefined);
     transactionStorage: TransactionStorage | undefined;
     initStorage(): Promise<IStorage<T>>;
     baseStorage: Promise<IStorage<T>>;

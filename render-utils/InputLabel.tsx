@@ -96,7 +96,7 @@ export class InputLabel extends preact.Component<InputLabelProps> {
                 value = "";
             }
             props.value = value;
-            addValueMapping(value => (+new Date(value).getTime() || "") + "");
+            addValueMapping(value => (new Date(value).getTime() || Date.now()) as any);
         }
         if (props.fontSize !== undefined) {
             props.style = { ...props.style as any, fontSize: props.fontSize };

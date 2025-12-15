@@ -15,9 +15,16 @@ const getPackageJsonPath = cache((directory: string): string | undefined => {
 const getMainPath = cache((directory: string): string | undefined => {
     let packageJsonPath = getPackageJsonPath(directory);
     if (!packageJsonPath) return undefined;
-    let packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+    let packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as {
+        main?: string;
+        exports?: {
+            "."?: {
+                require?: string;
+            };
+        };
+    };
     let dir = path.dirname(packageJsonPath);
-    let mainName = packageJson.main;
+    let mainName = packageJson.exports?.["."]?.require || packageJson.main;
     if (!mainName) {
         if (fs.existsSync(path.resolve(dir, "index.js"))) {
             mainName = "index.js";
@@ -29,6 +36,7 @@ const getMainPath = cache((directory: string): string | undefined => {
             mainName = "index.js";
         }
     }
+    // Handle the negative value ESM exports thing.
     let mainPath = path.resolve(dir, mainName);
     return mainPath;
 });
@@ -62,14 +70,14 @@ export function wrapModule(module: NodeJS.Module): string {
         }
     }
 
-    let isModuleMain: string | undefined;
+    let moduleMain: string | undefined;
     let dirname = path.dirname(module.filename);
     let packageJsonPath = getPackageJsonPath(dirname);
     if (packageJsonPath) {
         let mainPath = getMainPath(dirname);
         if (mainPath?.replaceAll("\\", "/") === module.filename.replaceAll("\\", "/")) {
             // Then we are the main of the module
-            isModuleMain = path.dirname(packageJsonPath).replaceAll("\\", "/");
+            moduleMain = path.dirname(packageJsonPath).replaceAll("\\", "/");
         }
     }
 
@@ -77,7 +85,7 @@ export function wrapModule(module: NodeJS.Module): string {
     let objWrapped = `{`
         + ` id: ${JSON.stringify(module.id.replaceAll("\\", "/"))},`
         + ` filename: ${JSON.stringify(module.filename.replaceAll("\\", "/"))},`
-        + ` isModuleMain: ${JSON.stringify(isModuleMain)},`
+        + ` isModuleMain: ${JSON.stringify(moduleMain)},`
         + ` paths: ${JSON.stringify(module.paths.map(p => p.replaceAll("\\", "/")))},`
         + ` moduleFields: ${JSON.stringify(moduleFields)},`
         + ` moduleFnc: ${wrapped}`

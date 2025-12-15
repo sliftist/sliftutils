@@ -15,7 +15,13 @@ export class Anchor extends preact.Component<{
         const { params, button, className, ...remaining } = this.props;
         let resolvedParams = params.map(getResolvedParam);
         let searchObj = new URLSearchParams(window.location.search);
-        let selected = resolvedParams.every(([param, value]) => searchObj.get(param) === value);
+        let selected = resolvedParams.every(([param, value], index) => {
+            let originalValue = params[index][0];
+            if (!(typeof originalValue === "string") && originalValue.value === value) {
+                return true;
+            }
+            return searchObj.get(param) === value;
+        });
         let link = (
             <a
                 {...remaining}

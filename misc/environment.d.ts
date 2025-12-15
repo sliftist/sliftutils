@@ -1,4 +1,3 @@
-/// <reference types="chrome" />
 export declare function isInChromeExtension(): string | false;
 export declare function isInChromeExtensionBackground(): boolean;
 export declare function isInChromeExtensionContentScript(): boolean | "";

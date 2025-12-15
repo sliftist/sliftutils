@@ -1,6 +1,32 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { IStorageRaw } from "./IStorage";
+declare global {
+    interface Window {
+        showSaveFilePicker(config?: {
+            types: {
+                description: string;
+                accept: {
+                    [mimeType: string]: string[];
+                };
+            }[];
+        }): Promise<FileSystemFileHandle>;
+        showDirectoryPicker(): Promise<FileSystemDirectoryHandle>;
+        showOpenFilePicker(config?: {
+            types: {
+                description: string;
+                accept: {
+                    [mimeType: string]: string[];
+                };
+            }[];
+        }): Promise<FileSystemFileHandle[]>;
+    }
+    interface FileSystemDirectoryHandle {
+        requestPermission(config?: {
+            mode: "read" | "readwrite";
+        }): Promise<PermissionState>;
+    }
+}
 type FileWrapper = {
     getFile(): Promise<{
         size: number;

@@ -1,4 +1,3 @@
-/// <reference types="socket-function" />
 import { SocketRegistered } from "socket-function/SocketFunctionTypes";
 type RemapFunction<T> = T extends (...args: infer Args) => Promise<infer Return> ? {
     (...args: Args): Return | undefined;

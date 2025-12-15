@@ -26,18 +26,6 @@ We use MobX for state management. Components should use a variable called synced
 
 The code automatically updates on save, so do not ever run commands to rerun the site.
 
-In the implementation for every type of API, there should be a companion file to manage the session (ex smsSession.ts). This should export a function which makes calling the API functions simple by automatically managing the session. Because the session helper will be making the function calls, it can try catch them and appropriately handle the session errors that require regenerating the session. Of course, if it's not a session error, it should just rethrow it.
-
-Use createPersistentObject for persistent things like session states. It's accessed synchronously and the key will have an undefined value if it the value isn't set. 
-
-    let persistent = createPersistentObject<{
-        token: string;
-    }>("sms");
-
-    persistent.token = "...";
-    persistent.token;
-
-
 Coding Styles
     Try not to use "null", and instead always use "undefined".
 
@@ -81,11 +69,22 @@ Coding Styles
 
     Never use inline styles, always use the CSS helper. 
 
-    Don't use as any.
+    Don't use `as any`.
+
+    When you're making fetch calls and you get a type of any, you need to cast it to the actual type, and not leave it as any. The same goes for when you're deserializing values.
     
     DO NOT redeclare constants and copy their value. JUST IMPORT THEM!
 
     DO NOT redeclare types. JUST IMPORT THEM!
+
+    Do not try catch for no reason. If you can't actually handle the exception, just let it throw.
+
+    For input events, always use event.currentTarget.
+
+    Use ref={elem => } callbacks. NEVER use .createRef.
+
+    NEVER render images with a fixed width+height. This will cause them to be stretched or cut off. This is terrible. Only set the width or height. 
+
 
 
 General Styling
@@ -114,8 +113,28 @@ API Calls
         APIController(getExtNodeId()).getModels()
 
 
+DiskCollection
+    If read an object from a collection, and then mutate it, and want to set it in the collection, you have to shallow copy it, so the DiskCollection picks up the change.
+        let x = collection.get("x");
+        x.y = Math.random();
+        // Not asynchronous, as sets are synchronous
+        collection.set("x", { ...x });
+    The non-async functions should be called in render functions, the async functions should be called in event handlers, etc. Except for .set, which should be called in all both cases. 
+    get(key: string): T | undefined;
+    async getPromise(key: string): Promise<T | undefined>;
+    set(key: string, value: T): void;
+    remove(key: string): void;
+    getKeys(): string[];
+    getKeysPromise(): Promise<string[]>;
+    getEntries(): [string, T][];
+    getValues(): T[];
+    async getValuesPromise(): Promise<T[]>;
+    getInfo(key: string);
+    async reset();
 
 css
+    Add very little styling, such as colours, rounding, etc, unless asked to add more styling.
+
     css should be set using className={css.cssPropertyName(cssPropertyValue).anotherPropertyName...}
     Always use the "css" helper for styling. For example:
         <div className={css.width(100).height(50)}>My width is 100px, my height is 50px</div>
