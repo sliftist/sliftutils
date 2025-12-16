@@ -65,7 +65,7 @@ export class FullscreenModal extends preact.Component<{
                             display: "flex",
                             flexDirection: "column",
                             gap: 10,
-                            maxHeight: "calc(100% - 200px)",
+                            maxHeight: "100%",
                             overflow: "auto",
                             ...this.props.style
                         }}

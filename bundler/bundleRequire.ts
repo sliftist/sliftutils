@@ -252,7 +252,7 @@ export function bundleRequire(config: BundleRequireConfig) {
                             if (property === "default") return newModule.exports;
 
                             console.warn(
-                                `Module ${newModule.filename} is not available (are you missing "module.allowclient = true"?). Tried to access ${String(property)}.`
+                                `Module ${newModule.filename} is not available. It might have not been imported in Node.js due to a flag which is checking the browser or an environment variable. It might also be that the entry point is weirdly configured and could not be detected.`
                             );
                             return undefined;
                         },

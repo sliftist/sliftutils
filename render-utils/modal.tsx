@@ -3,6 +3,7 @@ import { observable } from "mobx";
 import * as mobx from "mobx";
 import { observer } from "./observer";
 import { lazy } from "socket-function/src/caching";
+import { nextId } from "socket-function/src/misc";
 
 type ModalData = {
     contents: preact.ComponentChildren;
@@ -31,7 +32,6 @@ const ensureRootMounted = lazy(() => {
     preact.render(<ModalRoot />, root);
 });
 
-let modalIdCounter = 0;
 
 function closeModal(id: string) {
     const modal = activeModals[id];
@@ -54,7 +54,7 @@ export function showModal(config: {
 } {
     ensureRootMounted();
 
-    const id = `modal-${modalIdCounter++}`;
+    const id = `modal-${nextId()}`;
     activeModals[id] = {
         contents: config.contents,
         onClose: config.onClose

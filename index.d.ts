@@ -231,7 +231,32 @@ declare module "sliftutils/render-utils/Input" {
 
 declare module "sliftutils/render-utils/InputLabel" {
     import preact from "preact";
-    import { InputProps } from "./Input";
+    type InputProps = (preact.JSX.HTMLAttributes<HTMLInputElement> & {
+        /** ONLY throttles onChangeValue */
+        throttle?: number;
+        flavor?: "large" | "small" | "none";
+        focusOnMount?: boolean;
+        textarea?: boolean;
+        /** Update on key stroke, not on blur (just does onInput = onChange, as onInput already does this) */
+        hot?: boolean;
+        /** Updates arrow keys with modifier behavior to use larger numbers, instead of decimals. */
+        integer?: boolean;
+        /** Only works with number/integer */
+        reverseArrowKeyDirection?: boolean;
+        inputRef?: (x: HTMLInputElement | null) => void;
+        /** Don't blur on enter key */
+        noEnterKeyBlur?: boolean;
+        noFocusSelect?: boolean;
+        inputKey?: string;
+        fillWidth?: boolean;
+        autocompleteValues?: string[];
+        /** Forces the input to update when focused. Usually we hold updates, to prevent the user's
+         *      typing to be interrupted by background updates.
+         *      NOTE: "hot" is usually required when using this.
+         */
+        forceInputValueUpdatesWhenFocused?: boolean;
+        onChangeValue?: (value: string) => void;
+    });
     export type InputLabelProps = Omit<InputProps, "label" | "title"> & {
         label?: preact.ComponentChild;
         number?: boolean;
@@ -266,6 +291,7 @@ declare module "sliftutils/render-utils/InputLabel" {
     }> {
         render(): preact.JSX.Element;
     }
+    export {};
 
 }
 

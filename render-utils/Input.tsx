@@ -9,6 +9,7 @@ import { throttleFunction } from "socket-function/src/misc";
 //  This is useful for inputs which you want to run an action on, such as "add new item",
 //      as it allows you to remove a local state value to cache the value, by just
 //      doing the add on "onChangeValue".
+// IMPORTANT! InputProps is in both InputLabel.tsx and Input.tsx, so the types export correctly
 export type InputProps = (
     preact.JSX.HTMLAttributes<HTMLInputElement>
     & {

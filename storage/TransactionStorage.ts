@@ -73,13 +73,6 @@ let seqNum = 0;
 function getNextChunkPath(): string {
     return `${Date.now()}_${seqNum++}_${ourId}.chunk`;
 }
-function sortChunks(chunks: string[]): string[] {
-    function getChunkParts(chunk: string): unknown[] {
-        const parts = chunk.split("_");
-        return parts.map(part => +part);
-    }
-    return chunks.sort((a, b) => compareArray(getChunkParts(a), getChunkParts(b)));
-}
 
 export class TransactionStorage implements IStorage<Buffer> {
     public cache: Map<string, TransactionEntry> = new Map();
@@ -101,12 +94,14 @@ export class TransactionStorage implements IStorage<Buffer> {
     }
     // Helps get rid of parse errors which constantly log. Also, uses less space
     public static async compressAll() {
-        for (let storage of TransactionStorage.allStorage) {
-            await storage.compressTransactionLog(true);
-        }
+        await fileLockSection(async () => {
+            for (let storage of TransactionStorage.allStorage) {
+                await storage.compressTransactionLog(true);
+            }
+        });
     }
 
-    private init: Promise<void> | undefined = this.loadAllTransactions();
+    private init: Promise<unknown> | undefined = this.loadAllTransactions();
 
     private getCurrentChunk(): string {
         if (this.currentChunk && this.currentChunk.timeCreated < Date.now() - FILE_MAX_LIFETIME) {
@@ -245,33 +240,37 @@ export class TransactionStorage implements IStorage<Buffer> {
     }
 
 
-    private async loadAllTransactions(): Promise<void> {
-        if (isInBuild()) return;
+    // NOTE: This is either called in init (which blocks all other calls), or inside of the global file lock, so it is safe to load.
+    private async loadAllTransactions(): Promise<string[]> {
+        if (isInBuild()) return [];
+
         let time = Date.now();
         const keys = await this.rawStorage.getKeys();
         const transactionFiles = keys.filter(key => key.endsWith(CHUNK_EXT));
 
-        sortChunks(transactionFiles);
-
-        let size = 0;
-        for (const file of transactionFiles) {
-            let curSize = await this.loadTransactionFile(file);
-            size += curSize;
+        let entryList: TransactionEntry[][] = [];
+        for (let file of transactionFiles) {
+            entryList.push(await this.parseTransactionFile(file));
         }
+        let entries = entryList.flat();
+        this.applyTransactionEntries(entries);
+
         time = Date.now() - time;
         if (time > 50) {
-            console.log(`Loaded ${this.debugName} in ${formatTime(time)}, ${formatNumber(this.cache.size)} keys, from ${formatNumber(transactionFiles.length)} files, ${formatNumber(size)}B`, transactionFiles);
+            console.log(`Loaded ${this.debugName} in ${formatTime(time)}, ${formatNumber(this.cache.size)} keys, from ${formatNumber(transactionFiles.length)} files, entries ${formatNumber(entries.length)}B`, transactionFiles);
         }
 
         this.init = undefined;
+        return transactionFiles;
     }
 
-    private async loadTransactionFile(filename: string): Promise<number> {
+    // ONLY call this inside of loadAllTransactions
+    private async parseTransactionFile(filename: string): Promise<TransactionEntry[]> {
         const fullFile = await this.rawStorage.get(filename);
-        if (!fullFile) return 0;
+        if (!fullFile) return [];
         if (fullFile.length < 4) {
             //console.error(`Transaction in ${this.debugName} file ${filename} is too small, skipping`);
-            return 0;
+            return [];
         }
         let headerSize = fullFile.readUInt32LE(0);
         let headerBuffer = fullFile.slice(4, 4 + headerSize);
@@ -280,7 +279,7 @@ export class TransactionStorage implements IStorage<Buffer> {
             header = JSON.parse(headerBuffer.toString());
         } catch (e) {
             console.error(`Failed to parse header of transaction file in ${this.debugName}, ${filename}`);
-            return 0;
+            return [];
         }
         let content = fullFile.slice(4 + headerSize);
         if (header.zipped) {
@@ -314,10 +313,31 @@ export class TransactionStorage implements IStorage<Buffer> {
                 offset++;
                 continue;
             }
+
             this.entryCount++;
             let { entry } = entryObj;
             offset = entryObj.offset;
             entries.push(entry);
+        }
+        return entries;
+    }
+    private applyTransactionEntries(entries: TransactionEntry[]): void {
+        let pendingWriteTimes = new Map<string, number>();
+        for (const entry of this.pendingAppends) {
+            let prevTime = pendingWriteTimes.get(entry.key);
+            if (prevTime && prevTime > entry.time) {
+                continue;
+            }
+            pendingWriteTimes.set(entry.key, entry.time);
+        }
+
+        sort(entries, x => x.time);
+        for (let entry of entries) {
+            let time = entry.time;
+            let prevTime = pendingWriteTimes.get(entry.key);
+            if (prevTime && prevTime > time) {
+                continue;
+            }
 
             if (entry.value === undefined) {
                 this.cache.delete(entry.key);
@@ -329,7 +349,6 @@ export class TransactionStorage implements IStorage<Buffer> {
                 this.cache.set(entry.key, entry);
             }
         }
-        return fullFile.length;
     }
 
     private readTransactionEntry(buffer: Buffer, offset: number): {
@@ -432,79 +451,69 @@ export class TransactionStorage implements IStorage<Buffer> {
     private compressing = false;
     private async compressTransactionLog(force?: boolean): Promise<void> {
         if (this.compressing) return;
-        this.compressing = true;
+        try {
+            this.compressing = true;
 
-        let existingDiskEntries = await this.rawStorage.getKeys();
-        existingDiskEntries = existingDiskEntries.filter(x => x.endsWith(CHUNK_EXT));
-        let compressNow = force || (
-            this.entryCount > 100 && this.entryCount > this.cache.size * 3
-            // NOTE: This compress check breaks down if we only have very large values, but... those
-            //  don't work ANYWAYS (it is better to use one file per value instead).
-            //  - Maybe we should throw, or at least warn, on sets of value > 1MB,
-            //      at which point they should just use a file per value
-            || existingDiskEntries.length > Math.max(10, Math.ceil(this.entryCount / 1000))
-            || existingDiskEntries.length > 1000 * 10
-        );
-        if (!compressNow) return;
-        console.log(`Compressing ${this.debugName} transaction log, ${this.entryCount} entries, ${this.cache.size} keys`);
-
-        // Load off disk, in case there are other writes. We still race with them, but at least
-        //  this reduces the race condition considerably
-
-        sortChunks(existingDiskEntries);
-        for (let entry of existingDiskEntries) {
-            await this.loadTransactionFile(entry);
-        }
-
-        this.entryCount = this.cache.size;
-
-
-        let buffers: Buffer[] = [];
-        for (const entry of this.cache.values()) {
-            let buffer = this.serializeTransactionEntry(entry);
-            buffers.push(buffer);
-        }
-
-        let newChunks = this.chunkBuffers(buffers);
-
-        let newFiles: string[] = [];
-        for (let chunk of newChunks) {
-            let file = this.getCurrentChunk();
-            newFiles.push(file);
-            this.currentChunk = undefined;
-            let content = chunk.buffer;
-            let { header, headerBuffer } = this.getHeader(
-                // AND, never compress the last one, otherwise we can't append to it!
-                content.length >= FILE_ZIP_THRESHOLD && chunk !== newChunks[newChunks.length - 1]
+            let existingDiskEntries = await this.rawStorage.getKeys();
+            existingDiskEntries = existingDiskEntries.filter(x => x.endsWith(CHUNK_EXT));
+            let compressNow = force || (
+                this.entryCount > 100 && this.entryCount > this.cache.size * 3
+                // NOTE: This compress check breaks down if we only have very large values, but... those
+                //  don't work ANYWAYS (it is better to use one file per value instead).
+                //  - Maybe we should throw, or at least warn, on sets of value > 1MB,
+                //      at which point they should just use a file per value
+                || existingDiskEntries.length > Math.max(10, Math.ceil(this.entryCount / 1000))
+                || existingDiskEntries.length > 1000 * 10
             );
-            if (header.zipped) {
-                content = await Zip.gzip(content);
-            }
-            let buffer = Buffer.concat([headerBuffer, content]);
-            await this.rawStorage.set(file, buffer);
-            let verified = await this.rawStorage.get(file);
-            if (!verified?.equals(buffer)) {
-                console.error(`Failed to verify transaction file ${file} in ${this.debugName}`);
-                throw new Error(`Failed to verify transaction file ${file} in ${this.debugName}`);
-            }
-        }
-        // Delay, because we want to be absolutely certain that all the writes have finished before deleting the old files.
-        await delay(5000);
-        if (!isNode()) {
-            localStorage.setItem(`${this.debugName}-last-compress`, JSON.stringify({
-                time: Date.now(),
-                entryCount: this.entryCount,
-                cacheSize: this.cache.size,
-                newFiles,
-                existingDiskEntries,
-            }));
-        }
+            if (!compressNow) return;
+            console.log(`Compressing ${this.debugName} transaction log, ${this.entryCount} entries, ${this.cache.size} keys`);
 
-        // This is the ONLY time we can delete old files, as we know for sure the new file has all of our data.
-        //  Any future readers won't know this, unless they write it themselves (or unless they audit it against
-        //      the other generations, which is annoying).
-        for (const file of existingDiskEntries) {
-            await this.rawStorage.remove(file);
+            // Load off disk, in case there are other writes. We still race with them, but at least
+            //  this reduces the race condition considerably
+            existingDiskEntries = await this.loadAllTransactions();
+
+            this.entryCount = this.cache.size;
+
+
+            let buffers: Buffer[] = [];
+            for (const entry of this.cache.values()) {
+                let buffer = this.serializeTransactionEntry(entry);
+                buffers.push(buffer);
+            }
+
+            let newChunks = this.chunkBuffers(buffers);
+
+            let newFiles: string[] = [];
+            for (let chunk of newChunks) {
+                // Don't use the previous current chunk for the new file. Also clear it afterwards so it's not reused for any future rights. 
+                this.currentChunk = undefined;
+                let file = this.getCurrentChunk();
+                this.currentChunk = undefined;
+                newFiles.push(file);
+                let content = chunk.buffer;
+                let { header, headerBuffer } = this.getHeader(
+                    content.length >= FILE_ZIP_THRESHOLD
+                );
+                if (header.zipped) {
+                    content = await Zip.gzip(content);
+                }
+                let buffer = Buffer.concat([headerBuffer, content]);
+                await this.rawStorage.set(file, buffer);
+                let verified = await this.rawStorage.get(file);
+                if (!verified?.equals(buffer)) {
+                    console.error(`Failed to verify transaction file ${file} in ${this.debugName}`);
+                    throw new Error(`Failed to verify transaction file ${file} in ${this.debugName}`);
+                }
+            }
+
+            // This is the ONLY time we can delete old files, as we know for sure the new file has all of our data.
+            //  Any future readers won't know this, unless they write it themselves (or unless they audit it against
+            //      the other generations, which is annoying).
+            for (const file of existingDiskEntries) {
+                await this.rawStorage.remove(file);
+            }
+        } finally {
+            this.compressing = false;
         }
     }
 

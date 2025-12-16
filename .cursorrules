@@ -84,6 +84,14 @@ Coding Styles
     Use ref={elem => } callbacks. NEVER use .createRef.
 
     NEVER render images with a fixed width+height. This will cause them to be stretched or cut off. This is terrible. Only set the width or height. 
+    
+    Callback held should be avoided by using async and `import { PromiseObj } from "socket-function/src/misc";`. Most of the time, if there's an event callback, you should wrap it with a promise obj so that you can wait for it asynchronously. 
+
+    `import { keyBy, keyByArray } from "socket-function/src/misc";` Should be used when you need to create lookups from lists and you know what key you want. This can clobber values, or it can gather in an array.
+        let example: Map<number, { x: number }> = keyBy([{ x: 5 }, { x: 6 }]);
+        let example: Map<number, { x: number }[]> = keyByArrat([{ x: 5 }, { x: 5, version: 2 } { x: 6 }]);
+
+    Never use alert. If there's an error, you should throw it. 
 
 
 
