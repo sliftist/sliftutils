@@ -112,7 +112,7 @@ export class TransactionStorage implements IStorage<Buffer> {
         this.resyncCallbacks.push(callback);
     }
 
-    private init: Promise<unknown> | undefined = this.loadAllTransactions();
+    private init: Promise<unknown> | undefined = this.loadAllTransactions(true);
 
     private getCurrentChunk(): string {
         if (this.currentChunk && this.currentChunk.timeCreated < Date.now() - FILE_MAX_LIFETIME) {
@@ -285,10 +285,10 @@ export class TransactionStorage implements IStorage<Buffer> {
 
 
     // NOTE: This is either called in init (which blocks all other calls), or inside of the global file lock, so it is safe to load.
-    private async loadAllTransactions(): Promise<string[]> {
+    private async loadAllTransactions(initialLoad?: boolean): Promise<string[]> {
         if (isInBuild()) return [];
 
-        if (this.init) {
+        if (initialLoad) {
             runInfinitePoll(DISK_CHECK_INTERVAL, () => this.checkDisk());
         }
 
