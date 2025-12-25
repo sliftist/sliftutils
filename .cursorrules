@@ -114,6 +114,23 @@ Components
     URLParam, Parameters which are stored in the URL. The second argument is the default, which can be a number, string, or an object. Set and get with .value
         const todolistURL = new URLParam("todolist", "");
 
+    InputLabel and InputLabelURL should be used for inputs. For example:
+        <InputLabelURL
+            label="Show Previous Video"
+            checkbox
+            persisted={showPreviousVideoURL}
+        />
+        <InputLabel
+            label="Notes"
+            fillWidth
+            value={node.notes || ""}
+            onChangeValue={async (value) => {
+                const updatedNode = deepCloneJSON(node);
+                updatedNode.notes = value;
+                await VideoNode.set(node.id, updatedNode);
+            }}
+        />
+
 API Calls
     When in an event callback (which must be async)
         APIController(getExtNodeId()).getModels.promise()

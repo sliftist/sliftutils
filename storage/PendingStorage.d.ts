@@ -15,4 +15,5 @@ export declare class PendingStorage<T> implements IStorage<T> {
     private watchPending;
     private updatePending;
     reset(): Promise<void>;
+    watchResync(callback: () => void): void;
 }

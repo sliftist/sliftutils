@@ -1,10 +1,6 @@
 import preact from "preact";
 import { URLParam, batchURLParamUpdate, getResolvedParam } from "./URLParam";
-import { css, isNode } from "typesafecss";
-
-export const AnchorClass = (
-    css.textDecoration("none").color("hsl(210, 75%, 65%)").opacity(0.8, "hover")
-);
+import { CSSType, css, isNode } from "typesafecss";
 
 export class Anchor extends preact.Component<{
     className?: string;
@@ -13,6 +9,9 @@ export class Anchor extends preact.Component<{
 } & Omit<preact.JSX.HTMLAttributes<HTMLAnchorElement>, "href">> {
     render() {
         const { params, button, className, ...remaining } = this.props;
+        if (params.length === 0) {
+            return <span {...remaining}>{this.props.children}</span>;
+        }
         let resolvedParams = params.map(getResolvedParam);
         let searchObj = new URLSearchParams(window.location.search);
         let selected = resolvedParams.every(([param, value], index) => {

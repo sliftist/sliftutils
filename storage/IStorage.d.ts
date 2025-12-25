@@ -23,6 +23,7 @@ export type IStorage<T> = {
         lastModified: number;
     }>;
     reset(): Promise<void>;
+    watchResync?: (callback: () => void) => void;
 };
 export type IStorageRaw = {
     get(key: string): Promise<Buffer | undefined>;

@@ -22,6 +22,8 @@ export type IStorage<T> = {
         lastModified: number;
     }>;
     reset(): Promise<void>;
+    // Allows watching for when the storage detects and underlying changes, and resyncs all of it's data (which might 
+    watchResync?: (callback: () => void) => void;
 };
 // NOTE: In the file system some characters are disallowed, and some characters do special things
 //  (/ makes a folder). And there are even more rules, such as lengths per folder, etc, etc.

@@ -30,6 +30,11 @@ export class CBORStorage<T> implements IStorage<T> {
         return await this.storage.getInfo(key);
     }
 
+
+    public watchResync(callback: () => void): void {
+        this.storage.watchResync?.(callback);
+    }
+
     public async reset() {
         await this.storage.reset();
     }

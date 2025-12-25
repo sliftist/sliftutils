@@ -176,15 +176,16 @@ function renderTrimmed(config: {
         };
     }
 
-
     return {
         outerAttributes: {
             class: css.opacity(0.5, "hover").button,
             onClick: () => {
                 showFullscreenModal(
-                    <div className={css.whiteSpace("pre-wrap")}>
-                        {content}
-                    </div>
+                    {
+                        contents: <div className={css.whiteSpace("pre-wrap")}>
+                            {content}
+                        </div>
+                    },
                 );
             }
         },

@@ -27,7 +27,9 @@ export class JSONStorage<T> implements IStorage<T> {
     }
 
 
-
+    public watchResync(callback: () => void): void {
+        this.storage.watchResync?.(callback);
+    }
 
     public async reset() {
         await this.storage.reset();

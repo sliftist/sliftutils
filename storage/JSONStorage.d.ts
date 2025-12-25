@@ -12,5 +12,6 @@ export declare class JSONStorage<T> implements IStorage<T> {
         size: number;
         lastModified: number;
     } | undefined>;
+    watchResync(callback: () => void): void;
     reset(): Promise<void>;
 }

@@ -11,7 +11,15 @@ export class StorageSync<T> implements IStorageSync<T> {
         keySeqNum: 0,
     }, undefined, { deep: false });
 
-    constructor(public storage: IStorage<T>) { }
+    constructor(public storage: IStorage<T>) {
+        storage.watchResync?.(() => {
+            this.cached.clear();
+            this.infoCached.clear();
+            this.keys.clear();
+            this.loadedKeys = false;
+            this.synced.keySeqNum++;
+        });
+    }
 
     public get(key: string): T | undefined {
         if (!this.cached.has(key)) {

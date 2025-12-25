@@ -6,6 +6,7 @@ import { formatNumber, formatTime } from "socket-function/src/formatting/format"
 import { setPending } from "./PendingManager";
 import { isInBuild } from "../misc/environment";
 import { isNode } from "typesafecss";
+import { runInfinitePoll } from "socket-function/src/batching";
 
 /*
 // Spec:
@@ -39,6 +40,7 @@ UPDATE now we use chunks, because append is too slow.
 IMPORTANT! If there are multiple writers, we clobber writes from other writers when we compress
 */
 
+const DISK_CHECK_INTERVAL = timeInMinute * 5;
 
 const FILE_CHUNK_SIZE = 1024 * 1024;
 const FILE_MAX_LIFETIME = timeInMinute * 30;
@@ -76,6 +78,8 @@ function getNextChunkPath(): string {
 
 export class TransactionStorage implements IStorage<Buffer> {
     public cache: Map<string, TransactionEntry> = new Map();
+    // Maps file name to our last known write timestamp
+    private diskFiles: Map<string, number> = new Map();
     private currentChunk: {
         path: string;
         size: number;
@@ -91,6 +95,8 @@ export class TransactionStorage implements IStorage<Buffer> {
         private writeDelay = WRITE_DELAY
     ) {
         TransactionStorage.allStorage.push(this);
+        // VERY useful for debugging.
+        (globalThis as any)[`tx${this.debugName}`] = this;
     }
     // Helps get rid of parse errors which constantly log. Also, uses less space
     public static async compressAll() {
@@ -99,6 +105,11 @@ export class TransactionStorage implements IStorage<Buffer> {
                 await storage.compressTransactionLog(true);
             }
         });
+    }
+
+    private resyncCallbacks: (() => void)[] = [];
+    public watchResync(callback: () => void): void {
+        this.resyncCallbacks.push(callback);
     }
 
     private init: Promise<unknown> | undefined = this.loadAllTransactions();
@@ -113,8 +124,13 @@ export class TransactionStorage implements IStorage<Buffer> {
                 size: 0,
                 timeCreated: Date.now()
             };
+            // Timestamp will be updated after actual write
+            this.diskFiles.set(this.currentChunk.path, 0);
         }
         return this.currentChunk.path;
+    }
+    private updateDiskFileTimestamp(file: string): void {
+        this.diskFiles.set(file, Date.now());
     }
     private onAddToChunk(size: number): void {
         if (!this.currentChunk) return;
@@ -211,6 +227,7 @@ export class TransactionStorage implements IStorage<Buffer> {
                     }
                     let content = chunk.buffer;
                     await this.rawStorage.append(file, content);
+                    this.updateDiskFileTimestamp(file);
                     this.onAddToChunk(content.length);
                 }
 
@@ -239,14 +256,51 @@ export class TransactionStorage implements IStorage<Buffer> {
         return Array.from(this.cache.keys());
     }
 
+    public async checkDisk(): Promise<void> {
+        if (this.init) await this.init;
+        const anyChanges = async () => {
+            let keys = await this.rawStorage.getKeys();
+            let diskFiles = keys.filter(key => key.endsWith(CHUNK_EXT));
+            // Check if any known files have been modified externally (disk timestamp newer than ours)
+            for (let file of diskFiles) {
+                let ourTimestamp = this.diskFiles.get(file);
+                if (ourTimestamp === undefined) {
+                    return true;
+                }
+                let info = await this.rawStorage.getInfo(file);
+                if (info && info.lastModified > ourTimestamp) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!await anyChanges()) return;
+
+        await fileLockSection(async () => {
+            if (!await anyChanges()) return;
+            console.log(`Found new changes in collection from other tab. Loading them now. ${this.debugName}`);
+            await this.loadAllTransactions();
+        });
+    }
+
 
     // NOTE: This is either called in init (which blocks all other calls), or inside of the global file lock, so it is safe to load.
     private async loadAllTransactions(): Promise<string[]> {
         if (isInBuild()) return [];
 
+        if (this.init) {
+            runInfinitePoll(DISK_CHECK_INTERVAL, () => this.checkDisk());
+        }
+
         let time = Date.now();
         const keys = await this.rawStorage.getKeys();
         const transactionFiles = keys.filter(key => key.endsWith(CHUNK_EXT));
+        // Populate diskFiles with actual timestamps from disk
+        this.diskFiles = new Map();
+        for (let file of transactionFiles) {
+            let info = await this.rawStorage.getInfo(file);
+            this.diskFiles.set(file, info?.lastModified ?? Date.now());
+        }
 
         let entryList: TransactionEntry[][] = [];
         for (let file of transactionFiles) {
@@ -330,23 +384,60 @@ export class TransactionStorage implements IStorage<Buffer> {
             }
             pendingWriteTimes.set(entry.key, entry.time);
         }
-
-        sort(entries, x => x.time);
-        for (let entry of entries) {
-            let time = entry.time;
-            let prevTime = pendingWriteTimes.get(entry.key);
-            if (prevTime && prevTime > time) {
+        let latest = new Map<string, TransactionEntry>();
+        for (const entry of entries) {
+            let pendingTime = pendingWriteTimes.get(entry.key);
+            if (pendingTime && pendingTime > entry.time) {
                 continue;
             }
+            let prev = latest.get(entry.key);
+            if (prev && prev.time > entry.time) {
+                continue;
+            }
+            latest.set(entry.key, entry);
+        }
 
+        let anyChanged = false;
+        for (let entry of latest.values()) {
             if (entry.value === undefined) {
+                if (!this.cache.has(entry.key)) continue;
+                anyChanged = true;
                 this.cache.delete(entry.key);
             } else {
-                let prev = this.cache.get(entry.key);
-                if (prev && (prev.time > entry.time)) {
-                    continue;
+                if (!anyChanged) {
+                    let prev = this.cache.get(entry.key);
+                    if (!prev || prev.isZipped !== entry.isZipped) {
+                        anyChanged = true;
+                    } else {
+                        if (!prev.value) {
+                            if (entry.value) {
+                                anyChanged = true;
+                            }
+                        } else {
+                            if (!entry.value) {
+                                anyChanged = true;
+                            } else {
+                                // Both values, so... it might not have changed
+                                if (!prev.value.equals(entry.value)) {
+                                    anyChanged = true;
+                                }
+                            }
+                        }
+                    }
                 }
                 this.cache.set(entry.key, entry);
+            }
+        }
+
+        if (anyChanged) {
+            for (const callback of this.resyncCallbacks) {
+                try {
+                    callback();
+                } catch (e) {
+                    setImmediate(() => {
+                        throw e;
+                    });
+                }
             }
         }
     }
@@ -499,6 +590,7 @@ export class TransactionStorage implements IStorage<Buffer> {
                 }
                 let buffer = Buffer.concat([headerBuffer, content]);
                 await this.rawStorage.set(file, buffer);
+                this.updateDiskFileTimestamp(file);
                 let verified = await this.rawStorage.get(file);
                 if (!verified?.equals(buffer)) {
                     console.error(`Failed to verify transaction file ${file} in ${this.debugName}`);
@@ -511,6 +603,7 @@ export class TransactionStorage implements IStorage<Buffer> {
             //      the other generations, which is annoying).
             for (const file of existingDiskEntries) {
                 await this.rawStorage.remove(file);
+                this.diskFiles.delete(file);
             }
         } finally {
             this.compressing = false;
@@ -528,6 +621,7 @@ export class TransactionStorage implements IStorage<Buffer> {
 
             this.pendingAppends = [];
             this.cache.clear();
+            this.diskFiles.clear();
             this.currentChunk = undefined;
             this.entryCount = 0;
         });

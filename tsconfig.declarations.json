@@ -3,8 +3,8 @@
     "compilerOptions": {
         "declaration": true,
         "emitDeclarationOnly": true,
-        "outDir": "./render-utils",
-        "rootDir": "./render-utils"
+        "outDir": "./",
+        "rootDir": "./"
     },
     "include": [
         "render-utils/**/*.ts",

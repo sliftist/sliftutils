@@ -11,4 +11,5 @@ export declare class DelayedStorage<T> implements IStorage<T> {
         lastModified: number;
     } | undefined>;
     reset(): Promise<void>;
+    watchResync(callback: () => void): void;
 }

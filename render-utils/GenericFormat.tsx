@@ -5,12 +5,10 @@ import { css } from "typesafecss";
 
 export const errorMessage = css.hsl(0, 75, 50).color("white", "important", "soft")
     .padding("4px 6px", "soft")
-    .whiteSpace("pre-wrap").display("inline-block", "soft")
-    ;
+    .whiteSpace("pre-wrap").display("inline-block", "soft") as string;
 export const warnMessage = css.hsl(50, 75, 50).color("hsl(0, 0%, 7%)", "important", "soft")
     .padding("4px 6px", "soft")
-    .whiteSpace("pre-wrap").display("inline-block", "soft")
-    ;
+    .whiteSpace("pre-wrap").display("inline-block", "soft") as string;
 
 export type RowType = { [columnName: string]: unknown };
 export type FormatContext<RowT extends RowType = RowType> = {

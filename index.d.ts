@@ -140,6 +140,20 @@ declare module "sliftutils/misc/zip" {
 
 }
 
+declare module "sliftutils/render-utils/Anchor" {
+    import preact from "preact";
+    import { URLParam } from "./URLParam";
+    export declare class Anchor extends preact.Component<{
+        className?: string;
+        params: ([URLParam, unknown] | [string, string])[];
+        button?: boolean;
+    } & Omit<preact.JSX.HTMLAttributes<HTMLAnchorElement>, "href">> {
+        render(): preact.JSX.Element;
+    }
+    export declare function createLinkRaw(params: ([URLParam, unknown])[]): string;
+
+}
+
 declare module "sliftutils/render-utils/DropdownCustom" {
     import preact from "preact";
     import { LengthOrPercentage } from "typesafecss/cssTypes";
@@ -183,6 +197,25 @@ declare module "sliftutils/render-utils/FullscreenModal" {
     }> {
         render(): preact.JSX.Element;
     }
+
+}
+
+declare module "sliftutils/render-utils/GenericFormat" {
+    import preact from "preact";
+    export declare const errorMessage: string;
+    export declare const warnMessage: string;
+    export type RowType = {
+        [columnName: string]: unknown;
+    };
+    export type FormatContext<RowT extends RowType = RowType> = {
+        row?: RowT;
+        columnName?: RowT extends undefined ? string : keyof RowT;
+    };
+    export type JSXFormatter<T = unknown, RowT extends RowType = RowType> = (StringFormatters | `varray:${StringFormatters}` | `link:${string}` | ((value: T, context?: FormatContext<RowT>) => preact.ComponentChild));
+    type StringFormatters = ("guess" | "string" | "number" | "timeSpan" | "date" | "error" | "link" | "toSpaceCase");
+    export declare function toSpaceCase(text: string): string;
+    export declare function formatValue(value: unknown, formatter?: JSXFormatter, context?: FormatContext): preact.ComponentChild;
+    export {};
 
 }
 
@@ -469,6 +502,16 @@ declare module "sliftutils/render-utils/asyncObservable" {
 
 }
 
+declare module "sliftutils/render-utils/colors" {
+    export declare const redButton: string;
+    export declare const yellowButton: string;
+    export declare const greenButton: string;
+    export declare const errorMessage: string;
+    export declare const warnMessage: string;
+    export declare const AnchorClass: string;
+
+}
+
 declare module "sliftutils/render-utils/mobxTyped" {
     export declare function configureMobxNextFrameScheduler(): void;
 
@@ -531,6 +574,7 @@ declare module "sliftutils/storage/CBORStorage" {
             size: number;
             lastModified: number;
         } | undefined>;
+        watchResync(callback: () => void): void;
         reset(): Promise<void>;
     }
 
@@ -556,6 +600,7 @@ declare module "sliftutils/storage/DelayedStorage" {
             lastModified: number;
         } | undefined>;
         reset(): Promise<void>;
+        watchResync(callback: () => void): void;
     }
 
 }
@@ -772,6 +817,7 @@ declare module "sliftutils/storage/IStorage" {
             lastModified: number;
         }>;
         reset(): Promise<void>;
+        watchResync?: (callback: () => void) => void;
     };
     export type IStorageRaw = {
         get(key: string): Promise<Buffer | undefined>;
@@ -813,6 +859,7 @@ declare module "sliftutils/storage/JSONStorage" {
             size: number;
             lastModified: number;
         } | undefined>;
+        watchResync(callback: () => void): void;
         reset(): Promise<void>;
     }
 
@@ -846,6 +893,7 @@ declare module "sliftutils/storage/PendingStorage" {
         private watchPending;
         private updatePending;
         reset(): Promise<void>;
+        watchResync(callback: () => void): void;
     }
 
 }
@@ -928,13 +976,17 @@ declare module "sliftutils/storage/TransactionStorage" {
         private debugName;
         private writeDelay;
         cache: Map<string, TransactionEntry>;
+        private diskFiles;
         private currentChunk;
         private entryCount;
         private static allStorage;
         constructor(rawStorage: IStorageRaw, debugName: string, writeDelay?: number);
         static compressAll(): Promise<void>;
+        private resyncCallbacks;
+        watchResync(callback: () => void): void;
         private init;
         private getCurrentChunk;
+        private updateDiskFileTimestamp;
         private onAddToChunk;
         get(key: string): Promise<Buffer | undefined>;
         set(key: string, value: Buffer): Promise<void>;
@@ -949,8 +1001,10 @@ declare module "sliftutils/storage/TransactionStorage" {
         pushAppend(entry: TransactionEntry): Promise<void>;
         private updatePendingAppends;
         getKeys(): Promise<string[]>;
+        checkDisk(): Promise<void>;
         private loadAllTransactions;
-        private loadTransactionFile;
+        private parseTransactionFile;
+        private applyTransactionEntries;
         private readTransactionEntry;
         private serializeTransactionEntry;
         private getHeader;

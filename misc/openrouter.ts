@@ -1,4 +1,4 @@
-import { parseYAML } from "sliftutils/misc/yaml";
+import { parseYAML } from "./yaml";
 import { retryFunctional } from "socket-function/src/batching";
 import { formatNumber } from "socket-function/src/formatting/format";
 import { getAPIKey } from "./apiKeys";

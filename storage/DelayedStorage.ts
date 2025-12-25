@@ -27,4 +27,9 @@ export class DelayedStorage<T> implements IStorage<T> {
         const storage = await this.storage;
         return storage.reset();
     }
+    public watchResync(callback: () => void): void {
+        void this.storage.then(storage => {
+            storage.watchResync?.(callback);
+        });
+    }
 }

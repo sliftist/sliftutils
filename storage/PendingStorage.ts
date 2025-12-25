@@ -44,4 +44,7 @@ export class PendingStorage<T> implements IStorage<T> {
     public async reset() {
         return this.storage.reset();
     }
+    public watchResync(callback: () => void): void {
+        this.storage.watchResync?.(callback);
+    }
 }
