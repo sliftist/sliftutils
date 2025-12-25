@@ -56,6 +56,7 @@ export class FullscreenModal extends preact.Component<{
                     }}
                 >
                     <div
+                        className={"FullscreenModal"}
                         style={{
                             background: "hsl(0, 0%, 100%)",
                             padding: 20,

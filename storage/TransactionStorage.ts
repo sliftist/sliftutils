@@ -47,7 +47,6 @@ const FILE_MAX_LIFETIME = timeInMinute * 30;
 
 const FILE_ZIP_THRESHOLD = 16 * 1024 * 1024;
 
-const ZIP_THRESHOLD = 4096;
 const START_BYTES = Buffer.from([236, 49, 112, 121, 27, 127, 227, 63]);
 const END_BYTES = Buffer.from([220, 111, 243, 202, 200, 79, 213, 63]);
 // Delay writes, so we batch better, and thrash the disk less
@@ -56,6 +55,7 @@ const WRITE_DELAY = 500;
 interface TransactionEntry {
     key: string;
     value: Buffer | undefined;
+    // NOTE: We disabled per-entry zipping. Either use a raw collection so you don't have to load all of them into memory or shard your collection. Zipping is only a band-aid solution for memory issues. ALSO, it makes loading slower, which makes all other applications that don't need zipping worse.
     isZipped: boolean;
     time: number;
 }
@@ -143,9 +143,8 @@ export class TransactionStorage implements IStorage<Buffer> {
     public async get(key: string): Promise<Buffer | undefined> {
         await this.init;
         const value = this.cache.get(key);
-        if (value && value.isZipped && value.value) {
-            value.value = await Zip.gunzip(value.value);
-            value.isZipped = false;
+        if (value && value.isZipped) {
+            throw new Error(`Transactions should be unzipped on file ready, so this state should be impossible. Key: ${key}`);
         }
         return value?.value;
     }
@@ -157,11 +156,6 @@ export class TransactionStorage implements IStorage<Buffer> {
         let entry: TransactionEntry = { key, value, isZipped: false, time: 0 };
         this.cache.set(key, entry);
 
-        if (value.length >= ZIP_THRESHOLD) {
-            value = await Zip.gzip(value);
-            entry.value = value;
-            entry.isZipped = true;
-        }
         await this.pushAppend(entry);
     }
 
@@ -307,7 +301,7 @@ export class TransactionStorage implements IStorage<Buffer> {
             entryList.push(await this.parseTransactionFile(file));
         }
         let entries = entryList.flat();
-        this.applyTransactionEntries(entries);
+        this.applyTransactionEntries(entries, initialLoad);
 
         time = Date.now() - time;
         if (time > 50) {
@@ -375,7 +369,7 @@ export class TransactionStorage implements IStorage<Buffer> {
         }
         return entries;
     }
-    private applyTransactionEntries(entries: TransactionEntry[]): void {
+    private applyTransactionEntries(entries: TransactionEntry[], initialLoad?: boolean): void {
         let pendingWriteTimes = new Map<string, number>();
         for (const entry of this.pendingAppends) {
             let prevTime = pendingWriteTimes.get(entry.key);
@@ -404,9 +398,9 @@ export class TransactionStorage implements IStorage<Buffer> {
                 anyChanged = true;
                 this.cache.delete(entry.key);
             } else {
-                if (!anyChanged) {
+                if (!anyChanged && !initialLoad) {
                     let prev = this.cache.get(entry.key);
-                    if (!prev || prev.isZipped !== entry.isZipped) {
+                    if (!prev) {
                         anyChanged = true;
                     } else {
                         if (!prev.value) {
@@ -429,7 +423,8 @@ export class TransactionStorage implements IStorage<Buffer> {
             }
         }
 
-        if (anyChanged) {
+        if (anyChanged && !initialLoad) {
+            console.warn(`Transaction storage ${this.debugName} changed on disk, triggering full download from disk`);
             for (const callback of this.resyncCallbacks) {
                 try {
                     callback();
@@ -466,6 +461,11 @@ export class TransactionStorage implements IStorage<Buffer> {
 
         let isZipped = (flags & 1) === 1;
         let isDelete = (flags & 2) === 2;
+
+        if (isZipped) {
+            value = Zip.gunzipSync(value);
+            isZipped = false;
+        }
 
         let entry: TransactionEntry = { key, value, isZipped, time };
         if (isDelete) {

@@ -18,7 +18,6 @@ export class Page extends preact.Component {
         );
         if (ignore) return;
 
-        console.log("Checking hotkey", e.key, e);
         let key = e.key;
         if (e.ctrlKey) key = "Ctrl+" + key;
         if (e.shiftKey) key = "Shift+" + key;
