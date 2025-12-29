@@ -1344,15 +1344,15 @@ picomatch@^2.3.1:
   resolved "https://registry.yarnpkg.com/picomatch/-/picomatch-2.3.1.tgz#3ba3833733646d9d3e4995946c1365a67fb07a42"
   integrity sha512-JU3teHTNjmE2VCGFzuY8EXzCDVwEqB2a8fsIvwaStHhAWJEeVd1o1QD80CU6+ZdEXXSLbSsuLwJjkCBWqRQUVA==
 
-preact@10.24.0:
-  version "10.24.0"
-  resolved "https://registry.yarnpkg.com/preact/-/preact-10.24.0.tgz#bd8139bee35aafede3c6de96d2453982610dfeef"
-  integrity sha512-aK8Cf+jkfyuZ0ZZRG9FbYqwmEiGQ4y/PUO4SuTWoyWL244nZZh7bd5h2APd4rSNDYTBNghg1L+5iJN3Skxtbsw==
+preact-old-types@^10.28.1:
+  version "10.28.1"
+  resolved "https://registry.yarnpkg.com/preact-old-types/-/preact-old-types-10.28.1.tgz#58f9400aa1b80768809c296534ec7b49f6f09a0d"
+  integrity sha512-7r64HwL/PJtzE7jUMFkYVec+vSUf3z8Uozd8Bhl4HMvhcWINFzJsIEHKLAlkeCbzv+jTQl0UwVeMJQ26jK5bDg==
 
-preact@10.24.3:
-  version "10.24.3"
-  resolved "https://registry.yarnpkg.com/preact/-/preact-10.24.3.tgz#086386bd47071e3b45410ef20844c21e23828f64"
-  integrity sha512-Z2dPnBnMUfyQfSQ+GBdsGa16hz35YmLmtTLhM169uW944hYL6xzTYkJjC07j+Wosz733pMWx0fgON3JNw1jJQA==
+preact@10.24.3, "preact@npm:preact-old-types@*":
+  version "10.28.1"
+  resolved "https://registry.yarnpkg.com/preact-old-types/-/preact-old-types-10.28.1.tgz#58f9400aa1b80768809c296534ec7b49f6f09a0d"
+  integrity sha512-7r64HwL/PJtzE7jUMFkYVec+vSUf3z8Uozd8Bhl4HMvhcWINFzJsIEHKLAlkeCbzv+jTQl0UwVeMJQ26jK5bDg==
 
 prelude-ls@^1.2.1:
   version "1.2.1"
@@ -1494,17 +1494,17 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^0.163.0:
-  version "0.163.0"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-0.163.0.tgz#90f70833a10d6fa2fe2be65713d84a7c9be124d9"
-  integrity sha512-ufJZDIn2ZOpP8cnMh+B9NQZF2NNRS1HJB/bd4JL+9ZKv2E218epdrGmWh6OrQs2+8L1UPB51HJj0uLniHLM7nA==
+socket-function@^0.165.0:
+  version "0.165.0"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-0.165.0.tgz#2c262c5cc75a79233d08538517030c504745a94c"
+  integrity sha512-VfpljEyUEjQD4flTboGwgcerK2vuVvDM0iPNL4L4Qyo76G5DQVGcHCaYDwZuuAJ8gvTXDq9j7P7vgdjElNAhXw==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"
     cbor-x "^1.6.0"
     mobx "^6.6.2"
     pako "^2.1.0"
-    preact "10.24.0"
+    preact "10.24.3"
     typedev "^0.4.0"
     typenode "^5.13.0"
     ws "^8.17.1"

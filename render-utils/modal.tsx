@@ -68,7 +68,12 @@ export function showModal(config: {
 }
 
 export function closeAllModals() {
-    for (let key in activeModals) {
-        closeModal(key);
+    // for (let key in activeModals) {
+    //     closeModal(key);
+    // }
+    // Actually, just close the last opened modal
+    const keys = Object.keys(activeModals);
+    if (keys.length > 0) {
+        closeModal(keys[keys.length - 1]);
     }
 }

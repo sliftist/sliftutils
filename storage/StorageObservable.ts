@@ -12,12 +12,13 @@ export class StorageSync<T> implements IStorageSync<T> {
     }, undefined, { deep: false });
 
     constructor(public storage: IStorage<T>) {
-        storage.watchResync?.(() => {
-            this.cached.clear();
-            this.infoCached.clear();
-            this.keys.clear();
+        storage.watchResync?.(async () => {
+            // NOTE: If there's multiple tabs open, this'll trigger a lot, so we can't just clear all the values, as that'll cause a render where nothing's loaded. 
             this.loadedKeys = false;
-            this.synced.keySeqNum++;
+            let keys = await this.getKeysPromise();
+            for (let key of keys) {
+                this.get(key);
+            }
         });
     }
 

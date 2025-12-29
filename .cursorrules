@@ -26,7 +26,11 @@ We use MobX for state management. Components should use a variable called synced
 
 The code automatically updates on save, so do not ever run commands to rerun the site.
 
+Use tool calls to read files and directories where possible, instead of running "ls", "dir", etc.
+
 Coding Styles
+    Comments go in the line before, never after the semicolon. 
+
     Try not to use "null", and instead always use "undefined".
 
     Almost never check for undefined or null, just check for falsey.

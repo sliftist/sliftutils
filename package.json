@@ -48,7 +48,7 @@
         "mobx": "^6.13.3",
         "preact-old-types": "^10.28.1",
         "shell-quote": "^1.8.3",
-        "socket-function": "^0.164.0",
+        "socket-function": "^0.165.0",
         "typenode": "^6.0.0",
         "typesafecss": "*",
         "ws": "^8.18.3",

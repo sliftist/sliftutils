@@ -296,16 +296,17 @@ export class TransactionStorage implements IStorage<Buffer> {
             this.diskFiles.set(file, info?.lastModified ?? Date.now());
         }
 
+        let size = { value: 0 };
         let entryList: TransactionEntry[][] = [];
         for (let file of transactionFiles) {
-            entryList.push(await this.parseTransactionFile(file));
+            entryList.push(await this.parseTransactionFile(file, size));
         }
         let entries = entryList.flat();
         this.applyTransactionEntries(entries, initialLoad);
 
         time = Date.now() - time;
         if (time > 50) {
-            console.log(`Loaded ${this.debugName} in ${formatTime(time)}, ${formatNumber(this.cache.size)} keys, from ${formatNumber(transactionFiles.length)} files, entries ${formatNumber(entries.length)}B`, transactionFiles);
+            console.log(`Loaded ${this.debugName} in ${formatTime(time)}, ${formatNumber(this.cache.size)} keys, from ${formatNumber(transactionFiles.length)} files, entries ${formatNumber(entries.length)}, total size ${formatNumber(size.value)}B`, transactionFiles);
         }
 
         this.init = undefined;
@@ -313,13 +314,14 @@ export class TransactionStorage implements IStorage<Buffer> {
     }
 
     // ONLY call this inside of loadAllTransactions
-    private async parseTransactionFile(filename: string): Promise<TransactionEntry[]> {
+    private async parseTransactionFile(filename: string, size: { value: number }): Promise<TransactionEntry[]> {
         const fullFile = await this.rawStorage.get(filename);
         if (!fullFile) return [];
         if (fullFile.length < 4) {
             //console.error(`Transaction in ${this.debugName} file ${filename} is too small, skipping`);
             return [];
         }
+        size.value += fullFile.length;
         let headerSize = fullFile.readUInt32LE(0);
         let headerBuffer = fullFile.slice(4, 4 + headerSize);
         let header: TransactionHeader;

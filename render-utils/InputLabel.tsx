@@ -297,7 +297,7 @@ export class InputLabelURL extends preact.Component<InputLabelProps & {
         this.props.persisted.value;
         let props = { ...this.props };
         if (props.type === "number" || props.number) {
-            return <InputLabel {...props} value={Number(props.persisted.value) || 0} onChange={e => { props.persisted.value = e.currentTarget.value; props.onChange?.(e); }} />;
+            return <InputLabel {...props} value={Number(props.persisted.value) || 0} onChange={e => { props.persisted.value = +e.currentTarget.value; props.onChange?.(e); }} />;
         } else if (props.type === "checkbox" || this.props.checkbox) {
             return <InputLabel
                 {...props}

@@ -162,6 +162,15 @@ function updatePackageJson(packageJsonPath: string) {
         }
     }
 
+    if (!packageJson.resolutions) {
+        packageJson.resolutions = {};
+    }
+    for (let [key, value] of Object.entries(sourcePackageJson.resolutions)) {
+        if (!packageJson.resolutions[key]) {
+            packageJson.resolutions[key] = value;
+        }
+    }
+
     // Add hard-coded commands
     let hardCodedCommands: { [key: string]: string } = {
         "run-web": "node ./node_modules/sliftutils/builders/webRun.js",
