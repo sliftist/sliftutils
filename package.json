@@ -1,6 +1,6 @@
 {
     "name": "sliftutils",
-    "version": "0.88.0",
+    "version": "1.0.0",
     "main": "index.js",
     "license": "MIT",
     "files": [
@@ -14,7 +14,7 @@
         "update-types": "yarn emit-dts && yarn generate-index-dts",
         "prepublishOnly": "yarn update-types",
         "run-nodejs": "node ./build-nodejs/server.js",
-        "run-nodejs-dev": "typenode ./nodejs/server.ts",
+        "run-nodejs-dev": "typenode ./nodejs/server.ts --npminstall",
         "run-web": "node ./builders/webRun.js",
         "run-electron": "node ./node_modules/electron/cli.js ./build-electron/electronMain.js",
         "build-nodejs": "node ./builders/nodeJSBuildRun.js",
@@ -48,8 +48,8 @@
         "mobx": "^6.13.3",
         "preact-old-types": "^10.28.1",
         "shell-quote": "^1.8.3",
-        "socket-function": "^0.165.0",
-        "typenode": "^6.0.0",
+        "socket-function": "^1.0.1",
+        "typenode": "*",
         "typesafecss": "*",
         "ws": "^8.18.3",
         "yargs": "15.4.1"
