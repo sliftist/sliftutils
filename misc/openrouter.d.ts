@@ -28,6 +28,9 @@ export declare function yamlOpenRouterCall<T>(config: {
     onCost?: (cost: number) => void;
     validate?: (response: T) => void;
 }): Promise<T>;
+export declare function simpleAICall(model: string, message: string): Promise<string>;
+/** The message must request the result to be returned in YAML (we automatically parse this and return an object). */
+export declare function simpleAICallTyped<T>(model: string, message: string): Promise<T>;
 export declare function openRouterCall(config: {
     model: string;
     messages: MessageHistory;

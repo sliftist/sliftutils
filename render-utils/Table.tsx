@@ -70,7 +70,7 @@ export class Table<RowT extends RowType> extends preact.Component<TableType<RowT
                     let rowFields = this.props.getRowFields?.(row) || {};
                     return <tr
                         {...rowFields}
-                        className={rowFields.className + " " + (index % 2 === 1 && css.hsla(0, 0, 100, 0.25) || "")}
+                        className={rowFields.className + " " + (index % 2 === 1 && css.background("hsla(0, 0%, 100%, 0.25)", "soft") || "")}
                     >
                         <td className={css.center}>{index + 1}</td>
                         {Object.entries(columns).filter(x => x[1] !== null).map(([columnName, column]: [string, ColumnType]) => {

@@ -6,7 +6,7 @@ import { list } from "socket-function/src/misc";
 import { enableHotReloading } from "../builders/hotReload";
 import { URLParam } from "../render-utils/URLParam";
 import { Page } from "./Page";
-import { configureMobxNextFrameScheduler } from "sliftutils/render-utils/mobxTyped";
+import { configureMobxNextFrameScheduler } from "../render-utils/mobxTyped";
 
 
 async function main() {

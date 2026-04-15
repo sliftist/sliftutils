@@ -13,24 +13,6 @@ export class ExamplePage extends preact.Component {
         count: 0,
     });
 
-    onKeyDown = (e: KeyboardEvent) => {
-        // Skip if the current target is an ipnut
-        if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-            return;
-        }
-        let hotkeySelector = `[data-hotkey="${e.code}"]`;
-        let elements = document.querySelectorAll(hotkeySelector);
-        for (let element of elements) {
-            (element as HTMLElement).click();
-        }
-    };
-    componentDidMount(): void {
-        document.addEventListener("keydown", this.onKeyDown);
-    }
-    componentWillUnmount(): void {
-        document.removeEventListener("keydown", this.onKeyDown);
-    }
-
     render() {
         return (
             <div className={css.pad2(20)}>

@@ -48,7 +48,7 @@ export class Page extends preact.Component {
 
         return (
             <div className={css.size("100vw", "100vh").vbox(0)}>
-                <div className={css.hbox(12).pad2(20, 0)}>
+                <div className={css.hbox(12).pad2(20, 10).paddingBottom(5, "important")}>
                     {pages.map(p => (
                         <Anchor key={p.key} params={[[pageURL, p.key]]}>
                             {p.key}

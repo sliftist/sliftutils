@@ -18,6 +18,9 @@ export class DiskCollection<T> implements IStorageSync<T> {
             writeDelay?: number;
             cbor?: boolean;
             noPrompt?: boolean;
+            freeze?: "shallow" | "deep";
+            // May mutate newValue in order to change what will be written
+            beforeWrite?: (update: { newValue: T; key: string; collection: DiskCollection<T> }) => void;
         }
     ) {
     }
@@ -41,7 +44,11 @@ export class DiskCollection<T> implements IStorageSync<T> {
     private synced = new StorageSync(
         new PendingStorage(`Collection (${this.collectionName})`,
             new DelayedStorage<T>(this.baseStorage)
-        )
+        ),
+        {
+            freeze: this.config?.freeze,
+            beforeWrite: this.config?.beforeWrite && ((update) => this.config!.beforeWrite!({ ...update, collection: this })),
+        }
     );
 
     public get(key: string): T | undefined {

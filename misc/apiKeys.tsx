@@ -99,11 +99,20 @@ let getStorage = lazy((): {
 });
 
 export const getAPIKey = cache(async function getAPIKey(key: string): Promise<string> {
+    let innerKey = "key";
+    if (isNode()) {
+        if (key.includes(".json.")) {
+            let [baseKey, innerKeyPart] = key.split(".json.");
+            baseKey += ".json";
+            innerKey = innerKeyPart;
+            key = baseKey;
+        }
+    }
     let keyKey = getStorageKey(key);
     let localStorageValue = getStorage().getItem(keyKey);
     if (localStorageValue?.startsWith("{")) {
         try {
-            localStorageValue = JSON.parse(localStorageValue).key;
+            localStorageValue = JSON.parse(localStorageValue)[innerKey];
         } catch { }
     }
     if (localStorageValue) {

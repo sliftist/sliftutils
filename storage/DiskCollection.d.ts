@@ -10,6 +10,12 @@ export declare class DiskCollection<T> implements IStorageSync<T> {
         writeDelay?: number | undefined;
         cbor?: boolean | undefined;
         noPrompt?: boolean | undefined;
+        freeze?: "deep" | "shallow" | undefined;
+        beforeWrite?: ((update: {
+            newValue: T;
+            key: string;
+            collection: DiskCollection<T>;
+        }) => void) | undefined;
     } | undefined);
     transactionStorage: TransactionStorage | undefined;
     initStorage(): Promise<IStorage<T>>;

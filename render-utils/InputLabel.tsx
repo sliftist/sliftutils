@@ -6,7 +6,7 @@ import { observer } from "./observer";
 import { observable } from "mobx";
 
 // IMPORTANT! InputProps is in both InputLabel.tsx and Input.tsx, so the types export correctly
-type InputProps = (
+export type InputProps = (
     preact.JSX.HTMLAttributes<HTMLInputElement>
     & {
         /** ONLY throttles onChangeValue */

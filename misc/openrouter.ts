@@ -52,6 +52,20 @@ export async function yamlOpenRouterCall<T>(config: {
     }
 }
 
+export async function simpleAICall(model: string, message: string): Promise<string> {
+    return await openRouterCallBase({
+        model,
+        messages: [{ role: "user", content: message }],
+    });
+}
+/** The message must request the result to be returned in YAML (we automatically parse this and return an object). */
+export async function simpleAICallTyped<T>(model: string, message: string): Promise<T> {
+    return await yamlOpenRouterCall({
+        model,
+        messages: [{ role: "user", content: message }],
+    }) as T;
+}
+
 let pendingLog: {
     count: number;
     duration: number;

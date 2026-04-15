@@ -25,7 +25,8 @@ export class Anchor extends preact.Component<{
             <a
                 {...remaining}
                 className={
-                    css.textDecoration("none")
+                    "Anchor "
+                    + css.textDecoration("none")
                         .opacity(0.8, "hover")
                     + (selected && css.color("hsl(110, 75%, 65%)", "soft"))
                     + (!selected && css.color("hsl(210, 75%, 65%)", "soft"))

@@ -1,8 +1,11 @@
 import { observable } from "mobx";
-import { isDefined } from "../misc/types";
+import { deepFreezeObject, freezeObject, isDefined } from "../misc/types";
 import { IStorage, IStorageSync } from "./IStorage";
+import { PromiseObj } from "socket-function/src/misc";
 
-// NOTE: At around 500K values (depending on their size to some degree), this will take about 2 minutes to load. But once it does it will be fast. So... keep that in mind. I recommend not exceeding 100K
+export const storagePendingAccesses = { value: 0 };
+
+// NOTE: At around 500K values (depending on their size to some degree), this will take about 2 minutes to load. But once it does it will be fast. So... keep that in mind. I recommend not exceeding 100K.
 export class StorageSync<T> implements IStorageSync<T> {
     cached = observable.map<string, T | undefined>(undefined, { deep: false });
     infoCached = observable.map<string, { size: number; lastModified: number } | undefined>(undefined, { deep: false });
@@ -11,7 +14,11 @@ export class StorageSync<T> implements IStorageSync<T> {
         keySeqNum: 0,
     }, undefined, { deep: false });
 
-    constructor(public storage: IStorage<T>) {
+    constructor(public storage: IStorage<T>, private config?: {
+        freeze?: "shallow" | "deep";
+        // May mutate newValue in order to change what will be written
+        beforeWrite?: (update: { newValue: T; key: string; collection: StorageSync<T> }) => void;
+    }) {
         storage.watchResync?.(async () => {
             // NOTE: If there's multiple tabs open, this'll trigger a lot, so we can't just clear all the values, as that'll cause a render where nothing's loaded. 
             this.loadedKeys = false;
@@ -33,6 +40,9 @@ export class StorageSync<T> implements IStorageSync<T> {
         return this.cached.get(key);
     }
     public set(key: string, value: T): void {
+        if (this.config?.beforeWrite) {
+            this.config.beforeWrite({ newValue: value, key, collection: this });
+        }
         if (!this.keys.has(key)) {
             this.keys.add(key);
             this.synced.keySeqNum++;
@@ -78,19 +88,29 @@ export class StorageSync<T> implements IStorageSync<T> {
     public async getPromise(key: string): Promise<T | undefined> {
         let value = this.cached.get(key);
         if (value === undefined) {
+            storagePendingAccesses.value++;
             value = await this.storage.get(key);
-            if (this.cached.get(key) === undefined) {
+            if (value !== undefined && this.cached.get(key) === undefined) {
+                if (this.config?.freeze === "shallow") {
+                    freezeObject(value);
+                } else if (this.config?.freeze === "deep") {
+                    deepFreezeObject(value);
+                }
                 this.cached.set(key, value);
             }
+            triggerLoad();
         }
         return value;
     }
     private pendingGetKeys: Promise<string[]> | undefined;
     public async getKeysPromise(): Promise<string[]> {
+        if (this.loadedKeys) {
+            return Array.from(this.keys);
+        }
+        storagePendingAccesses.value++;
         if (this.pendingGetKeys) {
             return this.pendingGetKeys;
         }
-        if (this.loadedKeys) return Array.from(this.keys);
         this.loadedKeys = true;
         this.pendingGetKeys = this.storage.getKeys();
         void this.pendingGetKeys.finally(() => {
@@ -101,6 +121,7 @@ export class StorageSync<T> implements IStorageSync<T> {
             this.keys = new Set(keys);
             this.synced.keySeqNum++;
         }
+        triggerLoad();
         return Array.from(this.keys);
     }
 
@@ -128,4 +149,20 @@ export class StorageSync<T> implements IStorageSync<T> {
         this.synced.keySeqNum++;
         await this.storage.reset();
     }
+}
+
+let waitUntilNextLoadWatchers: PromiseObj<void>[] = [];
+export function waitUntilNextLoad(): Promise<void> {
+    let promise = new PromiseObj<void>();
+    waitUntilNextLoadWatchers.push(promise);
+    return promise.promise;
+}
+function triggerLoad() {
+    let watchers = waitUntilNextLoadWatchers;
+    waitUntilNextLoadWatchers = [];
+    void Promise.resolve().finally(() => {
+        for (let watcher of watchers) {
+            watcher.resolve();
+        }
+    });
 }

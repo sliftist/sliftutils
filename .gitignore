@@ -28,6 +28,7 @@ data
 *.gif
 *.bmp
 *.tiff
+*.cert
 temp
 yarn-error.log
 pretrained_models

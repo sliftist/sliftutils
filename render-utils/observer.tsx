@@ -1,5 +1,6 @@
 import * as preact from "preact";
 import { observable, Reaction } from "mobx";
+import { measureBlock } from "socket-function/src/profiling/measure";
 
 let globalConstructOrder = 1;
 export function observer<
@@ -27,7 +28,9 @@ export function observer<
         render(...args: any[]) {
             let output: preact.ComponentChild;
             this.reaction.track(() => {
-                output = (super.render as any)(...args);
+                measureBlock(() => {
+                    output = (super.render as any)(...args);
+                }, `${name}|render`);
             });
             return output;
         }

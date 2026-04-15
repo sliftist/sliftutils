@@ -78,7 +78,7 @@ async function main() {
     let packageJsonPath = path.join(targetDir, "package.json");
     if (fs.existsSync(packageJsonPath)) {
         console.log("\nUpdating package.json scripts...");
-        updatePackageJson(packageJsonPath);
+        await updatePackageJson(packageJsonPath);
     } else {
         console.warn("\nNo package.json found in target directory");
     }
@@ -136,7 +136,7 @@ function replaceImports(content: string, importMappings: { [key: string]: string
     return processedLines.join("\n");
 }
 
-function updatePackageJson(packageJsonPath: string) {
+async function updatePackageJson(packageJsonPath: string) {
     let packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
 
     // Read our current package.json to get the type script
@@ -191,8 +191,22 @@ function updatePackageJson(packageJsonPath: string) {
         }
     }
 
+    let needsYarnInstall = false;
+
+    // ALSO, add socket-function, if it doesn't have it already. This fixes intelliSense, for socket-function, which has a lot of useful utilities related to caching.
+    if (!packageJson.dependencies?.["socket-function"]) {
+        packageJson.dependencies = packageJson.dependencies || {};
+        packageJson.dependencies["socket-function"] = "*";
+        needsYarnInstall = true;
+    }
+
     fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, undefined, 4) + "\n", "utf8");
     console.log("  package.json updated");
+
+    if (needsYarnInstall) {
+        console.log("  Needs yarn install");
+        await execSync("yarn install", { cwd: path.dirname(packageJsonPath), stdio: "inherit" });
+    }
 }
 
 main().catch(error => {

@@ -401,26 +401,20 @@ export class TransactionStorage implements IStorage<Buffer> {
                 this.cache.delete(entry.key);
             } else {
                 if (!anyChanged && !initialLoad) {
-                    let prev = this.cache.get(entry.key);
-                    if (!prev) {
-                        anyChanged = true;
-                    } else {
-                        if (!prev.value) {
-                            if (entry.value) {
-                                anyChanged = true;
-                            }
-                        } else {
-                            if (!entry.value) {
-                                anyChanged = true;
-                            } else {
-                                // Both values, so... it might not have changed
-                                if (!prev.value.equals(entry.value)) {
-                                    anyChanged = true;
-                                }
-                            }
+                    const hasChanged = () => {
+                        let prev = this.cache.get(entry.key);
+                        if (!prev) {
+                            return true;
                         }
-                    }
+                        if (!!prev.value !== !!entry.value) return true;
+                        if (prev.value && entry.value && !prev.value.equals(entry.value)) {
+                            return true;
+                        }
+                        return false;
+                    };
+                    anyChanged = hasChanged() || anyChanged;
                 }
+
                 this.cache.set(entry.key, entry);
             }
         }

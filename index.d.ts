@@ -62,6 +62,149 @@ declare module "sliftutils/misc/helpers" {
 
 }
 
+declare module "sliftutils/misc/https/certs" {
+    /// <reference path="node-forge-ed25519.d.ts" />
+    /// <reference path="../../storage/storage.d.ts" />
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import * as forge from "node-forge";
+    import { MaybePromise } from "socket-function/src/types";
+    export declare const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
+    export declare const identityStorageKey = "machineCA_10";
+    export type IdentityStorageType = {
+        domain: string;
+        certB64: string;
+        keyB64: string;
+    };
+    export interface X509KeyPair {
+        domain: string;
+        cert: Buffer;
+        key: Buffer;
+    }
+    export declare function getCommonName(cert: Buffer | string): string;
+    export declare function createX509(config: {
+        domain: string;
+        issuer: X509KeyPair | "self";
+        lifeSpan: number;
+        keyPair: {
+            publicKey: forge.Ed25519PublicKey;
+            privateKey: forge.Ed25519PrivateKey;
+        } | forge.pki.KeyPair;
+    }): X509KeyPair;
+    export declare function privateKeyToPem(buffer: forge.pki.PrivateKey | forge.Ed25519PrivateKey): string;
+    export declare function parseCert(PEMorDER: string | Buffer): forge.pki.Certificate;
+    export declare function getPublicIdentifier(PEMorDER: string | Buffer): Buffer;
+    export declare const sign: (keyPair: {
+        key: string | Buffer;
+    }, data: unknown) => string;
+    export declare function verify(cert: string, signature: string, data: unknown): boolean;
+    export declare function validateCACert(domain: string, cert: string | Buffer): void;
+    export declare function validateCertificate(domain: string, cert: Buffer | string, issuerCert: Buffer | string): void;
+    export declare function generateKeyPair(): forge.pki.rsa.KeyPair;
+    export declare function generateRSAKeyPair(): forge.pki.rsa.KeyPair;
+    export declare function generateTestCA(domain: string): X509KeyPair;
+    export declare function createCertFromCA(config: {
+        CAKeyPair: X509KeyPair;
+    }): X509KeyPair;
+    export declare function getMachineId(domainName: string): string;
+    export type NodeIdParts = {
+        threadId: string;
+        machineId: string;
+        domain: string;
+        port: number;
+    };
+    export declare function decodeNodeId(nodeId: string): NodeIdParts | undefined;
+    export declare function decodeNodeIdAssert(nodeId: string): NodeIdParts;
+    export declare function encodeNodeId(parts: NodeIdParts): string;
+    export declare function setIdentityCARaw(domain: string, json: string): Promise<void>;
+    export declare function loadIdentityCA(domain: string): Promise<void>;
+    export declare function getIdentityCA(domain: string): X509KeyPair;
+    export declare function getIdentityCAPromise(domain: string): MaybePromise<X509KeyPair>;
+    export declare function getOwnMachineId(domain: string): string;
+    /** Part of the machineId comes from the publicKey, so we can use it to verify */
+    export declare function verifyMachineIdForPublicKey(config: {
+        machineId: string;
+        publicKey: Buffer;
+    }): boolean;
+    export declare function getThreadKeyCert(domain: string): X509KeyPair;
+    export declare const createTestBrowserKeyCert: {
+        (): Promise<X509KeyPair>;
+        reset(): void;
+        set(newValue: Promise<X509KeyPair>): void;
+    };
+    export declare function getOwnNodeId(): string;
+    export declare function getOwnNodeIdAllowUndefined(): string;
+
+}
+
+declare module "sliftutils/misc/https/dns" {
+    export declare function getRecordsRaw(type: string, key: string): Promise<{
+        id: string;
+        type: string;
+        name: string;
+        content: string;
+        proxied: boolean;
+    }[]>;
+    export declare function getRecords(type: string, key: string): Promise<string[]>;
+    export declare function deleteRecord(type: string, key: string, value: string): Promise<void>;
+    /** Removes all existing records (unless the record is already present) */
+    export declare function setRecord(type: string, key: string, value: string, proxied?: "proxied"): Promise<void>;
+    /** Keeps existing records */
+    export declare function addRecord(type: string, key: string, value: string, proxied?: "proxied"): Promise<void>;
+
+}
+
+declare module "sliftutils/misc/https/httpsCerts" {
+    /** NOTE: We also generate the domain *.domain */
+    export declare const getHTTPSCert: {
+        (key: string): Promise<{
+            key: string;
+            cert: string;
+        }>;
+        clear(key: string): void;
+        clearAll(): void;
+        forceSet(key: string, value: Promise<{
+            key: string;
+            cert: string;
+        }>): void;
+        getAllKeys(): string[];
+        get(key: string): Promise<{
+            key: string;
+            cert: string;
+        }> | undefined;
+    };
+
+}
+
+declare module "sliftutils/misc/https/node-forge-ed25519" {
+
+
+    declare module "node-forge" {
+        declare type Ed25519PublicKey = {
+            publicKeyBytes: Buffer;
+        } & Buffer;
+        declare type Ed25519PrivateKey = {
+            privateKeyBytes: Buffer;
+        } & Buffer;
+        class ed25519 {
+            static generateKeyPair(): { publicKey: Ed25519PublicKey, privateKey: Ed25519PrivateKey };
+            static privateKeyToPem(key: Ed25519PrivateKey): string;
+            static privateKeyFromPem(pem: string): Ed25519PrivateKey;
+            static publicKeyToPem(key: Ed25519PublicKey): string;
+            static publicKeyFromPem(pem: string): Ed25519PublicKey;
+        }
+    }
+}
+
+declare module "sliftutils/misc/https/persistentLocalStorage" {
+    import { MaybePromise } from "socket-function/src/types";
+    export declare function getKeyStore<T>(appName: string, key: string): {
+        get(): MaybePromise<T | undefined>;
+        set(value: T | null): MaybePromise<void>;
+    };
+
+}
+
 declare module "sliftutils/misc/matchFilter" {
     export declare function matchFilter(filter: {
         value: string;
@@ -100,6 +243,9 @@ declare module "sliftutils/misc/openrouter" {
         onCost?: (cost: number) => void;
         validate?: (response: T) => void;
     }): Promise<T>;
+    export declare function simpleAICall(model: string, message: string): Promise<string>;
+    /** The message must request the result to be returned in YAML (we automatically parse this and return an object). */
+    export declare function simpleAICallTyped<T>(model: string, message: string): Promise<T>;
     export declare function openRouterCall(config: {
         model: string;
         messages: MessageHistory;
@@ -127,6 +273,8 @@ declare module "sliftutils/misc/random" {
 
 declare module "sliftutils/misc/types" {
     export declare function isDefined<T>(value: T | undefined | null): value is T;
+    export declare function freezeObject(value: unknown): unknown;
+    export declare function deepFreezeObject(value: unknown): void;
 
 }
 
@@ -148,6 +296,7 @@ declare module "sliftutils/misc/zip" {
     import { MaybePromise } from "socket-function/src/types";
     export declare class Zip {
         static gzip(buffer: Buffer, level?: number): Promise<Buffer>;
+        static gzipSync(buffer: Buffer, level?: number): Buffer;
         static gunzip(buffer: Buffer): MaybePromise<Buffer>;
         static gunzipAsyncBase(buffer: Buffer): Promise<Buffer>;
         static gunzipUntracked(buffer: Buffer): Promise<Buffer>;
@@ -542,6 +691,11 @@ declare module "sliftutils/render-utils/asyncObservable" {
 
 }
 
+declare module "sliftutils/render-utils/autoMeasure" {
+    export declare function runAutoMeasure(): void;
+
+}
+
 declare module "sliftutils/render-utils/colors" {
     export declare const redButton: string;
     export declare const yellowButton: string;
@@ -658,6 +812,12 @@ declare module "sliftutils/storage/DiskCollection" {
             writeDelay?: number | undefined;
             cbor?: boolean | undefined;
             noPrompt?: boolean | undefined;
+            freeze?: "deep" | "shallow" | undefined;
+            beforeWrite?: ((update: {
+                newValue: T;
+                key: string;
+                collection: DiskCollection<T>;
+            }) => void) | undefined;
         } | undefined);
         transactionStorage: TransactionStorage | undefined;
         initStorage(): Promise<IStorage<T>>;
@@ -967,8 +1127,12 @@ declare module "sliftutils/storage/PrivateFileSystemStorage" {
 
 declare module "sliftutils/storage/StorageObservable" {
     import { IStorage, IStorageSync } from "./IStorage";
+    export declare const storagePendingAccesses: {
+        value: number;
+    };
     export declare class StorageSync<T> implements IStorageSync<T> {
         storage: IStorage<T>;
+        private config?;
         cached: import("mobx").ObservableMap<string, T | undefined>;
         infoCached: import("mobx").ObservableMap<string, {
             size: number;
@@ -978,7 +1142,14 @@ declare module "sliftutils/storage/StorageObservable" {
         synced: {
             keySeqNum: number;
         };
-        constructor(storage: IStorage<T>);
+        constructor(storage: IStorage<T>, config?: {
+            freeze?: "deep" | "shallow" | undefined;
+            beforeWrite?: ((update: {
+                newValue: T;
+                key: string;
+                collection: StorageSync<T>;
+            }) => void) | undefined;
+        } | undefined);
         get(key: string): T | undefined;
         set(key: string, value: T): void;
         remove(key: string): void;
@@ -998,6 +1169,13 @@ declare module "sliftutils/storage/StorageObservable" {
         reloadKey(key: string): void;
         reset(): Promise<void>;
     }
+    export declare function waitUntilNextLoad(): Promise<void>;
+
+}
+
+declare module "sliftutils/storage/StorageObservableAsync" {
+    /** Reruns the code until all StorageSyncs accessed have loaded their values. Not efficient,although will usually be O(values accessed), just due to how loading works (it won't be quadratic). */
+    export declare function rerunCodeUntilAllLoaded<T>(code: () => T): Promise<T>;
 
 }
 
@@ -1054,6 +1232,107 @@ declare module "sliftutils/storage/TransactionStorage" {
         reset(): Promise<void>;
     }
     export {};
+
+}
+
+declare module "sliftutils/storage/backblaze" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    export declare class ArchivesBackblaze {
+        private config;
+        constructor(config: {
+            bucketName: string;
+            public?: boolean;
+            immutable?: boolean;
+            cacheTime?: number;
+        });
+        private bucketName;
+        private bucketId;
+        private logging;
+        enableLogging(): void;
+        private log;
+        getDebugName(): string;
+        private getBucketAPI;
+        private last503Reset;
+        private apiRetryLogic;
+        get(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+            retryCount?: number;
+        }): Promise<Buffer | undefined>;
+        set(fileName: string, data: Buffer): Promise<void>;
+        del(fileName: string): Promise<void>;
+        setLargeFile(config: {
+            path: string;
+            getNextData(): Promise<Buffer | undefined>;
+        }): Promise<void>;
+        getInfo(fileName: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        find(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<string[]>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<{
+            path: string;
+            createTime: number;
+            size: number;
+        }[]>;
+        assertPathValid(path: string): Promise<void>;
+        getURL(path: string): Promise<string>;
+        getDownloadAuthorization(config: {
+            fileNamePrefix?: string;
+            validDurationInSeconds: number;
+            b2ContentDisposition?: string;
+            b2ContentLanguage?: string;
+            b2Expires?: string;
+            b2CacheControl?: string;
+            b2ContentEncoding?: string;
+            b2ContentType?: string;
+        }): Promise<{
+            bucketId: string;
+            fileNamePrefix: string;
+            authorizationToken: string;
+        }>;
+    }
+    export declare const getArchivesBackblaze: {
+        (key: string): ArchivesBackblaze;
+        clear(key: string): void;
+        clearAll(): void;
+        forceSet(key: string, value: ArchivesBackblaze): void;
+        getAllKeys(): string[];
+        get(key: string): ArchivesBackblaze | undefined;
+    };
+    export declare const getArchivesBackblazePrivateImmutable: {
+        (key: string): ArchivesBackblaze;
+        clear(key: string): void;
+        clearAll(): void;
+        forceSet(key: string, value: ArchivesBackblaze): void;
+        getAllKeys(): string[];
+        get(key: string): ArchivesBackblaze | undefined;
+    };
+    export declare const getArchivesBackblazePublicImmutable: {
+        (key: string): ArchivesBackblaze;
+        clear(key: string): void;
+        clearAll(): void;
+        forceSet(key: string, value: ArchivesBackblaze): void;
+        getAllKeys(): string[];
+        get(key: string): ArchivesBackblaze | undefined;
+    };
+    export declare const getArchivesBackblazePublic: {
+        (key: string): ArchivesBackblaze;
+        clear(key: string): void;
+        clearAll(): void;
+        forceSet(key: string, value: ArchivesBackblaze): void;
+        getAllKeys(): string[];
+        get(key: string): ArchivesBackblaze | undefined;
+    };
 
 }
 
