@@ -11,8 +11,8 @@ async function main() {
     console.log(`Target: ${targetDir}`);
 
     // Directories and files to copy
-    let directoriesToScan = ["electron", "extension", "web", "nodejs", "assets", ".vscode"];
-    let rootFiles = [".cursorrules", ".eslintrc.js", ".gitignore", "tsconfig.json"];
+    let directoriesToScan = ["electron", "extension", "web", "nodejs", "assets", ".vscode", ".cursor"];
+    let rootFiles = [".eslintrc.js", ".gitignore", "tsconfig.json"];
 
     // Import path mappings to convert relative imports to package imports
     let importMappings: { [key: string]: string } = {

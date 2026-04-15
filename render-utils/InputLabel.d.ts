@@ -1,5 +1,5 @@
 import preact from "preact";
-type InputProps = (preact.JSX.HTMLAttributes<HTMLInputElement> & {
+export type InputProps = (preact.JSX.HTMLAttributes<HTMLInputElement> & {
     /** ONLY throttles onChangeValue */
     throttle?: number;
     flavor?: "large" | "small" | "none";
@@ -59,4 +59,3 @@ export declare class InputLabelURL extends preact.Component<InputLabelProps & {
 }> {
     render(): preact.JSX.Element;
 }
-export {};
