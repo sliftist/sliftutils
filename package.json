@@ -1,6 +1,6 @@
 {
     "name": "sliftutils",
-    "version": "1.2.5",
+    "version": "1.2.6",
     "main": "index.js",
     "license": "MIT",
     "files": [
@@ -50,7 +50,7 @@
         "mobx": "^6.13.3",
         "preact-old-types": "^10.28.1",
         "shell-quote": "^1.8.3",
-        "socket-function": "^1.1.1",
+        "socket-function": "^1.1.21",
         "typenode": "*",
         "typesafecss": "*",
         "ws": "^8.18.3",
