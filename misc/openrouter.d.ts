@@ -13,6 +13,7 @@ export type MessageHistory2 = {
 }[];
 export declare function getTotalCost(): number;
 type OpenRouterOptions = {
+    apiKey?: string;
     provider?: {
         sort?: "throughput" | "price" | "latency";
         order?: string[];

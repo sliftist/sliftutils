@@ -128,14 +128,18 @@ export const getAPIKey = cache(async function getAPIKey(key: string): Promise<st
     try {
         let value = await promise;
 
-        getStorage().setItem(keyKey, value);
-        state.keys.push(key);
-        getStorage().setItem(getStorageKey("__keys"), JSON.stringify(state.keys));
+        setAPIKey(key, value);
         return value;
     } finally {
         obj.close();
     }
 });
+
+export function setAPIKey(key: string, value: string) {
+    getStorage().setItem(getStorageKey(key), value);
+    state.keys.push(key);
+    getStorage().setItem(getStorageKey("__keys"), JSON.stringify(state.keys));
+}
 
 @observer
 export class ManageAPIKeys extends preact.Component {

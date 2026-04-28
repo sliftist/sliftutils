@@ -10,6 +10,7 @@ export declare const getAPIKey: {
     getAllKeys(): string[];
     get(key: string): Promise<string> | undefined;
 };
+export declare function setAPIKey(key: string, value: string): void;
 export declare class ManageAPIKeys extends preact.Component {
     render(): string;
 }

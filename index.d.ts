@@ -14,6 +14,7 @@ declare module "sliftutils/misc/apiKeys" {
         getAllKeys(): string[];
         get(key: string): Promise<string> | undefined;
     };
+    export declare function setAPIKey(key: string, value: string): void;
     export declare class ManageAPIKeys extends preact.Component {
         render(): string;
     }
@@ -228,6 +229,7 @@ declare module "sliftutils/misc/openrouter" {
     }[];
     export declare function getTotalCost(): number;
     type OpenRouterOptions = {
+        apiKey?: string;
         provider?: {
             sort?: "throughput" | "price" | "latency";
             order?: string[];

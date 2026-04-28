@@ -22,6 +22,8 @@ export function getTotalCost() {
     return totalCost;
 }
 type OpenRouterOptions = {
+    // If not provided, we'll pop up a modal to ask the user for it, Or, if we're on the server, we'll try to read it from the user folder.
+    apiKey?: string;
     provider?: {
         sort?: "throughput" | "price" | "latency",
         // https://openrouter.ai/docs/features/provider-routing#ordering-specific-providers
@@ -90,7 +92,7 @@ export async function openRouterCallBase(config: {
     retries?: number;
 }): Promise<string> {
     let { model, messages, options, onCost } = config;
-    let openrouterKey = await getAPIKey("openrouter.json");
+    let openrouterKey = options?.apiKey || await getAPIKey("openrouter.json");
     console.log(`Calling ${model} with ${messages.length} messages`);
     let time = Date.now();
     let stillRunning = true;
