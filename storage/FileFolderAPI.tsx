@@ -255,26 +255,42 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                         retryCallback = resolve;
                     });
                     displayData.ui = (
-                        <button
-                            className={css.fontSize(40).pad2(80, 40)}
-                            onClick={async () => {
-                                displayData.ui = "Loading...";
-                                try {
-                                    const retryHandle = await tryToLoadPointer(storedId);
-                                    if (retryHandle) {
-                                        handle = retryHandle;
-                                        retryCallback(true);
-                                    } else {
+                        <div className={css.vbox(20).center}>
+                            <button
+                                className={css.fontSize(40).pad2(80, 40)}
+                                onClick={async () => {
+                                    displayData.ui = "Loading...";
+                                    try {
+                                        const retryHandle = await tryToLoadPointer(storedId);
+                                        if (retryHandle) {
+                                            handle = retryHandle;
+                                            retryCallback(true);
+                                        } else {
+                                            retryCallback(false);
+                                        }
+                                    } catch (retryError) {
+                                        console.error("Retry failed:", retryError);
                                         retryCallback(false);
                                     }
-                                } catch (retryError) {
-                                    console.error("Retry failed:", retryError);
-                                    retryCallback(false);
-                                }
-                            }}
-                        >
-                            Click to restore file system access
-                        </button>
+                                }}
+                            >
+                                Click to restore file system access
+                            </button>
+                            <button
+                                className={css.fontSize(40).pad2(80, 40)}
+                                onClick={async () => {
+                                    console.log("Waiting for user to give permission");
+                                    const pickedHandle = await window.showDirectoryPicker();
+                                    await pickedHandle.requestPermission({ mode: "readwrite" });
+                                    let newStoredId = await storeFileSystemPointer({ mode: "readwrite", handle: pickedHandle });
+                                    localStorage.setItem(getFileAPIKey(), newStoredId);
+                                    handle = pickedHandle as any;
+                                    retryCallback(true);
+                                }}
+                            >
+                                Pick Data Directory
+                            </button>
+                        </div>
                     );
                     const success = await retryPromise;
                     if (handle) {

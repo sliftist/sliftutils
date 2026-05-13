@@ -2,6 +2,7 @@ import { watchFilesAndTriggerHotReloading } from "socket-function/hot/HotReloadC
 import { isInBrowser, isInChromeExtension, isInChromeExtensionBackground, isInChromeExtensionContentScript } from "../misc/environment";
 
 const DEFAULT_WATCH_PORT = 9876;
+const CONTENT_SCRIPT_POLL_INTERVAL_MS = 1000;
 
 export async function enableHotReloading(config?: {
     port?: number;
@@ -39,7 +40,7 @@ function watchPortHotReload(port = DEFAULT_WATCH_PORT, onReload: () => void) {
                 try {
                     let data = JSON.parse(event.data);
                     if (data.type === "build-complete" && data.success) {
-                        console.log("[Hot Reload] Build complete, reloading page...");
+                        console.log("[Hot Reload] Build complete, reloading...");
                         onReload();
                     }
                 } catch (error) {
@@ -71,29 +72,31 @@ function watchPortHotReload(port = DEFAULT_WATCH_PORT, onReload: () => void) {
 }
 
 function chromeExtensionBackgroundHotReload(port = DEFAULT_WATCH_PORT) {
-    chrome.runtime.onConnect.addListener((port) => {
-        if (port.name === "hotReload") {
-            // Keep the port open so content scripts can detect when we disconnect
-        }
-    });
-
     watchPortHotReload(port, () => {
         chrome.runtime.reload();
     });
 }
 
 function chromeExtensionContentScriptHotReload() {
-    let port = chrome.runtime.connect({ name: "hotReload" });
-
-    let startTime = Date.now();
-
-    port.onDisconnect.addListener(() => {
-        let timeToFail = Date.now() - startTime;
-        if (timeToFail > 10000) {
-            console.warn("[Hot Reload] Could not connect to background script. Make sure the background script calls enableHotReloading().");
-            return;
+    // The background reloads the extension on build, which invalidates this
+    // content script's extension context. We detect that by touching
+    // chrome.storage.local on a poll — once the context is gone, the call
+    // throws "Extension context invalidated" and we refresh the page.
+    setInterval(() => {
+        try {
+            chrome.storage.local.get(null, () => {
+                if (chrome.runtime.lastError) {
+                    console.error("[Hot Reload] storage.get error:", chrome.runtime.lastError.message);
+                }
+            });
+        } catch (error) {
+            let message = (error as Error).message ?? "";
+            if (message.includes("Extension context invalidated")) {
+                console.log("[Hot Reload] Extension context invalidated, refreshing page...");
+                window.location.reload();
+                return;
+            }
+            console.error("[Hot Reload] poll error:", (error as Error).stack ?? error);
         }
-        console.log("[Hot Reload] Extension reloaded, refreshing page...");
-        window.location.reload();
-    });
+    }, CONTENT_SCRIPT_POLL_INTERVAL_MS);
 }

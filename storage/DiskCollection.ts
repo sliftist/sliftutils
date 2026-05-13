@@ -8,7 +8,7 @@ import { TransactionStorage } from "./TransactionStorage";
 import { PendingStorage } from "./PendingStorage";
 import { isDefined } from "../misc/types";
 import { PrivateFileSystemStorage } from "./PrivateFileSystemStorage";
-import { isInChromeExtension } from "../misc/environment";
+import { isInChromeExtension, isInChromeExtensionBackground } from "../misc/environment";
 import { CBORStorage } from "./CBORStorage";
 
 export class DiskCollection<T> implements IStorageSync<T> {
@@ -27,7 +27,7 @@ export class DiskCollection<T> implements IStorageSync<T> {
     public transactionStorage: TransactionStorage | undefined;
     async initStorage(): Promise<IStorage<T>> {
         // If a Chrome extension, just return null. 
-        if (isInChromeExtension()) return null as any;
+        if (isInChromeExtensionBackground()) return null as any;
         let curCollection: IStorageRaw;
         if (this.config?.noPrompt && !isNode()) {
             curCollection = await new PrivateFileSystemStorage(`collections/${this.collectionName}`);
