@@ -1,6 +1,6 @@
 {
     "name": "sliftutils",
-    "version": "1.2.23",
+    "version": "1.2.24",
     "main": "index.js",
     "license": "MIT",
     "files": [
@@ -25,7 +25,8 @@
         "watch-web": "node ./builders/watchRun.js --port 9877 \"web/*.ts\" \"web/*.tsx\" \"yarn build-web\"",
         "watch-extension": "node ./builders/watchRun.js --port 9878 \"extension/*.ts\" \"extension/*.tsx\" \"yarn build-extension\"",
         "watch-electron": "node ./builders/watchRun.js --port 9879 \"electron/*.ts\" \"electron/*.tsx\" \"yarn build-electron\"",
-        "notes": "mobx, preact, socket-function, typenode SHOULD be peerDependencies. But we want to use yarn (better dependency deduplication), so we can't use peerDependencies (as they aren't installed by default, which makes them a nightmare to use). If you want to override the versions, feel free to use overrides/resolutions."
+        "notes": "mobx, preact, socket-function, typenode SHOULD be peerDependencies. But we want to use yarn (better dependency deduplication), so we can't use peerDependencies (as they aren't installed by default, which makes them a nightmare to use). If you want to override the versions, feel free to use overrides/resolutions.",
+        "test": "typenode ./test.ts"
     },
     "bin": {
         "build-nodejs": "./builders/nodeJSBuildRun.js",
