@@ -16,7 +16,7 @@ const activeModals = observable({} as { [key: string]: ModalData }, undefined, {
 class ModalRoot extends preact.Component {
     render() {
         const modals: Array<[string, ModalData]> = Object.entries(activeModals);
-        return <div style={{ position: "relative", zIndex: 1 }}>
+        return <div style={{ position: "relative", zIndex: 2147483647 }}>
             {modals.map(([id, data]) => (
                 <div key={id}>
                     {data.contents}

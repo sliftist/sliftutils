@@ -174,6 +174,42 @@ export class DiskCollectionRaw implements IStorage<Buffer> {
     }
 }
 
+export class DiskCollectionRawSynced {
+    constructor(private collectionName: string) { }
+    async initStorage(): Promise<IStorage<Buffer>> {
+        let fileStorage = await getFileStorage();
+        let collections = await fileStorage.folder.getStorage("collections");
+        let baseStorage = await collections.folder.getStorage(this.collectionName);
+        return baseStorage;
+    }
+    private synced = new StorageSync(
+        new PendingStorage(`Collection (${this.collectionName})`,
+            new DelayedStorage(this.initStorage())
+        )
+    );
+
+    public get(key: string): Buffer | undefined {
+        return this.synced.get(key);
+    }
+
+    public async getPromise(key: string): Promise<Buffer | undefined> {
+        return await this.synced.getPromise(key);
+    }
+    public set(key: string, value: Buffer) {
+        this.synced.set(key, value);
+    }
+    public async getKeys(): Promise<string[]> {
+        return await this.synced.getKeysPromise();
+    }
+    public async getInfo(key: string) {
+        return await this.synced.getInfo(key);
+    }
+
+    public async reset() {
+        await this.synced.reset();
+    }
+}
+
 export class DiskCollectionRawBrowser {
     constructor(private collectionName: string) { }
     async initStorage(): Promise<IStorage<Buffer>> {
@@ -190,13 +226,13 @@ export class DiskCollectionRawBrowser {
     }
 
     public async getPromise(key: string): Promise<Buffer | undefined> {
-        return await this.synced.get(key);
+        return await this.synced.getPromise(key);
     }
     public set(key: string, value: Buffer) {
         this.synced.set(key, value);
     }
     public async getKeys(): Promise<string[]> {
-        return await this.synced.getKeys();
+        return await this.synced.getKeysPromise();
     }
     public async getInfo(key: string) {
         return await this.synced.getInfo(key);

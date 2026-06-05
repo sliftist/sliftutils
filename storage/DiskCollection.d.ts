@@ -67,6 +67,21 @@ export declare class DiskCollectionRaw implements IStorage<Buffer> {
     } | undefined>;
     reset(): Promise<void>;
 }
+export declare class DiskCollectionRawSynced {
+    private collectionName;
+    constructor(collectionName: string);
+    initStorage(): Promise<IStorage<Buffer>>;
+    private synced;
+    get(key: string): Buffer | undefined;
+    getPromise(key: string): Promise<Buffer | undefined>;
+    set(key: string, value: Buffer): void;
+    getKeys(): Promise<string[]>;
+    getInfo(key: string): Promise<{
+        size: number;
+        lastModified: number;
+    } | undefined>;
+    reset(): Promise<void>;
+}
 export declare class DiskCollectionRawBrowser {
     private collectionName;
     constructor(collectionName: string);

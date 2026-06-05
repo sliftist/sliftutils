@@ -1,5 +1,7 @@
 import { parseYAML } from "./yaml";
 import { retryFunctional } from "socket-function/src/batching";
+
+const CANNOT_RETRY = "(CANNOT RETRY)";
 import { formatNumber } from "socket-function/src/formatting/format";
 import { getAPIKey } from "./apiKeys";
 
@@ -97,7 +99,6 @@ export async function openRouterCallBase(config: {
     let time = Date.now();
     let stillRunning = true;
 
-    // Spawn monitoring loop
     void (async () => {
         while (stillRunning) {
             await new Promise(resolve => setTimeout(resolve, 5000));
@@ -126,7 +127,6 @@ export async function openRouterCallBase(config: {
                 }),
             });
 
-            // If it failed, throw
             if (response.status !== 200) {
                 let responseText = await response.text();
                 throw new Error(`Failed to call OpenRouter: ${response.status} ${response.statusText} ${responseText}`);
@@ -136,11 +136,34 @@ export async function openRouterCallBase(config: {
                     cost: number;
                 };
                 choices: {
+                    finish_reason?: string;
                     message: {
                         content: string;
+                        refusal?: string | null;
                     };
                 }[];
+                error?: {
+                    code?: number | string;
+                    message?: string;
+                    metadata?: unknown;
+                };
             };
+            if (responseObj.error) {
+                throw new Error(`OpenRouter returned an error: ${responseObj.error.code} ${responseObj.error.message} ${JSON.stringify(responseObj.error.metadata)}`);
+            }
+            let choice = responseObj.choices?.[0];
+            if (!choice) {
+                throw new Error(`OpenRouter returned no choices: ${JSON.stringify(responseObj)}`);
+            }
+            if (choice.message.refusal) {
+                throw new Error(`OpenRouter model refused content: ${choice.message.refusal} ${CANNOT_RETRY}`);
+            }
+            if (choice.finish_reason === "content_filter") {
+                throw new Error(`OpenRouter content filter triggered (finish_reason=content_filter): ${choice.message.content ?? ""} ${CANNOT_RETRY}`);
+            }
+            if (choice.finish_reason === "error") {
+                throw new Error(`OpenRouter completion errored (finish_reason=error): ${choice.message.content ?? ""}`);
+            }
             let newCost = responseObj.usage.cost;
             totalCost += newCost;
             onCost?.(newCost);
@@ -161,7 +184,10 @@ export async function openRouterCallBase(config: {
             pendingLog.duration += Date.now() - time;
             pendingLog.cost += newCost;
             return responseObj.choices[0].message.content as string;
-        }, { maxRetries: config.retries || 3 })();
+        }, {
+            maxRetries: config.retries || 3,
+            shouldRetry: message => !message.includes(CANNOT_RETRY),
+        })();
     } finally {
         stillRunning = false;
     }

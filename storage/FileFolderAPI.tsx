@@ -82,7 +82,7 @@ class DirectoryPrompter extends preact.Component {
         return (
             <div className={
                 css.position("fixed").pos(0, 0).size("100vw", "100vh")
-                    .zIndex(1)
+                    .zIndex(2147483647)
                     .background("white")
                     .center
                     .fontSize(40)
@@ -251,8 +251,10 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                     doneLoad = true;
                     // Show UI to get user to click and retry
                     let retryCallback: (success: boolean) => void;
-                    let retryPromise = new Promise<boolean>(resolve => {
+                    let retryReject: (err: Error) => void;
+                    let retryPromise = new Promise<boolean>((resolve, reject) => {
                         retryCallback = resolve;
+                        retryReject = reject;
                     });
                     displayData.ui = (
                         <div className={css.vbox(20).center}>
@@ -290,6 +292,14 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                             >
                                 Pick Data Directory
                             </button>
+                            <button
+                                className={css.fontSize(40).pad2(80, 40)}
+                                onClick={() => {
+                                    retryReject(new Error("User dismissed file system access prompt"));
+                                }}
+                            >
+                                Dismiss
+                            </button>
                         </div>
                     );
                     const success = await retryPromise;
@@ -304,23 +314,35 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
             }
         }
         let fileCallback: (handle: DirectoryWrapper) => void;
-        let promise = new Promise<DirectoryWrapper>(resolve => {
+        let fileReject: (err: Error) => void;
+        let promise = new Promise<DirectoryWrapper>((resolve, reject) => {
             fileCallback = resolve;
+            fileReject = reject;
         });
         displayData.ui = (
-            <button
-                className={css.fontSize(40).pad2(80, 40)}
-                onClick={async () => {
-                    console.log("Waiting for user to give permission");
-                    const handle = await window.showDirectoryPicker();
-                    await handle.requestPermission({ mode: "readwrite" });
-                    let storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
-                    localStorage.setItem(getFileAPIKey(), storedId);
-                    fileCallback(handle as any);
-                }}
-            >
-                Pick Data Directory
-            </button>
+            <div className={css.vbox(20).center}>
+                <button
+                    className={css.fontSize(40).pad2(80, 40)}
+                    onClick={async () => {
+                        console.log("Waiting for user to give permission");
+                        const handle = await window.showDirectoryPicker();
+                        await handle.requestPermission({ mode: "readwrite" });
+                        let storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
+                        localStorage.setItem(getFileAPIKey(), storedId);
+                        fileCallback(handle as any);
+                    }}
+                >
+                    Pick Data Directory
+                </button>
+                <button
+                    className={css.fontSize(40).pad2(80, 40)}
+                    onClick={() => {
+                        fileReject(new Error("User dismissed file system access prompt"));
+                    }}
+                >
+                    Dismiss
+                </button>
+            </div>
         );
         return await promise;
     } finally {
