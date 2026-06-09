@@ -29,6 +29,9 @@ export type IStorage<T> = {
 //  (/ makes a folder). And there are even more rules, such as lengths per folder, etc, etc.
 export type IStorageRaw = {
     get(key: string): Promise<Buffer | undefined>;
+    // Reads bytes in the range [start, end) (end is exclusive, clamped to the file size).
+    //  Returns undefined if the file doesn't exist.
+    getRange(key: string, config: { start: number; end: number }): Promise<Buffer | undefined>;
     // May or may not be efficient in the underlying storage
     append(key: string, value: Buffer): Promise<void>;
     set(key: string, value: Buffer): Promise<void>;

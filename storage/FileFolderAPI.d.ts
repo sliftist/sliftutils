@@ -32,6 +32,9 @@ type FileWrapper = {
         size: number;
         lastModified: number;
         arrayBuffer(): Promise<ArrayBuffer>;
+        slice(start: number, end: number): {
+            arrayBuffer(): Promise<ArrayBuffer>;
+        };
     }>;
     createWritable(config?: {
         keepExistingData?: boolean;

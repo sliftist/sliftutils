@@ -929,6 +929,9 @@ declare module "sliftutils/storage/FileFolderAPI" {
             size: number;
             lastModified: number;
             arrayBuffer(): Promise<ArrayBuffer>;
+            slice(start: number, end: number): {
+                arrayBuffer(): Promise<ArrayBuffer>;
+            };
         }>;
         createWritable(config?: {
             keepExistingData?: boolean;
@@ -1026,6 +1029,10 @@ declare module "sliftutils/storage/IStorage" {
     };
     export type IStorageRaw = {
         get(key: string): Promise<Buffer | undefined>;
+        getRange(key: string, config: {
+            start: number;
+            end: number;
+        }): Promise<Buffer | undefined>;
         append(key: string, value: Buffer): Promise<void>;
         set(key: string, value: Buffer): Promise<void>;
         remove(key: string): Promise<void>;
@@ -1117,6 +1124,10 @@ declare module "sliftutils/storage/PrivateFileSystemStorage" {
         private getFileHandle;
         private fileExists;
         get(key: string): Promise<Buffer | undefined>;
+        getRange(key: string, config: {
+            start: number;
+            end: number;
+        }): Promise<Buffer | undefined>;
         set(key: string, value: Buffer): Promise<void>;
         append(key: string, value: Buffer): Promise<void>;
         remove(key: string): Promise<void>;

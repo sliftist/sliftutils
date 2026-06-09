@@ -114,6 +114,17 @@ export class PrivateFileSystemStorage implements IStorageRaw {
         }
     }
 
+    public async getRange(key: string, config: { start: number; end: number }): Promise<Buffer | undefined> {
+        const fileHandle = await this.getFileHandle(key, false);
+        if (!fileHandle) {
+            return undefined;
+        }
+
+        const file = await fileHandle.getFile();
+        const arrayBuffer = await file.slice(config.start, config.end).arrayBuffer();
+        return Buffer.from(arrayBuffer);
+    }
+
     public async set(key: string, value: Buffer): Promise<void> {
         try {
             const fileHandle = await this.getFileHandle(key, true);

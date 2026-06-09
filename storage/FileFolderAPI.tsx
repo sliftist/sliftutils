@@ -40,6 +40,9 @@ type FileWrapper = {
         size: number;
         lastModified: number;
         arrayBuffer(): Promise<ArrayBuffer>;
+        // Matches Blob.slice (which the native File object provides), so the browser
+        //  implementation works vanilla. End is exclusive, both clamped to the file size.
+        slice(start: number, end: number): { arrayBuffer(): Promise<ArrayBuffer> };
     }>;
     createWritable(config?: { keepExistingData?: boolean }): Promise<{
         seek(offset: number): Promise<void>;
@@ -99,13 +102,29 @@ class NodeJSFileHandleWrapper implements FileWrapper {
 
     async getFile() {
         const stats = await fs.promises.stat(this.filePath);
+        const filePath = this.filePath;
         return {
             size: stats.size,
             lastModified: stats.mtimeMs,
             arrayBuffer: async () => {
-                const buffer = await fs.promises.readFile(this.filePath);
+                const buffer = await fs.promises.readFile(filePath);
                 return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-            }
+            },
+            slice: (start: number, end: number) => ({
+                arrayBuffer: async () => {
+                    const clampedStart = Math.min(Math.max(start, 0), stats.size);
+                    const clampedEnd = Math.min(Math.max(end, clampedStart), stats.size);
+                    const length = clampedEnd - clampedStart;
+                    const fileHandle = await fs.promises.open(filePath, "r");
+                    try {
+                        const buffer = Buffer.alloc(length);
+                        await fileHandle.read(buffer, 0, length, clampedStart);
+                        return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+                    } finally {
+                        await fileHandle.close();
+                    }
+                }
+            })
         };
     }
 
@@ -434,6 +453,17 @@ function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
                 const arrayBuffer = await fileContent.arrayBuffer();
+                return Buffer.from(arrayBuffer);
+            } catch (error) {
+                return undefined;
+            }
+        },
+
+        async getRange(key: string, config: { start: number; end: number }): Promise<Buffer | undefined> {
+            try {
+                const file = await handle.getFileHandle(key);
+                const fileContent = await file.getFile();
+                const arrayBuffer = await fileContent.slice(config.start, config.end).arrayBuffer();
                 return Buffer.from(arrayBuffer);
             } catch (error) {
                 return undefined;

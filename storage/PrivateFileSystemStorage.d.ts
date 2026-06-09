@@ -11,6 +11,10 @@ export declare class PrivateFileSystemStorage implements IStorageRaw {
     private getFileHandle;
     private fileExists;
     get(key: string): Promise<Buffer | undefined>;
+    getRange(key: string, config: {
+        start: number;
+        end: number;
+    }): Promise<Buffer | undefined>;
     set(key: string, value: Buffer): Promise<void>;
     append(key: string, value: Buffer): Promise<void>;
     remove(key: string): Promise<void>;

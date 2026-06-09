@@ -44,6 +44,12 @@ class VirtualFileStorage implements FileStorage {
         return badBuffer;
     }
 
+    async getRange(key: string, config: { start: number; end: number }): Promise<Buffer | undefined> {
+        const fullBuffer = await this.get(key);
+        if (!fullBuffer) return undefined;
+        return fullBuffer.subarray(config.start, config.end);
+    }
+
     async append(key: string, value: Buffer): Promise<void> {
         const store = this.getStore("readwrite");
         const fullPath = this.id + key;

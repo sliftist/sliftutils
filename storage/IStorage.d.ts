@@ -27,6 +27,10 @@ export type IStorage<T> = {
 };
 export type IStorageRaw = {
     get(key: string): Promise<Buffer | undefined>;
+    getRange(key: string, config: {
+        start: number;
+        end: number;
+    }): Promise<Buffer | undefined>;
     append(key: string, value: Buffer): Promise<void>;
     set(key: string, value: Buffer): Promise<void>;
     remove(key: string): Promise<void>;
