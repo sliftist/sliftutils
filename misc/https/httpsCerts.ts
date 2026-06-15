@@ -91,7 +91,7 @@ export const getHTTPSCert = cache(async (domain: string): Promise<{ key: string;
 });
 
 
-const getAccountKey = async function getAccountKey(domain: string) {
+export const getAccountKey = async function getAccountKey(domain: string) {
     let accountKey = getKeyStore<string>(domain, "letsEncryptAccountKey");
     let secret = await accountKey.get();
     if (!secret) {
@@ -105,11 +105,11 @@ const getAccountKey = async function getAccountKey(domain: string) {
 };
 
 
-function parseCert(PEMorDER: string | Buffer) {
+export function parseCert(PEMorDER: string | Buffer) {
     return forge.pki.certificateFromPem(normalizeCertToPEM(PEMorDER));
 }
 
-function normalizeCertToPEM(PEMorDER: string | Buffer): string {
+export function normalizeCertToPEM(PEMorDER: string | Buffer): string {
     if (PEMorDER.toString().startsWith("-----BEGIN CERTIFICATE-----")) {
         return PEMorDER.toString();
     }
@@ -118,7 +118,7 @@ function normalizeCertToPEM(PEMorDER: string | Buffer): string {
 }
 
 
-async function generateCert(config: {
+export async function generateCert(config: {
     accountKey: string;
     domain: string;
     altDomains?: string[];

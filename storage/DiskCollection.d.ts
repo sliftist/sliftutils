@@ -6,6 +6,8 @@ import { TransactionStorage } from "./TransactionStorage";
 export declare class DiskCollection<T> implements IStorageSync<T> {
     private collectionName;
     private config?;
+    static getForceNoPrompt(): boolean;
+    static setForceNoPrompt(forceNoPrompt: boolean): void;
     constructor(collectionName: string, config?: {
         writeDelay?: number | undefined;
         cbor?: boolean | undefined;

@@ -96,3 +96,10 @@ export const getSecret = cache(async function getSecret(key: string): Promise<st
         });
     });
 });
+
+export function setSecret(key: string, value: string) {
+    if (isNode()) {
+        throw new Error("setSecret is only supported in the browser. We don't want to break the user's file system with setSecret in NodeJS.");
+    }
+    localStorage.setItem(getStorageKey(key), value);
+}

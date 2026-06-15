@@ -11,7 +11,23 @@ import { PrivateFileSystemStorage } from "./PrivateFileSystemStorage";
 import { isInChromeExtension, isInChromeExtensionBackground } from "../misc/environment";
 import { CBORStorage } from "./CBORStorage";
 
+const FORCE_NO_PROMPT_KEY = "DiskCollection_forceNoPrompt";
+
 export class DiskCollection<T> implements IStorageSync<T> {
+    // Globally forces every DiskCollection into noPrompt mode (browser only), overriding per-collection config.
+    public static getForceNoPrompt(): boolean {
+        if (isNode()) return false;
+        return !!localStorage.getItem(FORCE_NO_PROMPT_KEY);
+    }
+    public static setForceNoPrompt(forceNoPrompt: boolean) {
+        if (isNode()) return;
+        if (forceNoPrompt) {
+            localStorage.setItem(FORCE_NO_PROMPT_KEY, "1");
+        } else {
+            localStorage.removeItem(FORCE_NO_PROMPT_KEY);
+        }
+    }
+
     constructor(
         private collectionName: string,
         private config?: {
@@ -29,7 +45,7 @@ export class DiskCollection<T> implements IStorageSync<T> {
         // If a Chrome extension, just return null. 
         if (isInChromeExtensionBackground()) return null as any;
         let curCollection: IStorageRaw;
-        if (this.config?.noPrompt && !isNode()) {
+        if (!isNode() && (this.config?.noPrompt || DiskCollection.getForceNoPrompt())) {
             curCollection = await new PrivateFileSystemStorage(`collections/${this.collectionName}`);
         } else {
             let fileStorage = await getFileStorage();

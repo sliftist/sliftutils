@@ -7,3 +7,4 @@ export declare const getSecret: {
     getAllKeys(): string[];
     get(key: string): Promise<string> | undefined;
 };
+export declare function setSecret(key: string, value: string): void;
