@@ -23,6 +23,8 @@ export declare class BulkDatabaseBase<T extends {
     private streamTimes;
     private streamFileName;
     private streamRowsWritten;
+    private lastCleanup;
+    private ownStreamFiles;
     private getStreamFileName;
     private invalidateOverlay;
     private setOverlayRow;
@@ -42,20 +44,21 @@ export declare class BulkDatabaseBase<T extends {
     updateBatch(entries: (Partial<T> & {
         key: string;
     })[]): Promise<void>;
-    private writeBulkFile;
-    private listStreamFiles;
+    private getValidFiles;
+    private commitManifest;
+    private consolidate;
     private loadStreamEntries;
     private orderStreamEntries;
     private maybeRolloverStream;
-    private rolloverStream;
     compact(): Promise<void>;
-    private listFiles;
     private makeRawGetRange;
     private loadFileReader;
     private fileLogicalSize;
     private handleUnreadableFile;
     private mergeFilesBase;
     private mergeFiles;
+    private mergeFilesLocked;
+    private cleanup;
     private formatInfo;
     private patchColumn;
     getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
