@@ -129,6 +129,14 @@ export declare const getFileStorageNested: {
     getAllKeys(): string[];
     get(key: string): Promise<FileStorage> | undefined;
 };
+export declare const getFileStorageNested2: {
+    (key: string): Promise<FileStorage>;
+    clear(key: string): void;
+    clearAll(): void;
+    forceSet(key: string, value: Promise<FileStorage>): void;
+    getAllKeys(): string[];
+    get(key: string): Promise<FileStorage> | undefined;
+};
 export declare const getFileStorage: {
     (): Promise<FileStorage>;
     reset(): void;
