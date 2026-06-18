@@ -379,6 +379,33 @@ export const getFileStorageNested = cache(async function getFileStorage(path: st
     }
     return wrapHandle(base);
 });
+// Supports if the user selects the folder that contains the data folder or the data folder directly. If pathStr is an absolute path (and we're in nodejs) we use it directly.
+export const getFileStorageNested2 = cache(async function getFileStorage(pathStr: string): Promise<FileStorage> {
+    let base: DirectoryWrapper;
+    pathStr = pathStr.replaceAll("\\", "/");
+    if (isNode()) {
+        if (path.isAbsolute(pathStr)) {
+            return wrapHandle(new NodeJSDirectoryHandleWrapper(pathStr));
+        }
+        base = new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
+    } else {
+        base = await getDirectoryHandle();
+        let dirs: string[] = [];
+        for await (const [name, entry] of base) {
+            if (entry.kind === "directory") {
+                dirs.push(name);
+            }
+        }
+        if (dirs.includes(".git") || dirs.includes("data")) {
+            base = await base.getDirectoryHandle("data", { create: true });
+        }
+    }
+    for (let part of pathStr.split("/")) {
+        if (!part) continue;
+        base = await base.getDirectoryHandle(part, { create: true });
+    }
+    return wrapHandle(base);
+});
 export const getFileStorage = lazy(async function getFileStorage(): Promise<FileStorage> {
     if (USE_INDEXED_DB) {
         return await getFileStorageIndexDB();

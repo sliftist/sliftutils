@@ -715,6 +715,7 @@ declare module "sliftutils/render-utils/colors" {
 }
 
 declare module "sliftutils/render-utils/mobxTyped" {
+    export { observable, runInAction, computed, autorun } from "mobx";
     export declare function configureMobxNextFrameScheduler(): void;
 
 }
@@ -758,6 +759,176 @@ declare module "sliftutils/render-utils/observer" {
         };
         readonly name: string;
     } & T;
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
+    export declare class BulkDatabase2<T extends {
+        key: string;
+    }> {
+        readonly name: string;
+        constructor(name: string);
+        static clearCache(): void;
+        private storage;
+        private overlay;
+        private streamTimes;
+        private loadVersion;
+        private streamFileName;
+        private streamRowsWritten;
+        private getStreamFileName;
+        private reader;
+        private syncSetup;
+        private localTime;
+        private applyRemote;
+        private resetReader;
+        write(entry: T): Promise<void>;
+        writeBatch(entries: T[]): Promise<void>;
+        delete(key: string): Promise<void>;
+        deleteBatch(keys: string[]): Promise<void>;
+        private writeBulkFile;
+        private listStreamFiles;
+        private loadStreamEntries;
+        private orderStreamEntries;
+        private maybeRolloverStream;
+        private rolloverStream;
+        compact(): Promise<void>;
+        private listFiles;
+        private loadFileReader;
+        private handleUnreadableFile;
+        private mergeFiles;
+        private formatInfo;
+        private patchColumn;
+        getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
+        getColumn<Column extends keyof T>(column: Column): Promise<{
+            key: string;
+            value: T[Column];
+        }[]>;
+        getKeys(): Promise<string[]>;
+        private baseColumns;
+        private baseColumnsLoading;
+        private baseFields;
+        private baseFieldsLoading;
+        private ensureBaseColumn;
+        private ensureBaseField;
+        getSingleFieldSync<Column extends keyof T>(config: {
+            key: string;
+            column: Column;
+        }): T[Column] | undefined;
+        getColumnSync<Column extends keyof T>(column: Column): {
+            key: string;
+            value: T[Column];
+        }[] | undefined;
+        getColumnInfo(): Promise<{
+            column: string;
+            byteSize: number;
+        }[]>;
+        getReaderInfo(): Promise<{
+            rowCount: number;
+            totalBytes: number;
+            keyCount: number;
+            sampleKey: string | undefined;
+            columns: {
+                column: string;
+                byteSize: number;
+            }[];
+        }>;
+    }
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    export declare const KEY_COLUMN = "key";
+    export declare const EMPTY_BUFFER: Buffer;
+    export declare function buildFileBuffer(rows: Record<string, unknown>[]): Buffer;
+    export type BaseBulkDatabaseReader = {
+        rowCount: number;
+        totalBytes: number;
+        keys: string[];
+        columns: {
+            column: string;
+            byteSize: number;
+        }[];
+        deletedKeys?: Set<string>;
+        getColumn: (column: string) => Promise<{
+            key: string;
+            value: unknown;
+        }[]>;
+        getSingleField: (key: string, column: string) => Promise<unknown | undefined>;
+    };
+    export declare function loadBulkDatabase(config: {
+        totalBytes: number;
+        getRange: (start: number, end: number) => Promise<Buffer>;
+    }): Promise<BaseBulkDatabaseReader>;
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/blockCache" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    export type GetRange = (start: number, end: number) => Promise<Buffer>;
+    export declare function encodeCompressedBlocks(data: Buffer): Buffer;
+    export declare class BlockCache {
+        private blocks;
+        private indexes;
+        clear(): void;
+        private touch;
+        private readIndex;
+        open(fileId: string, fileSize: number, rawGetRange: GetRange): Promise<{
+            uncompressedSize: number;
+            getRange: GetRange;
+        }>;
+        private makeGetRange;
+    }
+    export declare const blockCache: BlockCache;
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/streamLog" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { BaseBulkDatabaseReader } from "./BulkDatabaseFormat";
+    export declare const STREAM_EXTENSION = ".stream";
+    export type StreamEntry = {
+        time: number;
+        row?: Record<string, unknown>;
+        deletedKey?: string;
+    };
+    export declare function frameRows(entries: {
+        time: number;
+        row: Record<string, unknown>;
+    }[]): Buffer;
+    export declare function frameDeletes(entries: {
+        time: number;
+        key: string;
+    }[]): Buffer;
+    export declare function parseStream(buffer: Buffer): {
+        entries: StreamEntry[];
+        badBytes: number;
+    };
+    export declare function streamReaderFromEntries(entries: StreamEntry[], totalBytes: number): {
+        reader: BaseBulkDatabaseReader;
+        times: Map<string, number>;
+    };
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/syncClient" {
+    export type RemoteWrite = {
+        key: string;
+        time: number;
+        deleted?: boolean;
+        value?: unknown;
+    };
+    export declare function isSyncSupported(): boolean;
+    export declare function connect(collection: string, onWrite: (write: RemoteWrite) => void): Promise<RemoteWrite[]>;
+    export declare function broadcast(collection: string, write: RemoteWrite): void;
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/syncWorker" {
+    export {};
 
 }
 

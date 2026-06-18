@@ -1,4 +1,4 @@
-import { getFileStorageNested } from "../FileFolderAPI";
+import { getFileStorageNested, getFileStorageNested2 } from "../FileFolderAPI";
 import { sort } from "socket-function/src/misc";
 import { getTimeUnique } from "socket-function/src/bits";
 import { BaseBulkDatabaseReader, buildFileBuffer, EMPTY_BUFFER, loadBulkDatabase } from "./BulkDatabaseFormat";
@@ -75,7 +75,7 @@ export class BulkDatabase2<T extends { key: string }> {
         blockCache.clear();
     }
 
-    private storage = lazy(async () => getFileStorageNested(`${BULK_ROOT_FOLDER}/${this.name}`));
+    private storage = lazy(async () => getFileStorageNested2(`${BULK_ROOT_FOLDER}/${this.name}`));
 
     // In-memory overlay of pending writes/deletes, observable so reads re-render when it changes. It
     // takes priority over the loaded readers, so writes are reflected in reads without reloading.
