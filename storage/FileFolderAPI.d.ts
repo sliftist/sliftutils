@@ -70,6 +70,52 @@ type DirectoryWrapper = {
     ]>;
 };
 export declare function setFileAPIKey(key: string): void;
+export declare class NodeJSFileHandleWrapper implements FileWrapper {
+    private filePath;
+    constructor(filePath: string);
+    getFile(): Promise<{
+        size: number;
+        lastModified: number;
+        arrayBuffer: () => Promise<ArrayBuffer>;
+        slice: (start: number, end: number) => {
+            arrayBuffer: () => Promise<ArrayBuffer>;
+        };
+    }>;
+    createWritable(config?: {
+        keepExistingData?: boolean;
+    }): Promise<{
+        seek: (offset: number) => Promise<void>;
+        write: (value: Buffer) => Promise<void>;
+        close: () => Promise<void>;
+    }>;
+}
+export declare class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
+    private rootPath;
+    constructor(rootPath: string);
+    removeEntry(key: string, options?: {
+        recursive?: boolean;
+    }): Promise<void>;
+    getFileHandle(key: string, options?: {
+        create?: boolean;
+    }): Promise<FileWrapper>;
+    getDirectoryHandle(key: string, options?: {
+        create?: boolean;
+    }): Promise<DirectoryWrapper>;
+    [Symbol.asyncIterator](): AsyncIterableIterator<[
+        string,
+        {
+            kind: "file";
+            name: string;
+            getFile(): Promise<FileWrapper>;
+        } | {
+            kind: "directory";
+            name: string;
+            getDirectoryHandle(key: string, options?: {
+                create?: boolean;
+            }): Promise<DirectoryWrapper>;
+        }
+    ]>;
+}
 export declare const getDirectoryHandle: {
     (): Promise<DirectoryWrapper>;
     reset(): void;
@@ -98,4 +144,6 @@ export type NestedFileStorage = {
 export type FileStorage = IStorageRaw & {
     folder: NestedFileStorage;
 };
+export declare function wrapHandle(handle: DirectoryWrapper): FileStorage;
+export declare function tryToLoadPointer(pointer: string): Promise<DirectoryWrapper | undefined>;
 export {};
