@@ -763,23 +763,45 @@ declare module "sliftutils/render-utils/observer" {
 }
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
+    import { BulkDatabaseBase } from "./BulkDatabaseBase";
+    export { BulkDatabaseBase, noopReactiveDeps } from "./BulkDatabaseBase";
+    export type { ReactiveDeps, StorageFactory } from "./BulkDatabaseBase";
     export declare class BulkDatabase2<T extends {
+        key: string;
+    }> extends BulkDatabaseBase<T> {
+        constructor(name: string);
+    }
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
+    import type { FileStorage } from "../FileFolderAPI";
+    export interface ReactiveDeps {
+        observe(signal: string): void;
+        invalidate(signal: string): void;
+        batch(fn: () => void): void;
+    }
+    export declare const noopReactiveDeps: ReactiveDeps;
+    export type StorageFactory = (path: string) => Promise<FileStorage>;
+    export declare class BulkDatabaseBase<T extends {
         key: string;
     }> {
         readonly name: string;
-        constructor(name: string);
+        protected deps: ReactiveDeps;
+        private storageFactory;
+        constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory);
         static clearCache(): void;
         storage: {
-            (): Promise<import("../FileFolderAPI").FileStorage>;
+            (): Promise<FileStorage>;
             reset(): void;
-            set(newValue: Promise<import("../FileFolderAPI").FileStorage>): void;
+            set(newValue: Promise<FileStorage>): void;
         };
         private overlay;
         private streamTimes;
-        private loadVersion;
         private streamFileName;
         private streamRowsWritten;
         private getStreamFileName;
+        private setOverlay;
         private reader;
         private syncSetup;
         private localTime;
