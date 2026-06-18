@@ -96,7 +96,7 @@ class DirectoryPrompter extends preact.Component {
     }
 }
 
-class NodeJSFileHandleWrapper implements FileWrapper {
+export class NodeJSFileHandleWrapper implements FileWrapper {
     constructor(private filePath: string) {
     }
 
@@ -159,7 +159,7 @@ class NodeJSFileHandleWrapper implements FileWrapper {
     }
 }
 
-class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
+export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
     constructor(private rootPath: string) {
     }
 
@@ -241,6 +241,7 @@ class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
 
 
 // NOTE: Blocks until the user provides a directory
+// NOTE: If you want to override the location, you can explicitly call getDirectoryHandle.set with your own directory wrapper. Which if your server side can be the Node.js directory handle wrapper, or if your client side it can just be a pointer from tryToLoadPointer/fileSystemPointer.ts.
 export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Promise<DirectoryWrapper> {
     if (isNode()) {
         return new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
@@ -544,14 +545,14 @@ function wrapHandleNested(handle: DirectoryWrapper): NestedFileStorage {
     };
 }
 
-function wrapHandle(handle: DirectoryWrapper): FileStorage {
+export function wrapHandle(handle: DirectoryWrapper): FileStorage {
     return {
         ...wrapHandleFiles(handle),
         folder: wrapHandleNested(handle),
     };
 }
 
-async function tryToLoadPointer(pointer: string) {
+export async function tryToLoadPointer(pointer: string) {
     let result = await getFileSystemPointer({ pointer });
     if (!result) return;
     let handle = await result?.onUserActivation();
