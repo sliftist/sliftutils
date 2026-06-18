@@ -28,8 +28,11 @@ export declare class BulkDatabase2<T extends {
     private rolloverStream;
     compact(): Promise<void>;
     private listFiles;
+    private makeRawGetRange;
     private loadFileReader;
+    private fileLogicalSize;
     private handleUnreadableFile;
+    private mergeFilesBase;
     private mergeFiles;
     private formatInfo;
     private patchColumn;

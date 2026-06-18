@@ -134,7 +134,35 @@ function decodeBulkData(blob: Buffer, rowCount: number): unknown[] {
     return values;
 }
 
-export function buildFileBuffer(rows: Record<string, unknown>[]): Buffer {
+// Past this estimated logical size a single rows array is split across multiple files, so no one
+// file (and therefore no single column blob, and no single Buffer.concat) ever approaches the
+// ~2GB Buffer length limit. The cap is deliberately the same as the merge cap: 800MB is the most
+// we'll ever hold for one file. The estimate is rough on purpose — it only needs to keep each
+// chunk comfortably under the limit, not be exact.
+const FILE_SPLIT_BYTES = 800 * 1024 * 1024;
+
+// Per-value on-disk overhead: a 4-byte offset entry plus a 1-byte type tag.
+const PER_VALUE_OVERHEAD = 5;
+
+function estimateValueBytes(value: unknown): number {
+    if (value === undefined || value === null) return 0;
+    if (typeof value === "string") return value.length * 2;
+    if (typeof value === "number") return 8;
+    if (typeof value === "boolean") return 1;
+    if (ArrayBuffer.isView(value)) return value.byteLength;
+    if (typeof value === "object") return JSON.stringify(value).length;
+    return 0;
+}
+
+function estimateRowBytes(row: Record<string, unknown>): number {
+    let total = 0;
+    for (const value of Object.values(row)) {
+        total += estimateValueBytes(value) + PER_VALUE_OVERHEAD;
+    }
+    return total;
+}
+
+function buildOneFile(rows: Record<string, unknown>[]): Buffer {
     const columnNames: string[] = [];
     const columnSet = new Set<string>();
     for (const row of rows) {
@@ -156,6 +184,28 @@ export function buildFileBuffer(rows: Record<string, unknown>[]): Buffer {
     const lengthPrefix = Buffer.alloc(4);
     lengthPrefix.writeUInt32LE(headerBuf.length, 0);
     return Buffer.concat([lengthPrefix, headerBuf, ...blobs]);
+}
+
+// Returns one complete, independent file buffer per chunk of rows. When the caller hands us more
+// rows than fit comfortably in one file we partition by row range — each returned buffer is exactly
+// what buildOneFile would produce if called with that subset, so the chunks have disjoint keys and
+// the caller just writes each as its own file. A normal-sized write returns a single buffer.
+export function buildFileBuffer(rows: Record<string, unknown>[]): Buffer[] {
+    if (rows.length === 0) return [buildOneFile([])];
+    const result: Buffer[] = [];
+    let chunkStart = 0;
+    let chunkBytes = 0;
+    for (let i = 0; i < rows.length; i++) {
+        const rowBytes = estimateRowBytes(rows[i]);
+        if (i > chunkStart && chunkBytes + rowBytes > FILE_SPLIT_BYTES) {
+            result.push(buildOneFile(rows.slice(chunkStart, i)));
+            chunkStart = i;
+            chunkBytes = 0;
+        }
+        chunkBytes += rowBytes;
+    }
+    result.push(buildOneFile(rows.slice(chunkStart)));
+    return result;
 }
 
 export type BaseBulkDatabaseReader = {

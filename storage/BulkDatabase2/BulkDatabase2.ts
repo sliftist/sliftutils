@@ -14,8 +14,17 @@ import { connect as syncConnect, broadcast as syncBroadcast, isSyncSupported, Re
 // folder rather than sharing bulkDatabases/.
 const BULK_ROOT_FOLDER = "bulkDatabases2";
 const FILE_EXTENSION = ".bulk";
-// When a level accumulates this many files they are merged into one file at the next level up, cascading, so write count stays O(log n) files.
+// Once this many bulk files pile up we run a merge pass to consolidate small ones (bounded by the
+// byte caps below), so reads don't fan out across an unbounded number of files.
 const MERGE_FILE_COUNT = 8;
+
+// Memory ceiling for a single merge. Files are merged in contiguous (newest-first) runs whose combined
+// LOGICAL (uncompressed) size stays under MERGE_MAX_BYTES, so a merge never reads more than this into
+// memory at once. A file at or above MERGE_MIN_BYTES is "sealed": big enough already, never read back
+// in to be merged again. Sizes are measured uncompressed (from each file's index) because that — not
+// the smaller on-disk compressed size — is what actually lands in memory during a merge.
+const MERGE_MIN_BYTES = 400 * 1024 * 1024;
+const MERGE_MAX_BYTES = 800 * 1024 * 1024;
 
 // Tier-0 streaming rolls over into a columnar bulk file once it gets big enough — by row count,
 // byte size, or file count (many threads each stream to their own file). A single writeBatch that
@@ -39,9 +48,21 @@ let fileNameCounter = 0;
 
 type BulkFileInfo = { fileName: string; level: number; timestamp: number };
 
-function newFileName(level: number): string {
+let lastFileTime = 0;
+// A strictly-increasing integer timestamp for newly written files, so the newest-first order is
+// unambiguous even when several writes land in the same millisecond. (getTimeUnique isn't used here
+// because it may return a fractional value, which wouldn't round-trip through the integer file name.)
+function nextFileTime(): number {
+    lastFileTime = Math.max(Date.now(), lastFileTime + 1);
+    return lastFileTime;
+}
+
+// Files are ordered purely by timestamp (newest-first). A merged file is given the newest timestamp
+// of the run it replaced, so it occupies exactly that run's slot. The leading "0" is a vestigial
+// field kept so the name stays in the historical level_timestamp_counter shape parseFileName expects.
+function newFileName(timestamp: number): string {
     fileNameCounter++;
-    return `${level}_${Date.now()}_${fileNameCounter}${FILE_EXTENSION}`;
+    return `0_${timestamp}_${fileNameCounter}${FILE_EXTENSION}`;
 }
 
 type StreamFileInfo = { fileName: string; timestamp: number };
@@ -239,34 +260,18 @@ export class BulkDatabase2<T extends { key: string }> {
         await this.maybeRolloverStream();
     }
 
-    // Writes one columnar bulk file at level 0, then cascades level merges.
+    // Writes the rows as one or more columnar bulk files (buildFileBuffer splits a too-large batch by
+    // row range so no single file approaches the Buffer size limit), all sharing one timestamp since
+    // they're one write with disjoint keys. Then, if enough files have accumulated, runs bounded merge
+    // passes until nothing more can be consolidated.
     private async writeBulkFile(rows: Record<string, unknown>[]): Promise<void> {
         const storage = await this.storage();
-        await storage.set(newFileName(0), encodeCompressedBlocks(buildFileBuffer(rows)));
-        // Cascade merge: any level at >= MERGE_FILE_COUNT files merges into one file at level+1, repeating up the tree.
-        while (true) {
-            const files = await this.listFiles();
-            const byLevel = new Map<number, BulkFileInfo[]>();
-            for (const f of files) {
-                let list = byLevel.get(f.level);
-                if (!list) {
-                    list = [];
-                    byLevel.set(f.level, list);
-                }
-                list.push(f);
-            }
-            const levels = [...byLevel.keys()];
-            sort(levels, l => l);
-            const mergeLevel = levels.find(l => {
-                const list = byLevel.get(l);
-                return list && list.length >= MERGE_FILE_COUNT;
-            });
-            if (mergeLevel === undefined) break;
-            const levelFiles = byLevel.get(mergeLevel);
-            if (!levelFiles) {
-                throw new Error(`Expected files at level ${mergeLevel}, was empty`);
-            }
-            await this.mergeFiles(levelFiles, mergeLevel + 1);
+        const timestamp = nextFileTime();
+        for (const buffer of buildFileBuffer(rows)) {
+            await storage.set(newFileName(timestamp), encodeCompressedBlocks(buffer));
+        }
+        if ((await this.listFiles()).length >= MERGE_FILE_COUNT) {
+            while (await this.mergeFiles() > 0) { /* keep merging until no run can be consolidated */ }
         }
     }
 
@@ -358,13 +363,14 @@ export class BulkDatabase2<T extends { key: string }> {
         this.resetReader();
     }
 
-    // Force-merge every on-disk file into a single new file regardless of how many there are.
+    // Consolidate as much as the caps allow: repeatedly merge contiguous non-sealed runs until nothing
+    // more can be combined. Unlike a naive "merge everything into one file", this respects MERGE_MAX_BYTES
+    // so it never loads the whole collection into memory — a multi-GB collection settles into several
+    // capped files (sealed files are left as-is) rather than one giant one.
     public async compact(): Promise<void> {
-        const files = await this.listFiles();
-        if (files.length < 2) return;
-        const maxLevel = files.reduce((m, f) => Math.max(m, f.level), 0);
-        await this.mergeFiles(files, maxLevel + 1);
-        this.resetReader();
+        let merged = false;
+        while (await this.mergeFiles() > 0) merged = true;
+        if (merged) this.resetReader();
     }
 
     private async listFiles(): Promise<BulkFileInfo[]> {
@@ -374,20 +380,21 @@ export class BulkDatabase2<T extends { key: string }> {
             const parsed = parseFileName(n);
             return parsed && [parsed] || [];
         });
-        // Sort is stable, so timestamps stay newest-first within each level. Lower levels are always newer than higher levels (a merge consumes every file at its level, so survivors postdate it).
-        sort(files, f => -f.timestamp);
-        sort(files, f => f.level);
+        // Newest-first by timestamp; ties broken by file name (descending) for a deterministic order.
+        // A merged file inherits the newest timestamp of the run it replaced, so it lands exactly where
+        // that run was — keeping newest-wins correct without any level bookkeeping.
+        files.sort((a, b) => {
+            if (a.timestamp !== b.timestamp) return b.timestamp - a.timestamp;
+            return a.fileName < b.fileName && 1 || a.fileName > b.fileName && -1 || 0;
+        });
         return files;
     }
 
-    private async loadFileReader(fileName: string): Promise<BaseBulkDatabaseReader> {
+    private async makeRawGetRange(fileName: string): Promise<{ rawGetRange: GetRange; size: number } | undefined> {
         const storage = await this.storage();
         const info = await storage.getInfo(fileName);
-        if (!info) {
-            throw new Error(`Expected bulk file to exist, was missing: ${fileName}`);
-        }
-        const fileId = `${this.name}\u0000${fileName}`;
-        let getRange: GetRange = async (start, end) => {
+        if (!info) return undefined;
+        const rawGetRange: GetRange = async (start, end) => {
             if (end <= start) return EMPTY_BUFFER;
             const buf = await storage.getRange(fileName, { start, end });
             if (!buf) {
@@ -395,11 +402,35 @@ export class BulkDatabase2<T extends { key: string }> {
             }
             return buf;
         };
+        return { rawGetRange, size: info.size };
+    }
+
+    private async loadFileReader(fileName: string): Promise<BaseBulkDatabaseReader> {
+        const raw = await this.makeRawGetRange(fileName);
+        if (!raw) {
+            throw new Error(`Expected bulk file to exist, was missing: ${fileName}`);
+        }
+        const fileId = `${this.name}\u0000${fileName}`;
         // Files are immutable and stored as compressed blocks; replace getRange with a block-cached,
         // decompressing version (same interface) and read the logical (uncompressed) size from its
         // index. open() validates the file size against the index and throws if it's truncated/corrupt.
-        const opened = await blockCache.open(fileId, info.size, getRange);
+        const opened = await blockCache.open(fileId, raw.size, raw.rawGetRange);
         return loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange });
+    }
+
+    // Logical (uncompressed) size of a bulk file, read from its (cached) index without loading data.
+    // Used by the merge planner to bound how much it reads at once. Returns undefined for a file that's
+    // missing or unreadable so the planner simply leaves it out of any merge.
+    private async fileLogicalSize(fileName: string): Promise<number | undefined> {
+        try {
+            const raw = await this.makeRawGetRange(fileName);
+            if (!raw) return undefined;
+            const fileId = `${this.name}\u0000${fileName}`;
+            const opened = await blockCache.open(fileId, raw.size, raw.rawGetRange);
+            return opened.uncompressedSize;
+        } catch {
+            return undefined;
+        }
     }
 
     // A bulk file that won't load is either a write still in progress (recent) or a stale partial write
@@ -422,8 +453,11 @@ export class BulkDatabase2<T extends { key: string }> {
         console.warn(`${this.name}: skipping unreadable bulk file ${file.fileName} (recent — may be an in-progress write): ${message}`);
     }
 
-    // Read every row from `files` (already in newest-first order), pick newest-wins per key, write the merged set as a single new file at `newLevel`, then delete the consumed files.
-    private async mergeFiles(files: BulkFileInfo[], newLevel: number): Promise<void> {
+    // Merges exactly the files it's given (already newest-first), newest-wins per key, writing the
+    // result with `timestamp` so the new file takes the slot of the run it replaced, then deletes the
+    // consumed files. The caller is responsible for keeping the input under MERGE_MAX_BYTES — this
+    // function blindly reads it all into memory.
+    private async mergeFilesBase(files: BulkFileInfo[], timestamp: number): Promise<void> {
         const storage = await this.storage();
         const readers = await Promise.all(files.map(f => this.loadFileReader(f.fileName)));
 
@@ -446,10 +480,52 @@ export class BulkDatabase2<T extends { key: string }> {
             }
         }
 
-        await storage.set(newFileName(newLevel), encodeCompressedBlocks(buildFileBuffer(mergedRows)));
+        // The input is under the cap, so buildFileBuffer almost always returns a single buffer; the loop
+        // is only here to stay correct if a merge's deduped output still happens to exceed the split size.
+        for (const buffer of buildFileBuffer(mergedRows)) {
+            await storage.set(newFileName(timestamp), encodeCompressedBlocks(buffer));
+        }
         for (const f of files) {
             await storage.remove(f.fileName);
         }
+    }
+
+    // The cap-aware merge planner. Walks the files newest-first and merges contiguous runs of
+    // non-sealed files, each run capped at MERGE_MAX_BYTES of LOGICAL size so a single merge never
+    // loads more than that into memory. A file at/over MERGE_MIN_BYTES is sealed (left untouched) and
+    // breaks the run, as does an unreadable file. Because each run is contiguous in the newest-first
+    // order and its merged file keeps the run's newest timestamp, newest-wins ordering is preserved
+    // with no inversions. Returns the number of runs merged (0 means nothing left to consolidate).
+    private async mergeFiles(): Promise<number> {
+        const files = await this.listFiles();
+        const sizes = await Promise.all(files.map(f => this.fileLogicalSize(f.fileName)));
+
+        const batches: BulkFileInfo[][] = [];
+        let batch: BulkFileInfo[] = [];
+        let batchBytes = 0;
+        const flush = () => {
+            // A run of one file is pointless to "merge" — only consolidate when there are at least two.
+            if (batch.length >= 2) batches.push(batch);
+            batch = [];
+            batchBytes = 0;
+        };
+        for (let i = 0; i < files.length; i++) {
+            const size = sizes[i];
+            if (size === undefined || size >= MERGE_MIN_BYTES) {
+                flush();
+                continue;
+            }
+            if (batch.length && batchBytes + size > MERGE_MAX_BYTES) flush();
+            batch.push(files[i]);
+            batchBytes += size;
+        }
+        flush();
+
+        // batch[0] is the newest file in each (newest-first) run, so its timestamp is the run's slot.
+        for (const runFiles of batches) {
+            await this.mergeFilesBase(runFiles, runFiles[0].timestamp);
+        }
+        return batches.length;
     }
 
     private formatInfo(reader: BaseBulkDatabaseReader): string {

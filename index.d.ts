@@ -793,8 +793,11 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         private rolloverStream;
         compact(): Promise<void>;
         private listFiles;
+        private makeRawGetRange;
         private loadFileReader;
+        private fileLogicalSize;
         private handleUnreadableFile;
+        private mergeFilesBase;
         private mergeFiles;
         private formatInfo;
         private patchColumn;
@@ -841,7 +844,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     /// <reference types="node" />
     export declare const KEY_COLUMN = "key";
     export declare const EMPTY_BUFFER: Buffer;
-    export declare function buildFileBuffer(rows: Record<string, unknown>[]): Buffer;
+    export declare function buildFileBuffer(rows: Record<string, unknown>[]): Buffer[];
     export type BaseBulkDatabaseReader = {
         rowCount: number;
         totalBytes: number;
