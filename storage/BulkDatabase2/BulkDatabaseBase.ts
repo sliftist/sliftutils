@@ -215,10 +215,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return joined;
     });
 
-    // Connects to the SharedWorker (browser only) so writes in other tabs of this collection update
-    // our overlay. Runs once; no-op in Node / where SharedWorker is unavailable. We wait for the reader
-    // (and thus streamTimes) first so conflict resolution can see disk timestamps, then apply the
-    // worker's buffered recent writes (which may not be on disk yet).
+    // Connects to the cross-tab BroadcastChannel (browser only) so writes in other tabs of this
+    // collection update our overlay. Runs once; no-op in Node / where BroadcastChannel is unavailable.
+    // We wait for the reader (and thus streamTimes) first so conflict resolution can see disk
+    // timestamps, then peers reply to our hello with recent writes that may not be on disk yet (applied
+    // through the same applyRemote callback).
     private syncSetup = lazy(async () => {
         if (!isSyncSupported()) return;
         await this.reader();

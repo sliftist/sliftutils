@@ -953,11 +953,6 @@ declare module "sliftutils/storage/BulkDatabase2/syncClient" {
 
 }
 
-declare module "sliftutils/storage/BulkDatabase2/syncWorker" {
-    export {};
-
-}
-
 declare module "sliftutils/storage/CBORStorage" {
     /// <reference types="node" />
     /// <reference types="node" />
