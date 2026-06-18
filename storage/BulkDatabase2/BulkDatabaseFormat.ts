@@ -20,6 +20,10 @@ const TYPE_INT32_ARRAY = 10;
 const TYPE_UINT32_ARRAY = 11;
 const TYPE_FLOAT32_ARRAY = 12;
 const TYPE_FLOAT64_ARRAY = 13;
+// A cell whose row never set this column at all — as opposed to TYPE_UNDEFINED, an explicitly stored
+// undefined. On read, ABSENT falls through to older readers for that column; a stored undefined stops
+// the fall-through (it's a real value that clears the column).
+const TYPE_ABSENT = 14;
 
 const TYPED_ARRAY_TYPES: { type: number; ctor: { new(buffer: ArrayBuffer): ArrayBufferView; BYTES_PER_ELEMENT: number; name: string } }[] = [
     { type: TYPE_INT8_ARRAY, ctor: Int8Array },
@@ -35,12 +39,19 @@ const TYPED_ARRAY_TYPES: { type: number; ctor: { new(buffer: ArrayBuffer): Array
 
 export const EMPTY_BUFFER = Buffer.alloc(0) as Buffer;
 
+// Sentinel a reader returns for a cell whose row never set this column, so the join can fall through
+// to an older reader for that column. Distinct from a stored undefined, which is a real clearing value.
+export const ABSENT = Symbol("absent");
+
 type FileHeader = {
     rowCount: number;
     columns: { name: string; offset: number; length: number }[];
 };
 
 function encodeValue(value: unknown): { type: number; bytes: Buffer } {
+    if (value === ABSENT) {
+        return { type: TYPE_ABSENT, bytes: EMPTY_BUFFER };
+    }
     if (value === undefined || value === null) {
         return { type: TYPE_UNDEFINED, bytes: EMPTY_BUFFER };
     }
@@ -90,6 +101,7 @@ function decodeValue(type: number, bytes: Buffer): unknown {
         return bytes[0] === 1;
     }
     if (type === TYPE_OBJECT) return JSON.parse(bytes.toString("utf8"));
+    if (type === TYPE_ABSENT) return ABSENT;
     const entry = TYPED_ARRAY_TYPES.find(t => t.type === type);
     if (!entry) {
         throw new Error(`Expected a valid type tag, was ${type}`);
@@ -172,7 +184,8 @@ function buildOneFile(rows: Record<string, unknown>[]): Buffer {
             columnNames.push(field);
         }
     }
-    const blobs = columnNames.map(col => encodeBulkData(rows.map(row => row[col])));
+    // A row that doesn't include a column stores ABSENT (fall-through), not undefined (a real value).
+    const blobs = columnNames.map(col => encodeBulkData(rows.map(row => col in row ? row[col] : ABSENT)));
     let offset = 0;
     const columns = columnNames.map((name, i) => {
         const entry = { name, offset, length: blobs[i].length };

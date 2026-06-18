@@ -800,8 +800,12 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private streamTimes;
         private streamFileName;
         private streamRowsWritten;
+        private lastCleanup;
+        private ownStreamFiles;
         private getStreamFileName;
-        private setOverlay;
+        private invalidateOverlay;
+        private setOverlayRow;
+        private setOverlayDeleted;
         private reader;
         private syncSetup;
         private localTime;
@@ -811,20 +815,27 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         writeBatch(entries: T[]): Promise<void>;
         delete(key: string): Promise<void>;
         deleteBatch(keys: string[]): Promise<void>;
-        private writeBulkFile;
-        private listStreamFiles;
+        update(entry: Partial<T> & {
+            key: string;
+        }): Promise<void>;
+        updateBatch(entries: (Partial<T> & {
+            key: string;
+        })[]): Promise<void>;
+        private getValidFiles;
+        private commitManifest;
+        private consolidate;
         private loadStreamEntries;
         private orderStreamEntries;
         private maybeRolloverStream;
-        private rolloverStream;
         compact(): Promise<void>;
-        private listFiles;
         private makeRawGetRange;
         private loadFileReader;
         private fileLogicalSize;
         private handleUnreadableFile;
         private mergeFilesBase;
         private mergeFiles;
+        private mergeFilesLocked;
+        private cleanup;
         private formatInfo;
         private patchColumn;
         getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
@@ -867,6 +878,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     /// <reference types="node" />
     export declare const KEY_COLUMN = "key";
     export declare const EMPTY_BUFFER: Buffer;
+    export declare const ABSENT: unique symbol;
     export declare function buildFileBuffer(rows: Record<string, unknown>[]): Buffer[];
     export type BaseBulkDatabaseReader = {
         rowCount: number;
@@ -908,6 +920,33 @@ declare module "sliftutils/storage/BulkDatabase2/blockCache" {
         private makeGetRange;
     }
     export declare const blockCache: BlockCache;
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/manifest" {
+    export declare const MANIFEST_EXTENSION = ".manifest";
+    export type Manifest = {
+        startTime: number;
+        validBulkFiles: string[];
+        ignoredStreamFiles: string[];
+        readFiles: string[];
+    };
+    export declare function isManifestName(name: string): boolean;
+    export declare function manifestFileName(startTime: number, writerId: string, counter: number): string;
+    export declare function parseManifestStartTime(name: string): number | undefined;
+    export declare function chooseManifest(manifests: {
+        name: string;
+        manifest: Manifest;
+    }[]): {
+        name: string;
+        manifest: Manifest;
+    } | undefined;
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/mergeLock" {
+    export declare function tryAcquireMergeLock(collection: string, holderId: string): boolean;
+    export declare function releaseMergeLock(collection: string, holderId: string): void;
 
 }
 

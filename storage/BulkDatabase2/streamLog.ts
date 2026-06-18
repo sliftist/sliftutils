@@ -1,5 +1,5 @@
 import cborx from "cbor-x";
-import { BaseBulkDatabaseReader } from "./BulkDatabaseFormat";
+import { ABSENT, BaseBulkDatabaseReader } from "./BulkDatabaseFormat";
 
 // Tier-0 streaming format: an append log of whole-row writes and deletes (row-format, not columnar),
 // so small mutations are a single cheap append instead of rewriting a columnar file. Each block is:
@@ -64,10 +64,12 @@ export function parseStream(buffer: Buffer): { entries: StreamEntry[]; badBytes:
     return { entries, badBytes: buffer.length - pos };
 }
 
-// Wraps streamed entries (already ordered oldest-first) as a BaseBulkDatabaseReader. Applies
-// set/delete newest-wins: later entries overwrite earlier ones, and a delete tombstones the key
-// (exposed via deletedKeys so the join suppresses it in older bulk readers). Also returns the latest
-// timestamp seen per key (live or deleted), used for cross-tab conflict resolution.
+// Wraps streamed entries (already ordered oldest-first) as a BaseBulkDatabaseReader. Each set MERGES
+// its fields onto the key's current row (so a partial write/update only changes the columns it
+// includes); a delete tombstones the key (exposed via deletedKeys so the join suppresses it in older
+// bulk readers) and resets the merge. A column the merged row never set reads as ABSENT, so the join
+// falls through to older readers for it. Also returns the latest timestamp seen per key (live or
+// deleted), used for cross-tab conflict resolution.
 export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: number): { reader: BaseBulkDatabaseReader; times: Map<string, number> } {
     let byKey = new Map<string, Record<string, unknown>>();
     let deletedKeys = new Set<string>();
@@ -79,7 +81,7 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
             times.set(entry.deletedKey, entry.time);
         } else if (entry.row) {
             let key = entry.row.key as string;
-            byKey.set(key, entry.row);
+            byKey.set(key, { ...byKey.get(key), ...entry.row });
             deletedKeys.delete(key);
             times.set(key, entry.time);
         }
@@ -104,12 +106,12 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
         async getColumn(column) {
             return keys.map(key => {
                 let row = byKey.get(key);
-                return { key, value: row && row[column] };
+                return { key, value: row && column in row ? row[column] : ABSENT };
             });
         },
         async getSingleField(key, column) {
             let row = byKey.get(key);
-            return row && row[column];
+            return row && column in row ? row[column] : ABSENT;
         },
     };
     return { reader, times };
