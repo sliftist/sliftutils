@@ -96,7 +96,7 @@ export class BulkDatabase2<T extends { key: string }> {
         blockCache.clear();
     }
 
-    private storage = lazy(async () => getFileStorageNested2(`${BULK_ROOT_FOLDER}/${this.name}`));
+    public storage = lazy(async () => getFileStorageNested2(`${BULK_ROOT_FOLDER}/${this.name}`));
 
     // In-memory overlay of pending writes/deletes, observable so reads re-render when it changes. It
     // takes priority over the loaded readers, so writes are reflected in reads without reloading.

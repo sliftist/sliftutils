@@ -769,7 +769,11 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         readonly name: string;
         constructor(name: string);
         static clearCache(): void;
-        private storage;
+        storage: {
+            (): Promise<import("../FileFolderAPI").FileStorage>;
+            reset(): void;
+            set(newValue: Promise<import("../FileFolderAPI").FileStorage>): void;
+        };
         private overlay;
         private streamTimes;
         private loadVersion;

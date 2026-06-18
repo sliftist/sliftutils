@@ -13,7 +13,11 @@ const subscribers = new Map<string, ((write: RemoteWrite) => void)[]>();
 const recentResolvers = new Map<string, ((writes: RemoteWrite[]) => void)[]>();
 
 export function isSyncSupported(): boolean {
-    return typeof SharedWorker !== "undefined";
+    if (typeof SharedWorker === "undefined") return false;
+    // Under file:// the SharedWorker constructor throws a SecurityError (cross-origin / opaque
+    // origin), so skip it rather than logging that error on every load.
+    if (typeof location !== "undefined" && location.protocol === "file:") return false;
+    return true;
 }
 
 function ensure() {
