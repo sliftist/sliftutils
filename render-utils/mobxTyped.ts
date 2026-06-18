@@ -1,5 +1,9 @@
 import * as mobx from "mobx";
 import { batchFunction } from "socket-function/src/batching";
+
+// Re-export the core mobx primitives so downstream packages (which may have their own duplicate mobx
+// in node_modules) can share THIS mobx instance, otherwise reactivity doesn't cross package boundaries.
+export { observable, runInAction, computed, autorun } from "mobx";
 export function configureMobxNextFrameScheduler() {
     // NOTE: This makes a big difference if we do await calls in a loop which mutates observable state. BUT... we should probably just do those await calls before the loop?
     let batchReactionScheduler = batchFunction({
