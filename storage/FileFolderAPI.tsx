@@ -435,40 +435,78 @@ async function fixedGetFileHandle(config: {
     return await config.handle.getFileHandle(config.key, { create: true });
 }
 
+// A file that genuinely does not exist. We must NOT retry these, otherwise reading many missing
+// files (a common pattern) gets catastrophically slow.
+function isMissingError(error: unknown): boolean {
+    let name = (error as { name?: string })?.name;
+    let code = (error as { code?: string })?.code;
+    return name === "NotFoundError" || code === "ENOENT";
+}
+
+const MAX_READ_RETRIES = 6;
+
+// The browser File System Access API can transiently fail reads under heavy load (it appears to
+// throttle when a page issues many reads at once). Those failures surface as errors OTHER than
+// "not found", so we retry them with backoff. A real missing file (NotFoundError / ENOENT) returns
+// undefined immediately with no retry.
+async function readWithRetry<T>(label: string, key: string, read: () => Promise<T>): Promise<T | undefined> {
+    let backoff = 25;
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await read();
+        } catch (error) {
+            if (isMissingError(error)) return undefined;
+            let name = (error as { name?: string })?.name || "Error";
+            let message = (error as { message?: string })?.message || String(error);
+            if (attempt >= MAX_READ_RETRIES) {
+                console.warn(`${label} gave up on ${JSON.stringify(key)} after ${attempt} retries (${name}): ${message.slice(0, 200)}`);
+                return undefined;
+            }
+            console.warn(`${label} retrying ${JSON.stringify(key)} (attempt ${attempt + 1}, ${name}): ${message.slice(0, 200)}`);
+            await new Promise(resolve => setTimeout(resolve, backoff));
+            backoff = Math.min(backoff * 2, 1000);
+        }
+    }
+}
+
 function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
     return {
         async getInfo(key: string) {
-            try {
+            return readWithRetry("getInfo", key, async () => {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
                 return {
                     size: fileContent.size,
                     lastModified: fileContent.lastModified,
                 };
-            } catch (error) {
-                return undefined;
-            }
+            });
         },
         async get(key: string): Promise<Buffer | undefined> {
-            try {
+            return readWithRetry("get", key, async () => {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
                 const arrayBuffer = await fileContent.arrayBuffer();
+                // Under load the FS Access API can resolve with a truncated buffer and no error.
+                //  Treat a short read as transient so readWithRetry retries it.
+                if (arrayBuffer.byteLength !== fileContent.size) {
+                    throw Object.assign(new Error(`Short read: got ${arrayBuffer.byteLength} of ${fileContent.size} bytes`), { name: "ShortReadError" });
+                }
                 return Buffer.from(arrayBuffer);
-            } catch (error) {
-                return undefined;
-            }
+            });
         },
 
         async getRange(key: string, config: { start: number; end: number }): Promise<Buffer | undefined> {
-            try {
+            return readWithRetry("getRange", key, async () => {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
+                const clampedStart = Math.min(Math.max(config.start, 0), fileContent.size);
+                const clampedEnd = Math.min(Math.max(config.end, clampedStart), fileContent.size);
                 const arrayBuffer = await fileContent.slice(config.start, config.end).arrayBuffer();
+                if (arrayBuffer.byteLength !== clampedEnd - clampedStart) {
+                    throw Object.assign(new Error(`Short range read: got ${arrayBuffer.byteLength} of ${clampedEnd - clampedStart} bytes`), { name: "ShortReadError" });
+                }
                 return Buffer.from(arrayBuffer);
-            } catch (error) {
-                return undefined;
-            }
+            });
         },
 
         async append(key: string, value: Buffer): Promise<void> {
@@ -497,10 +535,18 @@ function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
 
         async getKeys(includeFolders: boolean = false): Promise<string[]> {
             const keys: string[] = [];
-            for await (const [name, entry] of handle) {
-                if (entry.kind === "file" || includeFolders) {
-                    keys.push(entry.name);
+            try {
+                for await (const [name, entry] of handle) {
+                    if (entry.kind === "file" || includeFolders) {
+                        keys.push(entry.name);
+                    }
                 }
+            } catch (error) {
+                let name = (error as { name?: string })?.name || "Error";
+                let message = (error as { message?: string })?.message || String(error);
+                // A failure mid-iteration would silently truncate the listing, so surface it loudly.
+                console.error(`getKeys directory iteration failed after ${keys.length} entries (${name}): ${message.slice(0, 300)}`);
+                throw error;
             }
             return keys;
         },
