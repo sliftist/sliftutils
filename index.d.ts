@@ -817,10 +817,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         private baseFieldsLoading;
         private ensureBaseColumn;
         private ensureBaseField;
-        getSingleFieldSync<Column extends keyof T>(config: {
-            key: string;
-            column: Column;
-        }): T[Column] | undefined;
+        getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined;
         getColumnSync<Column extends keyof T>(column: Column): {
             key: string;
             value: T[Column];

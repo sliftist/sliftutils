@@ -627,10 +627,9 @@ export class BulkDatabase2<T extends { key: string }> {
         })();
     }
 
-    public getSingleFieldSync<Column extends keyof T>(config: { key: string; column: Column }): T[Column] | undefined {
+    public getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined {
         void this.syncSetup();
         this.loadVersion.get();
-        let { key, column } = config;
         let col = String(column);
         let entry = this.overlay.get(key);
         if (entry !== undefined) {

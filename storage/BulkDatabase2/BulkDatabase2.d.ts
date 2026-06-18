@@ -52,10 +52,7 @@ export declare class BulkDatabase2<T extends {
     private baseFieldsLoading;
     private ensureBaseColumn;
     private ensureBaseField;
-    getSingleFieldSync<Column extends keyof T>(config: {
-        key: string;
-        column: Column;
-    }): T[Column] | undefined;
+    getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined;
     getColumnSync<Column extends keyof T>(column: Column): {
         key: string;
         value: T[Column];
