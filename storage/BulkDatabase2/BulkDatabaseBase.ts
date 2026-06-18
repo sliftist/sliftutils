@@ -1,6 +1,6 @@
 import { sort } from "socket-function/src/misc";
 import { getTimeUnique } from "socket-function/src/bits";
-import { BaseBulkDatabaseReader, buildFileBuffer, EMPTY_BUFFER, loadBulkDatabase } from "./BulkDatabaseFormat";
+import { ABSENT, BaseBulkDatabaseReader, buildFileBuffer, EMPTY_BUFFER, KEY_COLUMN, loadBulkDatabase } from "./BulkDatabaseFormat";
 import { lazy } from "socket-function/src/caching";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import { blue, red } from "socket-function/src/formatting/logColors";
@@ -168,11 +168,24 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return this.streamFileName;
     }
 
-    // Sets an overlay entry and invalidates both that key's signal and the overlay-wide signal.
-    private setOverlay(key: string, entry: OverlayEntry) {
-        this.overlay.set(key, entry);
+    private invalidateOverlay(key: string) {
         this.deps.invalidate(key);
         this.deps.invalidate(OVERLAY_SIGNAL);
+    }
+
+    // Merges a (possibly partial) row onto the key's current overlay value, so a partial write/update
+    // only changes the columns it includes — the rest fall through to disk on read. A prior delete is
+    // reset (the key is being re-created).
+    private setOverlayRow(key: string, row: Record<string, unknown>, time: number) {
+        const existing = this.overlay.get(key);
+        const value = existing && existing.value !== DELETED ? { ...existing.value, ...row } : { ...row };
+        this.overlay.set(key, { time, value });
+        this.invalidateOverlay(key);
+    }
+
+    private setOverlayDeleted(key: string, time: number) {
+        this.overlay.set(key, { time, value: DELETED });
+        this.invalidateOverlay(key);
     }
 
     private reader = lazy(async (): Promise<BaseBulkDatabaseReader> => {
@@ -241,8 +254,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private applyRemote(write: RemoteWrite) {
         if (write.time <= this.localTime(write.key)) return;
         this.deps.batch(() => {
-            if (write.deleted) this.setOverlay(write.key, { time: write.time, value: DELETED });
-            else this.setOverlay(write.key, { time: write.time, value: write.value as Record<string, unknown> });
+            if (write.deleted) this.setOverlayDeleted(write.key, write.time);
+            else this.setOverlayRow(write.key, write.value as Record<string, unknown>, write.time);
         });
     }
 
@@ -289,7 +302,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         await storage.append(this.getStreamFileName(), framed);
         this.streamRowsWritten += entries.length;
         this.deps.batch(() => {
-            for (const { time, row } of stamped) this.setOverlay(row.key as string, { time, value: row });
+            for (const { time, row } of stamped) this.setOverlayRow(row.key as string, row, time);
         });
         for (const { time, row } of stamped) syncBroadcast(this.name, { key: row.key as string, time, value: row });
         await this.maybeRolloverStream();
@@ -307,10 +320,35 @@ export class BulkDatabaseBase<T extends { key: string }> {
         await storage.append(this.getStreamFileName(), frameDeletes(stamped));
         this.streamRowsWritten += keys.length;
         this.deps.batch(() => {
-            for (const { time, key } of stamped) this.setOverlay(key, { time, value: DELETED });
+            for (const { time, key } of stamped) this.setOverlayDeleted(key, time);
         });
         for (const { time, key } of stamped) syncBroadcast(this.name, { key, time, deleted: true });
         await this.maybeRolloverStream();
+    }
+
+    public async update(entry: Partial<T> & { key: string }): Promise<void> {
+        return this.updateBatch([entry]);
+    }
+
+    // Like writeBatch, but each entry is a partial row — only the fields to change, plus the required
+    // key. Partial fields merge onto the existing row (unset columns fall through to the current value);
+    // an entry whose key isn't in the collection is skipped with a warning, since update never creates keys.
+    public async updateBatch(entries: (Partial<T> & { key: string })[]): Promise<void> {
+        if (!entries.length) return;
+        void this.syncSetup();
+        const reader = await this.reader();
+        const diskKeys = new Set(reader.keys);
+        const present: T[] = [];
+        for (const entry of entries) {
+            const overlayEntry = this.overlay.get(entry.key);
+            const exists = overlayEntry ? overlayEntry.value !== DELETED : diskKeys.has(entry.key);
+            if (!exists) {
+                console.warn(`${this.name}.update: key ${JSON.stringify(entry.key)} is not in the collection, ignoring`);
+                continue;
+            }
+            present.push(entry as unknown as T);
+        }
+        if (present.length) await this.writeBatch(present);
     }
 
     // Writes the rows as one or more columnar bulk files (buildFileBuffer splits a too-large batch by
@@ -398,7 +436,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 deleted.set(e.deletedKey, e.time);
             } else if (e.row) {
                 let key = e.row.key as string;
-                byKey.set(key, e.row);
+                // Merge partial writes/updates so unset columns aren't lost; columns never set in this
+                // stream stay absent in the rolled row and fall through to older bulk files on read.
+                byKey.set(key, { ...byKey.get(key), ...e.row });
                 deleted.delete(key);
             }
         }
@@ -506,28 +546,44 @@ export class BulkDatabaseBase<T extends { key: string }> {
         console.warn(`${this.name}: skipping unreadable bulk file ${file.fileName} (recent — may be an in-progress write): ${message}`);
     }
 
-    // Merges exactly the files it's given (already newest-first), newest-wins per key, writing the
-    // result with `timestamp` so the new file takes the slot of the run it replaced, then deletes the
-    // consumed files. The caller is responsible for keeping the input under MERGE_MAX_BYTES — this
-    // function blindly reads it all into memory.
+    // Merges exactly the files it's given (already newest-first), writing the result with `timestamp`
+    // so the new file takes the slot of the run it replaced, then deletes the consumed files. The merge
+    // is per-COLUMN newest-wins: for each key, each column takes the value from the newest reader that
+    // set it (non-ABSENT), so a partial write in a newer file doesn't drop columns that live only in an
+    // older file. Columns absent from every merged reader stay absent (they keep falling through to
+    // files outside this run). The caller keeps the input under MERGE_MAX_BYTES — this reads it all in.
     private async mergeFilesBase(files: BulkFileInfo[], timestamp: number): Promise<void> {
         const storage = await this.storage();
         const readers = await Promise.all(files.map(f => this.loadFileReader(f.fileName)));
 
+        // Load each reader's columns into key->value maps (values may be ABSENT for unset cells).
+        const loaded = await Promise.all(readers.map(async reader => {
+            const cols: { column: string; values: Map<string, unknown> }[] = [];
+            for (const col of reader.columns) {
+                if (col.column === KEY_COLUMN) continue;
+                const entries = await reader.getColumn(col.column);
+                cols.push({ column: col.column, values: new Map(entries.map(e => [e.key, e.value])) });
+            }
+            return { keys: reader.keys, keySet: new Set(reader.keys), cols };
+        }));
+
         const seen = new Set<string>();
         const mergedRows: Record<string, unknown>[] = [];
-        for (const reader of readers) {
-            const colData: Record<string, unknown[]> = {};
-            for (const col of reader.columns) {
-                colData[col.column] = (await reader.getColumn(col.column)).map(r => r.value);
-            }
-            for (let i = 0; i < reader.keys.length; i++) {
-                const key = reader.keys[i];
+        for (const reader of loaded) {
+            for (const key of reader.keys) {
                 if (seen.has(key)) continue;
                 seen.add(key);
-                const row: Record<string, unknown> = {};
-                for (const col of reader.columns) {
-                    row[col.column] = colData[col.column][i];
+                const row: Record<string, unknown> = { [KEY_COLUMN]: key };
+                const filled = new Set<string>();
+                for (const r of loaded) {
+                    if (!r.keySet.has(key)) continue;
+                    for (const c of r.cols) {
+                        if (filled.has(c.column)) continue;
+                        const value = c.values.get(key);
+                        if (value === ABSENT) continue;
+                        row[c.column] = value;
+                        filled.add(c.column);
+                    }
                 }
                 mergedRows.push(row);
             }
@@ -585,13 +641,16 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return `(collection has ${blue(formatNumber(reader.rowCount))} rows, ${blue(formatNumber(reader.totalBytes))}B)`;
     }
 
-    // Applies the overlay (pending writes/deletes) on top of a base column. No-op when empty.
+    // Applies the overlay (pending writes/deletes) on top of a base column. No-op when empty. An
+    // overlay entry that doesn't include this column leaves the base (disk) value in place — a partial
+    // write/update only overrides the columns it set; everything else falls through.
     private patchColumn(base: { key: string; value: unknown }[], column: string): { key: string; value: unknown }[] {
         if (this.overlay.size === 0) return base;
         const map = new Map(base.map(e => [e.key, e.value]));
         for (const [key, entry] of this.overlay) {
-            if (entry.value === DELETED) map.delete(key);
-            else map.set(key, entry.value[column]);
+            if (entry.value === DELETED) { map.delete(key); continue; }
+            if (column in entry.value) map.set(key, entry.value[column]);
+            else if (!map.has(key)) map.set(key, undefined);
         }
         return [...map].map(([key, value]) => ({ key, value }));
     }
@@ -603,7 +662,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const entry = this.overlay.get(key);
         if (entry !== undefined) {
             if (entry.value === DELETED) return undefined;
-            return entry.value[String(column)] as T[Column];
+            if (String(column) in entry.value) return entry.value[String(column)] as T[Column];
+            // column not set in the overlay entry — fall through to disk
         }
         let time = Date.now();
         let reader = await this.reader();
@@ -688,7 +748,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
         let entry = this.overlay.get(key);
         if (entry !== undefined) {
             if (entry.value === DELETED) return undefined;
-            return entry.value[col] as T[Column];
+            if (col in entry.value) return entry.value[col] as T[Column];
+            // column not set in the overlay entry — fall through to the base field cache
         }
         let cacheKey = nullJoin(col, key);
         if (!this.baseFields.has(cacheKey)) {
@@ -766,29 +827,34 @@ function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): BaseBulkDatabas
         keys,
         columns,
         async getColumn(column) {
-            const result: { key: string; value: unknown }[] = [];
-            const taken = new Set<string>();
+            // Resolve each key newest-wins, per column: the newest reader that has a non-ABSENT value
+            // for the key wins; an ABSENT cell (the row never set this column) falls through to an older
+            // reader. A stored undefined is a real value and stops the fall-through (clears the column).
+            const valueByKey = new Map<string, unknown>();
             for (const db of databases) {
-                // NOTE: This is annoying logic that's needed so that if the column is removed and you write to it, it will clobber the old value. Otherwise, if we just start making something undefined, it might not clobber the old value because the column wouldn't exist. Ugh...
-                let values: unknown[] | undefined;
+                let values: Map<string, unknown> | undefined;
                 if (db.columns.some(c => c.column === column)) {
-                    values = (await db.getColumn(column)).map(r => r.value);
+                    values = new Map((await db.getColumn(column)).map(e => [e.key, e.value]));
                 }
-                for (let i = 0; i < db.keys.length; i++) {
-                    const key = db.keys[i];
-                    if (taken.has(key) || deleted.has(key)) continue;
-                    taken.add(key);
-                    result.push({ key, value: values && values[i] });
+                for (const key of db.keys) {
+                    if (valueByKey.has(key) || deleted.has(key)) continue;
+                    const value = values ? values.get(key) : ABSENT;
+                    if (value === ABSENT) continue;
+                    valueByKey.set(key, value);
                 }
             }
-            return result;
+            return keys.map(key => ({ key, value: valueByKey.get(key) }));
         },
         async getSingleField(key, column) {
             if (deleted.has(key)) return undefined;
             for (let i = 0; i < databases.length; i++) {
                 if (!keySets[i].has(key)) continue;
-                if (!databases[i].columns.some(c => c.column === column)) return undefined;
-                return await databases[i].getSingleField(key, column);
+                // Column not in this reader at all, or the row didn't set it (ABSENT): fall through to
+                // an older reader rather than clobbering with undefined.
+                if (!databases[i].columns.some(c => c.column === column)) continue;
+                const value = await databases[i].getSingleField(key, column);
+                if (value === ABSENT) continue;
+                return value;
             }
             return undefined;
         },

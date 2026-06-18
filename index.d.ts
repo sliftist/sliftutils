@@ -801,7 +801,9 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private streamFileName;
         private streamRowsWritten;
         private getStreamFileName;
-        private setOverlay;
+        private invalidateOverlay;
+        private setOverlayRow;
+        private setOverlayDeleted;
         private reader;
         private syncSetup;
         private localTime;
@@ -811,6 +813,12 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         writeBatch(entries: T[]): Promise<void>;
         delete(key: string): Promise<void>;
         deleteBatch(keys: string[]): Promise<void>;
+        update(entry: Partial<T> & {
+            key: string;
+        }): Promise<void>;
+        updateBatch(entries: (Partial<T> & {
+            key: string;
+        })[]): Promise<void>;
         private writeBulkFile;
         private listStreamFiles;
         private loadStreamEntries;
@@ -867,6 +875,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     /// <reference types="node" />
     export declare const KEY_COLUMN = "key";
     export declare const EMPTY_BUFFER: Buffer;
+    export declare const ABSENT: unique symbol;
     export declare function buildFileBuffer(rows: Record<string, unknown>[]): Buffer[];
     export type BaseBulkDatabaseReader = {
         rowCount: number;

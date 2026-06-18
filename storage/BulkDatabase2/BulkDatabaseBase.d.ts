@@ -24,7 +24,9 @@ export declare class BulkDatabaseBase<T extends {
     private streamFileName;
     private streamRowsWritten;
     private getStreamFileName;
-    private setOverlay;
+    private invalidateOverlay;
+    private setOverlayRow;
+    private setOverlayDeleted;
     private reader;
     private syncSetup;
     private localTime;
@@ -34,6 +36,12 @@ export declare class BulkDatabaseBase<T extends {
     writeBatch(entries: T[]): Promise<void>;
     delete(key: string): Promise<void>;
     deleteBatch(keys: string[]): Promise<void>;
+    update(entry: Partial<T> & {
+        key: string;
+    }): Promise<void>;
+    updateBatch(entries: (Partial<T> & {
+        key: string;
+    })[]): Promise<void>;
     private writeBulkFile;
     private listStreamFiles;
     private loadStreamEntries;

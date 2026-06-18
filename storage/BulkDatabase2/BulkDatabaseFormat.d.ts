@@ -2,6 +2,7 @@
 /// <reference types="node" />
 export declare const KEY_COLUMN = "key";
 export declare const EMPTY_BUFFER: Buffer;
+export declare const ABSENT: unique symbol;
 export declare function buildFileBuffer(rows: Record<string, unknown>[]): Buffer[];
 export type BaseBulkDatabaseReader = {
     rowCount: number;
