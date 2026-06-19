@@ -7,6 +7,7 @@ import { css, isNode } from "typesafecss";
 import { IStorageRaw } from "./IStorage";
 import { runInSerial } from "socket-function/src/batching";
 import { getFileStorageIndexDB } from "./IndexedDBFileFolderAPI";
+import { getRemoteFileStorage } from "./remoteFileStorage";
 import fs from "fs";
 import path from "path";
 
@@ -78,6 +79,32 @@ export function setFileAPIKey(key: string) {
     fileAPIKey = key;
 }
 
+// ---- remote (server) storage config ----
+// Instead of a local folder, the user can point at a remoteFileServer.js instance (URL + password).
+// When configured, getFileStorageNested2 serves everything from that server. Persisted in localStorage.
+type RemoteConfig = { url: string; password: string };
+function remoteConfigKey() { return getFileAPIKey() + ":remote"; }
+function loadRemoteConfig(): RemoteConfig | undefined {
+    try {
+        const s = localStorage.getItem(remoteConfigKey());
+        if (!s) return undefined;
+        const c = JSON.parse(s);
+        if (c && typeof c.url === "string" && typeof c.password === "string") return c;
+    } catch { /* ignore */ }
+    return undefined;
+}
+function saveRemoteConfig(c: RemoteConfig) { localStorage.setItem(remoteConfigKey(), JSON.stringify(c)); }
+
+// One shared factory (and therefore one shared range cache) per remote config.
+let remoteFactory: { key: string; factory: ReturnType<typeof getRemoteFileStorage> } | undefined;
+function getRemoteFactory(remote: RemoteConfig) {
+    const key = remote.url + "\0" + remote.password;
+    if (!remoteFactory || remoteFactory.key !== key) {
+        remoteFactory = { key, factory: getRemoteFileStorage(remote.url, remote.password) };
+    }
+    return remoteFactory.factory;
+}
+
 @observer
 class DirectoryPrompter extends preact.Component {
     render() {
@@ -91,6 +118,53 @@ class DirectoryPrompter extends preact.Component {
                     .fontSize(40)
             }>
                 {displayData.ui}
+            </div>
+        );
+    }
+}
+
+// "Connect to a server" option for the directory prompt: collapses to a button, expands to URL +
+// password fields. On connect it validates the credentials against the server, persists the config, and
+// reloads so getFileStorageNested2 picks up the remote storage.
+@observer
+class ServerConnectForm extends preact.Component {
+    private obs = observable({ expanded: false, url: "", password: "", error: "", connecting: false });
+    private connect = async () => {
+        const s = this.obs;
+        s.error = "";
+        s.connecting = true;
+        try {
+            const url = s.url.trim().replace(/\/+$/, "");
+            if (!url) throw new Error("Enter a server URL");
+            // A successful listing proves the URL is reachable and the password is correct.
+            await (await getRemoteFileStorage(url, s.password.trim())("")).getKeys();
+            saveRemoteConfig({ url, password: s.password.trim() });
+            window.location.reload();
+        } catch (e) {
+            s.error = "Could not connect: " + ((e as Error).message || String(e));
+            s.connecting = false;
+        }
+    };
+    render() {
+        const s = this.obs;
+        const inputCss = css.fontSize(28).pad2(24, 14).width(560).maxWidth("80vw");
+        const btnCss = css.fontSize(32).pad2(60, 30);
+        if (!s.expanded) {
+            return <button className={btnCss} onClick={() => s.expanded = true}>Connect to a server</button>;
+        }
+        return (
+            <div className={css.vbox(16).center}>
+                <input className={inputCss} placeholder="https://host:8787" value={s.url}
+                    onInput={e => s.url = (e.target as HTMLInputElement).value} />
+                <input className={inputCss} type="password" placeholder="password (six words)" value={s.password}
+                    onInput={e => s.password = (e.target as HTMLInputElement).value} />
+                {s.error ? <div className={css.fontSize(20).color("red").maxWidth("80vw")}>{s.error}</div> : null}
+                <div className={css.hbox(16)}>
+                    <button className={btnCss} disabled={s.connecting} onClick={this.connect}>
+                        {s.connecting ? "Connecting…" : "Connect"}
+                    </button>
+                    <button className={btnCss} onClick={() => { s.expanded = false; s.error = ""; }}>Back</button>
+                </div>
             </div>
         );
     }
@@ -317,6 +391,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                             >
                                 Pick Data Directory
                             </button>
+                            <ServerConnectForm />
                             <button
                                 className={css.fontSize(40).pad2(80, 40)}
                                 onClick={() => {
@@ -359,6 +434,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                 >
                     Pick Data Directory
                 </button>
+                <ServerConnectForm />
                 <button
                     className={css.fontSize(40).pad2(80, 40)}
                     onClick={() => {
@@ -388,6 +464,10 @@ export const getFileStorageNested = cache(async function getFileStorage(path: st
 export const getFileStorageNested2 = cache(async function getFileStorage(pathStr: string): Promise<FileStorage> {
     let base: DirectoryWrapper;
     pathStr = pathStr.replaceAll("\\", "/");
+    if (!isNode()) {
+        const remote = loadRemoteConfig();
+        if (remote) return getRemoteFactory(remote)(pathStr);
+    }
     if (isNode()) {
         if (path.isAbsolute(pathStr)) {
             return wrapHandle(new NodeJSDirectoryHandleWrapper(pathStr));
@@ -424,6 +504,7 @@ export const getFileStorage = lazy(async function getFileStorage(): Promise<File
 });
 export function resetStorageLocation() {
     localStorage.removeItem(getFileAPIKey());
+    try { localStorage.removeItem(remoteConfigKey()); } catch { /* ignore */ }
     window.location.reload();
 }
 
