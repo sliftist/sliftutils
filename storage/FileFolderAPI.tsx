@@ -396,12 +396,15 @@ export const getFileStorageNested2 = cache(async function getFileStorage(pathStr
     } else {
         base = await getDirectoryHandle();
         let dirs: string[] = [];
+        let alls: string[] = [];
         for await (const [name, entry] of base) {
             if (entry.kind === "directory") {
                 dirs.push(name);
             }
+            alls.push(name);
         }
-        if (dirs.includes(".git") || dirs.includes("data")) {
+        // HACK: If there are enough files, it's almost certainly not a directory that contains collections. It's probably the user's data instead
+        if (dirs.includes(".git") || dirs.includes("data") || alls.length > 100) {
             base = await base.getDirectoryHandle("data", { create: true });
         }
     }
