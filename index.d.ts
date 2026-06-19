@@ -764,7 +764,7 @@ declare module "sliftutils/render-utils/observer" {
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
     import { BulkDatabaseBase } from "./BulkDatabaseBase";
-    export { BulkDatabaseBase, noopReactiveDeps } from "./BulkDatabaseBase";
+    export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
     export type { ReactiveDeps, StorageFactory } from "./BulkDatabaseBase";
     export declare class BulkDatabase2<T extends {
         key: string;
@@ -776,6 +776,14 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     import type { FileStorage } from "../FileFolderAPI";
+    export declare const bulkDatabase2Timing: {
+        streamSealAgeMs: number;
+        foldDataAgeMs: number;
+        foldTriggerAgeMs: number;
+        foldCheckIntervalMs: number;
+        cleanupAgeMs: number;
+        cleanupIntervalMs: number;
+    };
     export interface ReactiveDeps {
         observe(signal: string): void;
         invalidate(signal: string): void;
@@ -799,9 +807,8 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private overlay;
         private streamTimes;
         private streamFileName;
-        private streamRowsWritten;
         private lastCleanup;
-        private ownStreamFiles;
+        private lastFoldCheck;
         private getStreamFileName;
         private invalidateOverlay;
         private setOverlayRow;
@@ -823,6 +830,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         })[]): Promise<void>;
         private getValidFiles;
         private commitManifest;
+        private writeBulkFile;
         private consolidate;
         private loadStreamEntries;
         private orderStreamEntries;
@@ -879,21 +887,28 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     export declare const KEY_COLUMN = "key";
     export declare const EMPTY_BUFFER: Buffer;
     export declare const ABSENT: unique symbol;
-    export declare function buildFileBuffer(rows: Record<string, unknown>[]): Buffer[];
+    export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[]): Buffer[];
     export type BaseBulkDatabaseReader = {
         rowCount: number;
         totalBytes: number;
+        minTime: number;
+        maxTime: number;
         keys: string[];
         columns: {
             column: string;
             byteSize: number;
         }[];
-        deletedKeys?: Set<string>;
+        keyTimes: Map<string, number>;
+        deleteTimes?: Map<string, number>;
         getColumn: (column: string) => Promise<{
             key: string;
             value: unknown;
+            time: number;
         }[]>;
-        getSingleField: (key: string, column: string) => Promise<unknown | undefined>;
+        getSingleField: (key: string, column: string) => Promise<{
+            value: unknown;
+            time: number;
+        } | typeof ABSENT>;
     };
     export declare function loadBulkDatabase(config: {
         totalBytes: number;

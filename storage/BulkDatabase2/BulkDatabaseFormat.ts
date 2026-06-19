@@ -43,9 +43,18 @@ export const EMPTY_BUFFER = Buffer.alloc(0) as Buffer;
 // to an older reader for that column. Distinct from a stored undefined, which is a real clearing value.
 export const ABSENT = Symbol("absent");
 
+// Hidden per-row column holding each row's write-time (so reads can resolve a key to its latest value
+// by actual time). NUL-prefixed so it can't collide with a user column; excluded from `columns`.
+const TIME_COLUMN = String.fromCharCode(0) + "t";
+
 type FileHeader = {
     rowCount: number;
     columns: { name: string; offset: number; length: number }[];
+    // Oldest/newest write-time of the data in this file (from the stream entries it was folded from,
+    // carried through merges). Lets the reader order bulk files by actual data recency and lets merges
+    // assert that two files' time ranges never overlap. Absent (0) in files written before this existed.
+    minTime?: number;
+    maxTime?: number;
 };
 
 function encodeValue(value: unknown): { type: number; bytes: Buffer } {
@@ -174,7 +183,7 @@ function estimateRowBytes(row: Record<string, unknown>): number {
     return total;
 }
 
-function buildOneFile(rows: Record<string, unknown>[]): Buffer {
+function buildOneFile(rows: Record<string, unknown>[], times: number[]): Buffer {
     const columnNames: string[] = [];
     const columnSet = new Set<string>();
     for (const row of rows) {
@@ -186,13 +195,19 @@ function buildOneFile(rows: Record<string, unknown>[]): Buffer {
     }
     // A row that doesn't include a column stores ABSENT (fall-through), not undefined (a real value).
     const blobs = columnNames.map(col => encodeBulkData(rows.map(row => col in row ? row[col] : ABSENT)));
+    // The hidden per-row time column.
+    columnNames.push(TIME_COLUMN);
+    blobs.push(encodeBulkData(times));
     let offset = 0;
     const columns = columnNames.map((name, i) => {
         const entry = { name, offset, length: blobs[i].length };
         offset += blobs[i].length;
         return entry;
     });
-    const header: FileHeader = { rowCount: rows.length, columns };
+    let minTime = times.length ? times[0] : 0;
+    let maxTime = minTime;
+    for (const t of times) { if (t < minTime) minTime = t; if (t > maxTime) maxTime = t; }
+    const header: FileHeader = { rowCount: rows.length, columns, minTime, maxTime };
     const headerBuf = Buffer.from(JSON.stringify(header), "utf8");
     const lengthPrefix = Buffer.alloc(4);
     lengthPrefix.writeUInt32LE(headerBuf.length, 0);
@@ -203,38 +218,45 @@ function buildOneFile(rows: Record<string, unknown>[]): Buffer {
 // rows than fit comfortably in one file we partition by row range — each returned buffer is exactly
 // what buildOneFile would produce if called with that subset, so the chunks have disjoint keys and
 // the caller just writes each as its own file. A normal-sized write returns a single buffer.
-export function buildFileBuffer(rows: Record<string, unknown>[]): Buffer[] {
-    if (rows.length === 0) return [buildOneFile([])];
+// `times[i]` is row i's write-time, stored per row so reads resolve a key to its latest value by time.
+export function buildFileBuffer(rows: Record<string, unknown>[], times: number[]): Buffer[] {
+    if (rows.length === 0) return [buildOneFile([], [])];
     const result: Buffer[] = [];
     let chunkStart = 0;
     let chunkBytes = 0;
     for (let i = 0; i < rows.length; i++) {
         const rowBytes = estimateRowBytes(rows[i]);
         if (i > chunkStart && chunkBytes + rowBytes > FILE_SPLIT_BYTES) {
-            result.push(buildOneFile(rows.slice(chunkStart, i)));
+            result.push(buildOneFile(rows.slice(chunkStart, i), times.slice(chunkStart, i)));
             chunkStart = i;
             chunkBytes = 0;
         }
         chunkBytes += rowBytes;
     }
-    result.push(buildOneFile(rows.slice(chunkStart)));
+    result.push(buildOneFile(rows.slice(chunkStart), times.slice(chunkStart)));
     return result;
 }
 
 export type BaseBulkDatabaseReader = {
     rowCount: number;
     totalBytes: number;
+    // Write-time bounds of this reader's data (0 if unknown — old bulk files). Diagnostics only now.
+    minTime: number;
+    maxTime: number;
     // Keys is special, it's always automatically decoded, even though it is stored as a normal column
     keys: string[];
     columns: { column: string; byteSize: number }[];
-    // Keys this reader tombstones (deleted). A newer reader's deletion suppresses the key in all
-    // older readers. Bulk readers never set this; the tier-0 stream reader does.
-    deletedKeys?: Set<string>;
-    getColumn: (column: string) => Promise<{
-        key: string;
-        value: unknown;
-    }[]>;
-    getSingleField: (key: string, column: string) => Promise<unknown | undefined>;
+    // Each key's row write-time (the time of its newest write in this reader). The join compares these
+    // across readers to resolve a key to its latest value.
+    keyTimes: Map<string, number>;
+    // Per-key tombstone time: the key was deleted at this time. The join treats a delete like any other
+    // event — a delete only wins if it's newer than every set for the key. Only the stream reader sets it.
+    deleteTimes?: Map<string, number>;
+    // Each key's value for the column plus the row's write-time. value may be ABSENT (the row never set
+    // this column — the join then falls through to an older reader for that key/column).
+    getColumn: (column: string) => Promise<{ key: string; value: unknown; time: number }[]>;
+    // The value + write-time for (key, column), or ABSENT if this reader has no such cell.
+    getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | typeof ABSENT>;
 };
 
 export async function loadBulkDatabase(config: {
@@ -267,20 +289,29 @@ export async function loadBulkDatabase(config: {
     });
     const keyIndex = new Map(keys.map((key, i) => [key, i]));
 
+    // Per-row write-times. Old files (written before this column existed) fall back to the file's header
+    // time (or 0) for every row — fine, since such files predate concurrent-time resolution.
+    const times: number[] = colByName.has(TIME_COLUMN)
+        ? (await readWholeColumn(TIME_COLUMN)).map(v => typeof v === "number" ? v : 0)
+        : keys.map(() => header.maxTime || 0);
+
     return {
         rowCount,
         totalBytes: config.totalBytes,
+        minTime: header.minTime || 0,
+        maxTime: header.maxTime || 0,
         keys,
-        columns: header.columns.map(c => ({ column: c.name, byteSize: c.length })),
+        keyTimes: new Map(keys.map((key, i) => [key, times[i]])),
+        columns: header.columns.filter(c => c.name !== TIME_COLUMN).map(c => ({ column: c.name, byteSize: c.length })),
         async getColumn(column) {
             const values = await readWholeColumn(column);
-            return keys.map((key, i) => ({ key, value: values[i] }));
+            return keys.map((key, i) => ({ key, value: values[i], time: times[i] }));
         },
         async getSingleField(key, column) {
             const row = keyIndex.get(key);
-            if (row === undefined) return undefined;
+            if (row === undefined) return ABSENT;
             const col = colByName.get(column);
-            if (!col) return undefined;
+            if (!col) return ABSENT;
             const colBase = dataBase + col.offset;
             const offsetsBuf = await config.getRange(colBase + 4 * row, colBase + 4 * row + 8);
             const start = offsetsBuf.readUInt32LE(0);
@@ -292,7 +323,9 @@ export async function loadBulkDatabase(config: {
             if (end > start) {
                 bytes = await config.getRange(dataStart + start, dataStart + end);
             }
-            return decodeValue(typeBuf[0], bytes);
+            const value = decodeValue(typeBuf[0], bytes);
+            if (value === ABSENT) return ABSENT;
+            return { value, time: times[row] };
         },
     };
 }

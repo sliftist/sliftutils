@@ -1,4 +1,12 @@
 import type { FileStorage } from "../FileFolderAPI";
+export declare const bulkDatabase2Timing: {
+    streamSealAgeMs: number;
+    foldDataAgeMs: number;
+    foldTriggerAgeMs: number;
+    foldCheckIntervalMs: number;
+    cleanupAgeMs: number;
+    cleanupIntervalMs: number;
+};
 export interface ReactiveDeps {
     observe(signal: string): void;
     invalidate(signal: string): void;
@@ -22,9 +30,8 @@ export declare class BulkDatabaseBase<T extends {
     private overlay;
     private streamTimes;
     private streamFileName;
-    private streamRowsWritten;
     private lastCleanup;
-    private ownStreamFiles;
+    private lastFoldCheck;
     private getStreamFileName;
     private invalidateOverlay;
     private setOverlayRow;
@@ -46,6 +53,7 @@ export declare class BulkDatabaseBase<T extends {
     })[]): Promise<void>;
     private getValidFiles;
     private commitManifest;
+    private writeBulkFile;
     private consolidate;
     private loadStreamEntries;
     private orderStreamEntries;

@@ -27,32 +27,37 @@ const MERGE_FILE_COUNT = 8;
 const MERGE_MIN_BYTES = 400 * 1024 * 1024;
 const MERGE_MAX_BYTES = 800 * 1024 * 1024;
 
-// Tier-0 streaming rolls over into a columnar bulk file once it gets big enough — by row count,
-// byte size, or file count (many threads each stream to their own file). A single writeBatch that
-// already exceeds the row/byte limits skips streaming and writes a bulk file directly.
+// A single writeBatch that already exceeds these limits skips the tier-0 stream and folds straight
+// into a bulk file (streaming thousands of rows one frame at a time would be pointless).
 const ROLLOVER_ROWS = 5000;
 const ROLLOVER_BYTES = 5 * 1024 * 1024;
-const ROLLOVER_FILES = 100;
 
 // An unreadable file might be a write that is still in progress (another thread), so we can't delete
 // it on sight. Once it has been unreadable for longer than this (by its filename timestamp), no
 // writer is plausibly still working on it, so we delete it. Until then we just warn.
 const STALE_DELETE_MS = 24 * 60 * 60 * 1000;
 
-// How long a superseded/orphaned/old-manifest file must sit before cleanup deletes it (keyed off its
-// own name timestamp). Long enough that any reader still resolving an older manifest has finished — a
-// read is fast, this is a generous margin — and short enough that disk doesn't accumulate forever.
-const CLEANUP_AGE_MS = 60 * 1000;
-// Each instance runs a cleanup scan at most this often, so a burst of writes doesn't each pay for one.
-const CLEANUP_INTERVAL_MS = 10 * 1000;
-
-// A writer stops appending to its own stream file once it's this old and starts a fresh one, so no
-// stream file is ever appended to past this age. A writer may always fold its OWN stream files (it
-// controls them); it may fold a FOREIGN stream file only once it's older than FOREIGN_FOLD_AGE_MS — by
-// then its owner has long since sealed it (SEAL + margin), so folding can't race with an append. This
-// is what makes concurrent consolidation safe without a lock (the localStorage lock just trims waste).
-const STREAM_SEAL_AGE_MS = 60 * 1000;
-const FOREIGN_FOLD_AGE_MS = 2 * STREAM_SEAL_AGE_MS;
+// All the time thresholds, mutable so tests can shrink them from hours to milliseconds. The ordering
+// invariant relies on: streamSealAgeMs < foldDataAgeMs (a file is sealed well before it's foldable),
+// and foldTriggerAgeMs >= foldDataAgeMs.
+export const bulkDatabase2Timing = {
+    // A writer stops appending to its current stream file once it's this old (starts a fresh one), so no
+    // file is ever appended to past this age.
+    streamSealAgeMs: 10 * 60 * 60 * 1000,
+    // A fold reads every stream file CREATED longer ago than this (all sealed, with margin), and moves
+    // only the entries whose WRITE-TIME is older than this into bulk; newer entries are re-streamed.
+    // This single cutoff is what keeps every bulk write strictly older than every stream write.
+    foldDataAgeMs: 12 * 60 * 60 * 1000,
+    // We don't bother folding until some stream file is older than this (fold in big infrequent batches).
+    foldTriggerAgeMs: 36 * 60 * 60 * 1000,
+    // Per-instance throttle on how often we scan to see whether a fold is due.
+    foldCheckIntervalMs: 5 * 1000,
+    // How long a superseded/orphaned/old-manifest file must sit before cleanup deletes it (by its name
+    // timestamp) — long enough that any reader still on an older manifest has finished.
+    cleanupAgeMs: 60 * 1000,
+    // Per-instance throttle on cleanup scans.
+    cleanupIntervalMs: 10 * 1000,
+};
 
 // Marks a key as deleted in the in-memory overlay.
 const DELETED = Symbol("deleted");
@@ -184,20 +189,17 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // This instance's tier-0 stream file. Each instance (≈ each thread/tab) streams to its own file
     // so concurrent writers never touch the same file.
     private streamFileName: string | undefined;
-    private streamRowsWritten = 0;
     private lastCleanup = 0;
-    // Stream files this instance created (so it may fold them anytime — only the owner appends to them).
-    private ownStreamFiles = new Set<string>();
+    private lastFoldCheck = 0;
     private getStreamFileName(): string {
         // Seal (stop appending to) our current file once it's old enough, so no file is ever appended
-        // to past STREAM_SEAL_AGE_MS — that's what lets another writer safely fold it once it's aged.
+        // to past the seal age — that's what lets a consolidation safely fold it once it's aged out.
         if (this.streamFileName) {
             const info = parseStreamFileName(this.streamFileName);
-            if (info && Date.now() - info.timestamp >= STREAM_SEAL_AGE_MS) this.streamFileName = undefined;
+            if (info && Date.now() - info.timestamp >= bulkDatabase2Timing.streamSealAgeMs) this.streamFileName = undefined;
         }
         if (!this.streamFileName) {
             this.streamFileName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
-            this.ownStreamFiles.add(this.streamFileName);
         }
         return this.streamFileName;
     }
@@ -222,7 +224,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.invalidateOverlay(key);
     }
 
-    private reader = lazy(async (): Promise<BaseBulkDatabaseReader> => {
+    private reader = lazy(async (): Promise<ResolvedReader> => {
         let start = Date.now();
         const { bulkFiles, streamFiles } = await this.getValidFiles();
         // Load everything in parallel: each bulk file's columnar reader, plus all streamed entries.
@@ -241,8 +243,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.loadStreamEntries(streamFiles),
         ]);
         const bulkReaders = bulkReadersRaw.filter((r): r is BaseBulkDatabaseReader => !!r);
-        // Streamed entries are the newest writes, so their reader goes first (the join is newest-wins
-        // and lets the stream's deletes tombstone keys in the older bulk readers).
+        // The join resolves purely by write-time, so reader order doesn't matter.
         const readers: BaseBulkDatabaseReader[] = [];
         const ordered = this.orderStreamEntries(streamData.entries);
         if (ordered.length) {
@@ -253,7 +254,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.streamTimes = new Map();
         }
         readers.push(...bulkReaders);
-        const joined = joinBulkDatabases(readers);
+        const joined = await joinBulkDatabases(readers);
 
         let time = Date.now() - start;
         if (time > 50) {
@@ -324,12 +325,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const stamped = rows.map(row => ({ time: getTimeUnique(), row }));
         const framed = frameRows(stamped);
 
-        // A batch that already exceeds the rollover limits skips tier-0 and folds straight into a bulk
-        // file. It folds the current stream in too (rows applied on top as newest) so the invariant
-        // "everything in the stream is newer than everything in bulk" holds — otherwise this fresh bulk
-        // data would be wrongly clobbered by older stream entries.
+        // A batch that already exceeds the limits skips the tier-0 stream and writes a bulk file directly
+        // (streaming thousands of rows one frame at a time would be pointless).
         if (entries.length >= ROLLOVER_ROWS || framed.length >= ROLLOVER_BYTES) {
-            await this.consolidate(rows);
+            await this.writeBulkFile(rows);
             return;
         }
 
@@ -337,7 +336,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // overlay immediately — no reader reset.
         const storage = await this.storage();
         await storage.append(this.getStreamFileName(), framed);
-        this.streamRowsWritten += entries.length;
         this.deps.batch(() => {
             for (const { time, row } of stamped) this.setOverlayRow(row.key as string, row, time);
         });
@@ -355,7 +353,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const stamped = keys.map(key => ({ time: getTimeUnique(), key }));
         const storage = await this.storage();
         await storage.append(this.getStreamFileName(), frameDeletes(stamped));
-        this.streamRowsWritten += keys.length;
         this.deps.batch(() => {
             for (const { time, key } of stamped) this.setOverlayDeleted(key, time);
         });
@@ -451,65 +448,86 @@ export class BulkDatabaseBase<T extends { key: string }> {
         await storage.set(manifestFileName(startTime, writerId, nextCounter()), Buffer.from(JSON.stringify(manifest), "utf8"));
     }
 
-    // Folds the current stream tier into a new bulk file (optionally with `newRows` applied on top as
-    // the newest writes — used by the direct-bulk write path), then atomically swaps state by writing
-    // a new manifest that keeps all existing valid bulk files plus the new one and marks the consumed
-    // stream files ignored. Consumed stream files are NOT deleted here — cleanup removes them later,
-    // after readers still on the old manifest are gone. Surviving tombstones go to a fresh stream file
-    // (always valid) so deletes of keys living in older bulk files aren't lost.
-    private async consolidate(newRows?: Record<string, unknown>[]): Promise<void> {
+    // Writes `rows` directly as bulk file(s), stamped with the current time as their data range (the rows
+    // are being written now). Used by the large-batch write path. Commits a new manifest adding them to
+    // the valid set. The rows carry time=now, so the join orders them correctly against any older stream
+    // entry for the same key (newer time wins) — no clobber.
+    private async writeBulkFile(rows: Record<string, unknown>[]): Promise<void> {
         const storage = await this.storage();
         const startTime = nextFileTime();
         const view = await this.getValidFiles();
-        // Only fold streams we can fold without racing an appender: our own files, plus foreign files
-        // old enough that their owner has certainly sealed them. Younger foreign files stay valid (still
-        // read, just not folded by us) until their owner folds them or they age out.
         const now = Date.now();
-        const foldable = view.streamFiles.filter(f => this.ownStreamFiles.has(f.fileName) || now - f.timestamp >= FOREIGN_FOLD_AGE_MS);
-        const { entries } = await this.loadStreamEntries(foldable);
+        const times = rows.map(() => now);
+        const newBulkNames: string[] = [];
+        for (const buffer of buildFileBuffer(rows, times)) {
+            const name = newFileName(startTime);
+            await storage.set(name, encodeCompressedBlocks(buffer));
+            newBulkNames.push(name);
+        }
+        const validBulkFiles = view.bulkFiles.map(f => f.fileName).concat(newBulkNames);
+        const readFiles = [...view.allBulkNames, ...view.allStreamNames, ...view.manifestNames];
+        await this.commitManifest(startTime, readFiles, validBulkFiles, view.manifest?.ignoredStreamFiles || []);
+        this.resetReader();
+        if (validBulkFiles.length >= MERGE_FILE_COUNT) {
+            while (await this.mergeFiles() > 0) { /* consolidate accumulated bulk files */ }
+        }
+        await this.cleanup();
+    }
+
+    // Fold. Reads every stream file CREATED before the cutoff (all sealed, since seal age < fold age),
+    // resolves them into one bulk file carrying each key's latest write-time per row, and re-persists
+    // surviving tombstones to a fresh stream file (so deletes of keys living in older bulk files keep
+    // suppressing them). Because reads resolve by write-time, the folded data needn't be older than the
+    // stream — the join sorts it out — so we just fold whole files, no cutoff split. Folded files are
+    // marked ignored (cleanup deletes them later); the new manifest is the atomic swap.
+    private async consolidate(): Promise<void> {
+        const storage = await this.storage();
+        const startTime = nextFileTime();
+        const view = await this.getValidFiles();
+        const cutoff = Date.now() - bulkDatabase2Timing.foldDataAgeMs;
+        const selected = view.streamFiles.filter(f => f.timestamp < cutoff);
+        if (!selected.length) return;
+        const { entries } = await this.loadStreamEntries(selected);
         const ordered = this.orderStreamEntries(entries);
+
         const byKey = new Map<string, Record<string, unknown>>();
+        const byKeyTime = new Map<string, number>();
         const deleted = new Map<string, number>();
         for (const e of ordered) {
             if (e.deletedKey !== undefined) {
                 byKey.delete(e.deletedKey);
+                byKeyTime.delete(e.deletedKey);
                 deleted.set(e.deletedKey, e.time);
             } else if (e.row) {
                 const key = e.row.key as string;
                 byKey.set(key, { ...byKey.get(key), ...e.row });
-                deleted.delete(key);
-            }
-        }
-        // The direct-write batch is newer than anything in the stream, so apply it last (on top).
-        if (newRows) {
-            for (const row of newRows) {
-                const key = row.key as string;
-                byKey.set(key, { ...byKey.get(key), ...row });
+                byKeyTime.set(key, e.time); // ordered ascending, so this ends up the latest write
                 deleted.delete(key);
             }
         }
 
         const newBulkNames: string[] = [];
         if (byKey.size) {
-            for (const buffer of buildFileBuffer([...byKey.values()])) {
+            const rows = [...byKey.values()];
+            const times = rows.map(r => byKeyTime.get(r.key as string)!);
+            for (const buffer of buildFileBuffer(rows, times)) {
                 const name = newFileName(startTime);
                 await storage.set(name, encodeCompressedBlocks(buffer));
                 newBulkNames.push(name);
             }
         }
-        // Surviving tombstones -> a fresh stream file (always valid, never ignored).
-        this.streamFileName = undefined;
-        this.streamRowsWritten = 0;
+
+        // Surviving tombstones -> a fresh stream file (always valid). Written BEFORE the manifest so the
+        // folded sources are never ignored while their deletes are missing.
         if (deleted.size) {
-            await storage.append(this.getStreamFileName(), frameDeletes([...deleted].map(([key, time]) => ({ time, key }))));
+            const carryName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
+            await storage.set(carryName, frameDeletes([...deleted].map(([key, time]) => ({ time, key }))));
         }
 
         const validBulkFiles = view.bulkFiles.map(f => f.fileName).concat(newBulkNames);
-        // Only the files we actually folded become ignored — younger foreign streams stay valid.
-        const ignoredStreamFiles = [...new Set([...(view.manifest?.ignoredStreamFiles || []), ...foldable.map(f => f.fileName)])];
+        const ignoredStreamFiles = [...new Set([...(view.manifest?.ignoredStreamFiles || []), ...selected.map(f => f.fileName)])];
         const readFiles = [...view.allBulkNames, ...view.allStreamNames, ...view.manifestNames];
         await this.commitManifest(startTime, readFiles, validBulkFiles, ignoredStreamFiles);
-        for (const f of foldable) this.ownStreamFiles.delete(f.fileName);
         this.resetReader();
 
         if (validBulkFiles.length >= MERGE_FILE_COUNT) {
@@ -562,15 +580,14 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return entries.map(e => e.entry);
     }
 
+    // Folding is purely age-driven and done in big infrequent batches: once some stream file is older
+    // than the trigger age, fold everything past the data cutoff. Throttled so we don't scan on every write.
     private async maybeRolloverStream(): Promise<void> {
+        const now = Date.now();
+        if (now - this.lastFoldCheck < bulkDatabase2Timing.foldCheckIntervalMs) return;
+        this.lastFoldCheck = now;
         const { streamFiles } = await this.getValidFiles();
-        const storage = await this.storage();
-        let totalBytes = 0;
-        for (const f of streamFiles) {
-            const info = await storage.getInfo(f.fileName);
-            totalBytes += info?.size || 0;
-        }
-        if (streamFiles.length > ROLLOVER_FILES || totalBytes > ROLLOVER_BYTES || this.streamRowsWritten > ROLLOVER_ROWS) {
+        if (streamFiles.some(f => now - f.timestamp >= bulkDatabase2Timing.foldTriggerAgeMs)) {
             await this.consolidate();
         }
     }
@@ -648,54 +665,56 @@ export class BulkDatabaseBase<T extends { key: string }> {
         console.warn(`${this.name}: skipping unreadable bulk file ${file.fileName} (recent — may be an in-progress write): ${message}`);
     }
 
-    // Merges exactly the files it's given (already newest-first), writing the result with `timestamp`
-    // so the new file takes the slot of the run it replaced, and returns the new file name(s). It does
-    // NOT delete the inputs or write a manifest — the caller (mergeFiles) commits one manifest for the
-    // whole pass. The merge is per-COLUMN newest-wins: for each key, each column takes the value from
-    // the newest reader that set it (non-ABSENT), so a partial write in a newer file doesn't drop
-    // columns that live only in an older file. Columns absent from every merged reader stay absent (they
-    // keep falling through to files outside this run). The caller keeps the input under MERGE_MAX_BYTES.
+    // Merges exactly the files it's given, returning the new file name(s). It does NOT delete the inputs
+    // or write a manifest — the caller (mergeFiles) commits one manifest for the whole pass. The merge is
+    // per-COLUMN by write-TIME: for each key, each column takes the value with the newest write-time
+    // across the merged files (non-ABSENT), and the output row's time is the newest of those — so the
+    // merge preserves correct time-resolution (only collapsing per-column times within a single output
+    // row, the accepted per-row corner). The caller keeps the input under MERGE_MAX_BYTES.
     private async mergeFilesBase(files: BulkFileInfo[], timestamp: number): Promise<string[]> {
         const storage = await this.storage();
         const readers = await Promise.all(files.map(f => this.loadFileReader(f.fileName)));
 
-        // Load each reader's columns into key->value maps (values may be ABSENT for unset cells).
         const loaded = await Promise.all(readers.map(async reader => {
-            const cols: { column: string; values: Map<string, unknown> }[] = [];
+            const cols = new Map<string, Map<string, { value: unknown; time: number }>>();
             for (const col of reader.columns) {
                 if (col.column === KEY_COLUMN) continue;
                 const entries = await reader.getColumn(col.column);
-                cols.push({ column: col.column, values: new Map(entries.map(e => [e.key, e.value])) });
+                cols.set(col.column, new Map(entries.map(e => [e.key, { value: e.value, time: e.time }])));
             }
-            return { keys: reader.keys, keySet: new Set(reader.keys), cols };
+            return { keyTimes: reader.keyTimes, cols };
         }));
 
-        const seen = new Set<string>();
-        const mergedRows: Record<string, unknown>[] = [];
-        for (const reader of loaded) {
-            for (const key of reader.keys) {
-                if (seen.has(key)) continue;
-                seen.add(key);
-                const row: Record<string, unknown> = { [KEY_COLUMN]: key };
-                const filled = new Set<string>();
-                for (const r of loaded) {
-                    if (!r.keySet.has(key)) continue;
-                    for (const c of r.cols) {
-                        if (filled.has(c.column)) continue;
-                        const value = c.values.get(key);
-                        if (value === ABSENT) continue;
-                        row[c.column] = value;
-                        filled.add(c.column);
-                    }
-                }
-                mergedRows.push(row);
-            }
+        const allKeys = new Set<string>();
+        const allCols = new Set<string>();
+        for (const l of loaded) {
+            for (const k of l.keyTimes.keys()) allKeys.add(k);
+            for (const c of l.cols.keys()) allCols.add(c);
         }
 
-        // The input is under the cap, so buildFileBuffer almost always returns a single buffer; the loop
-        // is only here to stay correct if a merge's deduped output still happens to exceed the split size.
+        const mergedRows: Record<string, unknown>[] = [];
+        const mergedTimes: number[] = [];
+        for (const key of allKeys) {
+            const row: Record<string, unknown> = { [KEY_COLUMN]: key };
+            let rowTime = -Infinity;
+            for (const col of allCols) {
+                let bestTime = -Infinity;
+                let bestVal: unknown;
+                let found = false;
+                for (const l of loaded) {
+                    const cell = l.cols.get(col)?.get(key);
+                    if (!cell || cell.value === ABSENT) continue;
+                    if (cell.time > bestTime) { bestTime = cell.time; bestVal = cell.value; found = true; }
+                }
+                if (found) { row[col] = bestVal; if (bestTime > rowTime) rowTime = bestTime; }
+            }
+            for (const l of loaded) { const t = l.keyTimes.get(key); if (t !== undefined && t > rowTime) rowTime = t; }
+            mergedRows.push(row);
+            mergedTimes.push(rowTime === -Infinity ? 0 : rowTime);
+        }
+
         const names: string[] = [];
-        for (const buffer of buildFileBuffer(mergedRows)) {
+        for (const buffer of buildFileBuffer(mergedRows, mergedTimes)) {
             const name = newFileName(timestamp);
             await storage.set(name, encodeCompressedBlocks(buffer));
             names.push(name);
@@ -772,7 +791,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // us to it) is ignored. We never delete a file whose name we can't parse for an age.
     private async cleanup(): Promise<void> {
         const now = Date.now();
-        if (now - this.lastCleanup < CLEANUP_INTERVAL_MS) return;
+        if (now - this.lastCleanup < bulkDatabase2Timing.cleanupIntervalMs) return;
         this.lastCleanup = now;
         // Best-effort and must never throw: it runs fire-and-forget from reads, and the directory could
         // even be removed out from under us (e.g. the collection is being deleted) mid-scan.
@@ -786,19 +805,19 @@ export class BulkDatabaseBase<T extends { key: string }> {
             for (const name of view.allBulkNames) {
                 if (validBulk.has(name)) continue;
                 const info = parseFileName(name);
-                if (!info || now - info.timestamp < CLEANUP_AGE_MS) continue;
+                if (!info || now - info.timestamp < bulkDatabase2Timing.cleanupAgeMs) continue;
                 await remove(name);
             }
             for (const name of view.allStreamNames) {
                 if (validStream.has(name)) continue;
                 const info = parseStreamFileName(name);
-                if (!info || now - info.timestamp < CLEANUP_AGE_MS) continue;
+                if (!info || now - info.timestamp < bulkDatabase2Timing.cleanupAgeMs) continue;
                 await remove(name);
             }
             for (const name of view.manifestNames) {
                 if (name === view.manifestName) continue;
                 const startTime = parseManifestStartTime(name);
-                if (startTime === undefined || now - startTime < CLEANUP_AGE_MS) continue;
+                if (startTime === undefined || now - startTime < bulkDatabase2Timing.cleanupAgeMs) continue;
                 await remove(name);
             }
         } catch {
@@ -806,7 +825,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
     }
 
-    private formatInfo(reader: BaseBulkDatabaseReader): string {
+    private formatInfo(reader: ResolvedReader): string {
         return `(collection has ${blue(formatNumber(reader.rowCount))} rows, ${blue(formatNumber(reader.totalBytes))}B)`;
     }
 
@@ -959,24 +978,38 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 }
 
-// Lowest indexes are read first (newest-wins). A reader's deletedKeys tombstone a key in all older
-// readers; the newest reader that has a key live wins.
-function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): BaseBulkDatabaseReader {
-    const keySets = databases.map(db => new Set(db.keys));
-    const deleted = new Set<string>();
-    for (const db of databases) {
-        if (db.deletedKeys) for (const key of db.deletedKeys) deleted.add(key);
-    }
+// The merged, time-resolved view over all readers. getColumn/getSingleField return plain resolved
+// values (not {value,time}); the base layers the overlay on top of these.
+type ResolvedReader = {
+    rowCount: number;
+    totalBytes: number;
+    keys: string[];
+    columns: { column: string; byteSize: number }[];
+    getColumn: (column: string) => Promise<{ key: string; value: unknown }[]>;
+    getSingleField: (key: string, column: string) => Promise<unknown | undefined>;
+};
 
-    const keys: string[] = [];
-    const keySeen = new Set<string>();
+// Resolve every read by ACTUAL write-time across all readers (stream + bulk), per key and per column:
+//  - a column resolves to the value with the newest write-time among readers that set it (non-ABSENT);
+//    a reader that never set the column for that key falls through to an older reader.
+//  - a key is live iff its newest write is newer than its newest delete; per column, the value is
+//    suppressed if a delete is newer than that column's newest set.
+// No reliance on file order or partitioning — time is the only thing that decides.
+async function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): Promise<ResolvedReader> {
+    const deleteTime = new Map<string, number>();
     for (const db of databases) {
-        for (const key of db.keys) {
-            if (keySeen.has(key) || deleted.has(key)) continue;
-            keySeen.add(key);
-            keys.push(key);
-        }
+        if (!db.deleteTimes) continue;
+        for (const [key, t] of db.deleteTimes) deleteTime.set(key, Math.max(deleteTime.get(key) ?? -Infinity, t));
     }
+    const keyTime = new Map<string, number>();
+    for (const db of databases) {
+        for (const [key, t] of db.keyTimes) keyTime.set(key, Math.max(keyTime.get(key) ?? -Infinity, t));
+    }
+    const delOf = (key: string) => deleteTime.get(key) ?? -Infinity;
+    // Live keys: newest write strictly newer than newest delete.
+    const keys: string[] = [];
+    for (const [key, t] of keyTime) if (t > delOf(key)) keys.push(key);
+
     const columns: { column: string; byteSize: number }[] = [];
     const columnByName = new Map<string, { column: string; byteSize: number }>();
     for (const db of databases) {
@@ -990,42 +1023,41 @@ function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): BaseBulkDatabas
             existing.byteSize += col.byteSize;
         }
     }
+
     return {
         totalBytes: databases.reduce((acc, db) => acc + db.totalBytes, 0),
         rowCount: keys.length,
         keys,
         columns,
         async getColumn(column) {
-            // Resolve each key newest-wins, per column: the newest reader that has a non-ABSENT value
-            // for the key wins; an ABSENT cell (the row never set this column) falls through to an older
-            // reader. A stored undefined is a real value and stops the fall-through (clears the column).
-            const valueByKey = new Map<string, unknown>();
-            for (const db of databases) {
-                let values: Map<string, unknown> | undefined;
-                if (db.columns.some(c => c.column === column)) {
-                    values = new Map((await db.getColumn(column)).map(e => [e.key, e.value]));
+            const perReader = await Promise.all(databases.map(async db => {
+                if (!db.columns.some(c => c.column === column)) return undefined;
+                const entries = await db.getColumn(column);
+                return new Map(entries.map(e => [e.key, { value: e.value, time: e.time }]));
+            }));
+            return keys.map(key => {
+                let bestTime = -Infinity;
+                let bestVal: unknown;
+                let found = false;
+                for (const m of perReader) {
+                    const cell = m && m.get(key);
+                    if (!cell || cell.value === ABSENT) continue;
+                    if (cell.time > bestTime) { bestTime = cell.time; bestVal = cell.value; found = true; }
                 }
-                for (const key of db.keys) {
-                    if (valueByKey.has(key) || deleted.has(key)) continue;
-                    const value = values ? values.get(key) : ABSENT;
-                    if (value === ABSENT) continue;
-                    valueByKey.set(key, value);
-                }
-            }
-            return keys.map(key => ({ key, value: valueByKey.get(key) }));
+                return { key, value: (found && bestTime > delOf(key)) ? bestVal : undefined };
+            });
         },
         async getSingleField(key, column) {
-            if (deleted.has(key)) return undefined;
-            for (let i = 0; i < databases.length; i++) {
-                if (!keySets[i].has(key)) continue;
-                // Column not in this reader at all, or the row didn't set it (ABSENT): fall through to
-                // an older reader rather than clobbering with undefined.
-                if (!databases[i].columns.some(c => c.column === column)) continue;
-                const value = await databases[i].getSingleField(key, column);
-                if (value === ABSENT) continue;
-                return value;
+            let bestTime = -Infinity;
+            let bestVal: unknown;
+            let found = false;
+            for (const db of databases) {
+                if (!db.columns.some(c => c.column === column)) continue;
+                const r = await db.getSingleField(key, column);
+                if (r === ABSENT) continue;
+                if (r.time > bestTime) { bestTime = r.time; bestVal = r.value; found = true; }
             }
-            return undefined;
+            return (found && bestTime > delOf(key)) ? bestVal : undefined;
         },
     };
 }
