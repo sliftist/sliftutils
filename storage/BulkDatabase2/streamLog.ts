@@ -97,21 +97,31 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
         }
     }
     let columns = columnNames.map(column => ({ column, byteSize: 0 }));
+    // Per-key tombstone times for the join's delete resolution.
+    let deleteTimes = new Map<string, number>();
+    for (let key of deletedKeys) deleteTimes.set(key, times.get(key) || 0);
+    let timeValues = [...times.values()];
     let reader: BaseBulkDatabaseReader = {
         totalBytes,
         rowCount: keys.length,
+        minTime: timeValues.length ? Math.min(...timeValues) : 0,
+        maxTime: timeValues.length ? Math.max(...timeValues) : 0,
         keys,
+        keyTimes: new Map(keys.map(key => [key, times.get(key) || 0])),
         columns,
-        deletedKeys,
+        deleteTimes,
+        // A key's time is its latest write across all columns (per-key, not per-column). For a column
+        // it never set we return ABSENT so the join falls through to an older reader.
         async getColumn(column) {
             return keys.map(key => {
                 let row = byKey.get(key);
-                return { key, value: row && column in row ? row[column] : ABSENT };
+                return { key, value: row && column in row ? row[column] : ABSENT, time: times.get(key) || 0 };
             });
         },
         async getSingleField(key, column) {
             let row = byKey.get(key);
-            return row && column in row ? row[column] : ABSENT;
+            if (!row || !(column in row)) return ABSENT;
+            return { value: row[column], time: times.get(key) || 0 };
         },
     };
     return { reader, times };

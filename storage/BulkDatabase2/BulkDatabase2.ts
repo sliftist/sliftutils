@@ -2,7 +2,7 @@ import { getFileStorageNested2 } from "../FileFolderAPI";
 import { observable, runInAction } from "../../render-utils/mobxTyped";
 import { BulkDatabaseBase, ReactiveDeps } from "./BulkDatabaseBase";
 
-export { BulkDatabaseBase, noopReactiveDeps } from "./BulkDatabaseBase";
+export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
 export type { ReactiveDeps, StorageFactory } from "./BulkDatabaseBase";
 
 // mobx-backed reactivity: each signal string gets its own observable box. observe() reads it (so an
