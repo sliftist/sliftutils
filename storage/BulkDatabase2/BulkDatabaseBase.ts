@@ -1183,6 +1183,21 @@ export class BulkDatabaseBase<T extends { key: string }> {
             columns: reader.columns,
         };
     }
+
+    // Per-file breakdown of the collection's on-disk files, read FRESH from disk each call (so it
+    // reflects the latest sizes, including stream files still being appended). `bytes` is the actual
+    // on-disk (compressed, for bulk) size. Useful for showing collection size / fragmentation, and to
+    // decide whether to call tryMergeNow()/compact().
+    public async getFileInfo(): Promise<{ files: { name: string; type: "bulk" | "stream"; bytes: number }[]; count: number; totalBytes: number }> {
+        const { bulkFiles, streamFiles } = await this.listFiles();
+        const storage = await this.storage();
+        const sizeOf = async (name: string) => { try { return (await storage.getInfo(name))?.size ?? 0; } catch { return 0; } };
+        const files = [
+            ...await Promise.all(bulkFiles.map(async f => ({ name: f.fileName, type: "bulk" as const, bytes: await sizeOf(f.fileName) }))),
+            ...await Promise.all(streamFiles.map(async f => ({ name: f.fileName, type: "stream" as const, bytes: await sizeOf(f.fileName) }))),
+        ];
+        return { files, count: files.length, totalBytes: files.reduce((a, f) => a + f.bytes, 0) };
+    }
 }
 
 // The merged, time-resolved view over all readers. getColumn/getSingleField return the resolved value

@@ -69,6 +69,12 @@ export interface IBulkDatabase2<T extends { key: string }> {
     getColumnInfo(): Promise<BulkColumnInfo[]>;
     /** A cheap snapshot of the collection's shape (row/key counts, total bytes, columns) — no row data. */
     getReaderInfo(): Promise<BulkReaderInfo>;
+    /**
+     * Per-file breakdown of the on-disk files, read fresh from disk each call (latest sizes, including
+     * stream files still being appended). `bytes` is the actual on-disk size. Good for showing collection
+     * size/fragmentation and deciding whether to call tryMergeNow()/compact().
+     */
+    getFileInfo(): Promise<{ files: { name: string; type: "bulk" | "stream"; bytes: number }[]; count: number; totalBytes: number }>;
 
     /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
     compact(): Promise<void>;
