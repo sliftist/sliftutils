@@ -24,13 +24,10 @@ function frame(payload: Buffer): Buffer {
     return Buffer.concat([len, payload, len]);
 }
 
-// We deliberately do NOT batch/debounce writes here — each write is framed and appended (and flushed)
-// immediately. If a caller makes many individual writes and that causes lag, the fix is for them to
-// call writeBatch/deleteBatch with the whole set, not for us to silently coalesce. Caller-side
-// batching is strictly faster than anything we could do (it knows the full set up front), and not
-// batching gives the lowest possible latency for callers who genuinely want single writes — which
-// matters because the tab can be closed at any moment, so we want each write on disk as soon as
-// possible rather than sitting in a pending buffer that a close would lose.
+// Framing only — no batching here. BulkDatabase2 coalesces and flushes these framed bytes on a ramping
+// per-collection schedule (see streamAppend in BulkDatabaseBase), because the browser File System Access
+// API rewrites the whole file on every append, so one-append-per-write is quadratic. The first write
+// after a lull still flushes immediately, so a single action then a tab close is saved at once.
 
 // Times are assigned by the caller (BulkDatabase2) so the exact same timestamp lands on disk, in the
 // in-memory overlay, and in the cross-tab broadcast — keeping the global write order consistent.

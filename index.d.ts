@@ -852,6 +852,13 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
         compact(): Promise<void>;
         /**
+         * Flush buffered stream writes to disk now. Writes are coalesced and flushed on a ramping delay (to
+         * avoid the browser rewriting the whole stream file per write), so a write's promise resolving means
+         * "accepted" (in memory + cross-tab), not necessarily "on disk". Call this to force durability — it's
+         * also run automatically on tab hide/close and before every merge.
+         */
+        flush(): Promise<void>;
+        /**
          * Run one merge pass now (the same policy the database runs on a timer): consolidate recent
          * fragmentation and dedup a key range if it's worth it. Returns whether it merged anything and
          * whether it bailed because another tab/process holds the merge lock — so a scheduler can call this
@@ -881,6 +888,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         mergeSpacingMs: number;
         firstMergeTriggerFiles: number;
         firstMergeTriggerRangeMs: number;
+        writeFlushMaxDelayMs: number;
     };
     export interface ReactiveDeps {
         observe(signal: string): void;
@@ -896,6 +904,11 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         protected deps: ReactiveDeps;
         private storageFactory;
         constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory);
+        private pendingAppends;
+        private flushTimer;
+        private flushChain;
+        private currentFlushDelay;
+        private lastWriteTime;
         static clearCache(): void;
         storage: {
             (): Promise<FileStorage>;
@@ -920,6 +933,10 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         writeBatch(entries: T[]): Promise<void>;
         delete(key: string): Promise<void>;
         deleteBatch(keys: string[]): Promise<void>;
+        private streamAppend;
+        flush(): Promise<void>;
+        private flushPending;
+        private doFlush;
         update(entry: Partial<T> & {
             key: string;
         }): Promise<void>;

@@ -87,6 +87,13 @@ export interface IBulkDatabase2<T extends {
     /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
     compact(): Promise<void>;
     /**
+     * Flush buffered stream writes to disk now. Writes are coalesced and flushed on a ramping delay (to
+     * avoid the browser rewriting the whole stream file per write), so a write's promise resolving means
+     * "accepted" (in memory + cross-tab), not necessarily "on disk". Call this to force durability — it's
+     * also run automatically on tab hide/close and before every merge.
+     */
+    flush(): Promise<void>;
+    /**
      * Run one merge pass now (the same policy the database runs on a timer): consolidate recent
      * fragmentation and dedup a key range if it's worth it. Returns whether it merged anything and
      * whether it bailed because another tab/process holds the merge lock — so a scheduler can call this

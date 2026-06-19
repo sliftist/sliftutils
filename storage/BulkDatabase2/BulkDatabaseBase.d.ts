@@ -5,6 +5,7 @@ export declare const bulkDatabase2Timing: {
     mergeSpacingMs: number;
     firstMergeTriggerFiles: number;
     firstMergeTriggerRangeMs: number;
+    writeFlushMaxDelayMs: number;
 };
 export interface ReactiveDeps {
     observe(signal: string): void;
@@ -20,6 +21,11 @@ export declare class BulkDatabaseBase<T extends {
     protected deps: ReactiveDeps;
     private storageFactory;
     constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory);
+    private pendingAppends;
+    private flushTimer;
+    private flushChain;
+    private currentFlushDelay;
+    private lastWriteTime;
     static clearCache(): void;
     storage: {
         (): Promise<FileStorage>;
@@ -44,6 +50,10 @@ export declare class BulkDatabaseBase<T extends {
     writeBatch(entries: T[]): Promise<void>;
     delete(key: string): Promise<void>;
     deleteBatch(keys: string[]): Promise<void>;
+    private streamAppend;
+    flush(): Promise<void>;
+    private flushPending;
+    private doFlush;
     update(entry: Partial<T> & {
         key: string;
     }): Promise<void>;

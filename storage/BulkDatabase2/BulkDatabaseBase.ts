@@ -8,6 +8,7 @@ import { blockCache, encodeCompressedBlocks, GetRange } from "./blockCache";
 import { STREAM_EXTENSION, StreamEntry, frameRows, frameDeletes, parseStream, streamReaderFromEntries } from "./streamLog";
 import { connect as syncConnect, broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, isSyncSupported, RemoteWrite } from "./syncClient";
 import { tryAcquireMergeLock, releaseMergeLock } from "./mergeLock";
+import { isNode } from "typesafecss";
 import type { FileStorage } from "../FileFolderAPI";
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -52,6 +53,13 @@ const FIRST_MERGE_BYTES = TARGET_FILE_BYTES / 2;
 const KEY_GROUP_BYTES = 800 * 1024 * 1024;
 const DUP_THRESHOLD = 0.4;
 
+// The browser File System Access API has no real append — every "append" rewrites the whole file — so
+// streaming one write at a time is quadratic. We coalesce stream writes and flush on a RAMPING delay:
+// the first write after a lull flushes immediately (a single checkbox-then-close is saved at once), and
+// as writes keep coming the delay doubles from this step up to writeFlushMaxDelayMs, batching a burst
+// into one rewrite. (Node has a real append, so there the default delay is 0 = flush every write.)
+const WRITE_FLUSH_FIRST_STEP_MS = 250;
+
 // Time thresholds, mutable so tests can shrink them from hours to milliseconds.
 export const bulkDatabase2Timing = {
     // A writer stops appending to its current stream file once it's this old (starts a fresh one). A
@@ -69,6 +77,11 @@ export const bulkDatabase2Timing = {
     firstMergeTriggerFiles: 20,
     // ...or span a wider write-time range than this (data trickling in slowly still gets consolidated).
     firstMergeTriggerRangeMs: 3 * 24 * 60 * 60 * 1000,
+    // Max delay (per collection) before buffered stream writes are flushed to disk; the delay ramps up to
+    // this under sustained writing (see WRITE_FLUSH_FIRST_STEP_MS). 0 = flush every write immediately —
+    // the default in Node, where append is real and cheap; the browser ramps to 15s to avoid rewriting
+    // the whole stream file per write.
+    writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
 };
 
 // Marks a key as deleted in the in-memory overlay.
@@ -182,7 +195,32 @@ export class BulkDatabaseBase<T extends { key: string }> {
         public readonly name: string,
         protected deps: ReactiveDeps,
         private storageFactory: StorageFactory,
-    ) { }
+    ) {
+        // Best-effort: persist buffered stream writes when the tab is hidden/closing. visibilitychange →
+        // hidden fires early enough that the (async) flush usually completes; pagehide is the backstop.
+        // No-op outside a browser window (Node).
+        if (typeof window !== "undefined") {
+            try {
+                window.addEventListener("pagehide", () => void this.flushPending());
+                if (typeof document !== "undefined") {
+                    document.addEventListener("visibilitychange", () => {
+                        if (document.visibilityState === "hidden") void this.flushPending();
+                    });
+                }
+            } catch { /* not in a DOM context */ }
+        }
+    }
+
+    // ---- buffered stream writes (per collection) ----
+    // The browser rewrites the whole stream file on every append, so we coalesce writes and flush on a
+    // ramping delay (see WRITE_FLUSH_FIRST_STEP_MS / writeFlushMaxDelayMs). Each buffered item keeps an
+    // `apply` that re-applies its overlay mutation, so resetReader (which clears the overlay) can restore
+    // writes that aren't on disk yet. Removed from the buffer only once their append succeeds.
+    private pendingAppends: { framed: Buffer; apply: () => void }[] = [];
+    private flushTimer: ReturnType<typeof setTimeout> | undefined;
+    private flushChain: Promise<void> = Promise.resolve();
+    private currentFlushDelay = 0;
+    private lastWriteTime = 0;
 
     // Block range cache is global and immutable-file-safe; clear it to simulate a cold page load
     // (e.g. between an untimed prep step and the timed benchmark).
@@ -336,7 +374,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     // Reset the loaded reader and all derived in-memory caches/overlay. Used only on structural
-    // changes (large direct-bulk write, rollover, compact) after the data has been persisted.
+    // changes (large direct-bulk write, rollover, compact) after the data has been persisted. Writes
+    // still buffered (not yet on disk) are re-applied so the reset doesn't drop them from reads — they
+    // aren't in the reloaded reader until their append lands.
     private resetReader() {
         this.deps.batch(() => {
             this.reader.reset();
@@ -345,6 +385,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.baseFields.clear();
             this.baseFieldsLoading.clear();
             this.overlay.clear();
+            for (const p of this.pendingAppends) p.apply();
             this.deps.invalidate(LOAD_SIGNAL);
             this.deps.invalidate(OVERLAY_SIGNAL);
         });
@@ -372,14 +413,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
             return;
         }
 
-        // Otherwise append to this thread's stream file (one cheap append) and reflect it in the
-        // overlay immediately — no reader reset.
-        const storage = await this.storage();
-        await storage.append(this.getStreamFileName(), framed);
-        this.deps.batch(() => {
-            for (const { time, row } of stamped) this.setOverlayRow(row.key as string, row, time);
-        });
+        // Reflect in the overlay + broadcast to other tabs IMMEDIATELY (in-memory + cross-tab are always
+        // current), but buffer the disk append and flush it on a ramping schedule.
+        const apply = () => { for (const { time, row } of stamped) this.setOverlayRow(row.key as string, row, time); };
+        this.deps.batch(apply);
         for (const { time, row } of stamped) syncBroadcast(this.name, { key: row.key as string, time, value: row });
+        await this.streamAppend(framed, apply);
         void this.maybeMerge();
     }
 
@@ -391,13 +430,59 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (!keys.length) return;
         void this.syncSetup();
         const stamped = keys.map(key => ({ time: getTimeUnique(), key }));
-        const storage = await this.storage();
-        await storage.append(this.getStreamFileName(), frameDeletes(stamped));
-        this.deps.batch(() => {
-            for (const { time, key } of stamped) this.setOverlayDeleted(key, time);
-        });
+        const apply = () => { for (const { time, key } of stamped) this.setOverlayDeleted(key, time); };
+        this.deps.batch(apply);
         for (const { time, key } of stamped) syncBroadcast(this.name, { key, time, deleted: true });
+        await this.streamAppend(frameDeletes(stamped), apply);
         void this.maybeMerge();
+    }
+
+    // Buffers framed stream bytes and flushes on a ramping per-collection schedule (see the field block).
+    // `apply` re-applies this write's overlay mutation if resetReader clears the overlay before it's on
+    // disk. Awaits durability only on an immediate (idle/Node) flush, so a single action — then close — is
+    // saved at once; a burst returns fast and is flushed in the background.
+    private async streamAppend(framed: Buffer, apply: () => void): Promise<void> {
+        this.pendingAppends.push({ framed, apply });
+        const max = bulkDatabase2Timing.writeFlushMaxDelayMs;
+        const now = Date.now();
+        // Immediate when batching is off (Node / real append), or for the first write after a lull.
+        if (max <= 0 || this.currentFlushDelay <= 0 || now - this.lastWriteTime > max) {
+            this.lastWriteTime = now;
+            this.currentFlushDelay = max > 0 ? Math.min(max, WRITE_FLUSH_FIRST_STEP_MS) : 0;
+            await this.flushPending();
+            return;
+        }
+        // Active burst: coalesce into one scheduled flush and ramp the delay toward max.
+        this.lastWriteTime = now;
+        if (this.flushTimer === undefined) {
+            this.flushTimer = setTimeout(() => { this.flushTimer = undefined; void this.flushPending(); }, this.currentFlushDelay);
+        }
+        this.currentFlushDelay = Math.min(max, this.currentFlushDelay * 2);
+    }
+
+    // Flushes all buffered stream writes to disk as one append. Serialized (so two flushes never write the
+    // same file concurrently) and best-effort: a failed append keeps the data buffered for the next try.
+    public async flush(): Promise<void> {
+        await this.flushPending();
+    }
+
+    private async flushPending(): Promise<void> {
+        if (this.flushTimer !== undefined) { clearTimeout(this.flushTimer); this.flushTimer = undefined; }
+        this.flushChain = this.flushChain.then(() => this.doFlush()).catch(e => {
+            console.warn(`${this.name}: stream flush failed, will retry: ${(e as Error).message}`);
+        });
+        return this.flushChain;
+    }
+
+    private async doFlush(): Promise<void> {
+        if (!this.pendingAppends.length) return;
+        const batch = this.pendingAppends.slice();
+        const combined = Buffer.concat(batch.map(p => p.framed));
+        const storage = await this.storage();
+        // Throws on failure -> we don't splice, so the data stays buffered and a later flush retries it.
+        await storage.append(this.getStreamFileName(), combined);
+        // New writes added during the await are after `batch`, so removing the front is exactly the flushed set.
+        this.pendingAppends.splice(0, batch.length);
     }
 
     public async update(entry: Partial<T> & { key: string }): Promise<void> {
@@ -544,6 +629,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     public async compact(): Promise<void> {
         if (!tryAcquireMergeLock(this.name, writerId)) return; // someone else is already merging; fine
         try {
+            await this.flushPending(); // get buffered writes on disk so they're folded in
             syncBroadcastSeal(this.name);
             this.streamFileName = undefined;
             const { bulkFiles, streamFiles } = await this.listFiles();
@@ -808,6 +894,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     //     into key-disjoint files. Returns whether any merge happened.
     private async testMerge(): Promise<boolean> {
         let merged = false;
+        await this.flushPending(); // get buffered writes on disk so this pass can fold/consider them
         // Run a merge, pausing first if we've already merged this pass (so the pause is BETWEEN merges,
         // never before the first or after the last). Returns false if we lost the lock — stop entirely.
         const runMerge = async (bulk: BulkFileInfo[], stream: StreamFileInfo[]): Promise<boolean> => {
