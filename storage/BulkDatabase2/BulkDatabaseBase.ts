@@ -335,7 +335,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
         let time = Date.now() - start;
         if (time > 50) {
-            console.log(`${blue(`${this.name} loaded`)} in ${red(formatTime(time))} (${blue(formatNumber(joined.rowCount))} rows, ${bulkFiles.length} bulk + ${streamFiles.length} stream files)`);
+            // Bytes we actually had to read: the full stream files + each bulk file's key column (the
+            // part we read on load to get its keys).
+            let bytesRead = streamData.totalBytes;
+            for (const r of bulkReaders) bytesRead += r.columns.find(c => c.column === KEY_COLUMN)?.byteSize ?? 0;
+            console.log(`${blue(this.name)} loaded in ${red(formatTime(time))} (${blue(formatNumber(joined.rowCount))} rows, ${bulkFiles.length} bulk + ${streamFiles.length} stream files, read ${blue(formatNumber(bytesRead))}B)`);
         }
         return joined;
     }
