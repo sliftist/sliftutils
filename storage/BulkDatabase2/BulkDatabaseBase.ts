@@ -883,45 +883,60 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     // Applies the overlay (pending writes/deletes) on top of a base column. No-op when empty. An
-    // overlay entry that doesn't include this column leaves the base (disk) value in place — a partial
-    // write/update only overrides the columns it set; everything else falls through.
-    private patchColumn(base: { key: string; value: unknown }[], column: string): { key: string; value: unknown }[] {
+    // overlay entry that doesn't include this column leaves the base (disk) value+time in place — a
+    // partial write/update only overrides the columns it set; everything else falls through. An overlay
+    // override carries the overlay write's time (when that pending write happened).
+    private patchColumn(base: { key: string; value: unknown; time: number }[], column: string): { key: string; value: unknown; time: number }[] {
         if (this.overlay.size === 0) return base;
-        const map = new Map(base.map(e => [e.key, e.value]));
+        const map = new Map(base.map(e => [e.key, { value: e.value, time: e.time }]));
         for (const [key, entry] of this.overlay) {
             if (entry.value === DELETED) { map.delete(key); continue; }
-            if (column in entry.value) map.set(key, entry.value[column]);
-            else if (!map.has(key)) map.set(key, undefined);
+            if (column in entry.value) map.set(key, { value: entry.value[column], time: entry.time });
+            else if (!map.has(key)) map.set(key, { value: undefined, time: entry.time });
         }
-        return [...map].map(([key, value]) => ({ key, value }));
+        return [...map].map(([key, v]) => ({ key, value: v.value, time: v.time }));
     }
 
     // ---- async reads (overlay-aware) ----
 
     public async getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined> {
+        return (await this.getSingleFieldObj(key, column))?.value;
+    }
+
+    // Like getSingleField, but returns the same shape a getColumn entry has: { key, value, time }, where
+    // time is roughly when that value last changed (the resolved write-time; for a row-merged value it's
+    // the newest contributing write). Returns undefined only when the key isn't present/live.
+    public async getSingleFieldObj<Column extends keyof T>(key: string, column: Column): Promise<{ key: string; value: T[Column]; time: number } | undefined> {
         void this.syncSetup();
+        const col = String(column);
         const entry = this.overlay.get(key);
         if (entry !== undefined) {
             if (entry.value === DELETED) return undefined;
-            if (String(column) in entry.value) return entry.value[String(column)] as T[Column];
-            // column not set in the overlay entry — fall through to disk
+            if (col in entry.value) return { key, value: entry.value[col] as T[Column], time: entry.time };
+            // column not set in the overlay entry — fall through to disk for this column
         }
         let time = Date.now();
         let reader = await this.reader();
-        let result = await reader.getSingleField(key, String(column)) as T[Column] | undefined;
+        const r = await reader.getSingleField(key, col);
         time = Date.now() - time;
         if (time > 50) {
-            console.log(`${blue(`${this.name}.getSingleField(${JSON.stringify(key)}, ${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(reader)}`);
+            console.log(`${blue(`${this.name}.getSingleFieldObj(${JSON.stringify(key)}, ${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(reader)}`);
         }
-        return result;
+        if (r === undefined) {
+            // Not live on disk; but if the overlay holds the key (a partial write of a not-yet-on-disk
+            // key) it's live with this column unset.
+            if (entry !== undefined && entry.value !== DELETED) return { key, value: undefined as T[Column], time: entry.time };
+            return undefined;
+        }
+        return { key, value: r.value as T[Column], time: r.time };
     }
 
-    public async getColumn<Column extends keyof T>(column: Column): Promise<{ key: string; value: T[Column] }[]> {
+    public async getColumn<Column extends keyof T>(column: Column): Promise<{ key: string; value: T[Column]; time: number }[]> {
         void this.syncSetup();
         let time = Date.now();
         let reader = await this.reader();
-        let base = await reader.getColumn(String(column)) as { key: string; value: T[Column] }[];
-        let result = this.patchColumn(base, String(column)) as { key: string; value: T[Column] }[];
+        let base = await reader.getColumn(String(column));
+        let result = this.patchColumn(base, String(column)) as { key: string; value: T[Column]; time: number }[];
         time = Date.now() - time;
         if (time > 50) {
             console.log(`${blue(`${this.name}.getColumn(${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(reader)}`);
@@ -947,9 +962,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // loaded once and cached; the overlay is layered on top (we can't async-cache the combined result
     // because the overlay mutates).
 
-    private baseColumns = new Map<string, { key: string; value: unknown }[]>();
+    private baseColumns = new Map<string, { key: string; value: unknown; time: number }[]>();
     private baseColumnsLoading = new Set<string>();
-    private baseFields = new Map<string, unknown>();
+    // The disk-resolved field: { value, time } when the key is live on disk, or undefined when it isn't
+    // (Map.has distinguishes "loaded" from "not loaded yet").
+    private baseFields = new Map<string, { value: unknown; time: number } | undefined>();
     private baseFieldsLoading = new Set<string>();
 
     private ensureBaseColumn(column: string) {
@@ -972,9 +989,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.baseFieldsLoading.add(cacheKey);
         void (async () => {
             let reader = await this.reader();
-            let value = await reader.getSingleField(key, column);
+            let resolved = await reader.getSingleField(key, column);
             this.deps.batch(() => {
-                this.baseFields.set(cacheKey, value);
+                this.baseFields.set(cacheKey, resolved);
                 this.baseFieldsLoading.delete(cacheKey);
                 this.deps.invalidate(LOAD_SIGNAL);
             });
@@ -982,6 +999,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     public getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined {
+        return this.getSingleFieldObjSync(key, column)?.value;
+    }
+
+    // Sync (reactive) counterpart of getSingleFieldObj: { key, value, time } once loaded, undefined while
+    // loading or when the key isn't present/live. time is roughly when the value last changed.
+    public getSingleFieldObjSync<Column extends keyof T>(key: string, column: Column): { key: string; value: T[Column]; time: number } | undefined {
         void this.syncSetup();
         this.deps.observe(LOAD_SIGNAL);
         this.deps.observe(key);
@@ -989,18 +1012,24 @@ export class BulkDatabaseBase<T extends { key: string }> {
         let entry = this.overlay.get(key);
         if (entry !== undefined) {
             if (entry.value === DELETED) return undefined;
-            if (col in entry.value) return entry.value[col] as T[Column];
-            // column not set in the overlay entry — fall through to the base field cache
+            if (col in entry.value) return { key, value: entry.value[col] as T[Column], time: entry.time };
+            // column not set in the overlay entry — fall through to the base field cache for this column
         }
         let cacheKey = nullJoin(col, key);
         if (!this.baseFields.has(cacheKey)) {
             this.ensureBaseField(key, col);
             return undefined;
         }
-        return this.baseFields.get(cacheKey) as T[Column] | undefined;
+        const base = this.baseFields.get(cacheKey);
+        if (base === undefined) {
+            // Not live on disk; but an overlay entry for the key (partial write) makes it live, column unset.
+            if (entry !== undefined && entry.value !== DELETED) return { key, value: undefined as T[Column], time: entry.time };
+            return undefined;
+        }
+        return { key, value: base.value as T[Column], time: base.time };
     }
 
-    public getColumnSync<Column extends keyof T>(column: Column): { key: string; value: T[Column] }[] | undefined {
+    public getColumnSync<Column extends keyof T>(column: Column): { key: string; value: T[Column]; time: number }[] | undefined {
         void this.syncSetup();
         this.deps.observe(LOAD_SIGNAL);
         // Observe the overlay-wide signal so we recompute once the base arrives or the overlay changes.
@@ -1011,7 +1040,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.ensureBaseColumn(col);
             return undefined;
         }
-        return this.patchColumn(base, col) as { key: string; value: T[Column] }[];
+        return this.patchColumn(base, col) as { key: string; value: T[Column]; time: number }[];
     }
 
     public async getColumnInfo() {
@@ -1031,15 +1060,17 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 }
 
-// The merged, time-resolved view over all readers. getColumn/getSingleField return plain resolved
-// values (not {value,time}); the base layers the overlay on top of these.
+// The merged, time-resolved view over all readers. getColumn/getSingleField return the resolved value
+// AND its write-time (so reads can expose roughly when a value last changed); the base layers the
+// overlay on top of these. getSingleField returns undefined only when the key isn't live (deleted or
+// absent) — a live key whose column is merely unset returns { value: undefined, time: rowTime }.
 type ResolvedReader = {
     rowCount: number;
     totalBytes: number;
     keys: string[];
     columns: { column: string; byteSize: number }[];
-    getColumn: (column: string) => Promise<{ key: string; value: unknown }[]>;
-    getSingleField: (key: string, column: string) => Promise<unknown | undefined>;
+    getColumn: (column: string) => Promise<{ key: string; value: unknown; time: number }[]>;
+    getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | undefined>;
 };
 
 // Resolve every read by ACTUAL write-time across all readers (stream + bulk), per key and per column:
@@ -1097,10 +1128,15 @@ async function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): Promise<R
                     if (!cell || cell.value === ABSENT) continue;
                     if (cell.time > bestTime) { bestTime = cell.time; bestVal = cell.value; found = true; }
                 }
-                return { key, value: (found && bestTime > delOf(key)) ? bestVal : undefined };
+                // time = the column value's write-time when this column has one, else the row's last
+                // write-time (the key is live but never set this column).
+                const live = found && bestTime > delOf(key);
+                return { key, value: live ? bestVal : undefined, time: live ? bestTime : (keyTime.get(key) ?? 0) };
             });
         },
         async getSingleField(key, column) {
+            const kt = keyTime.get(key);
+            if (kt === undefined || kt <= delOf(key)) return undefined; // key not live
             let bestTime = -Infinity;
             let bestVal: unknown;
             let found = false;
@@ -1110,7 +1146,8 @@ async function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): Promise<R
                 if (r === ABSENT) continue;
                 if (r.time > bestTime) { bestTime = r.time; bestVal = r.value; found = true; }
             }
-            return (found && bestTime > delOf(key)) ? bestVal : undefined;
+            const live = found && bestTime > delOf(key);
+            return { value: live ? bestVal : undefined, time: live ? bestTime : kt };
         },
     };
 }
