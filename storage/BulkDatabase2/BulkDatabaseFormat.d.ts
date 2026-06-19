@@ -3,12 +3,15 @@
 export declare const KEY_COLUMN = "key";
 export declare const EMPTY_BUFFER: Buffer;
 export declare const ABSENT: unique symbol;
-export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[]): Buffer[];
+export declare const TARGET_FILE_BYTES: number;
+export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): Buffer[];
 export type BaseBulkDatabaseReader = {
     rowCount: number;
     totalBytes: number;
     minTime: number;
     maxTime: number;
+    minKey?: string;
+    maxKey?: string;
     keys: string[];
     columns: {
         column: string;
@@ -26,6 +29,18 @@ export type BaseBulkDatabaseReader = {
         time: number;
     } | typeof ABSENT>;
 };
+export type BulkHeaderInfo = {
+    rowCount: number;
+    minTime: number;
+    maxTime: number;
+    minKey?: string;
+    maxKey?: string;
+    columns: {
+        column: string;
+        byteSize: number;
+    }[];
+};
+export declare function loadBulkHeader(getRange: (start: number, end: number) => Promise<Buffer>, totalBytes: number): Promise<BulkHeaderInfo>;
 export declare function loadBulkDatabase(config: {
     totalBytes: number;
     getRange: (start: number, end: number) => Promise<Buffer>;

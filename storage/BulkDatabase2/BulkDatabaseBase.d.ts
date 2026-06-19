@@ -1,11 +1,9 @@
 import type { FileStorage } from "../FileFolderAPI";
 export declare const bulkDatabase2Timing: {
     streamSealAgeMs: number;
-    foldDataAgeMs: number;
-    foldTriggerAgeMs: number;
-    foldCheckIntervalMs: number;
-    cleanupAgeMs: number;
-    cleanupIntervalMs: number;
+    mergeCheckIntervalMs: number;
+    firstMergeTriggerFiles: number;
+    firstMergeTriggerRangeMs: number;
 };
 export interface ReactiveDeps {
     observe(signal: string): void;
@@ -30,13 +28,13 @@ export declare class BulkDatabaseBase<T extends {
     private overlay;
     private streamTimes;
     private streamFileName;
-    private lastCleanup;
-    private lastFoldCheck;
+    private lastMergeCheck;
     private getStreamFileName;
     private invalidateOverlay;
     private setOverlayRow;
     private setOverlayDeleted;
     private reader;
+    private buildReader;
     private syncSetup;
     private localTime;
     private applyRemote;
@@ -51,22 +49,26 @@ export declare class BulkDatabaseBase<T extends {
     updateBatch(entries: (Partial<T> & {
         key: string;
     })[]): Promise<void>;
-    private getValidFiles;
-    private commitManifest;
+    private listFiles;
     private writeBulkFile;
-    private consolidate;
     private loadStreamEntries;
     private orderStreamEntries;
-    private maybeRolloverStream;
+    private maybeMerge;
+    tryMergeNow(): Promise<{
+        merged: boolean;
+        lockFailed: boolean;
+    }>;
     compact(): Promise<void>;
+    merge(timeLo: number, timeHi: number): Promise<void>;
     private makeRawGetRange;
     private loadFileReader;
+    private readBulkHeader;
     private fileLogicalSize;
     private handleUnreadableFile;
-    private mergeFilesBase;
-    private mergeFiles;
-    private mergeFilesLocked;
-    private cleanup;
+    private resolveReaders;
+    private mergeFileSet;
+    private canDeleteStream;
+    private testMerge;
     private formatInfo;
     private patchColumn;
     getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;

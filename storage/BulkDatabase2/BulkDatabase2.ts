@@ -65,6 +65,18 @@ export interface IBulkDatabase2<T extends { key: string }> {
 
     /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
     compact(): Promise<void>;
+
+    /**
+     * Run one merge pass now (the same policy the database runs on a timer): consolidate recent
+     * fragmentation and dedup a key range if it's worth it. Returns whether it merged anything and
+     * whether it bailed because another tab/process holds the merge lock — so a scheduler can call this
+     * (e.g. every 30 minutes) and tell "nothing to do" from "someone else is already merging".
+     */
+    tryMergeNow(): Promise<{ merged: boolean; lockFailed: boolean }>;
+
+    /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
+     * most callers want compact() or tryMergeNow(). */
+    merge(timeLo: number, timeHi: number): Promise<void>;
 }
 
 // mobx-backed reactivity: each signal string gets its own observable box. observe() reads it (so an

@@ -1,62 +1,69 @@
 import { sort } from "socket-function/src/misc";
 import { getTimeUnique } from "socket-function/src/bits";
-import { ABSENT, BaseBulkDatabaseReader, buildFileBuffer, EMPTY_BUFFER, KEY_COLUMN, loadBulkDatabase } from "./BulkDatabaseFormat";
+import { ABSENT, BaseBulkDatabaseReader, buildFileBuffer, BulkHeaderInfo, EMPTY_BUFFER, KEY_COLUMN, loadBulkDatabase, loadBulkHeader, TARGET_FILE_BYTES } from "./BulkDatabaseFormat";
 import { lazy } from "socket-function/src/caching";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import { blue, red } from "socket-function/src/formatting/logColors";
 import { blockCache, encodeCompressedBlocks, GetRange } from "./blockCache";
 import { STREAM_EXTENSION, StreamEntry, frameRows, frameDeletes, parseStream, streamReaderFromEntries } from "./streamLog";
-import { connect as syncConnect, broadcast as syncBroadcast, isSyncSupported, RemoteWrite } from "./syncClient";
-import { Manifest, chooseManifest, isManifestName, manifestFileName, parseManifestStartTime } from "./manifest";
+import { connect as syncConnect, broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, isSyncSupported, RemoteWrite } from "./syncClient";
 import { tryAcquireMergeLock, releaseMergeLock } from "./mergeLock";
 import type { FileStorage } from "../FileFolderAPI";
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// KNOWN BUGS (accepted, documented):
+//
+//  • Inconsistent directory listing under concurrent merges. A read lists the directory, then loads
+//    each listed file. If a file is missing when we go to read it (a merge deleted it), we re-list and
+//    retry — the deleting merge wrote the replacement first, so the data is never gone, just moved.
+//    But a directory listing is not guaranteed atomic on every filesystem: a listing taken while
+//    another writer is mid-swap can in principle return a set of files that never simultaneously
+//    existed (e.g. the replacement but not a sibling it depends on). That yields a momentarily
+//    INCONSISTENT view — some keys may read stale or missing. It does NOT lose data on disk: a reload
+//    (refresh the page) re-lists and resolves correctly. We accept this rather than reintroduce a
+//    manifest; it's rare and OS/filesystem-dependent.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
 
 // BulkDatabase2's compressed-block format is not compatible with BulkDatabase, so it uses its own
 // folder rather than sharing bulkDatabases/.
 const BULK_ROOT_FOLDER = "bulkDatabases2";
 const FILE_EXTENSION = ".bulk";
-// Once this many bulk files pile up we run a merge pass to consolidate small ones (bounded by the
-// byte caps below), so reads don't fan out across an unbounded number of files.
-const MERGE_FILE_COUNT = 8;
-
-// Memory ceiling for a single merge. Files are merged in contiguous (newest-first) runs whose combined
-// LOGICAL (uncompressed) size stays under MERGE_MAX_BYTES, so a merge never reads more than this into
-// memory at once. A file at or above MERGE_MIN_BYTES is "sealed": big enough already, never read back
-// in to be merged again. Sizes are measured uncompressed (from each file's index) because that — not
-// the smaller on-disk compressed size — is what actually lands in memory during a merge.
-const MERGE_MIN_BYTES = 400 * 1024 * 1024;
-const MERGE_MAX_BYTES = 800 * 1024 * 1024;
-
 // A single writeBatch that already exceeds these limits skips the tier-0 stream and folds straight
 // into a bulk file (streaming thousands of rows one frame at a time would be pointless).
 const ROLLOVER_ROWS = 5000;
 const ROLLOVER_BYTES = 5 * 1024 * 1024;
 
-// An unreadable file might be a write that is still in progress (another thread), so we can't delete
-// it on sight. Once it has been unreadable for longer than this (by its filename timestamp), no
-// writer is plausibly still working on it, so we delete it. Until then we just warn.
+// An unreadable (corrupt/torn, not merely missing) file might be a write still in progress, so we
+// can't delete it on sight. Once it's been unreadable for longer than this (by its name timestamp),
+// no writer is plausibly still working on it, so we delete it. Until then we just warn.
 const STALE_DELETE_MS = 24 * 60 * 60 * 1000;
 
-// All the time thresholds, mutable so tests can shrink them from hours to milliseconds. The ordering
-// invariant relies on: streamSealAgeMs < foldDataAgeMs (a file is sealed well before it's foldable),
-// and foldTriggerAgeMs >= foldDataAgeMs.
+// A read lists the directory then loads each file; if a file vanished (a merge deleted it) we re-list
+// and retry, since the merge wrote the replacement first. Bounded so a pathological merge storm can't
+// loop forever — after this many tries we load whatever's currently there (the documented inconsistent
+// -view bug), which a later reload resolves.
+const MAX_READ_ATTEMPTS = 8;
+
+// The first ("consolidate recent") merge accumulates the newest files up to this many bytes into one
+// file (half the target, so it has room to grow before it needs splitting). The key-stratified second
+// merge groups keys into runs of this many bytes and only rewrites a group whose fraction of duplicate
+// (multi-file) keys exceeds DUP_THRESHOLD — i.e. only when deduping actually buys enough.
+const FIRST_MERGE_BYTES = TARGET_FILE_BYTES / 2;
+const KEY_GROUP_BYTES = 800 * 1024 * 1024;
+const DUP_THRESHOLD = 0.4;
+
+// Time thresholds, mutable so tests can shrink them from hours to milliseconds.
 export const bulkDatabase2Timing = {
-    // A writer stops appending to its current stream file once it's this old (starts a fresh one), so no
-    // file is ever appended to past this age.
+    // A writer stops appending to its current stream file once it's this old (starts a fresh one). A
+    // stream file older than this is therefore safe for a merge to delete: its writer has provably moved
+    // on to a new file and will never append to it again.
     streamSealAgeMs: 10 * 60 * 60 * 1000,
-    // A fold reads every stream file CREATED longer ago than this (all sealed, with margin), and moves
-    // only the entries whose WRITE-TIME is older than this into bulk; newer entries are re-streamed.
-    // This single cutoff is what keeps every bulk write strictly older than every stream write.
-    foldDataAgeMs: 12 * 60 * 60 * 1000,
-    // We don't bother folding until some stream file is older than this (fold in big infrequent batches).
-    foldTriggerAgeMs: 36 * 60 * 60 * 1000,
-    // Per-instance throttle on how often we scan to see whether a fold is due.
-    foldCheckIntervalMs: 5 * 1000,
-    // How long a superseded/orphaned/old-manifest file must sit before cleanup deletes it (by its name
-    // timestamp) — long enough that any reader still on an older manifest has finished.
-    cleanupAgeMs: 60 * 1000,
-    // Per-instance throttle on cleanup scans.
-    cleanupIntervalMs: 10 * 1000,
+    // Per-instance throttle: a write triggers at most one background testMerge scan per this interval.
+    mergeCheckIntervalMs: 30 * 60 * 1000,
+    // The first merge fires when the recent (up to FIRST_MERGE_BYTES) files number more than this...
+    firstMergeTriggerFiles: 20,
+    // ...or span a wider write-time range than this (data trickling in slowly still gets consolidated).
+    firstMergeTriggerRangeMs: 3 * 24 * 60 * 60 * 1000,
 };
 
 // Marks a key as deleted in the in-memory overlay.
@@ -157,6 +164,12 @@ function parseFileName(fileName: string): BulkFileInfo | undefined {
     return { fileName, level, timestamp };
 }
 
+// A file we listed is gone now (a concurrent merge deleted it after writing its replacement). Distinct
+// from a corrupt/torn file: missing => the data moved, so re-list and retry; corrupt => skip the file.
+class MissingFileError extends Error { }
+// Thrown out of a read build when a listed file went missing mid-load, so the build re-lists and retries.
+class FilesChangedError extends Error { }
+
 // All of BulkDatabase2's behavior, with no dependency on mobx or on a particular storage backend.
 // Reactivity is delegated to the injected ReactiveDeps and storage to the injected StorageFactory.
 export class BulkDatabaseBase<T extends { key: string }> {
@@ -189,8 +202,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // This instance's tier-0 stream file. Each instance (≈ each thread/tab) streams to its own file
     // so concurrent writers never touch the same file.
     private streamFileName: string | undefined;
-    private lastCleanup = 0;
-    private lastFoldCheck = 0;
+    // Seeded to construction time (not 0) so a fresh instance doesn't immediately seal+merge on its very
+    // first write — the first background merge check waits a full interval after construction.
+    private lastMergeCheck = Date.now();
     private getStreamFileName(): string {
         // Seal (stop appending to) our current file once it's old enough, so no file is ever appended
         // to past the seal age — that's what lets a consolidation safely fold it once it's aged out.
@@ -225,23 +239,43 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     private reader = lazy(async (): Promise<ResolvedReader> => {
+        // A merge can delete a file between our directory listing and our read of it. The merge wrote the
+        // replacement first, so the data isn't gone — it just moved to a file our stale listing didn't
+        // include. So on a missing file we re-list and rebuild. Bounded; the last attempt tolerates a
+        // missing file (loads whatever is there — the documented inconsistent-view bug, fixed by reload).
         let start = Date.now();
-        const { bulkFiles, streamFiles } = await this.getValidFiles();
-        // Load everything in parallel: each bulk file's columnar reader, plus all streamed entries.
-        // A corrupt/truncated bulk file is skipped with a warning rather than breaking the load or
-        // returning bad values: the write protocol always writes a new file before removing the old
-        // ones it supersedes, so a partially-written file's data still exists in another file.
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await this.buildReader(start, attempt >= MAX_READ_ATTEMPTS);
+            } catch (e) {
+                if (e instanceof FilesChangedError && attempt < MAX_READ_ATTEMPTS) continue;
+                throw e;
+            }
+        }
+    });
+
+    // One read build over a directory listing. Loads every bulk file's columnar reader plus all streamed
+    // entries, then joins them by write-time. A corrupt/torn bulk file is skipped with a warning (its
+    // data lives in another file). A *missing* file (deleted by a concurrent merge) throws
+    // FilesChangedError so the caller re-lists — unless tolerateMissing, when we proceed without it.
+    private async buildReader(start: number, tolerateMissing: boolean): Promise<ResolvedReader> {
+        const { bulkFiles, streamFiles } = await this.listFiles();
+        let filesChanged = false;
         const [bulkReadersRaw, streamData] = await Promise.all([
             Promise.all(bulkFiles.map(async f => {
                 try {
                     return await this.loadFileReader(f.fileName);
                 } catch (e) {
+                    if (e instanceof MissingFileError) { filesChanged = true; return undefined; }
                     await this.handleUnreadableFile(f, (e as Error).message);
                     return undefined;
                 }
             })),
             this.loadStreamEntries(streamFiles),
         ]);
+        if (streamData.missing) filesChanged = true;
+        if (filesChanged && !tolerateMissing) throw new FilesChangedError();
+
         const bulkReaders = bulkReadersRaw.filter((r): r is BaseBulkDatabaseReader => !!r);
         // The join resolves purely by write-time, so reader order doesn't matter.
         const readers: BaseBulkDatabaseReader[] = [];
@@ -260,9 +294,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (time > 50) {
             console.log(`${blue(`${this.name} loaded`)} in ${red(formatTime(time))} (${blue(formatNumber(joined.rowCount))} rows, ${bulkFiles.length} bulk + ${streamFiles.length} stream files)`);
         }
-        void this.cleanup(); // opportunistic, throttled, fire-and-forget — reads help GC orphans too
         return joined;
-    });
+    }
 
     // Connects to the cross-tab BroadcastChannel (browser only) so writes in other tabs of this
     // collection update our overlay. Runs once; no-op in Node / where BroadcastChannel is unavailable.
@@ -272,7 +305,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private syncSetup = lazy(async () => {
         if (!isSyncSupported()) return;
         await this.reader();
-        let recent = await syncConnect(this.name, write => this.applyRemote(write));
+        // onSeal: a peer is about to fold recent data; drop our current stream file so we stop appending
+        // to it (our next write starts a fresh one), letting the merge fold it whole.
+        let recent = await syncConnect(this.name, write => this.applyRemote(write), () => { this.streamFileName = undefined; });
         for (let write of recent) this.applyRemote(write);
     });
 
@@ -340,7 +375,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             for (const { time, row } of stamped) this.setOverlayRow(row.key as string, row, time);
         });
         for (const { time, row } of stamped) syncBroadcast(this.name, { key: row.key as string, time, value: row });
-        await this.maybeRolloverStream();
+        void this.maybeMerge();
     }
 
     public async delete(key: string): Promise<void> {
@@ -357,7 +392,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             for (const { time, key } of stamped) this.setOverlayDeleted(key, time);
         });
         for (const { time, key } of stamped) syncBroadcast(this.name, { key, time, deleted: true });
-        await this.maybeRolloverStream();
+        void this.maybeMerge();
     }
 
     public async update(entry: Partial<T> & { key: string }): Promise<void> {
@@ -385,172 +420,66 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (present.length) await this.writeBatch(present);
     }
 
-    // Resolves the authoritative on-disk state via manifests (see manifest.ts): valid bulk files
-    // (newest-first) + valid stream files, plus the chosen manifest and the raw name lists the
-    // commit/cleanup paths need. No manifest at all => every bulk file is valid (back-compat). Stream
-    // files are valid unless the chosen manifest lists them as already folded into a bulk file.
-    private async getValidFiles(): Promise<{
-        bulkFiles: BulkFileInfo[];
-        streamFiles: StreamFileInfo[];
-        manifest: Manifest | undefined;
-        manifestName: string | undefined;
-        allBulkNames: string[];
-        allStreamNames: string[];
-        manifestNames: string[];
-    }> {
+    // Lists every bulk + stream file currently on disk (no manifest — every file is part of the
+    // database). Bulk newest-first, streams oldest-first. Duplicate data (from a crashed/raced merge)
+    // is harmless: reads resolve by write-time and a later merge with enough duplication removes it.
+    private async listFiles(): Promise<{ bulkFiles: BulkFileInfo[]; streamFiles: StreamFileInfo[] }> {
         const storage = await this.storage();
         const names = await storage.getKeys();
-        const manifestNames: string[] = [];
-        const allBulkNames: string[] = [];
-        const allStreamNames: string[] = [];
+        const bulkFiles: BulkFileInfo[] = [];
+        const streamFiles: StreamFileInfo[] = [];
         for (const n of names) {
-            if (isManifestName(n)) manifestNames.push(n);
-            else if (n.endsWith(FILE_EXTENSION)) allBulkNames.push(n);
-            else if (n.endsWith(STREAM_EXTENSION)) allStreamNames.push(n);
+            if (n.endsWith(FILE_EXTENSION)) { const p = parseFileName(n); if (p) bulkFiles.push(p); }
+            else if (n.endsWith(STREAM_EXTENSION)) { const p = parseStreamFileName(n); if (p) streamFiles.push(p); }
         }
-        const parsed = (await Promise.all(manifestNames.map(async name => {
-            try {
-                const buf = await storage.get(name);
-                if (!buf) return undefined;
-                return { name, manifest: JSON.parse(buf.toString("utf8")) as Manifest };
-            } catch {
-                return undefined; // torn/corrupt/half-written manifest — ignore it
-            }
-        }))).filter((m): m is { name: string; manifest: Manifest } => !!m);
-        const chosen = chooseManifest(parsed);
-
-        let validBulkNames: string[];
-        if (!chosen) {
-            validBulkNames = allBulkNames;
-        } else {
-            const valid = new Set(chosen.manifest.validBulkFiles);
-            validBulkNames = allBulkNames.filter(n => valid.has(n));
-        }
-        const ignored = new Set(chosen?.manifest.ignoredStreamFiles || []);
-        const validStreamNames = allStreamNames.filter(n => !ignored.has(n));
-
-        const bulkFiles = validBulkNames.flatMap(n => { const p = parseFileName(n); return p ? [p] : []; });
         // Newest-first by timestamp; ties broken by file name for determinism.
         bulkFiles.sort((a, b) => {
             if (a.timestamp !== b.timestamp) return b.timestamp - a.timestamp;
             return a.fileName < b.fileName && 1 || a.fileName > b.fileName && -1 || 0;
         });
-        const streamFiles = validStreamNames.flatMap(n => { const p = parseStreamFileName(n); return p ? [p] : []; });
         sort(streamFiles, f => f.timestamp);
-
-        return { bulkFiles, streamFiles, manifest: chosen?.manifest, manifestName: chosen?.name, allBulkNames, allStreamNames, manifestNames };
+        return { bulkFiles, streamFiles };
     }
 
-    // Writes a brand-new manifest (never clobbering an existing one) capturing the full valid state.
-    private async commitManifest(startTime: number, readFiles: string[], validBulkFiles: string[], ignoredStreamFiles: string[]): Promise<void> {
-        const storage = await this.storage();
-        const manifest: Manifest = { startTime, validBulkFiles, ignoredStreamFiles, readFiles };
-        await storage.set(manifestFileName(startTime, writerId, nextCounter()), Buffer.from(JSON.stringify(manifest), "utf8"));
-    }
-
-    // Writes `rows` directly as bulk file(s), stamped with the current time as their data range (the rows
-    // are being written now). Used by the large-batch write path. Commits a new manifest adding them to
-    // the valid set. The rows carry time=now, so the join orders them correctly against any older stream
-    // entry for the same key (newer time wins) — no clobber.
+    // Writes `rows` directly as bulk file(s), stamped with the current time as their write-time (the rows
+    // are being written now). Used by the large-batch write path: no manifest, just new files on disk.
+    // The rows carry time=now, so the join orders them correctly against any older stream entry for the
+    // same key (newer time wins) — no clobber. A later testMerge consolidates them.
     private async writeBulkFile(rows: Record<string, unknown>[]): Promise<void> {
         const storage = await this.storage();
-        const startTime = nextFileTime();
-        const view = await this.getValidFiles();
+        const timestamp = nextFileTime();
         const now = Date.now();
         const times = rows.map(() => now);
-        const newBulkNames: string[] = [];
         for (const buffer of buildFileBuffer(rows, times)) {
-            const name = newFileName(startTime);
+            const name = newFileName(timestamp);
             await storage.set(name, encodeCompressedBlocks(buffer));
-            newBulkNames.push(name);
         }
-        const validBulkFiles = view.bulkFiles.map(f => f.fileName).concat(newBulkNames);
-        const readFiles = [...view.allBulkNames, ...view.allStreamNames, ...view.manifestNames];
-        await this.commitManifest(startTime, readFiles, validBulkFiles, view.manifest?.ignoredStreamFiles || []);
         this.resetReader();
-        if (validBulkFiles.length >= MERGE_FILE_COUNT) {
-            while (await this.mergeFiles() > 0) { /* consolidate accumulated bulk files */ }
-        }
-        await this.cleanup();
-    }
-
-    // Fold. Reads every stream file CREATED before the cutoff (all sealed, since seal age < fold age),
-    // resolves them into one bulk file carrying each key's latest write-time per row, and re-persists
-    // surviving tombstones to a fresh stream file (so deletes of keys living in older bulk files keep
-    // suppressing them). Because reads resolve by write-time, the folded data needn't be older than the
-    // stream — the join sorts it out — so we just fold whole files, no cutoff split. Folded files are
-    // marked ignored (cleanup deletes them later); the new manifest is the atomic swap.
-    private async consolidate(): Promise<void> {
-        const storage = await this.storage();
-        const startTime = nextFileTime();
-        const view = await this.getValidFiles();
-        const cutoff = Date.now() - bulkDatabase2Timing.foldDataAgeMs;
-        const selected = view.streamFiles.filter(f => f.timestamp < cutoff);
-        if (!selected.length) return;
-        const { entries } = await this.loadStreamEntries(selected);
-        const ordered = this.orderStreamEntries(entries);
-
-        const byKey = new Map<string, Record<string, unknown>>();
-        const byKeyTime = new Map<string, number>();
-        const deleted = new Map<string, number>();
-        for (const e of ordered) {
-            if (e.deletedKey !== undefined) {
-                byKey.delete(e.deletedKey);
-                byKeyTime.delete(e.deletedKey);
-                deleted.set(e.deletedKey, e.time);
-            } else if (e.row) {
-                const key = e.row.key as string;
-                byKey.set(key, { ...byKey.get(key), ...e.row });
-                byKeyTime.set(key, e.time); // ordered ascending, so this ends up the latest write
-                deleted.delete(key);
-            }
-        }
-
-        const newBulkNames: string[] = [];
-        if (byKey.size) {
-            const rows = [...byKey.values()];
-            const times = rows.map(r => byKeyTime.get(r.key as string)!);
-            for (const buffer of buildFileBuffer(rows, times)) {
-                const name = newFileName(startTime);
-                await storage.set(name, encodeCompressedBlocks(buffer));
-                newBulkNames.push(name);
-            }
-        }
-
-        // Surviving tombstones -> a fresh stream file (always valid). Written BEFORE the manifest so the
-        // folded sources are never ignored while their deletes are missing.
-        if (deleted.size) {
-            const carryName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
-            await storage.set(carryName, frameDeletes([...deleted].map(([key, time]) => ({ time, key }))));
-        }
-
-        const validBulkFiles = view.bulkFiles.map(f => f.fileName).concat(newBulkNames);
-        const ignoredStreamFiles = [...new Set([...(view.manifest?.ignoredStreamFiles || []), ...selected.map(f => f.fileName)])];
-        const readFiles = [...view.allBulkNames, ...view.allStreamNames, ...view.manifestNames];
-        await this.commitManifest(startTime, readFiles, validBulkFiles, ignoredStreamFiles);
-        this.resetReader();
-
-        if (validBulkFiles.length >= MERGE_FILE_COUNT) {
-            while (await this.mergeFiles() > 0) { /* consolidate accumulated bulk files */ }
-        }
-        await this.cleanup();
+        void this.maybeMerge();
     }
 
     // Reads and parses every stream file in parallel. Returns per-write entries (each carrying its
-    // unique timestamp + originating file) so callers can order writes globally across files.
-    private async loadStreamEntries(streamFiles: StreamFileInfo[]): Promise<{ entries: { time: number; fileName: string; entry: StreamEntry }[]; totalBytes: number }> {
-        if (!streamFiles.length) return { entries: [], totalBytes: 0 };
+    // unique timestamp + originating file) so callers can order writes globally across files, the
+    // prefix size we read per file (so a merge can verify nothing was appended before deleting it), and
+    // whether any listed file was missing (so a read can re-list and retry — a merge deleted it).
+    private async loadStreamEntries(streamFiles: StreamFileInfo[]): Promise<{ entries: { time: number; fileName: string; entry: StreamEntry }[]; totalBytes: number; missing: boolean; sizes: Map<string, number> }> {
+        const sizes = new Map<string, number>();
+        if (!streamFiles.length) return { entries: [], totalBytes: 0, missing: false, sizes };
         const storage = await this.storage();
+        let missing = false;
         // Read a bounded prefix [0, size) rather than the whole file: a foreign writer may be appending
         // concurrently, and storage.get() errors when the file grows past the size it stat'd. Reading a
         // prefix is tolerant — parseStream stops at the last complete frame, the file stays valid, and a
-        // later read picks up the rest. A file removed out from under us (cleanup) just yields undefined.
+        // later read picks up the rest. A file removed out from under us (a merge) sets `missing`.
         const buffers = await Promise.all(streamFiles.map(async f => {
             try {
                 const info = await storage.getInfo(f.fileName);
-                if (!info || info.size === 0) return undefined;
+                if (!info) { missing = true; return undefined; }
+                sizes.set(f.fileName, info.size);
+                if (info.size === 0) return undefined;
                 return await storage.getRange(f.fileName, { start: 0, end: info.size });
             } catch {
+                missing = true;
                 return undefined;
             }
         }));
@@ -568,7 +497,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 entries.push({ time: entry.time, fileName: streamFiles[i].fileName, entry });
             }
         }
-        return { entries, totalBytes };
+        return { entries, totalBytes, missing, sizes };
     }
 
     // Global mutation order across per-thread files: by unique timestamp, ties broken by file name.
@@ -580,38 +509,77 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return entries.map(e => e.entry);
     }
 
-    // Folding is purely age-driven and done in big infrequent batches: once some stream file is older
-    // than the trigger age, fold everything past the data cutoff. Throttled so we don't scan on every write.
-    private async maybeRolloverStream(): Promise<void> {
+    // Throttled, fire-and-forget after writes: run a background merge check at most once per interval.
+    private async maybeMerge(): Promise<void> {
         const now = Date.now();
-        if (now - this.lastFoldCheck < bulkDatabase2Timing.foldCheckIntervalMs) return;
-        this.lastFoldCheck = now;
-        const { streamFiles } = await this.getValidFiles();
-        if (streamFiles.some(f => now - f.timestamp >= bulkDatabase2Timing.foldTriggerAgeMs)) {
-            await this.consolidate();
+        if (now - this.lastMergeCheck < bulkDatabase2Timing.mergeCheckIntervalMs) return;
+        this.lastMergeCheck = now;
+        try {
+            await this.tryMergeNow();
+        } catch (e) {
+            console.warn(`${this.name}: background merge failed: ${(e as Error).message}`);
         }
     }
 
-    // Consolidate as much as the caps allow: repeatedly merge contiguous non-sealed runs until nothing
-    // more can be combined. Unlike a naive "merge everything into one file", this respects MERGE_MAX_BYTES
-    // so it never loads the whole collection into memory — a multi-GB collection settles into several
-    // capped files (sealed files are left as-is) rather than one giant one.
-    public async compact(): Promise<void> {
-        let merged = false;
-        while (await this.mergeFiles() > 0) merged = true;
-        if (merged) this.resetReader();
+    // Runs one merge pass now (the same one maybeMerge runs on a timer). Returns whether it merged
+    // anything, and whether it bailed because another tab/process holds the merge lock — so a caller
+    // (e.g. a 30-minute scheduler) can tell "nothing to do" from "someone else is doing it".
+    public async tryMergeNow(): Promise<{ merged: boolean; lockFailed: boolean }> {
+        if (!tryAcquireMergeLock(this.name, writerId)) return { merged: false, lockFailed: true };
+        try {
+            return { merged: await this.testMerge(), lockFailed: false };
+        } finally {
+            releaseMergeLock(this.name, writerId);
+        }
     }
 
-    private async makeRawGetRange(fileName: string): Promise<{ rawGetRange: GetRange; size: number } | undefined> {
+    // Full compaction: fold + dedup everything into key-sorted, ~256MB files. Reads the whole collection
+    // into memory (the accepted soft bound), so it's an explicit, occasional call. Deletes consumed bulk
+    // files and any stream file it's safe to (aged, or sealed-and-stable).
+    public async compact(): Promise<void> {
+        if (!tryAcquireMergeLock(this.name, writerId)) return; // someone else is already merging; fine
+        try {
+            syncBroadcastSeal(this.name);
+            this.streamFileName = undefined;
+            const { bulkFiles, streamFiles } = await this.listFiles();
+            if (bulkFiles.length + streamFiles.length >= 1) await this.mergeFileSet(bulkFiles, streamFiles);
+        } finally {
+            releaseMergeLock(this.name, writerId);
+        }
+    }
+
+    // The unified merge entry point: rewrite everything overlapping [timeLo, timeHi] into fresh
+    // key-sorted ~256MB bulk file(s). Selects bulk files by their header time range and stream files by
+    // their (creation .. seal-age) window. If the range reaches the present, first asks peers to seal so
+    // recent stream data is complete. Callers: testMerge (recent / key-group ranges); external callers
+    // can pass any range — older data just produces older files.
+    public async merge(timeLo: number, timeHi: number): Promise<void> {
+        if (timeHi >= Date.now()) { syncBroadcastSeal(this.name); this.streamFileName = undefined; }
+        const { bulkFiles, streamFiles } = await this.listFiles();
+        const headers = await Promise.all(bulkFiles.map(f => this.readBulkHeader(f.fileName)));
+        const selBulk = bulkFiles.filter((f, i) => {
+            const h = headers[i];
+            if (!h) return false;
+            // Old files (no recorded time range) only belong to a merge that reaches back to the start.
+            if (!h.maxTime && !h.minTime) return timeLo <= 0;
+            return h.minTime <= timeHi && h.maxTime >= timeLo;
+        });
+        const selStream = streamFiles.filter(f =>
+            f.timestamp <= timeHi && f.timestamp + bulkDatabase2Timing.streamSealAgeMs >= timeLo);
+        if (selBulk.length + selStream.length < 2) return;
+        await this.mergeFileSet(selBulk, selStream);
+    }
+
+    // Throws MissingFileError (not a generic error) when the file is gone, so callers can distinguish a
+    // file a merge deleted (re-list and retry / skip) from a corrupt one (handle as unreadable).
+    private async makeRawGetRange(fileName: string): Promise<{ rawGetRange: GetRange; size: number }> {
         const storage = await this.storage();
         const info = await storage.getInfo(fileName);
-        if (!info) return undefined;
+        if (!info) throw new MissingFileError(`bulk file ${fileName} is missing`);
         const rawGetRange: GetRange = async (start, end) => {
             if (end <= start) return EMPTY_BUFFER;
             const buf = await storage.getRange(fileName, { start, end });
-            if (!buf) {
-                throw new Error(`Expected range [${start}, ${end}) of ${fileName}, file was missing`);
-            }
+            if (!buf) throw new MissingFileError(`range [${start}, ${end}) of ${fileName} is missing`);
             return buf;
         };
         return { rawGetRange, size: info.size };
@@ -619,9 +587,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
     private async loadFileReader(fileName: string): Promise<BaseBulkDatabaseReader> {
         const raw = await this.makeRawGetRange(fileName);
-        if (!raw) {
-            throw new Error(`Expected bulk file to exist, was missing: ${fileName}`);
-        }
         const fileId = nullJoin(this.name, fileName);
         // Files are immutable and stored as compressed blocks; replace getRange with a block-cached,
         // decompressing version (same interface) and read the logical (uncompressed) size from its
@@ -630,13 +595,25 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange });
     }
 
+    // Reads only a bulk file's header (row count, time range, key range) — no column data — for merge
+    // planning. Returns undefined for a missing/corrupt file so the planner just leaves it out.
+    private async readBulkHeader(fileName: string): Promise<BulkHeaderInfo | undefined> {
+        try {
+            const raw = await this.makeRawGetRange(fileName);
+            const fileId = nullJoin(this.name, fileName);
+            const opened = await blockCache.open(fileId, raw.size, raw.rawGetRange);
+            return await loadBulkHeader(opened.getRange, opened.uncompressedSize);
+        } catch {
+            return undefined;
+        }
+    }
+
     // Logical (uncompressed) size of a bulk file, read from its (cached) index without loading data.
     // Used by the merge planner to bound how much it reads at once. Returns undefined for a file that's
     // missing or unreadable so the planner simply leaves it out of any merge.
     private async fileLogicalSize(fileName: string): Promise<number | undefined> {
         try {
             const raw = await this.makeRawGetRange(fileName);
-            if (!raw) return undefined;
             const fileId = nullJoin(this.name, fileName);
             const opened = await blockCache.open(fileId, raw.size, raw.rawGetRange);
             return opened.uncompressedSize;
@@ -665,16 +642,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
         console.warn(`${this.name}: skipping unreadable bulk file ${file.fileName} (recent — may be an in-progress write): ${message}`);
     }
 
-    // Merges exactly the files it's given, returning the new file name(s). It does NOT delete the inputs
-    // or write a manifest — the caller (mergeFiles) commits one manifest for the whole pass. The merge is
-    // per-COLUMN by write-TIME: for each key, each column takes the value with the newest write-time
-    // across the merged files (non-ABSENT), and the output row's time is the newest of those — so the
-    // merge preserves correct time-resolution (only collapsing per-column times within a single output
-    // row, the accepted per-row corner). The caller keeps the input under MERGE_MAX_BYTES.
-    private async mergeFilesBase(files: BulkFileInfo[], timestamp: number): Promise<string[]> {
-        const storage = await this.storage();
-        const readers = await Promise.all(files.map(f => this.loadFileReader(f.fileName)));
-
+    // Resolves a set of readers (stream + bulk) by ACTUAL write-time into merged rows + per-row times,
+    // plus the surviving tombstones (keys whose newest event is a delete). For each key/column, the
+    // value with the newest write-time across readers wins (non-ABSENT); the row's time is the newest of
+    // those. A key is deleted iff its newest delete is newer than its newest set. This is the same
+    // time-resolution reads use, captured so a merge can write the result back as bulk + a carry stream.
+    private async resolveReaders(readers: BaseBulkDatabaseReader[]): Promise<{ rows: Record<string, unknown>[]; times: number[]; deletes: Map<string, number> }> {
         const loaded = await Promise.all(readers.map(async reader => {
             const cols = new Map<string, Map<string, { value: unknown; time: number }>>();
             for (const col of reader.columns) {
@@ -682,21 +655,36 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 const entries = await reader.getColumn(col.column);
                 cols.set(col.column, new Map(entries.map(e => [e.key, { value: e.value, time: e.time }])));
             }
-            return { keyTimes: reader.keyTimes, cols };
+            return { keyTimes: reader.keyTimes, deleteTimes: reader.deleteTimes, cols };
         }));
 
-        const allKeys = new Set<string>();
-        const allCols = new Set<string>();
+        const deleteTime = new Map<string, number>();
         for (const l of loaded) {
-            for (const k of l.keyTimes.keys()) allKeys.add(k);
-            for (const c of l.cols.keys()) allCols.add(c);
+            if (!l.deleteTimes) continue;
+            for (const [k, t] of l.deleteTimes) deleteTime.set(k, Math.max(deleteTime.get(k) ?? -Infinity, t));
         }
+        const keyTime = new Map<string, number>();
+        for (const l of loaded) {
+            for (const [k, t] of l.keyTimes) keyTime.set(k, Math.max(keyTime.get(k) ?? -Infinity, t));
+        }
+        const allCols = new Set<string>();
+        for (const l of loaded) for (const c of l.cols.keys()) allCols.add(c);
 
-        const mergedRows: Record<string, unknown>[] = [];
-        const mergedTimes: number[] = [];
+        const rows: Record<string, unknown>[] = [];
+        const times: number[] = [];
+        const deletes = new Map<string, number>();
+        const allKeys = new Set<string>([...keyTime.keys(), ...deleteTime.keys()]);
         for (const key of allKeys) {
+            const setT = keyTime.get(key) ?? -Infinity;
+            const delT = deleteTime.get(key) ?? -Infinity;
+            if (setT <= delT) {
+                // The newest event for this key is a delete — carry the tombstone forward so it keeps
+                // suppressing any older set living in a file outside this merge.
+                if (delT > -Infinity) deletes.set(key, delT);
+                continue;
+            }
             const row: Record<string, unknown> = { [KEY_COLUMN]: key };
-            let rowTime = -Infinity;
+            let rowTime = setT;
             for (const col of allCols) {
                 let bestTime = -Infinity;
                 let bestVal: unknown;
@@ -708,121 +696,186 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 }
                 if (found) { row[col] = bestVal; if (bestTime > rowTime) rowTime = bestTime; }
             }
-            for (const l of loaded) { const t = l.keyTimes.get(key); if (t !== undefined && t > rowTime) rowTime = t; }
-            mergedRows.push(row);
-            mergedTimes.push(rowTime === -Infinity ? 0 : rowTime);
+            rows.push(row);
+            times.push(rowTime === -Infinity ? 0 : rowTime);
         }
-
-        const names: string[] = [];
-        for (const buffer of buildFileBuffer(mergedRows, mergedTimes)) {
-            const name = newFileName(timestamp);
-            await storage.set(name, encodeCompressedBlocks(buffer));
-            names.push(name);
-        }
-        return names;
+        return { rows, times, deletes };
     }
 
-    // The cap-aware merge planner. Walks the valid files newest-first and merges contiguous runs of
-    // non-sealed files, each run capped at MERGE_MAX_BYTES of LOGICAL size so a single merge never
-    // loads more than that into memory. A file at/over MERGE_MIN_BYTES is sealed (left untouched) and
-    // breaks the run, as does an unreadable file. The whole pass is committed as ONE new manifest:
-    // valid bulk = (old valid - consumed) + merged outputs; the consumed files are left on disk for
-    // cleanup. Returns the number of runs merged (0 means nothing left to consolidate).
-    private async mergeFiles(): Promise<number> {
-        // Best-effort cross-tab lock: if another tab is already merging, skip — the manifest backstop
-        // keeps us correct, and we'd only be racing to orphan each other's output. No-op in Node.
-        if (!tryAcquireMergeLock(this.name, writerId)) return 0;
-        try {
-            return await this.mergeFilesLocked();
-        } finally {
-            releaseMergeLock(this.name, writerId);
-        }
-    }
-
-    private async mergeFilesLocked(): Promise<number> {
-        const startTime = nextFileTime();
-        const view = await this.getValidFiles();
-        const files = view.bulkFiles;
-        const sizes = await Promise.all(files.map(f => this.fileLogicalSize(f.fileName)));
-
-        const batches: BulkFileInfo[][] = [];
-        let batch: BulkFileInfo[] = [];
-        let batchBytes = 0;
-        const flush = () => {
-            // A run of one file is pointless to "merge" — only consolidate when there are at least two.
-            if (batch.length >= 2) batches.push(batch);
-            batch = [];
-            batchBytes = 0;
-        };
-        for (let i = 0; i < files.length; i++) {
-            const size = sizes[i];
-            if (size === undefined || size >= MERGE_MIN_BYTES) {
-                flush();
-                continue;
-            }
-            if (batch.length && batchBytes + size > MERGE_MAX_BYTES) flush();
-            batch.push(files[i]);
-            batchBytes += size;
-        }
-        flush();
-        if (!batches.length) return 0;
-
-        const removed = new Set<string>();
-        const newBulkNames: string[] = [];
-        for (const runFiles of batches) {
-            // batch[0] is the newest file in each (newest-first) run, so its timestamp is the run's slot.
-            const produced = await this.mergeFilesBase(runFiles, runFiles[0].timestamp);
-            for (const f of runFiles) removed.add(f.fileName);
-            newBulkNames.push(...produced);
-        }
-        const validBulkFiles = files.map(f => f.fileName).filter(n => !removed.has(n)).concat(newBulkNames);
-        const ignoredStreamFiles = view.manifest?.ignoredStreamFiles || [];
-        const readFiles = [...view.allBulkNames, ...view.allStreamNames, ...view.manifestNames];
-        await this.commitManifest(startTime, readFiles, validBulkFiles, ignoredStreamFiles);
-        this.resetReader();
-        await this.cleanup();
-        return batches.length;
-    }
-
-    // Deletes files no longer referenced by the authoritative manifest that have sat long enough that
-    // no reader still resolving an older manifest needs them: superseded/orphaned bulk files,
-    // folded-away (ignored) stream files, and every manifest but the newest. Age-gated by each file's
-    // own name timestamp and throttled per instance. Best-effort — a failed remove (another writer beat
-    // us to it) is ignored. We never delete a file whose name we can't parse for an age.
-    private async cleanup(): Promise<void> {
+    // The one merge primitive. Reads the given bulk + stream files (skipping any that vanished or won't
+    // parse — their data lives elsewhere), resolves them by write-time, writes the result back as fresh
+    // key-sorted ~256MB bulk file(s) plus a carry stream for surviving tombstones, THEN deletes the
+    // inputs it consumed. Output is always written before any delete, so a crash leaves duplicates (next
+    // merge removes them), never a gap. A bulk file is deleted only if we actually read it; a stream file
+    // only if it's aged out (its writer has switched files) or — when cross-tab sync sealed it — its size
+    // didn't change while we read it. Returns whether it produced anything.
+    private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[]): Promise<boolean> {
+        const storage = await this.storage();
+        const timestamp = nextFileTime();
         const now = Date.now();
-        if (now - this.lastCleanup < bulkDatabase2Timing.cleanupIntervalMs) return;
-        this.lastCleanup = now;
-        // Best-effort and must never throw: it runs fire-and-forget from reads, and the directory could
-        // even be removed out from under us (e.g. the collection is being deleted) mid-scan.
-        try {
-            const storage = await this.storage();
-            const view = await this.getValidFiles();
-            const validBulk = new Set(view.bulkFiles.map(f => f.fileName));
-            const validStream = new Set(view.streamFiles.map(f => f.fileName));
-            const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
 
-            for (const name of view.allBulkNames) {
-                if (validBulk.has(name)) continue;
-                const info = parseFileName(name);
-                if (!info || now - info.timestamp < bulkDatabase2Timing.cleanupAgeMs) continue;
-                await remove(name);
+        const consumedBulk: BulkFileInfo[] = [];
+        const bulkReaders: BaseBulkDatabaseReader[] = [];
+        await Promise.all(bulkFiles.map(async f => {
+            try {
+                const r = await this.loadFileReader(f.fileName);
+                bulkReaders.push(r);
+                consumedBulk.push(f); // only files we actually read are safe to delete afterwards
+            } catch { /* missing or corrupt — skip; its data lives in another file */ }
+        }));
+
+        const streamData = await this.loadStreamEntries(streamFiles);
+        const ordered = this.orderStreamEntries(streamData.entries);
+        const streamReader = ordered.length ? streamReaderFromEntries(ordered, 0).reader : undefined;
+
+        const readers = streamReader ? [streamReader, ...bulkReaders] : bulkReaders;
+        if (!readers.length) return false;
+
+        const { rows, times, deletes } = await this.resolveReaders(readers);
+
+        // Write all outputs BEFORE deleting any input, so a throw mid-write just leaves duplicates.
+        const newNames: string[] = [];
+        if (rows.length) {
+            for (const buffer of buildFileBuffer(rows, times)) {
+                const name = newFileName(timestamp);
+                await storage.set(name, encodeCompressedBlocks(buffer));
+                newNames.push(name);
             }
-            for (const name of view.allStreamNames) {
-                if (validStream.has(name)) continue;
-                const info = parseStreamFileName(name);
-                if (!info || now - info.timestamp < bulkDatabase2Timing.cleanupAgeMs) continue;
-                await remove(name);
-            }
-            for (const name of view.manifestNames) {
-                if (name === view.manifestName) continue;
-                const startTime = parseManifestStartTime(name);
-                if (startTime === undefined || now - startTime < bulkDatabase2Timing.cleanupAgeMs) continue;
-                await remove(name);
-            }
-        } catch {
-            // ignore — cleanup is opportunistic; the next pass will catch up
         }
+        if (deletes.size) {
+            const carryName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
+            await storage.set(carryName, frameDeletes([...deletes].map(([key, time]) => ({ time, key }))));
+        }
+
+        const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
+        for (const f of consumedBulk) await remove(f.fileName);
+        for (const f of streamFiles) {
+            if (await this.canDeleteStream(f, now, streamData.sizes)) await remove(f.fileName);
+        }
+
+        this.resetReader();
+        return newNames.length > 0 || deletes.size > 0;
+    }
+
+    // A stream file is safe to delete iff no writer will ever append to it again: it's aged past the seal
+    // age (its writer has provably started a fresh file), OR cross-tab sync is active (so the seal we
+    // broadcast reached peers) and its size hasn't changed since we read it (nothing was appended during
+    // the merge). When neither holds we leave it: its data is now duplicated into bulk (resolved by time)
+    // and a later merge deletes it once aged. (Recreate-on-append means even a wrong delete wouldn't lose
+    // data, but the aged check also rules out the rare sparse-offset append race.)
+    private async canDeleteStream(f: StreamFileInfo, now: number, sizes: Map<string, number>): Promise<boolean> {
+        if (now - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs) return true;
+        if (!isSyncSupported()) return false;
+        const readSize = sizes.get(f.fileName);
+        if (readSize === undefined) return false;
+        let info;
+        try { info = await (await this.storage()).getInfo(f.fileName); } catch { return false; }
+        return !!info && info.size === readSize;
+    }
+
+    // The merge policy. Up to two passes:
+    //  1) Consolidate recent fragmentation: take the newest files up to ~FIRST_MERGE_BYTES and, if they
+    //     number more than firstMergeTriggerFiles or span more than firstMergeTriggerRangeMs, merge them
+    //     into one file. Seals first so recent stream data is complete; in Node (no cross-tab seal) only
+    //     aged streams are folded, so we never re-fold the same un-deletable stream forever.
+    //  2) Key-stratify: sort all keys, walk them in ~KEY_GROUP_BYTES groups, and rewrite the single group
+    //     whose fraction of duplicate (multi-file) keys is highest above DUP_THRESHOLD — merging every
+    //     bulk file overlapping that key range. Over time this sorts the data into key-disjoint files.
+    // Returns whether either pass merged anything.
+    private async testMerge(): Promise<boolean> {
+        let merged = false;
+
+        // ── Pass 1: consolidate recent files. ──
+        // Only seal (ask peers + ourselves to abandon current stream files) when cross-tab sync can
+        // actually fold recent streams; in Node it would just churn — fragmenting streams every pass for
+        // no benefit, since canDeleteStream there only deletes aged files anyway.
+        const foldRecentStreams = isSyncSupported(); // see canDeleteStream: else we'd re-fold forever
+        if (foldRecentStreams) {
+            syncBroadcastSeal(this.name);
+            this.streamFileName = undefined; // seal our own current stream so its recent data is complete
+        }
+        {
+            const { bulkFiles, streamFiles } = await this.listFiles();
+            const bulkMeta = await Promise.all(bulkFiles.map(async f => {
+                const [size, header] = await Promise.all([this.fileLogicalSize(f.fileName), this.readBulkHeader(f.fileName)]);
+                return { kind: "bulk" as const, file: f, bytes: size ?? 0, time: header?.maxTime || f.timestamp };
+            }));
+            const streamMeta: { kind: "stream"; file: StreamFileInfo; bytes: number; time: number }[] = [];
+            for (const f of streamFiles) {
+                const aged = Date.now() - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs;
+                if (!foldRecentStreams && !aged) continue;
+                let bytes = 0;
+                try { const info = await (await this.storage()).getInfo(f.fileName); bytes = info?.size ?? 0; } catch { bytes = 0; }
+                streamMeta.push({ kind: "stream", file: f, bytes, time: f.timestamp });
+            }
+            const items = [...bulkMeta, ...streamMeta].sort((a, b) => b.time - a.time);
+            const recent: typeof items = [];
+            let recentBytes = 0;
+            for (const it of items) {
+                recent.push(it);
+                recentBytes += it.bytes;
+                if (recentBytes >= FIRST_MERGE_BYTES) break;
+            }
+            const span = recent.length ? recent[0].time - recent[recent.length - 1].time : 0;
+            const triggered = recent.length >= 2
+                && (recent.length > bulkDatabase2Timing.firstMergeTriggerFiles || span > bulkDatabase2Timing.firstMergeTriggerRangeMs);
+            if (triggered) {
+                const rb = recent.filter(i => i.kind === "bulk").map(i => (i.file as BulkFileInfo));
+                const rs = recent.filter(i => i.kind === "stream").map(i => (i.file as StreamFileInfo));
+                if (await this.mergeFileSet(rb, rs)) merged = true;
+            }
+        }
+
+        // ── Pass 2: key-stratify the bulk files to remove duplication. ──
+        {
+            const { bulkFiles } = await this.listFiles();
+            if (bulkFiles.length >= 2) {
+                const infos = await Promise.all(bulkFiles.map(async f => {
+                    try {
+                        const reader = await this.loadFileReader(f.fileName);
+                        const keys = reader.keys;
+                        let min = keys[0], max = keys[0];
+                        for (const k of keys) { if (k < min) min = k; if (k > max) max = k; }
+                        return { file: f, keys, bytes: reader.totalBytes, min, max };
+                    } catch {
+                        return { file: f, keys: [] as string[], bytes: 0, min: undefined as string | undefined, max: undefined as string | undefined };
+                    }
+                }));
+                const usable = infos.filter(i => i.keys.length > 0);
+                const keyCount = new Map<string, number>();
+                let totalSlots = 0, totalBytes = 0;
+                for (const i of usable) {
+                    totalBytes += i.bytes;
+                    for (const k of i.keys) { keyCount.set(k, (keyCount.get(k) || 0) + 1); totalSlots++; }
+                }
+                if (totalSlots > 0) {
+                    const bytesPerSlot = totalBytes / totalSlots;
+                    const sortedKeys = [...keyCount.keys()].sort();
+                    // Walk sorted keys forming ~KEY_GROUP_BYTES groups; remember the group with the highest
+                    // duplicate fraction over the threshold (the most benefit), then merge its files.
+                    let best: { lo: string; hi: string; dup: number } | undefined;
+                    let gStart = 0, gBytes = 0, gSlots = 0, gUnique = 0;
+                    for (let i = 0; i < sortedKeys.length; i++) {
+                        const c = keyCount.get(sortedKeys[i])!;
+                        gBytes += c * bytesPerSlot; gSlots += c; gUnique += 1;
+                        if (gBytes >= KEY_GROUP_BYTES || i === sortedKeys.length - 1) {
+                            const dup = (gSlots - gUnique) / gSlots;
+                            if (dup > DUP_THRESHOLD && (!best || dup > best.dup)) best = { lo: sortedKeys[gStart], hi: sortedKeys[i], dup };
+                            gStart = i + 1; gBytes = 0; gSlots = 0; gUnique = 0;
+                        }
+                    }
+                    if (best) {
+                        const lo = best.lo, hi = best.hi;
+                        const groupFiles = usable
+                            .filter(i => i.min !== undefined && i.max !== undefined && i.min <= hi && i.max >= lo)
+                            .map(i => i.file);
+                        if (groupFiles.length >= 2 && await this.mergeFileSet(groupFiles, [])) merged = true;
+                    }
+                }
+            }
+        }
+
+        return merged;
     }
 
     private formatInfo(reader: ResolvedReader): string {

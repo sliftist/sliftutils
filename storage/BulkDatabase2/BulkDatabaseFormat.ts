@@ -51,10 +51,15 @@ type FileHeader = {
     rowCount: number;
     columns: { name: string; offset: number; length: number }[];
     // Oldest/newest write-time of the data in this file (from the stream entries it was folded from,
-    // carried through merges). Lets the reader order bulk files by actual data recency and lets merges
-    // assert that two files' time ranges never overlap. Absent (0) in files written before this existed.
+    // carried through merges). Lets the merge planner pick files overlapping a time range. Absent (0)
+    // in files written before this existed.
     minTime?: number;
     maxTime?: number;
+    // Lexicographically smallest/largest key in this file (rows are stored key-sorted). Lets the merge
+    // planner group/dedup by key range and lets a single-key read skip files whose range excludes the
+    // key. Absent (undefined) in files written before this existed — treated as "spans all keys".
+    minKey?: string;
+    maxKey?: string;
 };
 
 function encodeValue(value: unknown): { type: number; bytes: Buffer } {
@@ -155,12 +160,12 @@ function decodeBulkData(blob: Buffer, rowCount: number): unknown[] {
     return values;
 }
 
-// Past this estimated logical size a single rows array is split across multiple files, so no one
-// file (and therefore no single column blob, and no single Buffer.concat) ever approaches the
-// ~2GB Buffer length limit. The cap is deliberately the same as the merge cap: 800MB is the most
-// we'll ever hold for one file. The estimate is rough on purpose — it only needs to keep each
-// chunk comfortably under the limit, not be exact.
-const FILE_SPLIT_BYTES = 800 * 1024 * 1024;
+// Target logical (uncompressed) size of one bulk file. A rows array bigger than this is split across
+// multiple key-contiguous files, so files stay around this size (the merge policy's target) and no
+// single column blob / Buffer.concat ever approaches the ~2GB Buffer length limit. The estimate is
+// rough on purpose — it only needs to keep each chunk near the target, not be exact. A single row
+// bigger than the target still becomes its own (oversized) file, since we never split within a key.
+export const TARGET_FILE_BYTES = 256 * 1024 * 1024;
 
 // Per-value on-disk overhead: a 4-byte offset entry plus a 1-byte type tag.
 const PER_VALUE_OVERHEAD = 5;
@@ -207,42 +212,61 @@ function buildOneFile(rows: Record<string, unknown>[], times: number[]): Buffer 
     let minTime = times.length ? times[0] : 0;
     let maxTime = minTime;
     for (const t of times) { if (t < minTime) minTime = t; if (t > maxTime) maxTime = t; }
-    const header: FileHeader = { rowCount: rows.length, columns, minTime, maxTime };
+    let minKey: string | undefined;
+    let maxKey: string | undefined;
+    for (const row of rows) {
+        const key = row[KEY_COLUMN] as string;
+        if (minKey === undefined || key < minKey) minKey = key;
+        if (maxKey === undefined || key > maxKey) maxKey = key;
+    }
+    const header: FileHeader = { rowCount: rows.length, columns, minTime, maxTime, minKey, maxKey };
     const headerBuf = Buffer.from(JSON.stringify(header), "utf8");
     const lengthPrefix = Buffer.alloc(4);
     lengthPrefix.writeUInt32LE(headerBuf.length, 0);
     return Buffer.concat([lengthPrefix, headerBuf, ...blobs]);
 }
 
-// Returns one complete, independent file buffer per chunk of rows. When the caller hands us more
-// rows than fit comfortably in one file we partition by row range — each returned buffer is exactly
-// what buildOneFile would produce if called with that subset, so the chunks have disjoint keys and
-// the caller just writes each as its own file. A normal-sized write returns a single buffer.
+// Returns one complete, independent file buffer per chunk of rows. Rows are first sorted by key, then
+// partitioned into key-contiguous chunks of ~targetBytes each — so every returned file is key-sorted
+// (tight minKey/maxKey for the read-skip + merge planner) and stays near the target size, and no
+// single column blob / Buffer.concat approaches the ~2GB limit. The chunks have disjoint key ranges,
+// so the caller just writes each as its own file. A normal-sized write returns a single buffer.
 // `times[i]` is row i's write-time, stored per row so reads resolve a key to its latest value by time.
-export function buildFileBuffer(rows: Record<string, unknown>[], times: number[]): Buffer[] {
+export function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes = TARGET_FILE_BYTES): Buffer[] {
     if (rows.length === 0) return [buildOneFile([], [])];
+    // Sort rows + their times together by key so each output file is key-contiguous.
+    const order = rows.map((_, i) => i).sort((a, b) => {
+        const ka = rows[a][KEY_COLUMN] as string;
+        const kb = rows[b][KEY_COLUMN] as string;
+        return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+    const sortedRows = order.map(i => rows[i]);
+    const sortedTimes = order.map(i => times[i]);
     const result: Buffer[] = [];
     let chunkStart = 0;
     let chunkBytes = 0;
-    for (let i = 0; i < rows.length; i++) {
-        const rowBytes = estimateRowBytes(rows[i]);
-        if (i > chunkStart && chunkBytes + rowBytes > FILE_SPLIT_BYTES) {
-            result.push(buildOneFile(rows.slice(chunkStart, i), times.slice(chunkStart, i)));
+    for (let i = 0; i < sortedRows.length; i++) {
+        const rowBytes = estimateRowBytes(sortedRows[i]);
+        if (i > chunkStart && chunkBytes + rowBytes > targetBytes) {
+            result.push(buildOneFile(sortedRows.slice(chunkStart, i), sortedTimes.slice(chunkStart, i)));
             chunkStart = i;
             chunkBytes = 0;
         }
         chunkBytes += rowBytes;
     }
-    result.push(buildOneFile(rows.slice(chunkStart), times.slice(chunkStart)));
+    result.push(buildOneFile(sortedRows.slice(chunkStart), sortedTimes.slice(chunkStart)));
     return result;
 }
 
 export type BaseBulkDatabaseReader = {
     rowCount: number;
     totalBytes: number;
-    // Write-time bounds of this reader's data (0 if unknown — old bulk files). Diagnostics only now.
+    // Write-time bounds of this reader's data (0 if unknown — old bulk files).
     minTime: number;
     maxTime: number;
+    // Key-range bounds (undefined for old files / the stream reader — treat as "spans all keys").
+    minKey?: string;
+    maxKey?: string;
     // Keys is special, it's always automatically decoded, even though it is stored as a normal column
     keys: string[];
     columns: { column: string; byteSize: number }[];
@@ -258,6 +282,25 @@ export type BaseBulkDatabaseReader = {
     // The value + write-time for (key, column), or ABSENT if this reader has no such cell.
     getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | typeof ABSENT>;
 };
+
+// Reads just the file header (the 4-byte length + header JSON) — no column data. Used by the merge
+// planner to get each file's row count, time range, and key range cheaply across many files.
+export type BulkHeaderInfo = { rowCount: number; minTime: number; maxTime: number; minKey?: string; maxKey?: string; columns: { column: string; byteSize: number }[] };
+export async function loadBulkHeader(getRange: (start: number, end: number) => Promise<Buffer>, totalBytes: number): Promise<BulkHeaderInfo> {
+    const headerLength = (await getRange(0, 4)).readUInt32LE(0);
+    if (headerLength <= 0 || headerLength > totalBytes) {
+        throw new Error(`Expected header length in (0, ${totalBytes}], was ${headerLength}`);
+    }
+    const header = JSON.parse((await getRange(4, 4 + headerLength)).toString("utf8")) as FileHeader;
+    return {
+        rowCount: header.rowCount,
+        minTime: header.minTime || 0,
+        maxTime: header.maxTime || 0,
+        minKey: header.minKey,
+        maxKey: header.maxKey,
+        columns: header.columns.filter(c => c.name !== TIME_COLUMN).map(c => ({ column: c.name, byteSize: c.length })),
+    };
+}
 
 export async function loadBulkDatabase(config: {
     totalBytes: number;
@@ -300,6 +343,8 @@ export async function loadBulkDatabase(config: {
         totalBytes: config.totalBytes,
         minTime: header.minTime || 0,
         maxTime: header.maxTime || 0,
+        minKey: header.minKey,
+        maxKey: header.maxKey,
         keys,
         keyTimes: new Map(keys.map((key, i) => [key, times[i]])),
         columns: header.columns.filter(c => c.name !== TIME_COLUMN).map(c => ({ column: c.name, byteSize: c.length })),

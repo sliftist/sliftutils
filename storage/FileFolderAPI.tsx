@@ -183,7 +183,12 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
             // Create the file
             await fs.promises.writeFile(filePath, Buffer.alloc(0));
         } else if (!exists) {
-            throw new Error(`File not found: ${filePath}`);
+            // Tag as ENOENT so readWithRetry treats it as a genuinely-missing file (return undefined now)
+            // rather than a transient read failure to retry 6× with backoff — missing files are normal
+            // (a concurrent merge deletes a file mid-read), and retrying them is catastrophically slow.
+            const err = new Error(`File not found: ${filePath}`) as Error & { code?: string };
+            err.code = "ENOENT";
+            throw err;
         }
 
         return new NodeJSFileHandleWrapper(filePath);

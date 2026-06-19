@@ -834,6 +834,19 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         getReaderInfo(): Promise<BulkReaderInfo>;
         /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
         compact(): Promise<void>;
+        /**
+         * Run one merge pass now (the same policy the database runs on a timer): consolidate recent
+         * fragmentation and dedup a key range if it's worth it. Returns whether it merged anything and
+         * whether it bailed because another tab/process holds the merge lock — so a scheduler can call this
+         * (e.g. every 30 minutes) and tell "nothing to do" from "someone else is already merging".
+         */
+        tryMergeNow(): Promise<{
+            merged: boolean;
+            lockFailed: boolean;
+        }>;
+        /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
+         * most callers want compact() or tryMergeNow(). */
+        merge(timeLo: number, timeHi: number): Promise<void>;
     }
     export declare class BulkDatabase2<T extends {
         key: string;
@@ -847,11 +860,9 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     import type { FileStorage } from "../FileFolderAPI";
     export declare const bulkDatabase2Timing: {
         streamSealAgeMs: number;
-        foldDataAgeMs: number;
-        foldTriggerAgeMs: number;
-        foldCheckIntervalMs: number;
-        cleanupAgeMs: number;
-        cleanupIntervalMs: number;
+        mergeCheckIntervalMs: number;
+        firstMergeTriggerFiles: number;
+        firstMergeTriggerRangeMs: number;
     };
     export interface ReactiveDeps {
         observe(signal: string): void;
@@ -876,13 +887,13 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private overlay;
         private streamTimes;
         private streamFileName;
-        private lastCleanup;
-        private lastFoldCheck;
+        private lastMergeCheck;
         private getStreamFileName;
         private invalidateOverlay;
         private setOverlayRow;
         private setOverlayDeleted;
         private reader;
+        private buildReader;
         private syncSetup;
         private localTime;
         private applyRemote;
@@ -897,22 +908,26 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         updateBatch(entries: (Partial<T> & {
             key: string;
         })[]): Promise<void>;
-        private getValidFiles;
-        private commitManifest;
+        private listFiles;
         private writeBulkFile;
-        private consolidate;
         private loadStreamEntries;
         private orderStreamEntries;
-        private maybeRolloverStream;
+        private maybeMerge;
+        tryMergeNow(): Promise<{
+            merged: boolean;
+            lockFailed: boolean;
+        }>;
         compact(): Promise<void>;
+        merge(timeLo: number, timeHi: number): Promise<void>;
         private makeRawGetRange;
         private loadFileReader;
+        private readBulkHeader;
         private fileLogicalSize;
         private handleUnreadableFile;
-        private mergeFilesBase;
-        private mergeFiles;
-        private mergeFilesLocked;
-        private cleanup;
+        private resolveReaders;
+        private mergeFileSet;
+        private canDeleteStream;
+        private testMerge;
         private formatInfo;
         private patchColumn;
         getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
@@ -956,12 +971,15 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     export declare const KEY_COLUMN = "key";
     export declare const EMPTY_BUFFER: Buffer;
     export declare const ABSENT: unique symbol;
-    export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[]): Buffer[];
+    export declare const TARGET_FILE_BYTES: number;
+    export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): Buffer[];
     export type BaseBulkDatabaseReader = {
         rowCount: number;
         totalBytes: number;
         minTime: number;
         maxTime: number;
+        minKey?: string;
+        maxKey?: string;
         keys: string[];
         columns: {
             column: string;
@@ -979,6 +997,18 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
             time: number;
         } | typeof ABSENT>;
     };
+    export type BulkHeaderInfo = {
+        rowCount: number;
+        minTime: number;
+        maxTime: number;
+        minKey?: string;
+        maxKey?: string;
+        columns: {
+            column: string;
+            byteSize: number;
+        }[];
+    };
+    export declare function loadBulkHeader(getRange: (start: number, end: number) => Promise<Buffer>, totalBytes: number): Promise<BulkHeaderInfo>;
     export declare function loadBulkDatabase(config: {
         totalBytes: number;
         getRange: (start: number, end: number) => Promise<Buffer>;
@@ -1004,27 +1034,6 @@ declare module "sliftutils/storage/BulkDatabase2/blockCache" {
         private makeGetRange;
     }
     export declare const blockCache: BlockCache;
-
-}
-
-declare module "sliftutils/storage/BulkDatabase2/manifest" {
-    export declare const MANIFEST_EXTENSION = ".manifest";
-    export type Manifest = {
-        startTime: number;
-        validBulkFiles: string[];
-        ignoredStreamFiles: string[];
-        readFiles: string[];
-    };
-    export declare function isManifestName(name: string): boolean;
-    export declare function manifestFileName(startTime: number, writerId: string, counter: number): string;
-    export declare function parseManifestStartTime(name: string): number | undefined;
-    export declare function chooseManifest(manifests: {
-        name: string;
-        manifest: Manifest;
-    }[]): {
-        name: string;
-        manifest: Manifest;
-    } | undefined;
 
 }
 
@@ -1071,8 +1080,9 @@ declare module "sliftutils/storage/BulkDatabase2/syncClient" {
         value?: unknown;
     };
     export declare function isSyncSupported(): boolean;
-    export declare function connect(collection: string, onWrite: (write: RemoteWrite) => void): Promise<RemoteWrite[]>;
+    export declare function connect(collection: string, onWrite: (write: RemoteWrite) => void, onSeal?: () => void): Promise<RemoteWrite[]>;
     export declare function broadcast(collection: string, write: RemoteWrite): void;
+    export declare function broadcastSeal(collection: string): void;
 
 }
 

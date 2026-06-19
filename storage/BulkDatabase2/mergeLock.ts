@@ -1,8 +1,9 @@
-// Best-effort "only one tab merges this collection at a time" guard, layered ON TOP of the manifest
-// scheme (which guarantees correctness on its own). This is purely an efficiency measure: it stops two
-// tabs doing the same compaction at once and racing to orphan each other's output. It uses
-// localStorage (shared across same-origin tabs) and is a no-op where localStorage is unavailable
-// (Node) — there the manifest backstop alone keeps things correct, which is also what the Node stress
+// Best-effort "only one tab merges this collection at a time" guard. This is purely an efficiency
+// measure: correctness does NOT depend on it. Reads resolve by per-row write-time, merges write new
+// files before deleting consumed ones, and a duplicate-heavy region gets re-merged — so two tabs
+// merging at once only waste work and briefly duplicate data, never corrupt or lose it. The lock just
+// stops that wasted work. It uses localStorage (shared across same-origin tabs) and is a no-op where
+// localStorage is unavailable (Node) — there concurrent merges are harmless, which the Node stress
 // tests exercise. localStorage has no atomic compare-and-swap, so we write-then-reread to shrink the
 // race window, and a TTL frees a lock left behind by a tab that crashed or closed mid-merge.
 
