@@ -26,9 +26,11 @@
         "watch-extension": "node ./builders/watchRun.js --port 9878 \"extension/*.ts\" \"extension/*.tsx\" \"yarn build-extension\"",
         "watch-electron": "node ./builders/watchRun.js --port 9879 \"electron/*.ts\" \"electron/*.tsx\" \"yarn build-electron\"",
         "notes": "mobx, preact, socket-function, typenode SHOULD be peerDependencies. But we want to use yarn (better dependency deduplication), so we can't use peerDependencies (as they aren't installed by default, which makes them a nightmare to use). If you want to override the versions, feel free to use overrides/resolutions.",
-        "test": "typenode ./test.ts"
+        "test": "typenode ./test.ts",
+        "filehoster": "node ./bin/filehoster.js"
     },
     "bin": {
+        "filehoster": "./bin/filehoster.js",
         "build-nodejs": "./builders/nodeJSBuildRun.js",
         "buildnodejs": "./builders/nodeJSBuildRun.js",
         "build-extension": "./builders/extensionBuildRun.js",

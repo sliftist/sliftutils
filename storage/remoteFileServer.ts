@@ -1,29 +1,23 @@
-#!/usr/bin/env node
-"use strict";
-// Self-contained remote file server for sliftutils getRemoteFileStorage / BulkDatabase2.
-//
-// Serves a single folder on disk over self-signed HTTPS, authenticated with an auto-generated 6-word
-// password (sent as `Authorization: Bearer <password>`). No npm dependencies — just Node built-ins and
-// a one-time `openssl` call to make the self-signed cert.
-//
-//   node remoteFileServer.js /path/to/data            # serve a folder (prints URL + password)
-//   node remoteFileServer.js /path/to/data --port 9000
-//   PASSWORD="six word ..." node remoteFileServer.js /path/to/data   # fixed password
+import https from "https";
+import type { IncomingMessage, ServerResponse } from "http";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import os from "os";
+import { execFileSync } from "child_process";
+import { getExternalIP } from "socket-function/src/networking";
+import { forwardPort } from "socket-function/src/forwardPort";
+
+// Remote file server for sliftutils getRemoteFileStorage / BulkDatabase2. Serves one folder on disk over
+// self-signed HTTPS, authenticated with an auto-generated 6-word password (sent as
+// `Authorization: Bearer <password>`). Run it with `yarn filehoster <folder>` (or the `filehoster` bin).
 //
 // SECURITY: the cert is self-signed, so a browser must accept it once (open the printed https URL and
 // click through), and the Node client connects with cert verification disabled. The password is what
-// actually authorizes access; keep it secret. Anything reachable from the internet should additionally
-// be behind a tunnel/proxy you trust.
-
-const https = require("https");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-const os = require("os");
-const { execFileSync } = require("child_process");
+// authorizes access; keep it secret.
 
 // Common, memorable words (frequency-ordered subset) for passphrase generation.
-const WORDS = [
+const WORDS: string[] = [
     "that","with","which","this","from","have","they","were","their","there","when","them","said","been",
     "would","will","what","more","then","into","some","could","time","very","than","your","other","upon",
     "about","only","little","like","these","great","after","well","made","before","such","over","should",
@@ -196,24 +190,22 @@ const WORDS = [
     "leaned","studies","customs","prize","stir","obey","oath","badly","pursuit","resting",
 ];
 
-function generatePassword(wordCount) {
-    const words = [];
-    for (let i = 0; i < wordCount; i++) {
-        words.push(WORDS[crypto.randomInt(WORDS.length)]);
-    }
+export function generatePassword(wordCount: number): string {
+    const words: string[] = [];
+    for (let i = 0; i < wordCount; i++) words.push(WORDS[crypto.randomInt(WORDS.length)]);
     return words.join(" ");
 }
 
 // The password is always a list of words, so we compare case-insensitively and ignore any non-letter
 // characters. That makes it forgiving of voice dictation and mobile autocorrect (spacing, capitals,
 // stray punctuation) without meaningfully weakening a 6-word passphrase.
-function normalizePassword(p) {
+function normalizePassword(p: string): string {
     return String(p || "").toLowerCase().replace(/[^a-z]/g, "");
 }
 
 // Generate (once) and cache a self-signed key + cert via openssl, outside the served folder so its
 // private key is never reachable through the API.
-function getCert() {
+function getCert(): { key: Buffer; cert: Buffer } {
     const dir = path.join(os.homedir(), ".sliftutils-remote");
     fs.mkdirSync(dir, { recursive: true });
     const keyPath = path.join(dir, "key.pem");
@@ -227,13 +219,13 @@ function getCert() {
                 "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
             ], { stdio: "ignore" });
         } catch (e) {
-            throw new Error("Failed to generate a self-signed certificate with openssl (is openssl installed?): " + e.message);
+            throw new Error("Failed to generate a self-signed certificate with openssl (is openssl installed?): " + (e as Error).message);
         }
     }
     return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
 }
 
-function timingSafeEqualStr(a, b) {
+function timingSafeEqualStr(a: string, b: string): boolean {
     const ab = Buffer.from(a || "", "utf8");
     const bb = Buffer.from(b || "", "utf8");
     if (ab.length !== bb.length) return false;
@@ -241,7 +233,7 @@ function timingSafeEqualStr(a, b) {
 }
 
 // Resolve a client-supplied relative path against the root, refusing anything that escapes it.
-function safeResolve(root, rel) {
+function safeResolve(root: string, rel: string | null): string | undefined {
     if (rel == null) rel = "";
     if (rel.indexOf("\0") >= 0) return undefined;
     const full = path.resolve(root, "." + path.sep + rel.replace(/\\/g, "/"));
@@ -249,76 +241,118 @@ function safeResolve(root, rel) {
     return full;
 }
 
-function readBody(req) {
+function readBody(req: IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-        const chunks = [];
-        req.on("data", c => chunks.push(c));
+        const chunks: Buffer[] = [];
+        req.on("data", c => chunks.push(c as Buffer));
         req.on("end", () => resolve(Buffer.concat(chunks)));
         req.on("error", reject);
     });
 }
 
-function startRemoteFileServer(options) {
+function formatBytes(n: number): string {
+    if (n < 1024) return n + "B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + "KB";
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + "MB";
+    return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
+}
+
+export type RemoteFileServerOptions = {
+    root: string;
+    port?: number;
+    host?: string;
+    password?: string;
+    // When true, log batched per-(client, file) access totals every 5s. The CLI turns this on; the
+    // library (tests) leaves it off.
+    logAccess?: boolean;
+};
+export type RemoteFileServerHandle = { port: number; password: string; url: string; close: () => Promise<void> };
+
+export function startRemoteFileServer(options: RemoteFileServerOptions): Promise<RemoteFileServerHandle> {
     const root = path.resolve(options.root);
     if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
-    const port = options.port || 8787;
+    const port = options.port ?? 8787;
     const host = options.host || "0.0.0.0";
     const password = options.password || generatePassword(6);
     const normPassword = normalizePassword(password);
     const { key, cert } = getCert();
 
-    const server = https.createServer({ key, cert }, async (req, res) => {
-        const origin = req.headers["origin"] || "*";
-        const cors = {
+    // Batched access log: aggregate per (ip, op, file) so hammering one file logs once per 5s with the
+    // total request count and bytes, instead of a line per request.
+    type Acc = { ip: string; op: string; path: string; count: number; bytes: number };
+    const accessLog = new Map<string, Acc>();
+    let flushTimer: ReturnType<typeof setInterval> | undefined;
+    const recordAccess = (ip: string, op: string, p: string, bytes: number) => {
+        if (!options.logAccess) return;
+        const k = ip + "|" + op + "|" + p;
+        let e = accessLog.get(k);
+        if (!e) { e = { ip, op, path: p, count: 0, bytes: 0 }; accessLog.set(k, e); }
+        e.count++;
+        e.bytes += bytes;
+    };
+    if (options.logAccess) {
+        flushTimer = setInterval(() => {
+            if (!accessLog.size) return;
+            const rows = [...accessLog.values()].sort((a, b) => b.bytes - a.bytes);
+            accessLog.clear();
+            for (const e of rows) console.log(`  [${e.op}] ${e.ip}  ${e.path}  ${e.count}x  ${formatBytes(e.bytes)}`);
+        }, 5000);
+        flushTimer.unref?.();
+    }
+    const clientIp = (req: IncomingMessage) => (req.socket.remoteAddress || "?").replace(/^::ffff:/, "");
+
+    const server = https.createServer({ key, cert }, async (req: IncomingMessage, res: ServerResponse) => {
+        const origin = (req.headers["origin"] as string) || "*";
+        const cors: Record<string, string> = {
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "authorization, content-type",
             "Access-Control-Max-Age": "86400",
             "Vary": "Origin",
         };
-        const send = (status, headers, body) => {
+        const send = (status: number, headers: Record<string, string>, body?: Buffer | string) => {
             res.writeHead(status, Object.assign({}, cors, headers));
             res.end(body);
         };
-        const sendJson = (status, obj) => send(status, { "Content-Type": "application/json" }, JSON.stringify(obj));
+        const sendJson = (status: number, obj: unknown) => send(status, { "Content-Type": "application/json" }, JSON.stringify(obj));
 
         try {
-            if (req.method === "OPTIONS") return send(204, {}, undefined);
+            if (req.method === "OPTIONS") return send(204, {});
 
-            // Auth.
-            const auth = req.headers["authorization"] || "";
+            const auth = (req.headers["authorization"] as string) || "";
             const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
             if (!timingSafeEqualStr(normalizePassword(token), normPassword)) return sendJson(401, { error: "unauthorized" });
 
-            const url = new URL(req.url, "https://localhost");
+            const url = new URL(req.url || "/", "https://localhost");
             const op = url.pathname;
-            const full = safeResolve(root, url.searchParams.get("path") || "");
+            const relPath = url.searchParams.get("path") || "";
+            const full = safeResolve(root, relPath);
             if (full === undefined) return sendJson(403, { error: "path escapes root" });
 
             if (req.method === "GET" && op === "/list") {
                 const wantFolders = url.searchParams.get("folders") === "1";
-                let entries;
+                let entries: fs.Dirent[];
                 try { entries = fs.readdirSync(full, { withFileTypes: true }); }
-                catch (e) { return e.code === "ENOENT" ? sendJson(200, []) : sendJson(500, { error: e.message }); }
-                const names = entries.filter(d => wantFolders ? d.isDirectory() : d.isFile()).map(d => d.name);
-                return sendJson(200, names);
+                catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? sendJson(200, []) : sendJson(500, { error: (e as Error).message }); }
+                return sendJson(200, entries.filter(d => wantFolders ? d.isDirectory() : d.isFile()).map(d => d.name));
             }
             if (req.method === "GET" && op === "/info") {
-                let st;
-                try { st = fs.statSync(full); } catch (e) { return sendJson(404, { error: "not found" }); }
+                let st: fs.Stats;
+                try { st = fs.statSync(full); } catch { return sendJson(404, { error: "not found" }); }
                 return sendJson(200, { size: st.size, lastModified: st.mtimeMs });
             }
             if (req.method === "GET" && op === "/hasDir") {
-                let st; try { st = fs.statSync(full); } catch { return sendJson(200, { exists: false }); }
+                let st: fs.Stats; try { st = fs.statSync(full); } catch { return sendJson(200, { exists: false }); }
                 return sendJson(200, { exists: st.isDirectory() });
             }
             if (req.method === "GET" && op === "/read") {
-                let st;
-                try { st = fs.statSync(full); } catch (e) { return sendJson(404, { error: "not found" }); }
+                let st: fs.Stats;
+                try { st = fs.statSync(full); } catch { return sendJson(404, { error: "not found" }); }
                 let start = parseInt(url.searchParams.get("start") || "0", 10);
-                let end = url.searchParams.get("end") != null ? parseInt(url.searchParams.get("end"), 10) : st.size;
+                let end = url.searchParams.get("end") != null ? parseInt(url.searchParams.get("end") as string, 10) : st.size;
                 start = Math.min(Math.max(start, 0), st.size);
                 end = Math.min(Math.max(end, start), st.size);
+                recordAccess(clientIp(req), "read", relPath, end - start);
                 res.writeHead(200, Object.assign({}, cors, { "Content-Type": "application/octet-stream", "Content-Length": String(end - start) }));
                 if (end === start) return res.end();
                 fs.createReadStream(full, { start, end: end - 1 }).on("error", () => res.end()).pipe(res);
@@ -329,61 +363,77 @@ function startRemoteFileServer(options) {
                 fs.mkdirSync(path.dirname(full), { recursive: true });
                 if (op === "/append") fs.appendFileSync(full, body);
                 else fs.writeFileSync(full, body);
+                recordAccess(clientIp(req), "write", relPath, body.length);
                 return sendJson(200, { ok: true });
             }
             if (req.method === "DELETE" && op === "/remove") {
-                try { fs.unlinkSync(full); } catch (e) { if (e.code !== "ENOENT") return sendJson(500, { error: e.message }); }
+                try { fs.unlinkSync(full); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return sendJson(500, { error: (e as Error).message }); }
                 return sendJson(200, { ok: true });
             }
             if (req.method === "DELETE" && op === "/removeDir") {
-                try { fs.rmSync(full, { recursive: true, force: true }); } catch (e) { return sendJson(500, { error: e.message }); }
+                try { fs.rmSync(full, { recursive: true, force: true }); } catch (e) { return sendJson(500, { error: (e as Error).message }); }
                 return sendJson(200, { ok: true });
             }
             if (req.method === "POST" && op === "/reset") {
-                try {
-                    for (const name of fs.readdirSync(full)) fs.rmSync(path.join(full, name), { recursive: true, force: true });
-                } catch (e) { if (e.code !== "ENOENT") return sendJson(500, { error: e.message }); }
+                try { for (const name of fs.readdirSync(full)) fs.rmSync(path.join(full, name), { recursive: true, force: true }); }
+                catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return sendJson(500, { error: (e as Error).message }); }
                 return sendJson(200, { ok: true });
             }
             return sendJson(404, { error: "unknown endpoint" });
         } catch (e) {
-            try { sendJson(500, { error: String((e && e.message) || e) }); } catch { /* response already sent */ }
+            try { sendJson(500, { error: String((e as Error)?.message || e) }); } catch { /* response already sent */ }
         }
     });
 
-    return new Promise((resolve, reject) => {
+    return new Promise<RemoteFileServerHandle>((resolve, reject) => {
         server.on("error", reject);
         server.listen(port, host, () => {
-            const actualPort = server.address().port;
+            const addr = server.address();
+            const actualPort = typeof addr === "object" && addr ? addr.port : port;
             resolve({
                 port: actualPort,
                 password,
                 url: `https://localhost:${actualPort}`,
-                close: () => new Promise(r => server.close(() => r())),
+                close: () => new Promise<void>(r => { if (flushTimer) clearInterval(flushTimer); server.close(() => r()); }),
             });
         });
     });
 }
 
-module.exports = { startRemoteFileServer, generatePassword };
-
-if (require.main === module) {
+// CLI entry (invoked by bin/filehoster.js or `yarn filehoster <folder>`). Starts the server, logs the
+// password + local/public URLs + batched access, and keeps the UPnP port mapping alive.
+export async function runFileHoster(): Promise<void> {
     const args = process.argv.slice(2);
-    const root = args.find(a => !a.startsWith("--"));
+    const root = args.find(a => !a.startsWith("--") && !a.endsWith(".ts") && !a.endsWith(".js"));
     if (!root) {
-        console.error("Usage: node remoteFileServer.js <folder> [--port N]");
+        console.error("Usage: yarn filehoster <folder> [--port N]   (set a fixed password with PASSWORD=...)");
         process.exit(1);
     }
-    const portArg = args.indexOf("--port");
-    const port = portArg >= 0 ? parseInt(args[portArg + 1], 10) : 8787;
-    startRemoteFileServer({ root, port, password: process.env.PASSWORD }).then(info => {
-        console.log("");
-        console.log("  Serving:  " + path.resolve(root));
-        console.log("  URL:      " + info.url + "   (also reachable on your LAN IP at port " + info.port + ")");
-        console.log("  Password: " + info.password);
-        console.log("");
-        console.log("  In the app, choose \"Connect to a server\" and enter the URL + password.");
-        console.log("  (Self-signed cert: open the URL once in your browser and accept it first.)");
-        console.log("");
-    }).catch(e => { console.error("Failed to start:", e.message); process.exit(1); });
+    const portIdx = args.indexOf("--port");
+    const port = portIdx >= 0 ? parseInt(args[portIdx + 1], 10) : 8787;
+
+    const info = await startRemoteFileServer({ root, port, password: process.env.PASSWORD, logAccess: true });
+    let externalIP: string | undefined;
+    try { externalIP = (await getExternalIP()).trim(); } catch { /* offline / unreachable */ }
+
+    console.log("");
+    console.log("  Serving:   " + path.resolve(root));
+    console.log("  Password:  " + info.password);
+    console.log("  Local:     " + info.url);
+    if (externalIP) console.log("  Public:    https://" + externalIP + ":" + info.port + "   (once port-forwarding succeeds)");
+    console.log("");
+    console.log("  In the app, choose \"Connect to a server\" and enter the URL + password.");
+    console.log("  (Self-signed cert: open the URL once in your browser and accept it first.)");
+    console.log("");
+
+    // Keep the UPnP port mapping alive — leases expire ~hourly, so refresh well within that. No-op on
+    // Linux (forwardPort returns early there).
+    const refresh = async () => {
+        try { await forwardPort({ externalPort: info.port, internalPort: info.port }); }
+        catch (e) { console.warn("  port forwarding failed:", (e as Error).message); }
+    };
+    await refresh();
+    setInterval(refresh, 30 * 60 * 1000);
+
+    console.log("  [access] request logging on (batched every 5s)\n");
 }
