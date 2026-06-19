@@ -813,20 +813,37 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         getKeys(): Promise<string[]>;
         /** One field's value for a key, or undefined if the key/column isn't set or the key is deleted. */
         getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
-        /** A whole column as {key, value} for every live key. */
+        /**
+         * Like getSingleField but returns { key, value, time } (the same shape a getColumn entry has), where
+         * time is roughly when the value last changed. undefined only when the key isn't present/live.
+         */
+        getSingleFieldObj<Column extends keyof T>(key: string, column: Column): Promise<{
+            key: string;
+            value: T[Column];
+            time: number;
+        } | undefined>;
+        /** A whole column as { key, value, time } for every live key (time ≈ when each value last changed). */
         getColumn<Column extends keyof T>(column: Column): Promise<{
             key: string;
             value: T[Column];
+            time: number;
         }[]>;
         /**
          * Synchronous, reactive read of one field. Returns undefined while the base value is still loading
          * (and re-renders once it arrives, under a mobx observer); reflects pending writes immediately.
          */
         getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined;
-        /** Synchronous, reactive read of a whole column. undefined while still loading. */
+        /** Sync, reactive counterpart of getSingleFieldObj: { key, value, time } once loaded, else undefined. */
+        getSingleFieldObjSync<Column extends keyof T>(key: string, column: Column): {
+            key: string;
+            value: T[Column];
+            time: number;
+        } | undefined;
+        /** Synchronous, reactive read of a whole column ({ key, value, time }). undefined while still loading. */
         getColumnSync<Column extends keyof T>(column: Column): {
             key: string;
             value: T[Column];
+            time: number;
         }[] | undefined;
         /** The columns present on disk and their byte sizes (no row data read). */
         getColumnInfo(): Promise<BulkColumnInfo[]>;
@@ -931,9 +948,15 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private formatInfo;
         private patchColumn;
         getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
+        getSingleFieldObj<Column extends keyof T>(key: string, column: Column): Promise<{
+            key: string;
+            value: T[Column];
+            time: number;
+        } | undefined>;
         getColumn<Column extends keyof T>(column: Column): Promise<{
             key: string;
             value: T[Column];
+            time: number;
         }[]>;
         getKeys(): Promise<string[]>;
         private baseColumns;
@@ -943,9 +966,15 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private ensureBaseColumn;
         private ensureBaseField;
         getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined;
+        getSingleFieldObjSync<Column extends keyof T>(key: string, column: Column): {
+            key: string;
+            value: T[Column];
+            time: number;
+        } | undefined;
         getColumnSync<Column extends keyof T>(column: Column): {
             key: string;
             value: T[Column];
+            time: number;
         }[] | undefined;
         getColumnInfo(): Promise<{
             column: string;

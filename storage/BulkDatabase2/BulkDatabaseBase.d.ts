@@ -72,9 +72,15 @@ export declare class BulkDatabaseBase<T extends {
     private formatInfo;
     private patchColumn;
     getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
+    getSingleFieldObj<Column extends keyof T>(key: string, column: Column): Promise<{
+        key: string;
+        value: T[Column];
+        time: number;
+    } | undefined>;
     getColumn<Column extends keyof T>(column: Column): Promise<{
         key: string;
         value: T[Column];
+        time: number;
     }[]>;
     getKeys(): Promise<string[]>;
     private baseColumns;
@@ -84,9 +90,15 @@ export declare class BulkDatabaseBase<T extends {
     private ensureBaseColumn;
     private ensureBaseField;
     getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined;
+    getSingleFieldObjSync<Column extends keyof T>(key: string, column: Column): {
+        key: string;
+        value: T[Column];
+        time: number;
+    } | undefined;
     getColumnSync<Column extends keyof T>(column: Column): {
         key: string;
         value: T[Column];
+        time: number;
     }[] | undefined;
     getColumnInfo(): Promise<{
         column: string;
