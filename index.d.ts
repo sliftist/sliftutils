@@ -878,6 +878,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     export declare const bulkDatabase2Timing: {
         streamSealAgeMs: number;
         mergeCheckIntervalMs: number;
+        mergeSpacingMs: number;
         firstMergeTriggerFiles: number;
         firstMergeTriggerRangeMs: number;
     };
@@ -944,7 +945,9 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private resolveReaders;
         private mergeFileSet;
         private canDeleteStream;
+        private mergeSpacingDelay;
         private testMerge;
+        private findDuplicateGroups;
         private formatInfo;
         private patchColumn;
         getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;

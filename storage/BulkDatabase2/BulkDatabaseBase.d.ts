@@ -2,6 +2,7 @@ import type { FileStorage } from "../FileFolderAPI";
 export declare const bulkDatabase2Timing: {
     streamSealAgeMs: number;
     mergeCheckIntervalMs: number;
+    mergeSpacingMs: number;
     firstMergeTriggerFiles: number;
     firstMergeTriggerRangeMs: number;
 };
@@ -68,7 +69,9 @@ export declare class BulkDatabaseBase<T extends {
     private resolveReaders;
     private mergeFileSet;
     private canDeleteStream;
+    private mergeSpacingDelay;
     private testMerge;
+    private findDuplicateGroups;
     private formatInfo;
     private patchColumn;
     getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;

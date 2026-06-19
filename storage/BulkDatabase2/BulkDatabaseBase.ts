@@ -60,6 +60,11 @@ export const bulkDatabase2Timing = {
     streamSealAgeMs: 10 * 60 * 60 * 1000,
     // Per-instance throttle: a write triggers at most one background testMerge scan per this interval.
     mergeCheckIntervalMs: 30 * 60 * 1000,
+    // A single testMerge can do several merges (one pass-1 + several pass-2 groups). We wait this long
+    // after each one before the next, so a burst of writes doesn't rewrite every index on disk at once —
+    // it spreads the work out to keep peak lag low (important in the browser). The merge lock is kept
+    // alive across the wait. Set to 0 to disable spacing (tests).
+    mergeSpacingMs: 5 * 60 * 1000,
     // The first merge fires when the recent (up to FIRST_MERGE_BYTES) files number more than this...
     firstMergeTriggerFiles: 20,
     // ...or span a wider write-time range than this (data trickling in slowly still gets consolidated).
@@ -773,17 +778,43 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return !!info && info.size === readSize;
     }
 
-    // The merge policy. Up to two passes:
-    //  1) Consolidate recent fragmentation: take the newest files up to ~FIRST_MERGE_BYTES and, if they
-    //     number more than firstMergeTriggerFiles or span more than firstMergeTriggerRangeMs, merge them
-    //     into one file. Seals first so recent stream data is complete; in Node (no cross-tab seal) only
-    //     aged streams are folded, so we never re-fold the same un-deletable stream forever.
-    //  2) Key-stratify: sort all keys, walk them in ~KEY_GROUP_BYTES groups, and rewrite the single group
-    //     whose fraction of duplicate (multi-file) keys is highest above DUP_THRESHOLD — merging every
-    //     bulk file overlapping that key range. Over time this sorts the data into key-disjoint files.
-    // Returns whether either pass merged anything.
+    // Waits mergeSpacingMs between merges so a burst of work doesn't rewrite every index at once (keeps
+    // peak lag low for the browser). Heartbeats the merge lock through the wait; returns false if another
+    // tab took the lock over, so the caller stops doing further merges.
+    private async mergeSpacingDelay(): Promise<boolean> {
+        const total = bulkDatabase2Timing.mergeSpacingMs;
+        if (total <= 0) return tryAcquireMergeLock(this.name, writerId);
+        const step = 15 * 1000; // re-stamp the lock well within its TTL
+        let waited = 0;
+        while (waited < total) {
+            await new Promise<void>(r => setTimeout(r, Math.min(step, total - waited)));
+            waited += step;
+            if (!tryAcquireMergeLock(this.name, writerId)) return false; // another tab took over
+        }
+        return true;
+    }
+
+    // The merge policy. Two passes, with a mergeSpacingMs pause after every merge (so a write burst
+    // doesn't rewrite all indexes at once):
+    //  1) Consolidate recent fragmentation (one merge): take the newest files up to ~FIRST_MERGE_BYTES
+    //     and, if they number more than firstMergeTriggerFiles or span more than firstMergeTriggerRangeMs,
+    //     merge them into one file. Seals first so recent stream data is complete; in Node (no cross-tab
+    //     seal) only aged streams are folded, so we never re-fold the same un-deletable stream forever.
+    //  2) Key-stratify (possibly several merges): sort all keys, walk them in ~KEY_GROUP_BYTES groups, and
+    //     rewrite EVERY group whose fraction of duplicate (multi-file) keys exceeds DUP_THRESHOLD —
+    //     highest-duplication first — merging the bulk files overlapping that key range. Groups have
+    //     disjoint key ranges, so one group's merge doesn't change another's duplication; we re-select
+    //     each group's files at merge time (the file set shifts as we go). Over time this sorts the data
+    //     into key-disjoint files. Returns whether any merge happened.
     private async testMerge(): Promise<boolean> {
         let merged = false;
+        // Run a merge, pausing first if we've already merged this pass (so the pause is BETWEEN merges,
+        // never before the first or after the last). Returns false if we lost the lock — stop entirely.
+        const runMerge = async (bulk: BulkFileInfo[], stream: StreamFileInfo[]): Promise<boolean> => {
+            if (merged && !await this.mergeSpacingDelay()) return false;
+            if (await this.mergeFileSet(bulk, stream)) merged = true;
+            return true;
+        };
 
         // ── Pass 1: consolidate recent files. ──
         // Only seal (ask peers + ourselves to abandon current stream files) when cross-tab sync can
@@ -822,60 +853,67 @@ export class BulkDatabaseBase<T extends { key: string }> {
             if (triggered) {
                 const rb = recent.filter(i => i.kind === "bulk").map(i => (i.file as BulkFileInfo));
                 const rs = recent.filter(i => i.kind === "stream").map(i => (i.file as StreamFileInfo));
-                if (await this.mergeFileSet(rb, rs)) merged = true;
+                if (!await runMerge(rb, rs)) return merged;
             }
         }
 
         // ── Pass 2: key-stratify the bulk files to remove duplication. ──
-        {
+        // Compute the qualifying groups' key ranges once (over a post-pass-1 listing); their key ranges
+        // are disjoint, so they stay valid as we merge each in turn.
+        const groups = await this.findDuplicateGroups();
+        for (const g of groups) {
+            // Re-select the files overlapping this group's key range now (earlier merges shifted the set).
             const { bulkFiles } = await this.listFiles();
-            if (bulkFiles.length >= 2) {
-                const infos = await Promise.all(bulkFiles.map(async f => {
-                    try {
-                        const reader = await this.loadFileReader(f.fileName);
-                        const keys = reader.keys;
-                        let min = keys[0], max = keys[0];
-                        for (const k of keys) { if (k < min) min = k; if (k > max) max = k; }
-                        return { file: f, keys, bytes: reader.totalBytes, min, max };
-                    } catch {
-                        return { file: f, keys: [] as string[], bytes: 0, min: undefined as string | undefined, max: undefined as string | undefined };
-                    }
-                }));
-                const usable = infos.filter(i => i.keys.length > 0);
-                const keyCount = new Map<string, number>();
-                let totalSlots = 0, totalBytes = 0;
-                for (const i of usable) {
-                    totalBytes += i.bytes;
-                    for (const k of i.keys) { keyCount.set(k, (keyCount.get(k) || 0) + 1); totalSlots++; }
-                }
-                if (totalSlots > 0) {
-                    const bytesPerSlot = totalBytes / totalSlots;
-                    const sortedKeys = [...keyCount.keys()].sort();
-                    // Walk sorted keys forming ~KEY_GROUP_BYTES groups; remember the group with the highest
-                    // duplicate fraction over the threshold (the most benefit), then merge its files.
-                    let best: { lo: string; hi: string; dup: number } | undefined;
-                    let gStart = 0, gBytes = 0, gSlots = 0, gUnique = 0;
-                    for (let i = 0; i < sortedKeys.length; i++) {
-                        const c = keyCount.get(sortedKeys[i])!;
-                        gBytes += c * bytesPerSlot; gSlots += c; gUnique += 1;
-                        if (gBytes >= KEY_GROUP_BYTES || i === sortedKeys.length - 1) {
-                            const dup = (gSlots - gUnique) / gSlots;
-                            if (dup > DUP_THRESHOLD && (!best || dup > best.dup)) best = { lo: sortedKeys[gStart], hi: sortedKeys[i], dup };
-                            gStart = i + 1; gBytes = 0; gSlots = 0; gUnique = 0;
-                        }
-                    }
-                    if (best) {
-                        const lo = best.lo, hi = best.hi;
-                        const groupFiles = usable
-                            .filter(i => i.min !== undefined && i.max !== undefined && i.min <= hi && i.max >= lo)
-                            .map(i => i.file);
-                        if (groupFiles.length >= 2 && await this.mergeFileSet(groupFiles, [])) merged = true;
-                    }
-                }
-            }
+            const headers = await Promise.all(bulkFiles.map(f => this.readBulkHeader(f.fileName)));
+            const groupFiles = bulkFiles.filter((f, i) => {
+                const h = headers[i];
+                if (!h) return false;
+                // Old files without a key range are treated as spanning all keys (so always overlap).
+                if (h.minKey === undefined || h.maxKey === undefined) return true;
+                return h.minKey <= g.hi && h.maxKey >= g.lo;
+            });
+            if (groupFiles.length >= 2) { if (!await runMerge(groupFiles, [])) return merged; }
         }
 
         return merged;
+    }
+
+    // Finds key-range groups worth deduping: sorts all bulk keys, walks them in ~KEY_GROUP_BYTES groups,
+    // and returns the [lo, hi] of every group whose duplicate (multi-file) key fraction exceeds
+    // DUP_THRESHOLD, highest-duplication first (most benefit). Empty when nothing is worth it.
+    private async findDuplicateGroups(): Promise<{ lo: string; hi: string; dup: number }[]> {
+        const { bulkFiles } = await this.listFiles();
+        if (bulkFiles.length < 2) return [];
+        const infos = await Promise.all(bulkFiles.map(async f => {
+            try {
+                const reader = await this.loadFileReader(f.fileName);
+                return { keys: reader.keys, bytes: reader.totalBytes };
+            } catch {
+                return { keys: [] as string[], bytes: 0 };
+            }
+        }));
+        const keyCount = new Map<string, number>();
+        let totalSlots = 0, totalBytes = 0;
+        for (const i of infos) {
+            totalBytes += i.bytes;
+            for (const k of i.keys) { keyCount.set(k, (keyCount.get(k) || 0) + 1); totalSlots++; }
+        }
+        if (totalSlots === 0) return [];
+        const bytesPerSlot = totalBytes / totalSlots;
+        const sortedKeys = [...keyCount.keys()].sort();
+        const groups: { lo: string; hi: string; dup: number }[] = [];
+        let gStart = 0, gBytes = 0, gSlots = 0, gUnique = 0;
+        for (let i = 0; i < sortedKeys.length; i++) {
+            const c = keyCount.get(sortedKeys[i])!;
+            gBytes += c * bytesPerSlot; gSlots += c; gUnique += 1;
+            if (gBytes >= KEY_GROUP_BYTES || i === sortedKeys.length - 1) {
+                const dup = (gSlots - gUnique) / gSlots;
+                if (dup > DUP_THRESHOLD) groups.push({ lo: sortedKeys[gStart], hi: sortedKeys[i], dup });
+                gStart = i + 1; gBytes = 0; gSlots = 0; gUnique = 0;
+            }
+        }
+        groups.sort((a, b) => b.dup - a.dup);
+        return groups;
     }
 
     private formatInfo(reader: ResolvedReader): string {

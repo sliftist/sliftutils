@@ -21,15 +21,17 @@ function lockKey(collection: string): string {
     return "bulkDatabase2-merge:" + collection;
 }
 
-// Returns true if we now hold the lock (or there's no localStorage to coordinate through, in which
-// case we proceed and rely on the manifest backstop). Returns false if another tab holds a fresh lock.
+// Returns true if we now hold the lock (or there's no localStorage to coordinate through, in which case
+// we proceed — concurrent merges are harmless). Returns false only if a DIFFERENT holder has a fresh
+// lock. Re-stamping our own lock always succeeds, so this doubles as a heartbeat: call it periodically
+// during a long, spaced-out merge to keep the lock alive (and detect if another tab took it over).
 export function tryAcquireMergeLock(collection: string, holderId: string): boolean {
     const ls = getLocalStorage();
     if (!ls) return true;
     const key = lockKey(collection);
     const now = Date.now();
     const existing = ls.getItem(key);
-    if (existing) {
+    if (existing && !existing.startsWith(holderId + ":")) {
         const t = parseInt(existing.slice(existing.lastIndexOf(":") + 1), 10);
         if (Number.isFinite(t) && now - t < LOCK_TTL_MS) return false;
     }
