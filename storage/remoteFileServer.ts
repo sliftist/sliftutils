@@ -7,6 +7,7 @@ import os from "os";
 import { execFileSync } from "child_process";
 import { getExternalIP } from "socket-function/src/networking";
 import { forwardPort } from "socket-function/src/forwardPort";
+import { WebSocketServer, WebSocket } from "ws";
 
 // Remote file server for sliftutils getRemoteFileStorage / BulkDatabase2. Serves one folder on disk over
 // self-signed HTTPS, authenticated with an auto-generated 6-word password (sent as
@@ -400,6 +401,85 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
         }
     });
 
+    // WebSocket transport: same operations as the HTTP handler, but binary-framed and multiplexed over one
+    // socket so large concurrent reads don't pay per-request HTTP overhead. Frame: [u32 headerLen LE][header
+    // JSON][body bytes]. Request header {id, op, path, start?, end?, password?}; response {id, status, error?}.
+    const EMPTY = Buffer.alloc(0);
+    const wss = new WebSocketServer({ server });
+    wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+        const ip = clientIp(req);
+        let authed = false;
+        ws.on("message", (data: Buffer) => {
+            let id = 0;
+            const reply = (status: number, extra: object, body?: Buffer) => {
+                const h = Buffer.from(JSON.stringify(Object.assign({ id, status }, extra)), "utf8");
+                const len = Buffer.alloc(4);
+                len.writeUInt32LE(h.length, 0);
+                ws.send(Buffer.concat([len, h, body || EMPTY]));
+            };
+            void (async () => {
+                let header: any;
+                let body: Buffer;
+                try {
+                    const headerLen = data.readUInt32LE(0);
+                    header = JSON.parse(data.subarray(4, 4 + headerLen).toString("utf8"));
+                    body = data.subarray(4 + headerLen);
+                } catch { return; }
+                id = header.id || 0;
+                try {
+                    if (header.op === "auth") {
+                        authed = timingSafeEqualStr(normalizePassword(header.password || ""), normPassword);
+                        return reply(authed ? 200 : 401, {});
+                    }
+                    if (!authed) return reply(401, { error: "unauthorized" });
+                    const rel = String(header.path || "");
+                    const full = safeResolve(root, rel);
+                    if (full === undefined) return reply(403, { error: "path escapes root" });
+                    if (header.op === "info") {
+                        let st: fs.Stats;
+                        try { st = fs.statSync(full); } catch { return reply(404, {}); }
+                        return reply(200, {}, Buffer.from(JSON.stringify({ size: st.size, lastModified: st.mtimeMs, dir: st.isDirectory() })));
+                    }
+                    if (header.op === "list") {
+                        let entries: fs.Dirent[];
+                        try { entries = fs.readdirSync(full, { withFileTypes: true }); }
+                        catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? reply(200, {}, Buffer.from("[]")) : reply(500, { error: (e as Error).message }); }
+                        return reply(200, {}, Buffer.from(JSON.stringify(entries.filter(d => d.isFile() || d.isDirectory()).map(d => ({ name: d.name, dir: d.isDirectory() })))));
+                    }
+                    if (header.op === "read") {
+                        let st: fs.Stats;
+                        try { st = fs.statSync(full); } catch { return reply(404, {}); }
+                        const start = Math.min(Math.max(Number(header.start) || 0, 0), st.size);
+                        const end = header.end != null ? Math.min(Math.max(Number(header.end), start), st.size) : st.size;
+                        recordAccess(ip, "read", rel, end - start);
+                        if (end === start) return reply(200, {}, EMPTY);
+                        const fh = await fs.promises.open(full, "r");
+                        try {
+                            const buf = Buffer.allocUnsafe(end - start);
+                            const { bytesRead } = await fh.read(buf, 0, end - start, start);
+                            reply(200, {}, bytesRead === buf.length ? buf : buf.subarray(0, bytesRead));
+                        } finally { await fh.close(); }
+                        return;
+                    }
+                    if (header.op === "append" || header.op === "set") {
+                        fs.mkdirSync(path.dirname(full), { recursive: true });
+                        if (header.op === "append") fs.appendFileSync(full, body);
+                        else fs.writeFileSync(full, body);
+                        recordAccess(ip, "write", rel, body.length);
+                        return reply(200, {});
+                    }
+                    if (header.op === "remove") {
+                        try { fs.rmSync(full, { recursive: true, force: true }); } catch (e) { return reply(500, { error: (e as Error).message }); }
+                        return reply(200, {});
+                    }
+                    return reply(404, { error: "unknown op" });
+                } catch (e) {
+                    try { reply(500, { error: String((e as Error)?.message || e) }); } catch { /* socket gone */ }
+                }
+            })();
+        });
+    });
+
     return new Promise<RemoteFileServerHandle>((resolve, reject) => {
         server.on("error", reject);
         server.listen(port, host, () => {
@@ -409,7 +489,7 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
                 port: actualPort,
                 password,
                 url: `https://localhost:${actualPort}`,
-                close: () => new Promise<void>(r => { if (flushTimer) clearInterval(flushTimer); server.close(() => r()); }),
+                close: () => new Promise<void>(r => { if (flushTimer) clearInterval(flushTimer); for (const c of wss.clients) c.terminate(); wss.close(); server.close(() => r()); }),
             });
         });
     });

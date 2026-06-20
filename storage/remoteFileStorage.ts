@@ -1,5 +1,4 @@
 import { isNode } from "typesafecss";
-import https from "https";
 import type { DirectoryWrapper, FileWrapper } from "./FileFolderAPI";
 
 // A remote server (remoteFileServer.js) exposed as a DirectoryWrapper — the SAME interface as the
@@ -17,6 +16,7 @@ const DEFAULT_CACHE_BYTES = 128 * 1024 * 1024;
 export type RemoteOptions = {
     chunkBytes?: number;
     cacheBytes?: number;
+    maxFetchBytes?: number;      // cap per read request; large reads split into this many bytes each
     latencyMs?: number;          // artificial per-request delay, for simulating network latency in tests
     stats?: { requestCount: number; bytesFetched: number };
 };
@@ -35,46 +35,185 @@ type Stat = { size: number; lastModified: number; dir: boolean };
 // file, not one per block. Short enough that an append by another writer shows up promptly; our own
 // writes invalidate it immediately.
 const INFO_TTL_MS = 2000;
+// We keep at most this many bytes of read/write requests in flight at once (the rest queue), so a big
+// read doesn't fire hundreds of MB of requests at the server simultaneously.
+const MAX_INFLIGHT_BYTES = 64 * 1024 * 1024;
+// A single read request fetches at most this much; large reads are split into this many concurrent
+// requests (bounded by MAX_INFLIGHT_BYTES).
+const DEFAULT_MAX_FETCH_BYTES = 4 * 1024 * 1024;
+const STATS_LOG_INTERVAL_MS = 10 * 1000;
+const RECV_WINDOW_MS = 60 * 1000;
 
+function fmtBytes(n: number): string {
+    if (n < 1024) return n + "B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + "KB";
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + "MB";
+    return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
+}
+
+// Minimal WebSocket surface common to the browser's WebSocket and the `ws` package.
+type WSLike = {
+    readyState: number;
+    binaryType: string;
+    send(data: Uint8Array): void;
+    close(): void;
+    onopen: (() => void) | null;
+    onmessage: ((ev: { data: ArrayBuffer | Buffer }) => void) | null;
+    onclose: (() => void) | null;
+    onerror: ((e: unknown) => void) | null;
+};
+function makeWebSocket(url: string): WSLike {
+    if (isNode()) {
+        // `ws` is a Node dep; the eval hides it from the browser bundler (this branch never runs there).
+        const WS = (eval("require") as NodeRequire)("ws");
+        return new WS(url, { rejectUnauthorized: false }) as WSLike; // self-signed cert
+    }
+    return new WebSocket(url) as unknown as WSLike;
+}
+
+// Binary frame: [u32 headerLen LE][header JSON][body bytes].
+function encodeFrame(header: object, body?: Buffer): Buffer {
+    const h = Buffer.from(JSON.stringify(header), "utf8");
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(h.length, 0);
+    return Buffer.concat([len, h, body || EMPTY]);
+}
+function decodeFrame(buf: Buffer): { header: any; body: Buffer } {
+    const headerLen = buf.readUInt32LE(0);
+    const header = JSON.parse(buf.subarray(4, 4 + headerLen).toString("utf8"));
+    return { header, body: buf.subarray(4 + headerLen) };
+}
+
+type QueuedRequest = { id: number; frame: Buffer; bytes: number; resolve: (r: { status: number; body: Buffer }) => void; reject: (e: Error) => void };
+
+// One WebSocket to a remote server, multiplexing all ops over it. Requests are queued and only sent
+// while < MAX_INFLIGHT_BYTES are outstanding; every 10s (when there's traffic) it logs the queue depth
+// and throughput.
 class Connection {
-    private agent = isNode() ? new https.Agent({ rejectUnauthorized: false }) : undefined;
     private cache: RangeCache;
     private infoCache = new Map<string, { stat: Stat | undefined; at: number }>();
+
+    private ws: WSLike | undefined;
+    private connecting: Promise<void> | undefined;
+    private nextId = 1;
+    private pending = new Map<number, { resolve: (r: { status: number; body: Buffer }) => void; reject: (e: Error) => void; bytes: number }>();
+    private queue: QueuedRequest[] = [];
+    private inFlightBytes = 0;
+
+    private receivedTotal = 0;
+    private recvWindow: { t: number; n: number }[] = [];
+    private wsUrl: string;
+    private host: string;
+    private statsTimer: ReturnType<typeof setInterval>;
+
     constructor(public url: string, public password: string, private opts: RemoteOptions) {
-        this.cache = new RangeCache(opts.chunkBytes || DEFAULT_CHUNK_BYTES, opts.cacheBytes || DEFAULT_CACHE_BYTES);
         this.url = url.replace(/\/+$/, "");
+        this.wsUrl = this.url.replace(/^http/, "ws"); // https→wss, http→ws
+        this.host = (() => { try { return new URL(this.url).host; } catch { return this.url; } })();
+        this.cache = new RangeCache(opts.chunkBytes || DEFAULT_CHUNK_BYTES, opts.cacheBytes || DEFAULT_CACHE_BYTES, opts.maxFetchBytes || DEFAULT_MAX_FETCH_BYTES);
+        this.statsTimer = setInterval(() => this.logStats(), STATS_LOG_INTERVAL_MS);
+        (this.statsTimer as { unref?: () => void }).unref?.();
     }
 
-    // One HTTP request. Node uses the https module (self-signed cert → verification disabled); the
-    // browser uses fetch (the user has accepted the cert). Returns the raw status + body bytes.
-    async request(method: string, op: string, params: Record<string, string>, body?: Buffer): Promise<{ status: number; body: Buffer }> {
-        if (this.opts.latencyMs) await sleep(this.opts.latencyMs);
-        if (this.opts.stats) this.opts.stats.requestCount++;
-        const qs = new URLSearchParams(params).toString();
-        const fullUrl = this.url + op + (qs ? "?" + qs : "");
-        const headers: Record<string, string> = { authorization: "Bearer " + this.password };
-        if (body) headers["content-type"] = "application/octet-stream";
-        if (isNode()) {
-            return await new Promise((resolve, reject) => {
-                const u = new URL(fullUrl);
-                const req = https.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method, headers, agent: this.agent }, res => {
-                    const chunks: Buffer[] = [];
-                    res.on("data", d => chunks.push(d as Buffer));
-                    res.on("end", () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks) }));
-                });
-                req.on("error", reject);
-                if (body) req.write(body);
-                req.end();
-            });
+    close() {
+        clearInterval(this.statsTimer);
+        try { this.ws?.close(); } catch { /* */ }
+        this.ws = undefined;
+        this.connecting = undefined;
+    }
+
+    private logStats() {
+        const now = Date.now();
+        this.recvWindow = this.recvWindow.filter(e => now - e.t < RECV_WINDOW_MS);
+        if (this.inFlightBytes === 0 && this.queue.length === 0) return; // only when there's traffic
+        const recv60 = this.recvWindow.reduce((a, e) => a + e.n, 0);
+        const queuedBytes = this.queue.reduce((a, q) => a + q.bytes, 0);
+        console.log(`[remote ${this.host}] outstanding ${fmtBytes(this.inFlightBytes)} (${this.pending.size} req), queued ${fmtBytes(queuedBytes)} (${this.queue.length} req), recv/60s ${fmtBytes(recv60)}, recv total ${fmtBytes(this.receivedTotal)}`);
+    }
+
+    private ensureConnected(): Promise<void> {
+        if (this.ws && this.ws.readyState === 1) return Promise.resolve();
+        if (this.connecting) return this.connecting;
+        this.connecting = new Promise<void>((resolve, reject) => {
+            let authed = false;
+            const ws = makeWebSocket(this.wsUrl);
+            ws.binaryType = "arraybuffer";
+            this.ws = ws;
+            ws.onopen = () => ws.send(encodeFrame({ id: 0, op: "auth", password: this.password }));
+            ws.onmessage = (ev) => {
+                const buf = Buffer.isBuffer(ev.data) ? ev.data as Buffer : Buffer.from(ev.data as ArrayBuffer);
+                const { header } = decodeFrame(buf);
+                if (!authed && header.id === 0) {
+                    if (header.status === 200) { authed = true; resolve(); }
+                    else { reject(new Error("remote: authentication failed")); try { ws.close(); } catch { /* */ } }
+                    return;
+                }
+                this.onMessage(buf);
+            };
+            ws.onerror = () => { if (!authed) reject(new Error("remote: websocket connection error")); };
+            ws.onclose = () => {
+                if (!authed) reject(new Error("remote: connection closed before authenticating"));
+                this.handleDisconnect();
+            };
+        });
+        // Let a failed connection be retried next time.
+        this.connecting.catch(() => { this.ws = undefined; this.connecting = undefined; });
+        return this.connecting;
+    }
+
+    private onMessage(buf: Buffer) {
+        const { header, body } = decodeFrame(buf);
+        const p = this.pending.get(header.id);
+        if (!p) return;
+        this.pending.delete(header.id);
+        this.inFlightBytes -= p.bytes;
+        this.receivedTotal += body.length;
+        if (this.opts.stats) this.opts.stats.bytesFetched += body.length;
+        this.recvWindow.push({ t: Date.now(), n: body.length });
+        p.resolve({ status: header.status, body });
+        this.drain();
+    }
+
+    private handleDisconnect() {
+        const err = new Error("remote: websocket disconnected");
+        for (const p of this.pending.values()) p.reject(err);
+        for (const q of this.queue) q.reject(err);
+        this.pending.clear();
+        this.queue = [];
+        this.inFlightBytes = 0;
+        this.ws = undefined;
+        this.connecting = undefined;
+    }
+
+    private drain() {
+        while (this.queue.length && this.ws && this.ws.readyState === 1) {
+            const next = this.queue[0];
+            if (this.inFlightBytes > 0 && this.inFlightBytes + next.bytes > MAX_INFLIGHT_BYTES) break; // hold the queue
+            this.queue.shift();
+            this.inFlightBytes += next.bytes;
+            this.pending.set(next.id, { resolve: next.resolve, reject: next.reject, bytes: next.bytes });
+            if (this.opts.stats) this.opts.stats.requestCount++;
+            this.ws.send(next.frame);
         }
-        const res = await fetch(fullUrl, { method, headers, body: body ? new Uint8Array(body) : undefined });
-        return { status: res.status, body: Buffer.from(await res.arrayBuffer()) };
+    }
+
+    // Sends one request over the WebSocket (queued + throttled). `bytes` is the expected payload size,
+    // used for the in-flight cap.
+    private async request(op: string, params: Record<string, unknown>, body: Buffer | undefined, bytes: number): Promise<{ status: number; body: Buffer }> {
+        if (this.opts.latencyMs) await sleep(this.opts.latencyMs);
+        await this.ensureConnected();
+        const id = this.nextId++;
+        const frame = encodeFrame({ id, op, ...params }, body);
+        return new Promise((resolve, reject) => {
+            this.queue.push({ id, frame, bytes: Math.max(bytes, body ? body.length : 0, 1), resolve, reject });
+            this.drain();
+        });
     }
 
     async stat(path: string): Promise<Stat | undefined> {
         const cached = this.infoCache.get(path);
         if (cached && Date.now() - cached.at < INFO_TTL_MS) return cached.stat;
-        const r = await this.request("GET", "/info", { path });
+        const r = await this.request("info", { path }, undefined, 256);
         let stat: Stat | undefined;
         if (r.status === 404) stat = undefined;
         else if (r.status !== 200) throw new Error(`remote info failed (${r.status})`);
@@ -83,7 +222,7 @@ class Connection {
         return stat;
     }
     async list(path: string): Promise<{ name: string; dir: boolean }[]> {
-        const r = await this.request("GET", "/list", { path });
+        const r = await this.request("list", { path }, undefined, 4096);
         if (r.status !== 200) throw new Error(`remote list failed (${r.status})`);
         return JSON.parse(r.body.toString("utf8"));
     }
@@ -91,26 +230,24 @@ class Connection {
         return (await this.cache.read(this, path, start, end)) ?? EMPTY;
     }
     async readServer(path: string, start: number, end: number): Promise<Buffer | undefined> {
-        const r = await this.request("GET", "/read", { path, start: String(start), end: String(end) });
+        const r = await this.request("read", { path, start, end }, undefined, end - start);
         if (r.status === 404) return undefined;
         if (r.status !== 200) throw new Error(`remote read failed (${r.status})`);
-        if (this.opts.stats) this.opts.stats.bytesFetched += r.body.length;
         return r.body;
     }
     async append(path: string, body: Buffer): Promise<void> {
-        const r = await this.request("PUT", "/append", { path }, body);
+        const r = await this.request("append", { path }, body, body.length);
         if (r.status !== 200) throw new Error(`remote append failed (${r.status})`);
-        // Append-only keeps existing bytes, so cached chunks stay valid; just the size changed.
-        this.infoCache.delete(path);
+        this.infoCache.delete(path); // append-only keeps existing bytes; only the size changed
     }
     async set(path: string, body: Buffer): Promise<void> {
-        const r = await this.request("PUT", "/set", { path }, body);
+        const r = await this.request("set", { path }, body, body.length);
         if (r.status !== 200) throw new Error(`remote set failed (${r.status})`);
         this.cache.invalidate(path);
         this.infoCache.delete(path);
     }
     async remove(path: string): Promise<void> {
-        const r = await this.request("DELETE", "/remove", { path });
+        const r = await this.request("remove", { path }, undefined, 256);
         if (r.status !== 200) throw new Error(`remote remove failed (${r.status})`);
         this.cache.invalidate(path);
         this.infoCache.delete(path);
@@ -123,7 +260,7 @@ class Connection {
 class RangeCache {
     private chunks = new Map<string, Buffer>(); // path + "" + chunkIndex, insertion-ordered (LRU)
     private bytes = 0;
-    constructor(private chunkBytes: number, private budget: number) { }
+    constructor(private chunkBytes: number, private budget: number, private maxFetchBytes: number) { }
     private key(path: string, c: number) { return path + "" + c; }
     private peek(path: string, c: number): Buffer | undefined {
         const k = this.key(path, c);
@@ -152,24 +289,37 @@ class RangeCache {
     async read(conn: Connection, path: string, start: number, end: number): Promise<Buffer | undefined> {
         if (end <= start) return EMPTY;
         const CHUNK = this.chunkBytes;
+        const maxRunChunks = Math.max(1, Math.floor(this.maxFetchBytes / CHUNK));
         const firstChunk = Math.floor(start / CHUNK);
         const lastChunk = Math.floor((end - 1) / CHUNK);
-        let fetchFrom = -1, fetchTo = -1;
+        // Collect the chunks we don't have deeply enough into bounded contiguous runs (each <= maxFetchBytes).
+        const runs: { from: number; to: number }[] = [];
+        let runFrom = -1;
         for (let c = firstChunk; c <= lastChunk; c++) {
             const cStart = c * CHUNK;
             const needEnd = Math.min(end, cStart + CHUNK) - cStart;
             const have = this.peek(path, c);
-            if (!have || have.length < needEnd) { if (fetchFrom < 0) fetchFrom = c; fetchTo = c; }
+            if (!have || have.length < needEnd) {
+                if (runFrom < 0) runFrom = c;
+                if (c - runFrom + 1 >= maxRunChunks) { runs.push({ from: runFrom, to: c }); runFrom = -1; }
+            } else if (runFrom >= 0) {
+                runs.push({ from: runFrom, to: c - 1 });
+                runFrom = -1;
+            }
         }
-        if (fetchFrom >= 0) {
-            const bytes = await conn.readServer(path, fetchFrom * CHUNK, (fetchTo + 1) * CHUNK);
-            if (bytes === undefined) return undefined;
-            for (let c = fetchFrom; c <= fetchTo; c++) {
-                const off = (c - fetchFrom) * CHUNK;
+        if (runFrom >= 0) runs.push({ from: runFrom, to: lastChunk });
+        // Fetch all runs concurrently; the connection's queue caps total in-flight bytes.
+        let missingFile = false;
+        await Promise.all(runs.map(async run => {
+            const bytes = await conn.readServer(path, run.from * CHUNK, (run.to + 1) * CHUNK);
+            if (bytes === undefined) { missingFile = true; return; }
+            for (let c = run.from; c <= run.to; c++) {
+                const off = (c - run.from) * CHUNK;
                 if (off >= bytes.length) break;
                 this.store(path, c, bytes.subarray(off, Math.min(off + CHUNK, bytes.length)));
             }
-        }
+        }));
+        if (missingFile) return undefined;
         const parts: Buffer[] = [];
         for (let c = firstChunk; c <= lastChunk; c++) {
             const cStart = c * CHUNK;
@@ -228,6 +378,7 @@ class RemoteDirectoryWrapper implements DirectoryWrapper {
     // native API — e.g. recursive walks using `handle.entries()` — works the same over the network.
     readonly kind = "directory" as const;
     get name() { return baseName(this.dirPath); }
+    get fullPath() { return this.dirPath; }
     async removeEntry(key: string): Promise<void> {
         await this.conn.remove(joinPath(this.dirPath, key));
     }
@@ -271,17 +422,19 @@ export function getRemoteDirectoryHandle(url: string, password: string, options:
 
 export type RemoteConnectResult = { status: "ok" } | { status: "unauthorized" } | { status: "unreachable"; error: string };
 
-// Verifies a server is reachable and the password works — by actually listing the root. Distinguishes
-// "connected" / "wrong password" / "couldn't reach it" (the last usually meaning the self-signed cert
-// isn't trusted yet in the browser, since fetch failures carry no detail).
+// Verifies a server is reachable and the password works — by opening the WebSocket, authenticating, and
+// listing the root. Distinguishes "connected" / "wrong password" / "couldn't reach it" (the last usually
+// meaning the self-signed cert isn't trusted yet in the browser, since the socket just fails to open).
 export async function testRemoteConnection(url: string, password: string, options: RemoteOptions = {}): Promise<RemoteConnectResult> {
     const conn = new Connection(url, password, options);
     try {
-        const r = await conn.request("GET", "/list", { path: "" });
-        if (r.status === 200) return { status: "ok" };
-        if (r.status === 401) return { status: "unauthorized" };
-        return { status: "unreachable", error: `server returned ${r.status}` };
+        await conn.list("");
+        return { status: "ok" };
     } catch (e) {
-        return { status: "unreachable", error: (e as Error)?.message || String(e) };
+        const msg = (e as Error)?.message || String(e);
+        if (/auth/i.test(msg)) return { status: "unauthorized" };
+        return { status: "unreachable", error: msg };
+    } finally {
+        conn.close();
     }
 }

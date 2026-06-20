@@ -60,6 +60,9 @@ export type FileWrapper = {
 export type DirectoryWrapper = {
     readonly kind: "directory";
     readonly name: string;
+    // Full path from the storage root, for diagnostics/logging (the native handle doesn't expose paths,
+    // so it's optional). e.g. "bulkDatabases2/myCollection".
+    readonly fullPath?: string;
     removeEntry(key: string, options?: { recursive?: boolean }): Promise<void>;
     getFileHandle(key: string, options?: { create?: boolean }): Promise<FileWrapper>;
     getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper>;
@@ -291,6 +294,7 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
     }
     readonly kind = "directory" as const;
     get name() { return path.basename(this.rootPath); }
+    get fullPath() { return this.rootPath; }
     entries() { return this[Symbol.asyncIterator](); }
 
     async removeEntry(key: string, options?: { recursive?: boolean }) {
@@ -574,9 +578,11 @@ async function readWithRetry<T>(label: string, key: string, read: () => Promise<
 }
 
 function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
+    // Log the full path (root + filename) when available, so a failing file is identifiable.
+    const pathOf = (key: string) => handle.fullPath ? handle.fullPath + "/" + key : key;
     return {
         async getInfo(key: string) {
-            return readWithRetry("getInfo", key, async () => {
+            return readWithRetry("getInfo", pathOf(key), async () => {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
                 return {
@@ -586,7 +592,7 @@ function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
             });
         },
         async get(key: string): Promise<Buffer | undefined> {
-            return readWithRetry("get", key, async () => {
+            return readWithRetry("get", pathOf(key), async () => {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
                 const arrayBuffer = await fileContent.arrayBuffer();
@@ -600,7 +606,7 @@ function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
         },
 
         async getRange(key: string, config: { start: number; end: number }): Promise<Buffer | undefined> {
-            return readWithRetry("getRange", key, async () => {
+            return readWithRetry("getRange", pathOf(key), async () => {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
                 const clampedStart = Math.min(Math.max(config.start, 0), fileContent.size);
