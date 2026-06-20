@@ -377,6 +377,7 @@ class RemoteDirectoryWrapper implements DirectoryWrapper {
     // Mirror the native FileSystemDirectoryHandle shape (name/kind/entries) so code written against the
     // native API — e.g. recursive walks using `handle.entries()` — works the same over the network.
     readonly kind = "directory" as const;
+    readonly isRemote = true;
     get name() { return baseName(this.dirPath); }
     get fullPath() { return this.dirPath; }
     async removeEntry(key: string): Promise<void> {

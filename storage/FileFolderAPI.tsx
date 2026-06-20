@@ -63,6 +63,9 @@ export type DirectoryWrapper = {
     // Full path from the storage root, for diagnostics/logging (the native handle doesn't expose paths,
     // so it's optional). e.g. "bulkDatabases2/myCollection".
     readonly fullPath?: string;
+    // True when this storage is served over the network (a remote server) rather than a local disk, so
+    // callers can adapt for the higher latency/cost (local/native handles leave it undefined = false).
+    readonly isRemote?: boolean;
     removeEntry(key: string, options?: { recursive?: boolean }): Promise<void>;
     getFileHandle(key: string, options?: { create?: boolean }): Promise<FileWrapper>;
     getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper>;
@@ -509,6 +512,9 @@ export type NestedFileStorage = {
 
 export type FileStorage = IStorageRaw & {
     folder: NestedFileStorage;
+    // Mirrors DirectoryWrapper.isRemote: true when this storage is served over the network. Lets callers
+    // (e.g. BulkDatabase2, which skips automatic compaction over the network by default) adapt.
+    isRemote?: boolean;
 };
 
 let appendQueue = cache((key: string) => {
@@ -705,6 +711,7 @@ export function wrapHandle(handle: DirectoryWrapper): FileStorage {
     return {
         ...wrapHandleFiles(handle),
         folder: wrapHandleNested(handle),
+        isRemote: handle.isRemote,
     };
 }
 

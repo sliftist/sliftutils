@@ -80,6 +80,14 @@ export interface IBulkDatabase2<T extends { key: string }> {
     compact(): Promise<void>;
 
     /**
+     * Whether this collection's storage is served over the network (a remote server) rather than local
+     * disk. Apps can branch on this to adapt to the higher latency. Note: over the network the database
+     * skips automatic background compaction by default — call the static
+     * `BulkDatabase2.enableNetworkCompaction()` once to opt in.
+     */
+    isRemote(): Promise<boolean>;
+
+    /**
      * Flush buffered stream writes to disk now. Writes are coalesced and flushed on a ramping delay (to
      * avoid the browser rewriting the whole stream file per write), so a write's promise resolving means
      * "accepted" (in memory + cross-tab), not necessarily "on disk". Call this to force durability — it's

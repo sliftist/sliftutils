@@ -77,6 +77,11 @@ export const bulkDatabase2Timing = {
     firstMergeTriggerFiles: 20,
     // ...or span a wider write-time range than this (data trickling in slowly still gets consolidated).
     firstMergeTriggerRangeMs: 3 * 24 * 60 * 60 * 1000,
+    // Tier-0 stream data can't be read per-cell — a read pulls the whole stream — so once the stream
+    // exceeds BOTH of these it's folded into bulk (columnar, range-readable) promptly, bypassing the merge
+    // throttle. The byte bound matters most over the network, where pulling the whole stream is expensive.
+    streamFoldTriggerRows: 100,
+    streamFoldTriggerBytes: 64 * 1024 * 1024,
     // Max delay (per collection) before buffered stream writes are flushed to disk; the delay ramps up to
     // this under sustained writing (see WRITE_FLUSH_FIRST_STEP_MS). 0 = flush every write immediately —
     // the default in Node, where append is real and cheap; the browser ramps to 15s to avoid rewriting
@@ -131,6 +136,11 @@ export type StorageFactory = (path: string) => Promise<FileStorage>;
 // from ever colliding with a real data key.
 const LOAD_SIGNAL = NULL + "load";
 const OVERLAY_SIGNAL = NULL + "overlay";
+
+// Over network storage we skip automatic (background) compaction by default — reading and rewriting whole
+// files over the network is expensive. An app that wants it anyway opts in once via
+// BulkDatabaseBase.enableNetworkCompaction(). Explicit compact()/tryMergeNow() calls are unaffected.
+let networkCompactionEnabled = false;
 
 let fileNameCounter = 0;
 // Random per-process id baked into file names so two processes (tabs) writing the same collection
@@ -216,7 +226,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // ramping delay (see WRITE_FLUSH_FIRST_STEP_MS / writeFlushMaxDelayMs). Each buffered item keeps an
     // `apply` that re-applies its overlay mutation, so resetReader (which clears the overlay) can restore
     // writes that aren't on disk yet. Removed from the buffer only once their append succeeds.
-    private pendingAppends: { framed: Buffer; apply: () => void }[] = [];
+    private pendingAppends: { framed: Buffer; apply: () => void; rows: number }[] = [];
     private flushTimer: ReturnType<typeof setTimeout> | undefined;
     private flushChain: Promise<void> = Promise.resolve();
     private currentFlushDelay = 0;
@@ -228,7 +238,33 @@ export class BulkDatabaseBase<T extends { key: string }> {
         blockCache.clear();
     }
 
+    // Opt in to automatic compaction even when the storage is remote (off by default — see
+    // networkCompactionEnabled). Global; affects every collection. Explicit compact()/tryMergeNow() always
+    // run regardless of this.
+    public static enableNetworkCompaction() {
+        networkCompactionEnabled = true;
+    }
+
     public storage = lazy(async () => this.storageFactory(`${BULK_ROOT_FOLDER}/${this.name}`));
+
+    // True when this collection's storage is served over the network (a remote server). Apps can branch on
+    // this to adjust behavior for the higher latency (e.g. show a "slower storage" hint, prefetch less).
+    public async isRemote(): Promise<boolean> {
+        return !!(await this.storage()).isRemote;
+    }
+
+    // Whether the tier-0 stream is big enough to fold into bulk now (both bounds): too many rows AND too
+    // many bytes to keep reading whole. See bulkDatabase2Timing.streamFoldTrigger*.
+    private streamNeedsFold(): boolean {
+        return this.streamRowsOnDisk >= bulkDatabase2Timing.streamFoldTriggerRows && this.streamBytesOnDisk > bulkDatabase2Timing.streamFoldTriggerBytes;
+    }
+
+    // Automatic (background) compaction is skipped over the network unless the app opted in. Explicit
+    // compact()/tryMergeNow() bypass this.
+    private async automaticCompactionAllowed(): Promise<boolean> {
+        if (networkCompactionEnabled) return true;
+        return !(await this.storage()).isRemote;
+    }
 
     // In-memory overlay of pending writes/deletes. It takes priority over the loaded readers, so writes
     // are reflected in reads without reloading. Reads observe the relevant signal; mutations invalidate it.
@@ -241,6 +277,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // Latest stream-on-disk timestamp per key (from the loaded stream files). Used together with the
     // overlay to decide whether an incoming remote write is actually newer than what we have.
     private streamTimes = new Map<string, number>();
+
+    // Approximate size of the tier-0 stream data on disk: set accurately from the last reader build, then
+    // kept current as each flush appends more. Drives the stream-fold trigger (see streamNeedsFold);
+    // reset on resetReader, since after a merge/reset the next reader build re-measures it.
+    private streamRowsOnDisk = 0;
+    private streamBytesOnDisk = 0;
 
     // This instance's tier-0 stream file. Each instance (≈ each thread/tab) streams to its own file
     // so concurrent writers never touch the same file.
@@ -319,6 +361,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (streamData.missing) filesChanged = true;
         if (filesChanged && !tolerateMissing) throw new FilesChangedError();
 
+        // Accurate stream size as of this load; subsequent flushes keep it current (see doFlush).
+        this.streamRowsOnDisk = streamData.entries.length;
+        this.streamBytesOnDisk = streamData.totalBytes;
+
         const bulkReaders = bulkReadersRaw.filter((r): r is BaseBulkDatabaseReader => !!r);
         // The join resolves purely by write-time, so reader order doesn't matter.
         const readers: BaseBulkDatabaseReader[] = [];
@@ -389,6 +435,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.baseFields.clear();
             this.baseFieldsLoading.clear();
             this.overlay.clear();
+            // The next reader build re-measures the stream; clear the estimate so a just-folded stream
+            // doesn't keep looking "heavy" and re-trigger a fold before then.
+            this.streamRowsOnDisk = 0;
+            this.streamBytesOnDisk = 0;
             for (const p of this.pendingAppends) p.apply();
             this.deps.invalidate(LOAD_SIGNAL);
             this.deps.invalidate(OVERLAY_SIGNAL);
@@ -422,7 +472,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const apply = () => { for (const { time, row } of stamped) this.setOverlayRow(row.key as string, row, time); };
         this.deps.batch(apply);
         for (const { time, row } of stamped) syncBroadcast(this.name, { key: row.key as string, time, value: row });
-        await this.streamAppend(framed, apply);
+        await this.streamAppend(framed, apply, stamped.length);
         void this.maybeMerge();
     }
 
@@ -437,7 +487,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const apply = () => { for (const { time, key } of stamped) this.setOverlayDeleted(key, time); };
         this.deps.batch(apply);
         for (const { time, key } of stamped) syncBroadcast(this.name, { key, time, deleted: true });
-        await this.streamAppend(frameDeletes(stamped), apply);
+        await this.streamAppend(frameDeletes(stamped), apply, stamped.length);
         void this.maybeMerge();
     }
 
@@ -445,8 +495,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // `apply` re-applies this write's overlay mutation if resetReader clears the overlay before it's on
     // disk. Awaits durability only on an immediate (idle/Node) flush, so a single action — then close — is
     // saved at once; a burst returns fast and is flushed in the background.
-    private async streamAppend(framed: Buffer, apply: () => void): Promise<void> {
-        this.pendingAppends.push({ framed, apply });
+    private async streamAppend(framed: Buffer, apply: () => void, rows: number): Promise<void> {
+        this.pendingAppends.push({ framed, apply, rows });
         const max = bulkDatabase2Timing.writeFlushMaxDelayMs;
         const now = Date.now();
         // Immediate when batching is off (Node / real append), or for the first write after a lull.
@@ -487,6 +537,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
         await storage.append(this.getStreamFileName(), combined);
         // New writes added during the await are after `batch`, so removing the front is exactly the flushed set.
         this.pendingAppends.splice(0, batch.length);
+        // Keep the stream-size estimate current so the fold trigger sees write-accumulation between reads.
+        this.streamBytesOnDisk += combined.length;
+        for (const p of batch) this.streamRowsOnDisk += p.rows;
     }
 
     public async update(entry: Partial<T> & { key: string }): Promise<void> {
@@ -603,10 +656,13 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return entries.map(e => e.entry);
     }
 
-    // Throttled, fire-and-forget after writes: run a background merge check at most once per interval.
+    // Throttled, fire-and-forget after writes: run a background merge check at most once per interval — but
+    // a tier-0 stream that's grown too big folds promptly, bypassing the throttle. Skipped entirely over
+    // the network unless the app opted in (see automaticCompactionAllowed).
     private async maybeMerge(): Promise<void> {
+        if (!await this.automaticCompactionAllowed()) return;
         const now = Date.now();
-        if (now - this.lastMergeCheck < bulkDatabase2Timing.mergeCheckIntervalMs) return;
+        if (!this.streamNeedsFold() && now - this.lastMergeCheck < bulkDatabase2Timing.mergeCheckIntervalMs) return;
         this.lastMergeCheck = now;
         try {
             await this.tryMergeNow();
@@ -951,8 +1007,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 if (recentBytes >= FIRST_MERGE_BYTES) break;
             }
             const span = recent.length ? recent[0].time - recent[recent.length - 1].time : 0;
-            const triggered = recent.length >= 2
-                && (recent.length > bulkDatabase2Timing.firstMergeTriggerFiles || span > bulkDatabase2Timing.firstMergeTriggerRangeMs);
+            // Fold when there's enough fragmentation to consolidate, OR when a foldable stream has grown too
+            // big to keep reading whole (even if it's the only recent file) — see streamNeedsFold.
+            const heavyStreamRecent = this.streamNeedsFold() && recent.some(i => i.kind === "stream");
+            const triggered =
+                recent.length >= 2 && (recent.length > bulkDatabase2Timing.firstMergeTriggerFiles || span > bulkDatabase2Timing.firstMergeTriggerRangeMs)
+                || heavyStreamRecent && recent.length >= 1;
             if (triggered) {
                 const rb = recent.filter(i => i.kind === "bulk").map(i => (i.file as BulkFileInfo));
                 const rs = recent.filter(i => i.kind === "stream").map(i => (i.file as StreamFileInfo));
