@@ -95,6 +95,16 @@ function loadRemoteConfig(): RemoteConfig | undefined {
 }
 function saveRemoteConfig(c: RemoteConfig) { localStorage.setItem(remoteConfigKey(), JSON.stringify(c)); }
 
+// The server is always HTTPS on the filehoster's default port, so the user only needs to type the host
+// (e.g. "65.109.93.113"). We strip any scheme/path they include and default the port if omitted.
+const DEFAULT_REMOTE_PORT = 8787; // matches remoteFileServer.js's default
+function normalizeServerUrl(raw: string): string {
+    let s = raw.trim().replace(/^\w+:\/\//, "").replace(/\/.*$/, "");
+    if (!s) return "";
+    if (!/:\d+$/.test(s)) s += ":" + DEFAULT_REMOTE_PORT;
+    return "https://" + s;
+}
+
 // One shared factory (and therefore one shared range cache) per remote config.
 let remoteFactory: { key: string; factory: ReturnType<typeof getRemoteFileStorage> } | undefined;
 function getRemoteFactory(remote: RemoteConfig) {
@@ -129,7 +139,7 @@ class DirectoryPrompter extends preact.Component {
 @observer
 class ServerConnectForm extends preact.Component {
     private obs = observable({ expanded: false, url: "", password: "", error: "", connecting: false, needsCert: false, showPassword: false });
-    private cleanUrl() { return this.obs.url.trim().replace(/\/+$/, ""); }
+    private cleanUrl() { return normalizeServerUrl(this.obs.url); }
     private connect = async () => {
         const s = this.obs;
         s.error = "";
@@ -166,7 +176,7 @@ class ServerConnectForm extends preact.Component {
         }
         return (
             <div className={css.vbox(16).center}>
-                <input className={inputCss} placeholder="https://host:8787" value={s.url}
+                <input className={inputCss} placeholder="server address (e.g. 65.109.93.113, or host:port)" value={s.url}
                     onInput={e => s.url = (e.target as HTMLInputElement).value} />
                 <div className={css.hbox(10).center}>
                     <input className={inputCss} type={s.showPassword ? "text" : "password"} placeholder="password (six words)" value={s.password}
