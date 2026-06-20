@@ -128,7 +128,7 @@ class DirectoryPrompter extends preact.Component {
 // reloads so getFileStorageNested2 picks up the remote storage.
 @observer
 class ServerConnectForm extends preact.Component {
-    private obs = observable({ expanded: false, url: "", password: "", error: "", connecting: false, needsCert: false });
+    private obs = observable({ expanded: false, url: "", password: "", error: "", connecting: false, needsCert: false, showPassword: false });
     private cleanUrl() { return this.obs.url.trim().replace(/\/+$/, ""); }
     private connect = async () => {
         const s = this.obs;
@@ -168,8 +168,13 @@ class ServerConnectForm extends preact.Component {
             <div className={css.vbox(16).center}>
                 <input className={inputCss} placeholder="https://host:8787" value={s.url}
                     onInput={e => s.url = (e.target as HTMLInputElement).value} />
-                <input className={inputCss} type="password" placeholder="password (six words)" value={s.password}
-                    onInput={e => s.password = (e.target as HTMLInputElement).value} />
+                <div className={css.hbox(10).center}>
+                    <input className={inputCss} type={s.showPassword ? "text" : "password"} placeholder="password (six words)" value={s.password}
+                        onInput={e => s.password = (e.target as HTMLInputElement).value} />
+                    <button className={css.fontSize(22).pad2(24, 12)} onClick={() => s.showPassword = !s.showPassword}>
+                        {s.showPassword ? "Hide" : "Show"}
+                    </button>
+                </div>
                 {s.error ? <div className={css.fontSize(22).color("red").maxWidth("80vw")}>{s.error}</div> : null}
                 {s.needsCert ? (
                     <div className={css.vbox(10).center.fontSize(20).maxWidth(620).maxWidth("80vw").textAlign("center").color("hsl(0, 0%, 25%)")}>
