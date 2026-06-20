@@ -26,8 +26,8 @@ import type { FileStorage } from "../FileFolderAPI";
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
 // BulkDatabase2's compressed-block format is not compatible with BulkDatabase, so it uses its own
-// folder rather than sharing bulkDatabases/.
-const BULK_ROOT_FOLDER = "bulkDatabases2";
+// folder rather than sharing bulkDatabases/. Exported so a server-side compactor can find collections.
+export const BULK_ROOT_FOLDER = "bulkDatabases2";
 const FILE_EXTENSION = ".bulk";
 // A single writeBatch that already exceeds these limits skips the tier-0 stream and folds straight
 // into a bulk file (streaming thousands of rows one frame at a time would be pointless).

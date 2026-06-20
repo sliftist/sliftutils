@@ -7,7 +7,10 @@ import os from "os";
 import { execFileSync } from "child_process";
 import { getExternalIP } from "socket-function/src/networking";
 import { forwardPort } from "socket-function/src/forwardPort";
+import { runInfinitePollCallAtStart } from "socket-function/src/batching";
 import { WebSocketServer, WebSocket } from "ws";
+import { BulkDatabaseBase, bulkDatabase2Timing, noopReactiveDeps, BULK_ROOT_FOLDER } from "./BulkDatabase2/BulkDatabaseBase";
+import { wrapHandle, NodeJSDirectoryHandleWrapper, DirectoryWrapper } from "./FileFolderAPI";
 
 // Remote file server for sliftutils getRemoteFileStorage / BulkDatabase2. Serves one folder on disk over
 // self-signed HTTPS, authenticated with an auto-generated 6-word password (sent as
@@ -567,6 +570,54 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
     });
 }
 
+// ── server-side compaction (--autocompact) ──
+// Remote clients (e.g. a TV) skip compaction by default — it's expensive to read/rewrite whole files over
+// the network. So the host can do it locally instead: load each bulk database's index and run one merge
+// pass, on startup and every 3 hours. Far more efficient (local disk, no network), and the data still gets
+// compacted eventually.
+const AUTOCOMPACT_INTERVAL_MS = 3 * 60 * 60 * 1000;
+// One reused compactor instance per collection (keyed by baseDir\0name), so we don't leak the per-instance
+// timers/caches by recreating instances each loop.
+const compactors = new Map<string, BulkDatabaseBase<{ key: string }>>();
+function getCompactor(baseDir: string, name: string): BulkDatabaseBase<{ key: string }> {
+    const key = baseDir + "\0" + name;
+    let db = compactors.get(key);
+    if (!db) {
+        // BulkDatabaseBase asks its factory for `bulkDatabases2/<name>`, so root the factory at baseDir.
+        const factory = async (p: string) => {
+            let base: DirectoryWrapper = new NodeJSDirectoryHandleWrapper(baseDir);
+            for (const part of p.split("/")) { if (part) base = await base.getDirectoryHandle(part, { create: true }); }
+            return wrapHandle(base);
+        };
+        db = new BulkDatabaseBase<{ key: string }>(name, noopReactiveDeps, factory);
+        compactors.set(key, db);
+    }
+    return db;
+}
+
+// One full pass: rescan the disk for collections (new ones may have appeared) and run a merge on each,
+// strictly one after another (never in parallel).
+export async function autocompactBulkDatabases(root: string): Promise<void> {
+    // Collections live under <baseDir>/bulkDatabases2/<name>/. The app may nest its data under a "data"
+    // subfolder (see getFileStorageNested2's heuristic), so look in both <root> and <root>/data.
+    for (const baseDir of [root, path.join(root, "data")]) {
+        let names: string[];
+        try {
+            names = fs.readdirSync(path.join(baseDir, BULK_ROOT_FOLDER), { withFileTypes: true })
+                .filter(d => d.isDirectory()).map(d => d.name);
+        } catch { continue; } // no bulkDatabases2 here
+        for (const name of names) {
+            try {
+                const t = Date.now();
+                const res = await getCompactor(baseDir, name).tryMergeNow();
+                if (res.merged) console.log(`  [autocompact] ${name}: merged (${Date.now() - t}ms)`);
+            } catch (e) {
+                console.warn(`  [autocompact] ${name}: failed — ${(e as Error).message}`);
+            }
+        }
+    }
+}
+
 // CLI entry (invoked by bin/filehoster.js or `yarn filehoster <folder>`). Starts the server, logs the
 // password + local/public URLs + batched access, and keeps the UPnP port mapping alive.
 export async function runFileHoster(): Promise<void> {
@@ -607,4 +658,14 @@ export async function runFileHoster(): Promise<void> {
     setInterval(refresh, 30 * 60 * 1000);
 
     console.log("  [access] request logging on (batched every 5s)\n");
+
+    if (args.includes("--autocompact")) {
+        // No UI to protect on a host, so don't space merges out — compact promptly each pass.
+        bulkDatabase2Timing.mergeSpacingMs = 0;
+        console.log("  [autocompact] compacting bulk databases on startup, then every 3h (serial)\n");
+        // Fire-and-forget: runs the first pass now and re-runs every 3h. Not awaited, so it doesn't block
+        // startup; each pass rescans the disk for new collections and merges them one at a time.
+        void runInfinitePollCallAtStart(AUTOCOMPACT_INTERVAL_MS, () => autocompactBulkDatabases(root))
+            .catch(e => console.error("  [autocompact] poll error:", (e as Error).stack));
+    }
 }
