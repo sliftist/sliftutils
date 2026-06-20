@@ -260,8 +260,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private currentFlushDelay = 0;
     private lastWriteTime = 0;
 
-    // Block range cache is global and immutable-file-safe; clear it to simulate a cold page load
-    // (e.g. between an untimed prep step and the timed benchmark).
+    // Block range cache is global and immutable-file-safe; clear it to simulate a cold page load (e.g.
+    // between an untimed prep step and the timed benchmark). The per-instance sub-reader caches need no
+    // clearing here — a cold load is a fresh instance, which starts with empty caches.
     public static clearCache() {
         blockCache.clear();
     }
@@ -328,6 +329,17 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // (the rest see the bumped epoch, skip their own reload, and just await the in-flight one).
     private readerEpoch = 0;
     private fileSetPollTimer: ReturnType<typeof setInterval> | undefined;
+
+    // Per-file decoded sub-reader caches (keyed by fileName), so reloading the index re-reads only the
+    // files that actually changed — the stitch (join) still runs, but unchanged files skip re-decoding.
+    // Per-INSTANCE (not global), because a cached reader's getRange is bound to THIS instance's storage
+    // backend; in production a collection has one backend, and a "fresh client" is a new process with empty
+    // caches anyway. Bulk files are immutable, so a name maps to fixed content (cache until the file is
+    // gone). Stream files are append-only, so size is the version: reuse on a size match, else parse only
+    // the appended suffix. Pruned per build for files a merge removed (pruneFileCaches); survive the reader
+    // reset (that's the point — a reload reuses them).
+    private bulkReaderCache = new Map<string, BaseBulkDatabaseReader>();
+    private streamReaderCache = new Map<string, { readSize: number; parsedPos: number; entries: StreamEntry[] }>();
     // Bumped on every overlay mutation / reader reset. An async column build captures it before its awaits
     // and only caches its result if it hasn't changed since — so a write or reset mid-build (which clears
     // the cache and may swap the reader) can never leave a stale entry behind.
@@ -493,6 +505,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.readerKeys = new Set(joined.keys);
         // The files this index was built from, so the poll can detect a concurrent merge changing the set.
         this.loadedFileSet = new Set([...bulkFiles.map(f => f.fileName), ...streamFiles.map(f => f.fileName)]);
+        // Evict cached sub-readers for files a merge removed, so the caches track the live file set.
+        this.pruneFileCaches(bulkFiles, streamFiles);
 
         let time = Date.now() - start;
         if (time > 50) {
@@ -786,17 +800,38 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (!streamFiles.length) return { entries: [], totalBytes: 0, missing: false, sizes };
         const storage = await this.storage();
         let missing = false;
-        // Read a bounded prefix [0, size) rather than the whole file: a foreign writer may be appending
-        // concurrently, and storage.get() errors when the file grows past the size it stat'd. Reading a
-        // prefix is tolerant — parseStream stops at the last complete frame, the file stays valid, and a
+        // Per-file parse, reusing streamCache when the file hasn't grown. Stream files are append-only, so
+        // size is the version: same size ⇒ same parsed entries; a larger size ⇒ parse only the appended
+        // suffix and tack it on. We read a bounded prefix [0, size) — a foreign writer may be appending, and
+        // storage.get() errors past the stat'd size; parseStream stops at the last complete frame, so a
         // later read picks up the rest. A file removed out from under us (a merge) sets `missing`.
-        const buffers = await Promise.all(streamFiles.map(async f => {
+        const perFile = await Promise.all(streamFiles.map(async (f): Promise<{ fileName: string; size: number; entries: StreamEntry[] } | undefined> => {
             try {
                 const info = await storage.getInfo(f.fileName);
                 if (!info) { missing = true; return undefined; }
-                sizes.set(f.fileName, info.size);
-                if (info.size === 0) return undefined;
-                return await storage.getRange(f.fileName, { start: 0, end: info.size });
+                const size = info.size;
+                sizes.set(f.fileName, size);
+                const cached = this.streamReaderCache.get(f.fileName);
+                if (cached && cached.readSize === size) return { fileName: f.fileName, size, entries: cached.entries };
+                if (size === 0) { this.streamReaderCache.set(f.fileName, { readSize: 0, parsedPos: 0, entries: [] }); return { fileName: f.fileName, size: 0, entries: [] }; }
+                if (cached && size > cached.readSize) {
+                    // Grew: parse only the appended bytes from where we last stopped (a frame boundary).
+                    const suffix = await storage.getRange(f.fileName, { start: cached.parsedPos, end: size });
+                    if (!suffix) { missing = true; return undefined; }
+                    const parsed = parseStream(suffix);
+                    if (parsed.badBytes > 0) console.warn(`${this.name} stream file ${f.fileName} had ${parsed.badBytes} trailing bad/incomplete bytes (stopped reading there)`);
+                    const entries = parsed.entries.length ? cached.entries.concat(parsed.entries) : cached.entries;
+                    const parsedPos = cached.parsedPos + (suffix.length - parsed.badBytes);
+                    this.streamReaderCache.set(f.fileName, { readSize: size, parsedPos, entries });
+                    return { fileName: f.fileName, size, entries };
+                }
+                // Cold (or the rare shrink/rewrite): full read from the start.
+                const buffer = await storage.getRange(f.fileName, { start: 0, end: size });
+                if (!buffer) { missing = true; return undefined; }
+                const parsed = parseStream(buffer);
+                if (parsed.badBytes > 0) console.warn(`${this.name} stream file ${f.fileName} had ${parsed.badBytes} trailing bad/incomplete bytes (stopped reading there)`);
+                this.streamReaderCache.set(f.fileName, { readSize: size, parsedPos: size - parsed.badBytes, entries: parsed.entries });
+                return { fileName: f.fileName, size, entries: parsed.entries };
             } catch {
                 missing = true;
                 return undefined;
@@ -804,17 +839,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }));
         const entries: { time: number; fileName: string; entry: StreamEntry }[] = [];
         let totalBytes = 0;
-        for (let i = 0; i < streamFiles.length; i++) {
-            const buffer = buffers[i];
-            if (!buffer) continue;
-            totalBytes += buffer.length;
-            const parsed = parseStream(buffer);
-            if (parsed.badBytes > 0) {
-                console.warn(`${this.name} stream file ${streamFiles[i].fileName} had ${parsed.badBytes} trailing bad/incomplete bytes (stopped reading there)`);
-            }
-            for (const entry of parsed.entries) {
-                entries.push({ time: entry.time, fileName: streamFiles[i].fileName, entry });
-            }
+        for (const pf of perFile) {
+            if (!pf) continue;
+            totalBytes += pf.size;
+            for (const entry of pf.entries) entries.push({ time: entry.time, fileName: pf.fileName, entry });
         }
         return { entries, totalBytes, missing, sizes };
     }
@@ -913,13 +941,30 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     private async loadFileReader(fileName: string): Promise<BaseBulkDatabaseReader> {
+        // Bulk files are immutable, so a decoded sub-reader (keys + keyTimes + columns) is valid until the
+        // file is gone — reuse it so an index reload doesn't re-decode unchanged files. (We skip the getInfo
+        // existence check on a hit; if the file was merged away mid-build the deferred read fails and
+        // readWithReload recovers — and buildReader won't ask for files that aren't currently listed.)
+        const cached = this.bulkReaderCache.get(fileName);
+        if (cached) return cached;
         const raw = await this.makeRawGetRange(fileName);
         const fileId = nullJoin(this.name, fileName);
-        // Files are immutable and stored as compressed blocks; replace getRange with a block-cached,
-        // decompressing version (same interface) and read the logical (uncompressed) size from its
-        // index. open() validates the file size against the index and throws if it's truncated/corrupt.
+        // Stored as compressed blocks; replace getRange with a block-cached, decompressing version (same
+        // interface) and read the logical (uncompressed) size from its index. open() validates the file
+        // size against the index and throws if it's truncated/corrupt.
         const opened = await blockCache.open(fileId, raw.size, raw.rawGetRange);
-        return loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange });
+        const reader = await loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange });
+        this.bulkReaderCache.set(fileName, reader);
+        return reader;
+    }
+
+    // Drop cached sub-readers for files that no longer exist (a merge replaced them), so the caches track
+    // the live file set instead of growing with churn. Called after each successful build.
+    private pruneFileCaches(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[]) {
+        const liveBulk = new Set(bulkFiles.map(f => f.fileName));
+        const liveStream = new Set(streamFiles.map(f => f.fileName));
+        for (const name of this.bulkReaderCache.keys()) if (!liveBulk.has(name)) this.bulkReaderCache.delete(name);
+        for (const name of this.streamReaderCache.keys()) if (!liveStream.has(name)) this.streamReaderCache.delete(name);
     }
 
     // Reads only a bulk file's header (row count, time range, key range) — no column data — for merge
