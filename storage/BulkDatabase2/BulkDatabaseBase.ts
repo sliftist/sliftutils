@@ -87,6 +87,13 @@ export const bulkDatabase2Timing = {
     // the default in Node, where append is real and cheap; the browser ramps to 15s to avoid rewriting
     // the whole stream file per write.
     writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
+    // When a read hits a file a concurrent merge (another tab/process) deleted, we reload the index
+    // (re-list files, re-read headers/keys) and retry — but at most this often, so a burst of failing reads
+    // can't rebuild repeatedly.
+    indexReloadThrottleMs: 15 * 1000,
+    // We also proactively re-list files this often; if the set changed under us we reload the index, so
+    // reads pick up another writer's merge even without first hitting an error.
+    fileSetPollIntervalMs: 30 * 60 * 1000,
 };
 
 // Marks a key as deleted in the in-memory overlay.
@@ -236,6 +243,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 }
             } catch { /* not in a DOM context */ }
         }
+        // Proactively notice another writer's merge (files added/removed) and reload the index, so reads
+        // stay correct even without first hitting a missing-file error.
+        this.fileSetPollTimer = setInterval(() => void this.pollFileSet(), bulkDatabase2Timing.fileSetPollIntervalMs);
+        (this.fileSetPollTimer as { unref?: () => void }).unref?.();
     }
 
     // ---- buffered stream writes (per collection) ----
@@ -305,6 +316,15 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // update of an existing key (only the written columns change) from adding/removing a key (which appears
     // in / disappears from EVERY column). Set on reader build, cleared on reset.
     private readerKeys: Set<string> | undefined;
+
+    // ---- the on-disk index ----
+    // The "index" is the loaded reader (file headers + key columns joined into a resolved view) plus the
+    // set of files it was built from. A concurrent merge in another tab/process rewrites files out from
+    // under us; we notice either when a read hits a deleted file (readWithReload) or via the periodic poll
+    // (pollFileSet), and reload the index — cheap, since a build only reads headers + key columns.
+    private loadedFileSet: Set<string> | undefined; // file names the current reader was built from
+    private lastIndexReload = 0;                     // throttle for error-triggered reloads
+    private fileSetPollTimer: ReturnType<typeof setInterval> | undefined;
     // Bumped on every overlay mutation / reader reset. An async column build captures it before its awaits
     // and only caches its result if it hasn't changed since — so a write or reset mid-build (which clears
     // the cache and may swap the reader) can never leave a stale entry behind.
@@ -468,6 +488,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // Live keys of this reader, so per-column cache invalidation can tell an update of an existing key
         // (only its set columns change) from a key add/remove (which touches every column).
         this.readerKeys = new Set(joined.keys);
+        // The files this index was built from, so the poll can detect a concurrent merge changing the set.
+        this.loadedFileSet = new Set([...bulkFiles.map(f => f.fileName), ...streamFiles.map(f => f.fileName)]);
 
         let time = Date.now() - start;
         if (time > 50) {
@@ -513,29 +535,85 @@ export class BulkDatabaseBase<T extends { key: string }> {
         });
     }
 
-    // Reset the loaded reader and all derived in-memory caches/overlay. Used only on structural
-    // changes (large direct-bulk write, rollover, compact) after the data has been persisted. Writes
-    // still buffered (not yet on disk) are re-applied so the reset doesn't drop them from reads — they
-    // aren't in the reloaded reader until their append lands.
+    // Drop the loaded index (reader) and everything derived from it, so the next read rebuilds via
+    // buildReader. Does NOT touch the overlay — callers decide what to do with pending writes.
+    private clearReaderState() {
+        this.reader.reset();
+        this.baseColumns.clear();
+        this.baseColumnsLoading.clear();
+        this.baseFields.clear();
+        this.baseFieldsLoading.clear();
+        this.columnCache.clear();
+        this.readerKeys = undefined;     // the next build repopulates it
+        this.loadedFileSet = undefined;  // ditto
+        // The next build re-measures the stream; clear the estimate so a just-folded stream doesn't keep
+        // looking "heavy" and re-trigger a fold before then.
+        this.streamRowsOnDisk = 0;
+        this.streamBytesOnDisk = 0;
+        this.dataGen++;
+    }
+
+    // Reset the loaded reader AND drop the overlay. Used only on structural changes WE made (large
+    // direct-bulk write, rollover, compact) after the data has been persisted. Writes still buffered (not
+    // yet on disk) are re-applied so the reset doesn't drop them from reads — they aren't in the reloaded
+    // reader until their append lands.
     private resetReader() {
         this.deps.batch(() => {
-            this.reader.reset();
-            this.baseColumns.clear();
-            this.baseColumnsLoading.clear();
-            this.baseFields.clear();
-            this.baseFieldsLoading.clear();
+            this.clearReaderState();
             this.overlay.clear();
-            this.dataGen++;
-            this.columnCache.clear();
-            this.readerKeys = undefined; // the next reader build repopulates it
-            // The next reader build re-measures the stream; clear the estimate so a just-folded stream
-            // doesn't keep looking "heavy" and re-trigger a fold before then.
-            this.streamRowsOnDisk = 0;
-            this.streamBytesOnDisk = 0;
             for (const p of this.pendingAppends) p.apply();
             this.invalidateSignal(LOAD_SIGNAL);
             this.invalidateSignal(OVERLAY_SIGNAL);
         });
+    }
+
+    // Reload just the on-disk index after the file set changed UNDER us (a concurrent merge). Keeps the
+    // overlay: our pending writes are in-memory and independent of which files exist on disk.
+    private reloadReader() {
+        this.deps.batch(() => {
+            this.clearReaderState();
+            this.invalidateSignal(LOAD_SIGNAL);
+            this.invalidateSignal(OVERLAY_SIGNAL);
+        });
+    }
+
+    // A read hit a file a concurrent merge deleted. Reload the index — at most once per
+    // indexReloadThrottleMs, so a burst of failing reads doesn't rebuild over and over.
+    private maybeReloadIndex() {
+        const now = Date.now();
+        if (now - this.lastIndexReload < bulkDatabase2Timing.indexReloadThrottleMs) return;
+        this.lastIndexReload = now;
+        this.reloadReader();
+    }
+
+    // Run a read against the loaded index; if a file vanished mid-read (a concurrent merge deleted it),
+    // reload the index (throttled) and retry once against the fresh reader.
+    private async readWithReload<R>(fn: (reader: ResolvedReader) => Promise<R>): Promise<R> {
+        let reader = await this.reader();
+        try {
+            return await fn(reader);
+        } catch (e) {
+            if (!(e instanceof MissingFileError)) throw e;
+            this.maybeReloadIndex();
+            reader = await this.reader();
+            return await fn(reader);
+        }
+    }
+
+    // Proactively reload the index if the on-disk file set changed under us (a merge in another tab/
+    // process), so reads pick up the new files even without first hitting a read error. Cheap — just lists
+    // the directory. Runs on a timer (fileSetPollIntervalMs).
+    private async pollFileSet(): Promise<void> {
+        if (!this.loadedFileSet) return; // reader not built yet → nothing loaded to compare against
+        let current: Set<string>;
+        try {
+            const { bulkFiles, streamFiles } = await this.listFiles();
+            current = new Set([...bulkFiles.map(f => f.fileName), ...streamFiles.map(f => f.fileName)]);
+        } catch { return; }
+        const prev = this.loadedFileSet;
+        if (!prev) return; // reloaded during the await
+        const changed = current.size !== prev.size || [...current].some(n => !prev.has(n));
+        if (changed) this.reloadReader();
     }
 
     // ---- writes ----
@@ -1210,11 +1288,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
             // column not set in the overlay entry — fall through to disk for this column
         }
         let time = Date.now();
-        let reader = await this.reader();
-        const r = await reader.getSingleField(key, col);
+        const r = await this.readWithReload(reader => reader.getSingleField(key, col));
         time = Date.now() - time;
         if (time > 50) {
-            console.log(`${blue(`${this.name}.getSingleFieldObj(${JSON.stringify(key)}, ${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(reader)}`);
+            console.log(`${blue(`${this.name}.getSingleFieldObj(${JSON.stringify(key)}, ${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(await this.reader())}`);
         }
         if (r === undefined) {
             // Not live on disk; but if the overlay holds the key (a partial write of a not-yet-on-disk
@@ -1232,12 +1309,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (cached) return cached as { key: string; value: T[Column]; time: number }[];
         const gen = this.dataGen;
         let time = Date.now();
-        let reader = await this.reader();
-        let base = await reader.getColumn(col);
+        let base = await this.readWithReload(reader => reader.getColumn(col));
         let result = this.patchColumn(base, col) as { key: string; value: T[Column]; time: number }[];
         time = Date.now() - time;
         if (time > 50) {
-            console.log(`${blue(`${this.name}.getColumn(${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(reader)}`);
+            console.log(`${blue(`${this.name}.getColumn(${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(await this.reader())}`);
         }
         Object.freeze(result);
         // Only cache if no write/reset happened during the awaits above (else this result may be stale).
@@ -1274,13 +1350,19 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (this.baseColumns.has(column) || this.baseColumnsLoading.has(column)) return;
         this.baseColumnsLoading.add(column);
         void (async () => {
-            let reader = await this.reader();
-            let base = await reader.getColumn(column);
-            this.deps.batch(() => {
-                this.baseColumns.set(column, base);
+            try {
+                const base = await this.readWithReload(reader => reader.getColumn(column));
+                this.deps.batch(() => {
+                    this.baseColumns.set(column, base);
+                    this.baseColumnsLoading.delete(column);
+                    this.invalidateSignal(LOAD_SIGNAL);
+                });
+            } catch (e) {
+                // The load failed (e.g. a file vanished and the reload retry also failed). Clear the loading
+                // flag so a later read retries, rather than leaving the column wedged as "loading" forever.
                 this.baseColumnsLoading.delete(column);
-                this.invalidateSignal(LOAD_SIGNAL);
-            });
+                console.warn(`${this.name}.getColumnSync(${JSON.stringify(column)}) load failed, will retry: ${(e as Error).message}`);
+            }
         })();
     }
 
@@ -1289,13 +1371,17 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (this.baseFields.has(cacheKey) || this.baseFieldsLoading.has(cacheKey)) return;
         this.baseFieldsLoading.add(cacheKey);
         void (async () => {
-            let reader = await this.reader();
-            let resolved = await reader.getSingleField(key, column);
-            this.deps.batch(() => {
-                this.baseFields.set(cacheKey, resolved);
+            try {
+                const resolved = await this.readWithReload(reader => reader.getSingleField(key, column));
+                this.deps.batch(() => {
+                    this.baseFields.set(cacheKey, resolved);
+                    this.baseFieldsLoading.delete(cacheKey);
+                    this.invalidateSignal(LOAD_SIGNAL);
+                });
+            } catch (e) {
                 this.baseFieldsLoading.delete(cacheKey);
-                this.invalidateSignal(LOAD_SIGNAL);
-            });
+                console.warn(`${this.name}.getSingleFieldSync(${JSON.stringify(key)}, ${JSON.stringify(column)}) load failed, will retry: ${(e as Error).message}`);
+            }
         })();
     }
 
