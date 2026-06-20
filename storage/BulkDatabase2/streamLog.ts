@@ -97,12 +97,18 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
     // Per-key tombstone times for the join's delete resolution.
     let deleteTimes = new Map<string, number>();
     for (let key of deletedKeys) deleteTimes.set(key, times.get(key) || 0);
-    let timeValues = [...times.values()];
+    // Iterate to find min/max — NOT Math.min(...times)/Math.max(...times): spreading a large array as call
+    // arguments overflows the stack ("Maximum call stack size exceeded") once a stream has many keys.
+    let minTime = Infinity, maxTime = -Infinity;
+    for (let t of times.values()) {
+        if (t < minTime) minTime = t;
+        if (t > maxTime) maxTime = t;
+    }
     let reader: BaseBulkDatabaseReader = {
         totalBytes,
         rowCount: keys.length,
-        minTime: timeValues.length ? Math.min(...timeValues) : 0,
-        maxTime: timeValues.length ? Math.max(...timeValues) : 0,
+        minTime: times.size ? minTime : 0,
+        maxTime: times.size ? maxTime : 0,
         keys,
         keyTimes: new Map(keys.map(key => [key, times.get(key) || 0])),
         columns,
