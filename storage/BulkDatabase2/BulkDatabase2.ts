@@ -1,9 +1,9 @@
 import { getFileStorageNested2 } from "../FileFolderAPI";
 import { observable, runInAction } from "../../render-utils/mobxTyped";
-import { BulkDatabaseBase, ReactiveDeps } from "./BulkDatabaseBase";
+import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config } from "./BulkDatabaseBase";
 
 export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-export type { ReactiveDeps, StorageFactory } from "./BulkDatabaseBase";
+export type { ReactiveDeps, StorageFactory, BulkDatabase2Config } from "./BulkDatabaseBase";
 
 /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
 export type BulkColumnInfo = { column: string; byteSize: number };
@@ -138,7 +138,7 @@ class MobxReactiveDeps implements ReactiveDeps {
 // this just supplies mobx reactivity and the default (getFileStorageNested2) storage backend, so the
 // sync reads (getSingleFieldSync / getColumnSync) stay observable for mobx components.
 export class BulkDatabase2<T extends { key: string }> extends BulkDatabaseBase<T> implements IBulkDatabase2<T> {
-    constructor(name: string) {
-        super(name, new MobxReactiveDeps(), getFileStorageNested2);
+    constructor(name: string, config?: BulkDatabase2Config) {
+        super(name, new MobxReactiveDeps(), getFileStorageNested2, config);
     }
 }

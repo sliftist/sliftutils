@@ -129,6 +129,22 @@ export const noopReactiveDeps: ReactiveDeps = {
 // file needn't know about getFileStorageNested2 / the browser-vs-node storage details).
 export type StorageFactory = (path: string) => Promise<FileStorage>;
 
+// Optional per-collection configuration.
+export type BulkDatabase2Config = {
+    // When set (> 0), the reactive change notifications writes/loads emit are throttled and BATCHED
+    // globally (across all keys), so a high-frequency write source doesn't re-run watchers on every single
+    // change. The throttle RAMPS like the write-flush one: the first change after a lull notifies
+    // immediately, then under sustained changes the delay doubles up to triggerThrottleMs, coalescing the
+    // burst into one notification. In-memory/async reads are always current — only the OBSERVABLE
+    // notification (the mobx re-render trigger) is delayed and merged.
+    triggerThrottleMs?: number;
+};
+
+// Trigger-throttle ramp: the first deferred notification waits this long, then the delay doubles on each
+// further change up to BulkDatabase2Config.triggerThrottleMs. ~16ms ≈ one animation frame, so an isolated
+// burst still notifies within a frame.
+const TRIGGER_THROTTLE_FIRST_STEP_MS = 16;
+
 // The load/reset lifecycle shares one signal; every sync read observes it so it re-renders when the
 // reader resets or a base column/field finishes loading. The overlay's per-key signal is the key
 // itself (a point read observes just its key), plus one overlay-wide signal that whole-column reads
@@ -205,6 +221,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         public readonly name: string,
         protected deps: ReactiveDeps,
         private storageFactory: StorageFactory,
+        private config: BulkDatabase2Config = {},
     ) {
         // Best-effort: persist buffered stream writes when the tab is hidden/closing. visibilitychange →
         // hidden fires early enough that the (async) flush usually completes; pagehide is the backstop.
@@ -284,10 +301,22 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // SHALLOWLY: Object.freeze locks the array itself (callers can't mutate a shared result) but never the
     // element objects or their values, so typed-array column values keep their fast representation.
     private columnCache = new Map<string, { key: string; value: unknown; time: number }[]>();
+    // Live keys of the currently-loaded reader (disk only, no overlay), so a write can tell a partial
+    // update of an existing key (only the written columns change) from adding/removing a key (which appears
+    // in / disappears from EVERY column). Set on reader build, cleared on reset.
+    private readerKeys: Set<string> | undefined;
     // Bumped on every overlay mutation / reader reset. An async column build captures it before its awaits
     // and only caches its result if it hasn't changed since — so a write or reset mid-build (which clears
     // the cache and may swap the reader) can never leave a stale entry behind.
     private dataGen = 0;
+
+    // ---- trigger throttle (see BulkDatabase2Config.triggerThrottleMs) ----
+    // Signals whose notification is deferred, the pending flush timer, and the ramping delay. Data state is
+    // already updated synchronously; only these observable notifications are batched/delayed.
+    private pendingSignals = new Set<string>();
+    private triggerTimer: ReturnType<typeof setTimeout> | undefined;
+    private currentTriggerDelay = 0;
+    private lastTriggerTime = 0;
 
     // Approximate size of the tier-0 stream data on disk: set accurately from the last reader build, then
     // kept current as each flush appends more. Drives the stream-fold trigger (see streamNeedsFold);
@@ -314,26 +343,71 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return this.streamFileName;
     }
 
-    private invalidateOverlay(key: string) {
+    // Invalidate after an overlay change. `columns` is the set of columns whose resolved result actually
+    // changed — only those cached columns are dropped — or "all" when the key set itself changed (a key
+    // added or removed appears in / disappears from every column).
+    private invalidateOverlay(key: string, columns: Iterable<string> | "all") {
         this.dataGen++;
-        this.columnCache.clear();
-        this.deps.invalidate(key);
-        this.deps.invalidate(OVERLAY_SIGNAL);
+        if (columns === "all") this.columnCache.clear();
+        else for (const c of columns) this.columnCache.delete(c);
+        this.invalidateSignal(key);
+        this.invalidateSignal(OVERLAY_SIGNAL);
+    }
+
+    // Whether `key` is currently a live key in the resolved view (overlay wins over disk). A write to a key
+    // that's already live only changes the columns it sets; a write to an absent key (or one currently
+    // deleted in the overlay) makes it appear in every column, so every column's cache must drop.
+    private isLiveNow(key: string): boolean {
+        const e = this.overlay.get(key);
+        if (e) return e.value !== DELETED;
+        return this.readerKeys?.has(key) ?? false;
+    }
+
+    // Notify observers of `signal`. With triggerThrottleMs set, notifications are batched and delayed on a
+    // ramping schedule so a high-frequency source can't re-run watchers on every change: a change after a
+    // lull notifies on the next tick (no real delay, but all of one change's signals batch together);
+    // under sustained changes the delay doubles up to the max, coalescing the burst into one notification.
+    // Only the OBSERVABLE notification is delayed — the underlying data was already updated, so a read in
+    // the meantime still sees current values.
+    private invalidateSignal(signal: string) {
+        const maxMs = this.config.triggerThrottleMs ?? 0;
+        if (maxMs <= 0) { this.deps.invalidate(signal); return; }
+        this.pendingSignals.add(signal);
+        const now = Date.now();
+        const lull = now - this.lastTriggerTime > maxMs;
+        this.lastTriggerTime = now;
+        if (this.triggerTimer !== undefined) return; // a flush is already scheduled; it will pick this up
+        // Lull resets the ramp (notify next tick); an active burst ramps the delay toward the max.
+        this.currentTriggerDelay = lull ? 0 : Math.min(maxMs, Math.max(TRIGGER_THROTTLE_FIRST_STEP_MS, this.currentTriggerDelay * 2));
+        this.triggerTimer = setTimeout(() => { this.triggerTimer = undefined; this.flushSignals(); }, this.currentTriggerDelay);
+        (this.triggerTimer as { unref?: () => void }).unref?.();
+    }
+
+    private flushSignals() {
+        if (this.pendingSignals.size === 0) return;
+        const signals = [...this.pendingSignals];
+        this.pendingSignals.clear();
+        this.deps.batch(() => { for (const s of signals) this.deps.invalidate(s); });
     }
 
     // Merges a (possibly partial) row onto the key's current overlay value, so a partial write/update
     // only changes the columns it includes — the rest fall through to disk on read. A prior delete is
     // reset (the key is being re-created).
     private setOverlayRow(key: string, row: Record<string, unknown>, time: number) {
+        // Decide BEFORE mutating: if the key is already live, only the columns this write sets change;
+        // otherwise it's a new/re-created key that joins every column.
+        const wasLive = this.isLiveNow(key);
         const existing = this.overlay.get(key);
         const value = existing && existing.value !== DELETED ? { ...existing.value, ...row } : { ...row };
         this.overlay.set(key, { time, value });
-        this.invalidateOverlay(key);
+        this.invalidateOverlay(key, wasLive ? Object.keys(row) : "all");
     }
 
     private setOverlayDeleted(key: string, time: number) {
+        // Deleting a live key removes it from every column; deleting an absent key changes no column.
+        const columns = this.isLiveNow(key) ? "all" : [];
         this.overlay.set(key, { time, value: DELETED });
-        this.invalidateOverlay(key);
+        this.invalidateOverlay(key, columns);
     }
 
     private reader = lazy(async (): Promise<ResolvedReader> => {
@@ -391,6 +465,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
         readers.push(...bulkReaders);
         const joined = await joinBulkDatabases(readers);
+        // Live keys of this reader, so per-column cache invalidation can tell an update of an existing key
+        // (only its set columns change) from a key add/remove (which touches every column).
+        this.readerKeys = new Set(joined.keys);
 
         let time = Date.now() - start;
         if (time > 50) {
@@ -450,13 +527,14 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.overlay.clear();
             this.dataGen++;
             this.columnCache.clear();
+            this.readerKeys = undefined; // the next reader build repopulates it
             // The next reader build re-measures the stream; clear the estimate so a just-folded stream
             // doesn't keep looking "heavy" and re-trigger a fold before then.
             this.streamRowsOnDisk = 0;
             this.streamBytesOnDisk = 0;
             for (const p of this.pendingAppends) p.apply();
-            this.deps.invalidate(LOAD_SIGNAL);
-            this.deps.invalidate(OVERLAY_SIGNAL);
+            this.invalidateSignal(LOAD_SIGNAL);
+            this.invalidateSignal(OVERLAY_SIGNAL);
         });
     }
 
@@ -1201,7 +1279,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.deps.batch(() => {
                 this.baseColumns.set(column, base);
                 this.baseColumnsLoading.delete(column);
-                this.deps.invalidate(LOAD_SIGNAL);
+                this.invalidateSignal(LOAD_SIGNAL);
             });
         })();
     }
@@ -1216,7 +1294,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.deps.batch(() => {
                 this.baseFields.set(cacheKey, resolved);
                 this.baseFieldsLoading.delete(cacheKey);
-                this.deps.invalidate(LOAD_SIGNAL);
+                this.invalidateSignal(LOAD_SIGNAL);
             });
         })();
     }
