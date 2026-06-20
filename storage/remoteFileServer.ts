@@ -317,7 +317,16 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
             if (!accessLog.size) return;
             const rows = [...accessLog.values()].sort((a, b) => b.bytes - a.bytes);
             accessLog.clear();
-            for (const e of rows) console.log(`  [${e.op}] ${e.ip}  ${e.path}  ${e.count}x  ${formatBytes(e.bytes)}`);
+            // Fixed-width columns first so lines align, then the variable-length path last. count is the
+            // number of requests folded into this row (R = requests, not a multiplier).
+            const time = new Date().toTimeString().slice(0, 8);
+            for (const e of rows) {
+                const size = formatBytes(e.bytes).padStart(9);
+                const reqs = (e.count + "R").padStart(6);
+                const op = `[${e.op.padEnd(5)}]`;
+                const ip = e.ip.padEnd(15);
+                console.log(`  ${time}  ${size}  ${reqs}  ${op}  ${ip}  ${e.path}`);
+            }
         }, 5000);
         flushTimer.unref?.();
     }
