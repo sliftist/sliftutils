@@ -86,14 +86,20 @@ type RemoteConfig = { url: string; password: string };
 function remoteConfigKey() { return getFileAPIKey() + ":remote"; }
 function loadRemoteConfig(): RemoteConfig | undefined {
     try {
-        const s = localStorage.getItem(remoteConfigKey());
+        const key = remoteConfigKey();
+        const s = localStorage.getItem(key);
+        console.log("[remotecfg] load", JSON.stringify(key), "->", s);
         if (!s) return undefined;
         const c = JSON.parse(s);
         if (c && typeof c.url === "string" && typeof c.password === "string") return c;
-    } catch { /* ignore */ }
+    } catch (e) { console.warn("[remotecfg] load error", e); }
     return undefined;
 }
-function saveRemoteConfig(c: RemoteConfig) { localStorage.setItem(remoteConfigKey(), JSON.stringify(c)); }
+function saveRemoteConfig(c: RemoteConfig) {
+    const key = remoteConfigKey();
+    localStorage.setItem(key, JSON.stringify(c));
+    console.log("[remotecfg] saved", JSON.stringify(key), "readback ->", localStorage.getItem(key));
+}
 
 // The server is always HTTPS on the filehoster's default port, so the user only needs to type the host
 // (e.g. "65.109.93.113"). We strip any scheme/path they include and default the port if omitted.

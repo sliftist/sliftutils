@@ -427,14 +427,18 @@ export async function runFileHoster(): Promise<void> {
     let externalIP: string | undefined;
     try { externalIP = (await getExternalIP()).trim(); } catch { /* offline / unreachable */ }
 
+    // What the user types into the app: just the host, plus ":port" only if it's not the default. No
+    // scheme — the app always uses https.
+    const host = externalIP || "localhost";
+    const appAddress = host + (info.port === 8787 ? "" : ":" + info.port);
+    const certUrl = "https://" + host + ":" + info.port;
     console.log("");
     console.log("  Serving:   " + path.resolve(root));
     console.log("  Password:  " + info.password);
-    console.log("  Local:     " + info.url);
-    if (externalIP) console.log("  Public:    https://" + externalIP + ":" + info.port + "   (once port-forwarding succeeds)");
+    console.log("  Address:   " + appAddress + "     <- in the app, choose \"Connect to a server\" and enter this");
     console.log("");
-    console.log("  In the app, choose \"Connect to a server\" and enter the URL + password.");
-    console.log("  (Self-signed cert: open the URL once in your browser and accept it first.)");
+    console.log("  First time only: open  " + certUrl + "  in a browser once and accept the");
+    console.log("  self-signed certificate warning, then connect from the app.");
     console.log("");
 
     // Keep the UPnP port mapping alive — leases expire ~hourly, so refresh well within that. No-op on
