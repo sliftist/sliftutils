@@ -278,6 +278,17 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // overlay to decide whether an incoming remote write is actually newer than what we have.
     private streamTimes = new Map<string, number>();
 
+    // Cache of fully-resolved (overlay-patched) column results, keyed by column name. The result only
+    // changes when the overlay mutates or the reader resets, so we keep it until then — repeat whole-column
+    // reads (common in a UI re-render) are then free, however large the column. Each cached array is frozen
+    // SHALLOWLY: Object.freeze locks the array itself (callers can't mutate a shared result) but never the
+    // element objects or their values, so typed-array column values keep their fast representation.
+    private columnCache = new Map<string, { key: string; value: unknown; time: number }[]>();
+    // Bumped on every overlay mutation / reader reset. An async column build captures it before its awaits
+    // and only caches its result if it hasn't changed since — so a write or reset mid-build (which clears
+    // the cache and may swap the reader) can never leave a stale entry behind.
+    private dataGen = 0;
+
     // Approximate size of the tier-0 stream data on disk: set accurately from the last reader build, then
     // kept current as each flush appends more. Drives the stream-fold trigger (see streamNeedsFold);
     // reset on resetReader, since after a merge/reset the next reader build re-measures it.
@@ -304,6 +315,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     private invalidateOverlay(key: string) {
+        this.dataGen++;
+        this.columnCache.clear();
         this.deps.invalidate(key);
         this.deps.invalidate(OVERLAY_SIGNAL);
     }
@@ -435,6 +448,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.baseFields.clear();
             this.baseFieldsLoading.clear();
             this.overlay.clear();
+            this.dataGen++;
+            this.columnCache.clear();
             // The next reader build re-measures the stream; clear the estimate so a just-folded stream
             // doesn't keep looking "heavy" and re-trigger a fold before then.
             this.streamRowsOnDisk = 0;
@@ -1134,14 +1149,21 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
     public async getColumn<Column extends keyof T>(column: Column): Promise<{ key: string; value: T[Column]; time: number }[]> {
         void this.syncSetup();
+        const col = String(column);
+        const cached = this.columnCache.get(col);
+        if (cached) return cached as { key: string; value: T[Column]; time: number }[];
+        const gen = this.dataGen;
         let time = Date.now();
         let reader = await this.reader();
-        let base = await reader.getColumn(String(column));
-        let result = this.patchColumn(base, String(column)) as { key: string; value: T[Column]; time: number }[];
+        let base = await reader.getColumn(col);
+        let result = this.patchColumn(base, col) as { key: string; value: T[Column]; time: number }[];
         time = Date.now() - time;
         if (time > 50) {
             console.log(`${blue(`${this.name}.getColumn(${JSON.stringify(column)})`)} took ${red(formatTime(time))} ${this.formatInfo(reader)}`);
         }
+        Object.freeze(result);
+        // Only cache if no write/reset happened during the awaits above (else this result may be stale).
+        if (this.dataGen === gen) this.columnCache.set(col, result);
         return result;
     }
 
@@ -1236,12 +1258,19 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // Observe the overlay-wide signal so we recompute once the base arrives or the overlay changes.
         this.deps.observe(OVERLAY_SIGNAL);
         let col = String(column);
+        const cached = this.columnCache.get(col);
+        if (cached) return cached as { key: string; value: T[Column]; time: number }[];
         let base = this.baseColumns.get(col);
         if (!base) {
             this.ensureBaseColumn(col);
             return undefined;
         }
-        return this.patchColumn(base, col) as { key: string; value: T[Column]; time: number }[];
+        // Synchronous (no awaits) → reads the current overlay and caches it atomically; an observer re-runs
+        // (and the cache is cleared) on any later change, so the frozen result is safe to share.
+        let result = this.patchColumn(base, col) as { key: string; value: T[Column]; time: number }[];
+        Object.freeze(result);
+        this.columnCache.set(col, result);
+        return result;
     }
 
     public async getColumnInfo() {
