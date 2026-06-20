@@ -86,20 +86,14 @@ type RemoteConfig = { url: string; password: string };
 function remoteConfigKey() { return getFileAPIKey() + ":remote"; }
 function loadRemoteConfig(): RemoteConfig | undefined {
     try {
-        const key = remoteConfigKey();
-        const s = localStorage.getItem(key);
-        console.log("[remotecfg] load", JSON.stringify(key), "->", s);
+        const s = localStorage.getItem(remoteConfigKey());
         if (!s) return undefined;
         const c = JSON.parse(s);
         if (c && typeof c.url === "string" && typeof c.password === "string") return c;
-    } catch (e) { console.warn("[remotecfg] load error", e); }
+    } catch { /* ignore */ }
     return undefined;
 }
-function saveRemoteConfig(c: RemoteConfig) {
-    const key = remoteConfigKey();
-    localStorage.setItem(key, JSON.stringify(c));
-    console.log("[remotecfg] saved", JSON.stringify(key), "readback ->", localStorage.getItem(key));
-}
+function saveRemoteConfig(c: RemoteConfig) { localStorage.setItem(remoteConfigKey(), JSON.stringify(c)); }
 
 // The server is always HTTPS on the filehoster's default port, so the user only needs to type the host
 // (e.g. "65.109.93.113"). We strip any scheme/path they include and default the port if omitted.
@@ -139,11 +133,12 @@ class DirectoryPrompter extends preact.Component {
     }
 }
 
-// "Connect to a server" option for the directory prompt: collapses to a button, expands to URL +
-// password fields. On connect it validates the credentials against the server, persists the config, and
-// reloads so getFileStorageNested2 picks up the remote storage.
+// "Connect to a server" option for the directory prompt: collapses to a button, expands to address +
+// password fields. On connect it actually connects to the server; on success it persists the config and
+// calls onConnected so the caller (getStorageChoice) resolves with the live remote storage — no reload.
+// Connection failures are shown to the user (and logged, without the password), never swallowed.
 @observer
-class ServerConnectForm extends preact.Component {
+class ServerConnectForm extends preact.Component<{ onConnected: (config: RemoteConfig) => void }> {
     private obs = observable({ expanded: false, url: "", password: "", error: "", connecting: false, needsCert: false, showPassword: false });
     private cleanUrl() { return normalizeServerUrl(this.obs.url); }
     private connect = async () => {
@@ -153,22 +148,28 @@ class ServerConnectForm extends preact.Component {
         s.connecting = true;
         try {
             const url = this.cleanUrl();
-            if (!url) { s.error = "Enter a server URL"; return; }
+            if (!url) { s.error = "Enter a server address."; return; }
             const result = await probeRemoteConnection(url, s.password.trim());
             if (result.status === "ok") {
-                saveRemoteConfig({ url, password: s.password.trim() });
-                window.location.reload();
+                const config: RemoteConfig = { url, password: s.password.trim() };
+                saveRemoteConfig(config);             // remember for next session
+                this.props.onConnected(config);       // resolve the pending storage request now (no reload)
                 return;
             }
             if (result.status === "unauthorized") {
                 s.error = "The server rejected that password.";
+                console.error("Remote connect: unauthorized for", url);
             } else {
-                // Reached nothing back — almost always the self-signed certificate isn't trusted yet.
+                // Got nothing back — usually the self-signed certificate isn't trusted yet, but show the
+                // actual error too so a wrong address / down server / CORS issue is diagnosable.
                 s.needsCert = true;
-                s.error = "Couldn't reach the server.";
+                s.error = "Couldn't reach the server: " + result.error;
+                console.error("Remote connect: unreachable", url, "-", result.error);
             }
         } catch (e) {
-            s.error = "Could not connect: " + ((e as Error).message || String(e));
+            // Should be rare (probeRemoteConnection handles its own errors), but never swallow it.
+            s.error = "Connection error: " + ((e as Error).message || String(e));
+            console.error("Remote connect threw:", e);
         } finally {
             s.connecting = false;
         }
@@ -362,141 +363,100 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
 }
 
 
-// NOTE: Blocks until the user provides a directory
-// NOTE: If you want to override the location, you can explicitly call getDirectoryHandle.set with your own directory wrapper. Which if your server side can be the Node.js directory handle wrapper, or if your client side it can just be a pointer from tryToLoadPointer/fileSystemPointer.ts.
-export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Promise<DirectoryWrapper> {
+// What storage the user chose: a local directory handle, or a remote server config.
+type StorageChoice = { type: "local"; handle: DirectoryWrapper } | { type: "remote"; config: RemoteConfig };
+
+// Resolves (once) what storage to use. If a remote server was connected in a previous session we use it
+// straight away; otherwise we prompt (Pick directory / Connect to a server / Dismiss). The Connect path
+// actually connects to the server and resolves with its config — so when this returns, the storage is
+// ready. No page reload. Blocks until the user chooses (or dismisses, which rejects).
+export const getStorageChoice = lazy(async function getStorageChoice(): Promise<StorageChoice> {
     if (isNode()) {
-        return new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
+        return { type: "local", handle: new NodeJSDirectoryHandleWrapper(path.resolve("./data/")) };
     }
+    const savedRemote = loadRemoteConfig();
+    if (savedRemote) return { type: "remote", config: savedRemote };
+
     let root = document.createElement("div");
     document.body.appendChild(root);
     preact.render(<DirectoryPrompter />, root);
     try {
+        let resolveChoice!: (c: StorageChoice) => void;
+        let rejectChoice!: (e: Error) => void;
+        const choicePromise = new Promise<StorageChoice>((res, rej) => { resolveChoice = res; rejectChoice = rej; });
 
-        let handle: DirectoryWrapper | undefined;
+        const pickLocal = async () => {
+            try {
+                const handle = await window.showDirectoryPicker();
+                await handle.requestPermission({ mode: "readwrite" });
+                const storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
+                localStorage.setItem(getFileAPIKey(), storedId);
+                resolveChoice({ type: "local", handle: handle as any });
+            } catch (e) {
+                console.error("Directory pick failed/cancelled:", e); // stay on the prompt
+            }
+        };
+        // The three options, rendered fresh each time (so reused-vnode issues can't arise).
+        const renderOptions = () => (
+            <>
+                <button className={css.fontSize(40).pad2(80, 40)} onClick={pickLocal}>Pick Data Directory</button>
+                <ServerConnectForm onConnected={config => resolveChoice({ type: "remote", config })} />
+                <button className={css.fontSize(40).pad2(80, 40)}
+                    onClick={() => rejectChoice(new Error("User dismissed file system access prompt"))}>Dismiss</button>
+            </>
+        );
 
+        // A previously-picked local folder: try to restore its handle (may need a click for activation).
         const storedId = localStorage.getItem(getFileAPIKey());
         if (storedId) {
             let doneLoad = false;
-            setTimeout(() => {
-                if (doneLoad) return;
-                console.log("Waiting for user to click");
-                displayData.ui = "Click anywhere to allow file system access";
-            }, 500);
+            setTimeout(() => { if (!doneLoad) displayData.ui = "Click anywhere to allow file system access"; }, 500);
             try {
-                handle = await tryToLoadPointer(storedId);
+                const handle = await tryToLoadPointer(storedId);
+                doneLoad = true;
+                if (handle) return { type: "local", handle };
             } catch (e) {
+                doneLoad = true;
                 console.error(e);
-                // Check if the error is due to user activation being required
-                const errorMessage = e instanceof Error ? e.message : String(e);
-                if (errorMessage.includes("user activation") || errorMessage.includes("User activation")) {
-                    doneLoad = true;
-                    // Show UI to get user to click and retry
-                    let retryCallback: (success: boolean) => void;
-                    let retryReject: (err: Error) => void;
-                    let retryPromise = new Promise<boolean>((resolve, reject) => {
-                        retryCallback = resolve;
-                        retryReject = reject;
-                    });
+                const msg = e instanceof Error ? e.message : String(e);
+                if (msg.includes("user activation") || msg.includes("User activation")) {
                     displayData.ui = (
                         <div className={css.vbox(20).center}>
-                            <button
-                                className={css.fontSize(40).pad2(80, 40)}
-                                onClick={async () => {
-                                    displayData.ui = "Loading...";
-                                    try {
-                                        const retryHandle = await tryToLoadPointer(storedId);
-                                        if (retryHandle) {
-                                            handle = retryHandle;
-                                            retryCallback(true);
-                                        } else {
-                                            retryCallback(false);
-                                        }
-                                    } catch (retryError) {
-                                        console.error("Retry failed:", retryError);
-                                        retryCallback(false);
-                                    }
-                                }}
-                            >
-                                Click to restore file system access
-                            </button>
-                            <button
-                                className={css.fontSize(40).pad2(80, 40)}
-                                onClick={async () => {
-                                    console.log("Waiting for user to give permission");
-                                    const pickedHandle = await window.showDirectoryPicker();
-                                    await pickedHandle.requestPermission({ mode: "readwrite" });
-                                    let newStoredId = await storeFileSystemPointer({ mode: "readwrite", handle: pickedHandle });
-                                    localStorage.setItem(getFileAPIKey(), newStoredId);
-                                    handle = pickedHandle as any;
-                                    retryCallback(true);
-                                }}
-                            >
-                                Pick Data Directory
-                            </button>
-                            <ServerConnectForm />
-                            <button
-                                className={css.fontSize(40).pad2(80, 40)}
-                                onClick={() => {
-                                    retryReject(new Error("User dismissed file system access prompt"));
-                                }}
-                            >
-                                Dismiss
-                            </button>
+                            <button className={css.fontSize(40).pad2(80, 40)} onClick={async () => {
+                                displayData.ui = "Loading...";
+                                try {
+                                    const h = await tryToLoadPointer(storedId);
+                                    if (h) { resolveChoice({ type: "local", handle: h }); return; }
+                                } catch (retryError) { console.error("Retry failed:", retryError); }
+                                displayData.ui = <div className={css.vbox(20).center}>{renderOptions()}</div>;
+                            }}>Click to restore file system access</button>
+                            {renderOptions()}
                         </div>
                     );
-                    const success = await retryPromise;
-                    if (handle) {
-                        return handle;
-                    }
+                    return await choicePromise;
                 }
             }
-            doneLoad = true;
-            if (handle) {
-                return handle;
-            }
         }
-        let fileCallback: (handle: DirectoryWrapper) => void;
-        let fileReject: (err: Error) => void;
-        let promise = new Promise<DirectoryWrapper>((resolve, reject) => {
-            fileCallback = resolve;
-            fileReject = reject;
-        });
-        displayData.ui = (
-            <div className={css.vbox(20).center}>
-                <button
-                    className={css.fontSize(40).pad2(80, 40)}
-                    onClick={async () => {
-                        console.log("Waiting for user to give permission");
-                        const handle = await window.showDirectoryPicker();
-                        await handle.requestPermission({ mode: "readwrite" });
-                        let storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
-                        localStorage.setItem(getFileAPIKey(), storedId);
-                        fileCallback(handle as any);
-                    }}
-                >
-                    Pick Data Directory
-                </button>
-                <ServerConnectForm />
-                <button
-                    className={css.fontSize(40).pad2(80, 40)}
-                    onClick={() => {
-                        fileReject(new Error("User dismissed file system access prompt"));
-                    }}
-                >
-                    Dismiss
-                </button>
-            </div>
-        );
-        return await promise;
+        displayData.ui = <div className={css.vbox(20).center}>{renderOptions()}</div>;
+        return await choicePromise;
     } finally {
         preact.render(null, root);
         root.remove();
     }
 });
 
+// Local-only directory handle, for callers that don't support remote storage. Throws if the user has
+// configured a remote server (rather than silently doing the wrong thing).
+export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Promise<DirectoryWrapper> {
+    const choice = await getStorageChoice();
+    if (choice.type === "remote") throw new Error("Storage is configured to use a remote server; a local directory handle isn't available here.");
+    return choice.handle;
+});
+
 export const getFileStorageNested = cache(async function getFileStorage(path: string): Promise<FileStorage> {
-    let base = await getDirectoryHandle();
+    const choice = await getStorageChoice();
+    if (choice.type === "remote") return getRemoteFactory(choice.config)(path);
+    let base = choice.handle;
     for (let part of path.split("/")) {
         if (!part) continue;
         base = await base.getDirectoryHandle(part, { create: true });
@@ -507,17 +467,15 @@ export const getFileStorageNested = cache(async function getFileStorage(path: st
 export const getFileStorageNested2 = cache(async function getFileStorage(pathStr: string): Promise<FileStorage> {
     let base: DirectoryWrapper;
     pathStr = pathStr.replaceAll("\\", "/");
-    if (!isNode()) {
-        const remote = loadRemoteConfig();
-        if (remote) return getRemoteFactory(remote)(pathStr);
-    }
     if (isNode()) {
         if (path.isAbsolute(pathStr)) {
             return wrapHandle(new NodeJSDirectoryHandleWrapper(pathStr));
         }
         base = new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
     } else {
-        base = await getDirectoryHandle();
+        const choice = await getStorageChoice();
+        if (choice.type === "remote") return getRemoteFactory(choice.config)(pathStr);
+        base = choice.handle;
         let dirs: string[] = [];
         let alls: string[] = [];
         for await (const [name, entry] of base) {
@@ -541,9 +499,9 @@ export const getFileStorage = lazy(async function getFileStorage(): Promise<File
     if (USE_INDEXED_DB) {
         return await getFileStorageIndexDB();
     }
-
-    let handle = await getDirectoryHandle();
-    return wrapHandle(handle);
+    const choice = await getStorageChoice();
+    if (choice.type === "remote") return getRemoteFactory(choice.config)("");
+    return wrapHandle(choice.handle);
 });
 export function resetStorageLocation() {
     localStorage.removeItem(getFileAPIKey());

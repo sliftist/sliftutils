@@ -1384,6 +1384,10 @@ declare module "sliftutils/storage/FileFolderAPI" {
         ]>;
     };
     export declare function setFileAPIKey(key: string): void;
+    type RemoteConfig = {
+        url: string;
+        password: string;
+    };
     export declare class NodeJSFileHandleWrapper implements FileWrapper {
         private filePath;
         constructor(filePath: string);
@@ -1430,6 +1434,18 @@ declare module "sliftutils/storage/FileFolderAPI" {
             }
         ]>;
     }
+    type StorageChoice = {
+        type: "local";
+        handle: DirectoryWrapper;
+    } | {
+        type: "remote";
+        config: RemoteConfig;
+    };
+    export declare const getStorageChoice: {
+        (): Promise<StorageChoice>;
+        reset(): void;
+        set(newValue: Promise<StorageChoice>): void;
+    };
     export declare const getDirectoryHandle: {
         (): Promise<DirectoryWrapper>;
         reset(): void;
