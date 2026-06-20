@@ -274,6 +274,40 @@ function formatBytes(n: number): string {
     return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
 }
 
+// Parse a single-range HTTP Range header ("bytes=start-end", "bytes=start-", "bytes=-suffix") into an
+// INCLUSIVE [start, end]. Returns "unsatisfiable" for a range past the file, or undefined for no/garbled
+// range (caller then serves the whole file). Only single ranges are supported (what media players use).
+function parseRange(header: string, size: number): { start: number; end: number } | "unsatisfiable" | undefined {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+    if (!m) return undefined;
+    const sRaw = m[1], eRaw = m[2];
+    if (sRaw === "" && eRaw === "") return undefined;
+    let start: number, end: number;
+    if (sRaw === "") {
+        const suffix = parseInt(eRaw, 10);
+        if (!suffix) return "unsatisfiable";
+        start = Math.max(0, size - suffix);
+        end = size - 1;
+    } else {
+        start = parseInt(sRaw, 10);
+        end = eRaw === "" ? size - 1 : parseInt(eRaw, 10);
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) return "unsatisfiable";
+    return { start, end: Math.min(end, size - 1) };
+}
+
+const MEDIA_TYPES: Record<string, string> = {
+    mp4: "video/mp4", m4v: "video/mp4", webm: "video/webm", mkv: "video/x-matroska", mov: "video/quicktime",
+    avi: "video/x-msvideo", ogv: "video/ogg", ts: "video/mp2t",
+    mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", flac: "audio/flac", wav: "audio/wav", ogg: "audio/ogg", opus: "audio/opus",
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", avif: "image/avif", svg: "image/svg+xml",
+    pdf: "application/pdf", txt: "text/plain; charset=utf-8", json: "application/json",
+};
+function mediaContentType(filePath: string): string {
+    const ext = filePath.slice(filePath.lastIndexOf(".") + 1).toLowerCase();
+    return MEDIA_TYPES[ext] || "application/octet-stream";
+}
+
 // Public (no-auth) landing page. The browser can't trust a self-signed cert from a background fetch, so
 // the user opens this URL once, accepts the browser's security warning, and the cert becomes trusted for
 // the origin — then the app's fetches work. This page is what they see after accepting.
@@ -336,8 +370,9 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
         const origin = (req.headers["origin"] as string) || "*";
         const cors: Record<string, string> = {
             "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "authorization, content-type",
+            "Access-Control-Allow-Methods": "GET, HEAD, PUT, POST, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "authorization, content-type, range",
+            "Access-Control-Expose-Headers": "content-range, accept-ranges, content-length",
             "Access-Control-Max-Age": "86400",
             "Vary": "Origin",
         };
@@ -359,7 +394,8 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
             }
 
             const auth = (req.headers["authorization"] as string) || "";
-            const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+            // Bearer header for API clients; ?token= query for media URLs (a <video> element can't set headers).
+            const token = (auth.startsWith("Bearer ") ? auth.slice(7) : "") || url.searchParams.get("token") || "";
             if (!timingSafeEqualStr(normalizePassword(token), normPassword)) return sendJson(401, { error: "unauthorized" });
 
             const relPath = url.searchParams.get("path") || "";
@@ -389,6 +425,33 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
                 res.writeHead(200, Object.assign({}, cors, { "Content-Type": "application/octet-stream", "Content-Length": String(end - start) }));
                 if (end === start) return res.end();
                 fs.createReadStream(full, { start, end: end - 1 }).on("error", () => res.end()).pipe(res);
+                return;
+            }
+            // Range-capable media endpoint for <video>/<img>/fetch: honors the Range header (206 +
+            // Content-Range + Accept-Ranges) so seeking works. Auth came from the ?token= query above.
+            if ((req.method === "GET" || req.method === "HEAD") && op === "/media") {
+                let st: fs.Stats;
+                try { st = fs.statSync(full); } catch { return sendJson(404, { error: "not found" }); }
+                if (st.isDirectory()) return sendJson(400, { error: "is a directory" });
+                const rangeHeader = req.headers["range"] as string | undefined;
+                const range = rangeHeader ? parseRange(rangeHeader, st.size) : undefined;
+                if (range === "unsatisfiable") {
+                    res.writeHead(416, Object.assign({}, cors, { "Content-Range": `bytes */${st.size}`, "Accept-Ranges": "bytes" }));
+                    return res.end();
+                }
+                const start = range ? range.start : 0;
+                const end = range ? range.end : st.size - 1; // inclusive
+                const length = st.size === 0 ? 0 : end - start + 1;
+                const headers: Record<string, string> = Object.assign({}, cors, {
+                    "Content-Type": mediaContentType(full),
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": String(length),
+                });
+                if (range) headers["Content-Range"] = `bytes ${start}-${end}/${st.size}`;
+                res.writeHead(range ? 206 : 200, headers);
+                if (req.method === "HEAD" || length === 0) return res.end();
+                recordAccess(clientIp(req), "read", relPath, length);
+                fs.createReadStream(full, { start, end }).on("error", () => res.end()).pipe(res);
                 return;
             }
             if ((req.method === "PUT" || req.method === "POST") && (op === "/append" || op === "/set")) {

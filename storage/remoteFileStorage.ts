@@ -358,6 +358,11 @@ class RemoteFileWrapper implements FileWrapper {
             },
         };
     }
+    async getURL() {
+        // HTTPS URL into the server's range-capable /media endpoint. The token rides in the query because a
+        // <video>/<img> element can't send an Authorization header.
+        return `${this.conn.url}/media?path=${encodeURIComponent(this.filePath)}&token=${encodeURIComponent(this.conn.password)}`;
+    }
     async createWritable(config?: { keepExistingData?: boolean }) {
         const conn = this.conn, filePath = this.filePath, append = !!config?.keepExistingData;
         const chunks: Buffer[] = [];

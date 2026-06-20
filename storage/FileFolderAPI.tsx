@@ -56,6 +56,10 @@ export type FileWrapper = {
         write(value: Buffer): Promise<void>;
         close(): Promise<void>;
     }>;
+    // Returns a URL for the file's bytes, usable in <video>/<img>/fetch. Optional — the native browser
+    // FileSystemFileHandle has no such method, so prefer the getFileURL() helper, which falls back to a
+    // blob: URL via createObjectURL for native handles. Always release it with disposeFileURL when done.
+    getURL?(): Promise<string>;
 };
 export type DirectoryWrapper = {
     readonly kind: "directory";
@@ -259,6 +263,10 @@ export class NodeJSFileHandleWrapper implements FileWrapper {
                 }
             })
         };
+    }
+
+    async getURL() {
+        return "file://" + path.resolve(this.filePath);
     }
 
     async createWritable(config?: { keepExistingData?: boolean }) {
@@ -713,6 +721,25 @@ export function wrapHandle(handle: DirectoryWrapper): FileStorage {
         folder: wrapHandleNested(handle),
         isRemote: handle.isRemote,
     };
+}
+
+// Returns a URL for a file's bytes, ready to drop into <video>/<img>/fetch. A native (local) file becomes
+// an in-memory blob: URL; a remote file becomes an https URL into the server's range-capable /media
+// endpoint (auth token in the query, since a media element can't send headers). Both support HTTP range /
+// seeking. ALWAYS hand the result to disposeFileURL when finished — for blob: URLs that frees memory.
+export async function getFileURL(file: FileWrapper): Promise<string> {
+    if (file.getURL) return file.getURL();
+    // Native FileSystemFileHandle (or any Blob-backed file): a blob: URL over the File itself.
+    const f = await file.getFile();
+    return URL.createObjectURL(f as unknown as Blob);
+}
+
+// Releases a URL from getFileURL. blob: URLs leak until the document is gone unless revoked; https/file:
+// URLs need no cleanup, so this is a no-op for them.
+export function disposeFileURL(url: string): void {
+    if (url.startsWith("blob:")) {
+        try { URL.revokeObjectURL(url); } catch { /* not in a browser, or already revoked */ }
+    }
 }
 
 // A StorageFactory backed by a remote server (path -> FileStorage), for code that injects its own
