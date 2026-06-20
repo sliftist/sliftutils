@@ -1315,6 +1315,7 @@ declare module "sliftutils/storage/FileFolderAPI" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { IStorageRaw } from "./IStorage";
+    import { RemoteOptions } from "./remoteFileStorage";
     declare global {
         interface Window {
             showSaveFilePicker(config?: {
@@ -1341,7 +1342,7 @@ declare module "sliftutils/storage/FileFolderAPI" {
             }): Promise<PermissionState>;
         }
     }
-    type FileWrapper = {
+    export type FileWrapper = {
         getFile(): Promise<{
             size: number;
             lastModified: number;
@@ -1358,7 +1359,7 @@ declare module "sliftutils/storage/FileFolderAPI" {
             close(): Promise<void>;
         }>;
     };
-    type DirectoryWrapper = {
+    export type DirectoryWrapper = {
         removeEntry(key: string, options?: {
             recursive?: boolean;
         }): Promise<void>;
@@ -1384,10 +1385,6 @@ declare module "sliftutils/storage/FileFolderAPI" {
         ]>;
     };
     export declare function setFileAPIKey(key: string): void;
-    type RemoteConfig = {
-        url: string;
-        password: string;
-    };
     export declare class NodeJSFileHandleWrapper implements FileWrapper {
         private filePath;
         constructor(filePath: string);
@@ -1434,18 +1431,6 @@ declare module "sliftutils/storage/FileFolderAPI" {
             }
         ]>;
     }
-    type StorageChoice = {
-        type: "local";
-        handle: DirectoryWrapper;
-    } | {
-        type: "remote";
-        config: RemoteConfig;
-    };
-    export declare const getStorageChoice: {
-        (): Promise<StorageChoice>;
-        reset(): void;
-        set(newValue: Promise<StorageChoice>): void;
-    };
     export declare const getDirectoryHandle: {
         (): Promise<DirectoryWrapper>;
         reset(): void;
@@ -1483,8 +1468,8 @@ declare module "sliftutils/storage/FileFolderAPI" {
         folder: NestedFileStorage;
     };
     export declare function wrapHandle(handle: DirectoryWrapper): FileStorage;
+    export declare function getRemoteFileStorageFactory(url: string, password: string, options?: RemoteOptions): (pathStr: string) => Promise<FileStorage>;
     export declare function tryToLoadPointer(pointer: string): Promise<DirectoryWrapper | undefined>;
-    export {};
 
 }
 
@@ -1877,44 +1862,18 @@ declare module "sliftutils/storage/remoteFileServer" {
 }
 
 declare module "sliftutils/storage/remoteFileStorage" {
-    /// <reference types="node" />
-    /// <reference types="node" />
-    /// <reference types="node" />
-    import https from "https";
-    import type { FileStorage } from "./FileFolderAPI";
-    export type RemoteFileStorageOptions = {
+    import type { DirectoryWrapper } from "./FileFolderAPI";
+    export type RemoteOptions = {
         chunkBytes?: number;
         cacheBytes?: number;
         latencyMs?: number;
-    };
-    type Connection = {
-        url: string;
-        password: string;
-        latencyMs: number;
-        agent: https.Agent | undefined;
-        cache: RangeCache;
-        stats: {
+        stats?: {
             requestCount: number;
             bytesFetched: number;
         };
     };
-    declare class RangeCache {
-        private chunkBytes;
-        private budget;
-        private chunks;
-        private bytes;
-        constructor(chunkBytes: number, budget: number);
-        private key;
-        private peek;
-        private store;
-        invalidate(path: string): void;
-        getRange(conn: Connection, path: string, start: number, end: number): Promise<Buffer | undefined>;
-    }
-    export type RemoteStorageFactory = ((path: string) => Promise<FileStorage>) & {
-        stats: Connection["stats"];
-    };
-    export declare function getRemoteFileStorage(url: string, password: string, options?: RemoteFileStorageOptions): RemoteStorageFactory;
-    export type RemoteProbeResult = {
+    export declare function getRemoteDirectoryHandle(url: string, password: string, options?: RemoteOptions): DirectoryWrapper;
+    export type RemoteConnectResult = {
         status: "ok";
     } | {
         status: "unauthorized";
@@ -1922,8 +1881,7 @@ declare module "sliftutils/storage/remoteFileStorage" {
         status: "unreachable";
         error: string;
     };
-    export declare function probeRemoteConnection(url: string, password: string): Promise<RemoteProbeResult>;
-    export {};
+    export declare function testRemoteConnection(url: string, password: string, options?: RemoteOptions): Promise<RemoteConnectResult>;
 
 }
 

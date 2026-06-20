@@ -1,6 +1,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { IStorageRaw } from "./IStorage";
+import { RemoteOptions } from "./remoteFileStorage";
 declare global {
     interface Window {
         showSaveFilePicker(config?: {
@@ -27,7 +28,7 @@ declare global {
         }): Promise<PermissionState>;
     }
 }
-type FileWrapper = {
+export type FileWrapper = {
     getFile(): Promise<{
         size: number;
         lastModified: number;
@@ -44,7 +45,7 @@ type FileWrapper = {
         close(): Promise<void>;
     }>;
 };
-type DirectoryWrapper = {
+export type DirectoryWrapper = {
     removeEntry(key: string, options?: {
         recursive?: boolean;
     }): Promise<void>;
@@ -70,10 +71,6 @@ type DirectoryWrapper = {
     ]>;
 };
 export declare function setFileAPIKey(key: string): void;
-type RemoteConfig = {
-    url: string;
-    password: string;
-};
 export declare class NodeJSFileHandleWrapper implements FileWrapper {
     private filePath;
     constructor(filePath: string);
@@ -120,18 +117,6 @@ export declare class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
         }
     ]>;
 }
-type StorageChoice = {
-    type: "local";
-    handle: DirectoryWrapper;
-} | {
-    type: "remote";
-    config: RemoteConfig;
-};
-export declare const getStorageChoice: {
-    (): Promise<StorageChoice>;
-    reset(): void;
-    set(newValue: Promise<StorageChoice>): void;
-};
 export declare const getDirectoryHandle: {
     (): Promise<DirectoryWrapper>;
     reset(): void;
@@ -169,5 +154,5 @@ export type FileStorage = IStorageRaw & {
     folder: NestedFileStorage;
 };
 export declare function wrapHandle(handle: DirectoryWrapper): FileStorage;
+export declare function getRemoteFileStorageFactory(url: string, password: string, options?: RemoteOptions): (pathStr: string) => Promise<FileStorage>;
 export declare function tryToLoadPointer(pointer: string): Promise<DirectoryWrapper | undefined>;
-export {};

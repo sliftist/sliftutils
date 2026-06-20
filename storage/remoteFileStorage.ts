@@ -1,99 +1,140 @@
 import { isNode } from "typesafecss";
 import https from "https";
-import type { FileStorage, NestedFileStorage } from "./FileFolderAPI";
+import type { DirectoryWrapper, FileWrapper } from "./FileFolderAPI";
 
-// Client for remoteFileServer.js: exposes a remote folder as a FileStorage (so BulkDatabase2 runs over
-// the network unchanged). One HTTP round trip per operation. A pure data-level range cache (below)
-// fetches in large aligned chunks and reuses them, because over the network latency dominates — reading
-// 1MB costs about the same as 64KB, so fewer round trips wins.
+// A remote server (remoteFileServer.js) exposed as a DirectoryWrapper — the SAME interface as the
+// Node.js and File-System-Access handles. So getDirectoryHandle can return one of these and everything
+// downstream (wrapHandle, navigation, BulkDatabase2) works unchanged; nothing else knows it's remote.
+//
+// Files here are immutable (written once) or append-only, so the range cache (raw compressed bytes, in
+// ~1MB aligned chunks) is always valid — over the network latency dominates, so reading 1MB costs about
+// the same as 64KB and far fewer round trips wins.
 
 const EMPTY = Buffer.alloc(0);
-
-// Over the network, fetch reads in chunks this big and cache them. Big because each request pays a
-// full round trip; over-reading a bit is far cheaper than another round trip.
 const DEFAULT_CHUNK_BYTES = 1024 * 1024;
 const DEFAULT_CACHE_BYTES = 128 * 1024 * 1024;
 
-export type RemoteFileStorageOptions = {
-    // Bytes per cached chunk (aligned). Reads coalesce/serve from these.
+export type RemoteOptions = {
     chunkBytes?: number;
-    // Max total bytes held in the range cache (LRU eviction).
     cacheBytes?: number;
-    // Artificial per-request delay, for simulating network latency in tests.
-    latencyMs?: number;
+    latencyMs?: number;          // artificial per-request delay, for simulating network latency in tests
+    stats?: { requestCount: number; bytesFetched: number };
 };
 
-type Connection = {
-    url: string;
-    password: string;
-    latencyMs: number;
-    agent: https.Agent | undefined;
-    cache: RangeCache;
-    // Observable stats (handy for tests / diagnostics).
-    stats: { requestCount: number; bytesFetched: number };
-};
-
+function enoent(p: string): Error {
+    return Object.assign(new Error(`File not found: ${p}`), { code: "ENOENT", name: "NotFoundError" });
+}
+function toArrayBuffer(b: Buffer): ArrayBuffer {
+    return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
+}
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-// One HTTP request. Node uses the https module (self-signed cert → verification disabled); the browser
-// uses fetch (the user accepts the self-signed cert once). Returns the raw status + body bytes.
-async function httpRequest(conn: Connection, method: string, op: string, params: Record<string, string>, body?: Buffer): Promise<{ status: number; body: Buffer }> {
-    if (conn.latencyMs > 0) await sleep(conn.latencyMs);
-    conn.stats.requestCount++;
-    const qs = new URLSearchParams(params).toString();
-    const fullUrl = conn.url.replace(/\/+$/, "") + op + (qs ? "?" + qs : "");
-    const headers: Record<string, string> = { authorization: "Bearer " + conn.password };
-    if (body) headers["content-type"] = "application/octet-stream";
+type Stat = { size: number; lastModified: number; dir: boolean };
 
-    if (isNode()) {
-        return await new Promise((resolve, reject) => {
-            const u = new URL(fullUrl);
-            const req = https.request({
-                hostname: u.hostname, port: u.port, path: u.pathname + u.search, method, headers, agent: conn.agent,
-            }, res => {
-                const chunks: Buffer[] = [];
-                res.on("data", d => chunks.push(d as Buffer));
-                res.on("end", () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks) }));
-            });
-            req.on("error", reject);
-            if (body) req.write(body);
-            req.end();
-        });
+// A stat is cached this long, so the burst of size lookups during a single read pass is one request per
+// file, not one per block. Short enough that an append by another writer shows up promptly; our own
+// writes invalidate it immediately.
+const INFO_TTL_MS = 2000;
+
+class Connection {
+    private agent = isNode() ? new https.Agent({ rejectUnauthorized: false }) : undefined;
+    private cache: RangeCache;
+    private infoCache = new Map<string, { stat: Stat | undefined; at: number }>();
+    constructor(public url: string, public password: string, private opts: RemoteOptions) {
+        this.cache = new RangeCache(opts.chunkBytes || DEFAULT_CHUNK_BYTES, opts.cacheBytes || DEFAULT_CACHE_BYTES);
+        this.url = url.replace(/\/+$/, "");
     }
-    const res = await fetch(fullUrl, { method, headers, body: body ? new Uint8Array(body) : undefined });
-    const buf = Buffer.from(await res.arrayBuffer());
-    return { status: res.status, body: buf };
+
+    // One HTTP request. Node uses the https module (self-signed cert → verification disabled); the
+    // browser uses fetch (the user has accepted the cert). Returns the raw status + body bytes.
+    async request(method: string, op: string, params: Record<string, string>, body?: Buffer): Promise<{ status: number; body: Buffer }> {
+        if (this.opts.latencyMs) await sleep(this.opts.latencyMs);
+        if (this.opts.stats) this.opts.stats.requestCount++;
+        const qs = new URLSearchParams(params).toString();
+        const fullUrl = this.url + op + (qs ? "?" + qs : "");
+        const headers: Record<string, string> = { authorization: "Bearer " + this.password };
+        if (body) headers["content-type"] = "application/octet-stream";
+        if (isNode()) {
+            return await new Promise((resolve, reject) => {
+                const u = new URL(fullUrl);
+                const req = https.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method, headers, agent: this.agent }, res => {
+                    const chunks: Buffer[] = [];
+                    res.on("data", d => chunks.push(d as Buffer));
+                    res.on("end", () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks) }));
+                });
+                req.on("error", reject);
+                if (body) req.write(body);
+                req.end();
+            });
+        }
+        const res = await fetch(fullUrl, { method, headers, body: body ? new Uint8Array(body) : undefined });
+        return { status: res.status, body: Buffer.from(await res.arrayBuffer()) };
+    }
+
+    async stat(path: string): Promise<Stat | undefined> {
+        const cached = this.infoCache.get(path);
+        if (cached && Date.now() - cached.at < INFO_TTL_MS) return cached.stat;
+        const r = await this.request("GET", "/info", { path });
+        let stat: Stat | undefined;
+        if (r.status === 404) stat = undefined;
+        else if (r.status !== 200) throw new Error(`remote info failed (${r.status})`);
+        else stat = JSON.parse(r.body.toString("utf8")) as Stat;
+        this.infoCache.set(path, { stat, at: Date.now() });
+        return stat;
+    }
+    async list(path: string): Promise<{ name: string; dir: boolean }[]> {
+        const r = await this.request("GET", "/list", { path });
+        if (r.status !== 200) throw new Error(`remote list failed (${r.status})`);
+        return JSON.parse(r.body.toString("utf8"));
+    }
+    async read(path: string, start: number, end: number): Promise<Buffer> {
+        return (await this.cache.read(this, path, start, end)) ?? EMPTY;
+    }
+    async readServer(path: string, start: number, end: number): Promise<Buffer | undefined> {
+        const r = await this.request("GET", "/read", { path, start: String(start), end: String(end) });
+        if (r.status === 404) return undefined;
+        if (r.status !== 200) throw new Error(`remote read failed (${r.status})`);
+        if (this.opts.stats) this.opts.stats.bytesFetched += r.body.length;
+        return r.body;
+    }
+    async append(path: string, body: Buffer): Promise<void> {
+        const r = await this.request("PUT", "/append", { path }, body);
+        if (r.status !== 200) throw new Error(`remote append failed (${r.status})`);
+        // Append-only keeps existing bytes, so cached chunks stay valid; just the size changed.
+        this.infoCache.delete(path);
+    }
+    async set(path: string, body: Buffer): Promise<void> {
+        const r = await this.request("PUT", "/set", { path }, body);
+        if (r.status !== 200) throw new Error(`remote set failed (${r.status})`);
+        this.cache.invalidate(path);
+        this.infoCache.delete(path);
+    }
+    async remove(path: string): Promise<void> {
+        const r = await this.request("DELETE", "/remove", { path });
+        if (r.status !== 200) throw new Error(`remote remove failed (${r.status})`);
+        this.cache.invalidate(path);
+        this.infoCache.delete(path);
+    }
 }
 
-async function readRange(conn: Connection, path: string, start: number, end: number): Promise<Buffer | undefined> {
-    const r = await httpRequest(conn, "GET", "/read", { path, start: String(start), end: String(end) });
-    if (r.status === 404) return undefined;
-    if (r.status !== 200) throw new Error(`remote read failed (${r.status}): ${r.body.toString("utf8").slice(0, 200)}`);
-    conn.stats.bytesFetched += r.body.length;
-    return r.body;
-}
-
-// Caches the longest-known prefix of each aligned chunk per path. Safe because every file here is either
-// immutable (bulk files, written once under a unique name) or append-only (stream files): the bytes at a
-// given offset never change, only more are added. So a cached [0, n) of a chunk is always valid; a read
-// that needs MORE than we have refetches (and picks up appended bytes). It never distinguishes file
-// types — it only does range reads.
+// Caches the longest-known prefix of each aligned chunk per path. Valid because files are immutable or
+// append-only (the bytes at an offset never change). It only does range reads — it doesn't care what
+// the files are.
 class RangeCache {
-    private chunks = new Map<string, Buffer>(); // key: path + "" + chunkIndex (insertion-ordered → LRU)
+    private chunks = new Map<string, Buffer>(); // path + "" + chunkIndex, insertion-ordered (LRU)
     private bytes = 0;
     constructor(private chunkBytes: number, private budget: number) { }
-
     private key(path: string, c: number) { return path + "" + c; }
     private peek(path: string, c: number): Buffer | undefined {
         const k = this.key(path, c);
         const v = this.chunks.get(k);
-        if (v) { this.chunks.delete(k); this.chunks.set(k, v); } // bump to most-recent
+        if (v) { this.chunks.delete(k); this.chunks.set(k, v); }
         return v;
     }
     private store(path: string, c: number, buf: Buffer) {
         const k = this.key(path, c);
         const ex = this.chunks.get(k);
-        if (ex && ex.length >= buf.length) { this.chunks.delete(k); this.chunks.set(k, ex); return; } // keep longer prefix
+        if (ex && ex.length >= buf.length) { this.chunks.delete(k); this.chunks.set(k, ex); return; }
         if (ex) this.bytes -= ex.length;
         this.chunks.delete(k);
         this.chunks.set(k, buf);
@@ -106,17 +147,13 @@ class RangeCache {
     }
     invalidate(path: string) {
         const prefix = path + "";
-        for (const k of [...this.chunks.keys()]) {
-            if (k.startsWith(prefix)) { this.bytes -= (this.chunks.get(k) as Buffer).length; this.chunks.delete(k); }
-        }
+        for (const k of [...this.chunks.keys()]) if (k.startsWith(prefix)) { this.bytes -= (this.chunks.get(k) as Buffer).length; this.chunks.delete(k); }
     }
-
-    async getRange(conn: Connection, path: string, start: number, end: number): Promise<Buffer | undefined> {
+    async read(conn: Connection, path: string, start: number, end: number): Promise<Buffer | undefined> {
         if (end <= start) return EMPTY;
         const CHUNK = this.chunkBytes;
         const firstChunk = Math.floor(start / CHUNK);
         const lastChunk = Math.floor((end - 1) / CHUNK);
-        // Find the contiguous span of chunks we don't have enough of, and fetch it in one request.
         let fetchFrom = -1, fetchTo = -1;
         for (let c = firstChunk; c <= lastChunk; c++) {
             const cStart = c * CHUNK;
@@ -125,11 +162,11 @@ class RangeCache {
             if (!have || have.length < needEnd) { if (fetchFrom < 0) fetchFrom = c; fetchTo = c; }
         }
         if (fetchFrom >= 0) {
-            const bytes = await readRange(conn, path, fetchFrom * CHUNK, (fetchTo + 1) * CHUNK);
-            if (bytes === undefined) return undefined; // file missing
+            const bytes = await conn.readServer(path, fetchFrom * CHUNK, (fetchTo + 1) * CHUNK);
+            if (bytes === undefined) return undefined;
             for (let c = fetchFrom; c <= fetchTo; c++) {
                 const off = (c - fetchFrom) * CHUNK;
-                if (off >= bytes.length) break; // hit EOF — no bytes for this chunk
+                if (off >= bytes.length) break;
                 this.store(path, c, bytes.subarray(off, Math.min(off + CHUNK, bytes.length)));
             }
         }
@@ -139,122 +176,99 @@ class RangeCache {
             const from = Math.max(start, cStart) - cStart;
             const to = Math.min(end, cStart + CHUNK) - cStart;
             const chunk = this.peek(path, c);
-            if (!chunk || chunk.length < to) {
-                // File ended before the requested end — return what's available (callers read within EOF).
-                if (chunk && chunk.length > from) parts.push(chunk.subarray(from, chunk.length));
-                break;
-            }
+            if (!chunk || chunk.length < to) { if (chunk && chunk.length > from) parts.push(chunk.subarray(from, chunk.length)); break; }
             parts.push(chunk.subarray(from, to));
         }
         return parts.length === 1 ? parts[0] : Buffer.concat(parts);
     }
 }
 
-function makeStorage(conn: Connection, basePath: string): FileStorage {
-    const rel = (key: string) => basePath ? basePath + "/" + key : key;
+const joinPath = (base: string, key: string) => (base ? base + "/" + key : key);
 
-    const folder: NestedFileStorage = {
-        async hasKey(key: string): Promise<boolean> {
-            const r = await httpRequest(conn, "GET", "/hasDir", { path: rel(key) });
-            if (r.status !== 200) return false;
-            return !!JSON.parse(r.body.toString("utf8")).exists;
-        },
-        async getStorage(key: string): Promise<FileStorage> {
-            return makeStorage(conn, rel(key));
-        },
-        async removeStorage(key: string): Promise<void> {
-            await httpRequest(conn, "DELETE", "/removeDir", { path: rel(key) });
-            conn.cache.invalidate(rel(key));
-        },
-        async getKeys(): Promise<string[]> {
-            const r = await httpRequest(conn, "GET", "/list", { path: basePath, folders: "1" });
-            if (r.status !== 200) throw new Error(`remote list failed (${r.status})`);
-            return JSON.parse(r.body.toString("utf8"));
-        },
-    };
-
-    return {
-        async getInfo(key: string) {
-            const r = await httpRequest(conn, "GET", "/info", { path: rel(key) });
-            if (r.status === 404) return undefined;
-            if (r.status !== 200) throw new Error(`remote info failed (${r.status})`);
-            return JSON.parse(r.body.toString("utf8")) as { size: number; lastModified: number };
-        },
-        async get(key: string) {
-            const info = await this.getInfo(key);
-            if (!info) return undefined;
-            return this.getRange(key, { start: 0, end: info.size });
-        },
-        async getRange(key: string, config: { start: number; end: number }) {
-            return conn.cache.getRange(conn, rel(key), config.start, config.end);
-        },
-        async append(key: string, value: Buffer) {
-            const r = await httpRequest(conn, "PUT", "/append", { path: rel(key) }, value);
-            if (r.status !== 200) throw new Error(`remote append failed (${r.status})`);
-            // No invalidation needed: append-only files keep their prefix; a read past it refetches.
-        },
-        async set(key: string, value: Buffer) {
-            const r = await httpRequest(conn, "PUT", "/set", { path: rel(key) }, value);
-            if (r.status !== 200) throw new Error(`remote set failed (${r.status})`);
-            conn.cache.invalidate(rel(key));
-        },
-        async remove(key: string) {
-            await httpRequest(conn, "DELETE", "/remove", { path: rel(key) });
-            conn.cache.invalidate(rel(key));
-        },
-        async getKeys(includeFolders: boolean = false) {
-            const r = await httpRequest(conn, "GET", "/list", { path: basePath, folders: includeFolders ? "1" : "0" });
-            if (r.status !== 200) throw new Error(`remote list failed (${r.status})`);
-            return JSON.parse(r.body.toString("utf8"));
-        },
-        async reset() {
-            await httpRequest(conn, "POST", "/reset", { path: basePath });
-            conn.cache.invalidate(basePath);
-        },
-        folder,
-    };
+class RemoteFileWrapper implements FileWrapper {
+    // `stat` is supplied when the parent already statted us (avoids a second /info). `createIntent` means
+    // this was opened with create:true, so a missing file reads as empty (it'll be created on write).
+    constructor(private conn: Connection, private filePath: string, private stat?: Stat, private createIntent = false) { }
+    async getFile() {
+        let stat = this.stat ?? await this.conn.stat(this.filePath);
+        if (!stat) {
+            if (!this.createIntent) throw enoent(this.filePath);
+            stat = { size: 0, lastModified: Date.now(), dir: false };
+        }
+        const conn = this.conn, filePath = this.filePath, size = stat.size;
+        return {
+            size, lastModified: stat.lastModified,
+            async arrayBuffer() { return toArrayBuffer(await conn.read(filePath, 0, size)); },
+            slice(start: number, end: number) {
+                return { async arrayBuffer() { return toArrayBuffer(await conn.read(filePath, start, end)); } };
+            },
+        };
+    }
+    async createWritable(config?: { keepExistingData?: boolean }) {
+        const conn = this.conn, filePath = this.filePath, append = !!config?.keepExistingData;
+        const chunks: Buffer[] = [];
+        return {
+            async seek() { /* the server appends to the end / overwrites the whole file; offset unused */ },
+            async write(value: Buffer) { chunks.push(value); },
+            async close() {
+                const body = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+                if (append) await conn.append(filePath, body); else await conn.set(filePath, body);
+            },
+        };
+    }
 }
 
-export type RemoteStorageFactory = ((path: string) => Promise<FileStorage>) & { stats: Connection["stats"] };
-
-// Returns a StorageFactory (path -> FileStorage) backed by a remoteFileServer.js instance. Drop-in for
-// getFileStorageNested2 in BulkDatabase2. `password` is the 6-word password the server printed.
-export function getRemoteFileStorage(url: string, password: string, options: RemoteFileStorageOptions = {}): RemoteStorageFactory {
-    const conn: Connection = {
-        url,
-        password,
-        latencyMs: options.latencyMs || 0,
-        // Self-signed cert: skip verification in Node. (The browser path uses fetch, where the user has
-        // already accepted the cert.) The password is what authorizes access.
-        agent: isNode() ? new https.Agent({ rejectUnauthorized: false }) : undefined,
-        cache: new RangeCache(options.chunkBytes || DEFAULT_CHUNK_BYTES, options.cacheBytes || DEFAULT_CACHE_BYTES),
-        stats: { requestCount: 0, bytesFetched: 0 },
-    };
-    const factory = ((path: string) => Promise.resolve(makeStorage(conn, path.replace(/^\/+|\/+$/g, "")))) as RemoteStorageFactory;
-    factory.stats = conn.stats;
-    return factory;
+class RemoteDirectoryWrapper implements DirectoryWrapper {
+    constructor(private conn: Connection, private dirPath: string) { }
+    async removeEntry(key: string): Promise<void> {
+        await this.conn.remove(joinPath(this.dirPath, key));
+    }
+    async getFileHandle(key: string, options?: { create?: boolean }): Promise<FileWrapper> {
+        const p = joinPath(this.dirPath, key);
+        if (options?.create) return new RemoteFileWrapper(this.conn, p, undefined, true);
+        const stat = await this.conn.stat(p);                 // matches the File API: throw if missing
+        if (!stat || stat.dir) throw enoent(p);
+        return new RemoteFileWrapper(this.conn, p, stat, false);
+    }
+    async getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper> {
+        const p = joinPath(this.dirPath, key);
+        if (!options?.create) {
+            const stat = await this.conn.stat(p);
+            if (!stat || !stat.dir) throw enoent(p);
+        }
+        return new RemoteDirectoryWrapper(this.conn, p);       // dirs are created lazily on first write
+    }
+    async *[Symbol.asyncIterator](): AsyncIterableIterator<[string, { kind: "file"; name: string; getFile(): Promise<FileWrapper> } | { kind: "directory"; name: string; getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper> }]> {
+        const entries = await this.conn.list(this.dirPath);
+        for (const e of entries) {
+            const childPath = joinPath(this.dirPath, e.name);
+            if (e.dir) {
+                yield [e.name, { kind: "directory", name: e.name, getDirectoryHandle: (k, o) => new RemoteDirectoryWrapper(this.conn, childPath).getDirectoryHandle(k, o) }];
+            } else {
+                yield [e.name, { kind: "file", name: e.name, getFile: async () => new RemoteFileWrapper(this.conn, childPath) }];
+            }
+        }
+    }
 }
 
-export type RemoteProbeResult =
-    | { status: "ok" }
-    | { status: "unauthorized" }
-    // Couldn't reach the server at all — in the browser this is usually the self-signed certificate not
-    // being trusted yet (fetch throws with no detail), but also covers a wrong URL / server down / CORS.
-    | { status: "unreachable"; error: string };
+// A DirectoryWrapper rooted at a remote server. Drop-in for the Node / File-API handles.
+export function getRemoteDirectoryHandle(url: string, password: string, options: RemoteOptions = {}): DirectoryWrapper {
+    return new RemoteDirectoryWrapper(new Connection(url, password, options), "");
+}
 
-// Probes a remote server: distinguishes "connected" from "wrong password" from "couldn't reach it". The
-// browser can't tell a cert-distrust from other network failures (fetch just throws), so the UI treats
-// `unreachable` as "you probably need to accept the self-signed certificate first".
-export async function probeRemoteConnection(url: string, password: string): Promise<RemoteProbeResult> {
+export type RemoteConnectResult = { status: "ok" } | { status: "unauthorized" } | { status: "unreachable"; error: string };
+
+// Verifies a server is reachable and the password works — by actually listing the root. Distinguishes
+// "connected" / "wrong password" / "couldn't reach it" (the last usually meaning the self-signed cert
+// isn't trusted yet in the browser, since fetch failures carry no detail).
+export async function testRemoteConnection(url: string, password: string, options: RemoteOptions = {}): Promise<RemoteConnectResult> {
+    const conn = new Connection(url, password, options);
     try {
-        await (await getRemoteFileStorage(url, password)("")).getKeys();
-        return { status: "ok" };
+        const r = await conn.request("GET", "/list", { path: "" });
+        if (r.status === 200) return { status: "ok" };
+        if (r.status === 401) return { status: "unauthorized" };
+        return { status: "unreachable", error: `server returned ${r.status}` };
     } catch (e) {
-        const msg = (e as Error)?.message || String(e);
-        // Our client throws "remote ... failed (NNN)" when it actually got an HTTP response (so the cert
-        // is trusted); a thrown fetch with no status means we never connected.
-        const m = msg.match(/\((\d{3})\)/);
-        if (m) return m[1] === "401" ? { status: "unauthorized" } : { status: "unreachable", error: msg };
-        return { status: "unreachable", error: msg };
+        return { status: "unreachable", error: (e as Error)?.message || String(e) };
     }
 }

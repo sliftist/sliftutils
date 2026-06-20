@@ -203,6 +203,22 @@ function normalizePassword(p: string): string {
     return String(p || "").toLowerCase().replace(/[^a-z]/g, "");
 }
 
+// The password is generated once and saved (next to the cert, outside the served folder), then reused
+// across restarts — so connected clients keep working after the server bounces, instead of getting a
+// new password every time. Override with the PASSWORD env var.
+function getOrCreatePassword(): string {
+    const dir = path.join(os.homedir(), ".sliftutils-remote");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "password.txt");
+    try {
+        const existing = fs.readFileSync(file, "utf8").trim();
+        if (existing) return existing;
+    } catch { /* not created yet */ }
+    const pw = generatePassword(6);
+    fs.writeFileSync(file, pw + "\n", { mode: 0o600 });
+    return pw;
+}
+
 // Generate (once) and cache a self-signed key + cert via openssl, outside the served folder so its
 // private key is never reachable through the API.
 function getCert(): { key: Buffer; cert: Buffer } {
@@ -278,7 +294,7 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
     if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
     const port = options.port ?? 8787;
     const host = options.host || "0.0.0.0";
-    const password = options.password || generatePassword(6);
+    const password = options.password || getOrCreatePassword();
     const normPassword = normalizePassword(password);
     const { key, cert } = getCert();
 
@@ -340,21 +356,17 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
             const full = safeResolve(root, relPath);
             if (full === undefined) return sendJson(403, { error: "path escapes root" });
 
+            // One listing returns every entry with its type, so a directory read is a single round trip.
             if (req.method === "GET" && op === "/list") {
-                const wantFolders = url.searchParams.get("folders") === "1";
                 let entries: fs.Dirent[];
                 try { entries = fs.readdirSync(full, { withFileTypes: true }); }
                 catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? sendJson(200, []) : sendJson(500, { error: (e as Error).message }); }
-                return sendJson(200, entries.filter(d => wantFolders ? d.isDirectory() : d.isFile()).map(d => d.name));
+                return sendJson(200, entries.filter(d => d.isFile() || d.isDirectory()).map(d => ({ name: d.name, dir: d.isDirectory() })));
             }
             if (req.method === "GET" && op === "/info") {
                 let st: fs.Stats;
                 try { st = fs.statSync(full); } catch { return sendJson(404, { error: "not found" }); }
-                return sendJson(200, { size: st.size, lastModified: st.mtimeMs });
-            }
-            if (req.method === "GET" && op === "/hasDir") {
-                let st: fs.Stats; try { st = fs.statSync(full); } catch { return sendJson(200, { exists: false }); }
-                return sendJson(200, { exists: st.isDirectory() });
+                return sendJson(200, { size: st.size, lastModified: st.mtimeMs, dir: st.isDirectory() });
             }
             if (req.method === "GET" && op === "/read") {
                 let st: fs.Stats;
@@ -377,17 +389,9 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
                 recordAccess(clientIp(req), "write", relPath, body.length);
                 return sendJson(200, { ok: true });
             }
+            // Removes a file or a directory (recursively); missing is fine.
             if (req.method === "DELETE" && op === "/remove") {
-                try { fs.unlinkSync(full); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return sendJson(500, { error: (e as Error).message }); }
-                return sendJson(200, { ok: true });
-            }
-            if (req.method === "DELETE" && op === "/removeDir") {
                 try { fs.rmSync(full, { recursive: true, force: true }); } catch (e) { return sendJson(500, { error: (e as Error).message }); }
-                return sendJson(200, { ok: true });
-            }
-            if (req.method === "POST" && op === "/reset") {
-                try { for (const name of fs.readdirSync(full)) fs.rmSync(path.join(full, name), { recursive: true, force: true }); }
-                catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return sendJson(500, { error: (e as Error).message }); }
                 return sendJson(200, { ok: true });
             }
             return sendJson(404, { error: "unknown endpoint" });
