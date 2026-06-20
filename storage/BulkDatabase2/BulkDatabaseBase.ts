@@ -45,6 +45,10 @@ const STALE_DELETE_MS = 24 * 60 * 60 * 1000;
 // -view bug), which a later reload resolves.
 const MAX_READ_ATTEMPTS = 8;
 
+// A read that hits a file a concurrent merge deleted reloads the index and retries; if it keeps hitting
+// missing files this many times it gives up and throws (so a genuinely-unreadable file can't loop forever).
+const MAX_INDEX_RELOAD_ATTEMPTS = 3;
+
 // The first ("consolidate recent") merge accumulates the newest files up to this many bytes into one
 // file (half the target, so it has room to grow before it needs splitting). The key-stratified second
 // merge groups keys into runs of this many bytes and only rewrites a group whose fraction of duplicate
@@ -87,12 +91,8 @@ export const bulkDatabase2Timing = {
     // the default in Node, where append is real and cheap; the browser ramps to 15s to avoid rewriting
     // the whole stream file per write.
     writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
-    // When a read hits a file a concurrent merge (another tab/process) deleted, we reload the index
-    // (re-list files, re-read headers/keys) and retry — but at most this often, so a burst of failing reads
-    // can't rebuild repeatedly.
-    indexReloadThrottleMs: 15 * 1000,
-    // We also proactively re-list files this often; if the set changed under us we reload the index, so
-    // reads pick up another writer's merge even without first hitting an error.
+    // We proactively re-list files this often; if the set changed under us (another tab/process merged) we
+    // reload the index, so reads pick up the change even without first hitting a missing-file error.
     fileSetPollIntervalMs: 30 * 60 * 1000,
 };
 
@@ -323,7 +323,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // under us; we notice either when a read hits a deleted file (readWithReload) or via the periodic poll
     // (pollFileSet), and reload the index — cheap, since a build only reads headers + key columns.
     private loadedFileSet: Set<string> | undefined; // file names the current reader was built from
-    private lastIndexReload = 0;                     // throttle for error-triggered reloads
+    // Bumped every time the index is cleared/reloaded. A failed read captures it before reading and only
+    // triggers a reload if it's unchanged afterward — so N concurrent failures coalesce onto ONE rebuild
+    // (the rest see the bumped epoch, skip their own reload, and just await the in-flight one).
+    private readerEpoch = 0;
     private fileSetPollTimer: ReturnType<typeof setInterval> | undefined;
     // Bumped on every overlay mutation / reader reset. An async column build captures it before its awaits
     // and only caches its result if it hasn't changed since — so a write or reset mid-build (which clears
@@ -551,6 +554,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.streamRowsOnDisk = 0;
         this.streamBytesOnDisk = 0;
         this.dataGen++;
+        this.readerEpoch++; // so an in-flight read knows the index changed under it (see readWithReload)
     }
 
     // Reset the loaded reader AND drop the overlay. Used only on structural changes WE made (large
@@ -577,26 +581,23 @@ export class BulkDatabaseBase<T extends { key: string }> {
         });
     }
 
-    // A read hit a file a concurrent merge deleted. Reload the index — at most once per
-    // indexReloadThrottleMs, so a burst of failing reads doesn't rebuild over and over.
-    private maybeReloadIndex() {
-        const now = Date.now();
-        if (now - this.lastIndexReload < bulkDatabase2Timing.indexReloadThrottleMs) return;
-        this.lastIndexReload = now;
-        this.reloadReader();
-    }
-
     // Run a read against the loaded index; if a file vanished mid-read (a concurrent merge deleted it),
-    // reload the index (throttled) and retry once against the fresh reader.
+    // reload the index and retry — looping until it succeeds or we've tried MAX_INDEX_RELOAD_ATTEMPTS times.
+    // Reloads coalesce: a failing read only resets the index if nobody has reset it since the read grabbed
+    // its reader (readerEpoch unchanged). So N concurrent failures cause ONE rebuild — the first resets, the
+    // rest see the bumped epoch and just await the in-flight rebuild that lazy() shares — and a good rebuild
+    // is never thrown away by a straggler.
     private async readWithReload<R>(fn: (reader: ResolvedReader) => Promise<R>): Promise<R> {
-        let reader = await this.reader();
-        try {
-            return await fn(reader);
-        } catch (e) {
-            if (!(e instanceof MissingFileError)) throw e;
-            this.maybeReloadIndex();
-            reader = await this.reader();
-            return await fn(reader);
+        for (let attempt = 0; ; attempt++) {
+            const reader = await this.reader();
+            const epoch = this.readerEpoch; // epoch of the reader we're about to use
+            try {
+                return await fn(reader);
+            } catch (e) {
+                if (!(e instanceof MissingFileError) || attempt >= MAX_INDEX_RELOAD_ATTEMPTS) throw e;
+                if (this.readerEpoch === epoch) this.reloadReader();
+                // else: another reader already reloaded the index — loop and use its rebuild.
+            }
         }
     }
 
