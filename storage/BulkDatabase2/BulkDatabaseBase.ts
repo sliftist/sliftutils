@@ -1177,6 +1177,25 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return reader.columns;
     }
 
+    // Raw vs. resolved key counts: how much duplicate/stale key data is sitting on disk that a compact()
+    // would collapse. rawKeys counts every key-slot across all loaded files — each set and each delete
+    // tombstone (a key written into N files counts N times); finalKeys is the number of live resolved
+    // keys (after newest-write-wins and tombstones). Both come straight from the already-loaded reader, so
+    // this is ~free. wastedKeys = rawKeys - finalKeys; duplication = rawKeys / finalKeys (well above 1 ⇒
+    // fragmented, compaction would shrink it).
+    public async getKeyStats(): Promise<{ rawKeys: number; finalKeys: number; wastedKeys: number; duplication: number; readers: number }> {
+        const reader = await this.reader();
+        const rawKeys = reader.rawKeyCount;
+        const finalKeys = reader.keys.length;
+        return {
+            rawKeys,
+            finalKeys,
+            wastedKeys: rawKeys - finalKeys,
+            duplication: finalKeys ? rawKeys / finalKeys : 0,
+            readers: reader.readerCount,
+        };
+    }
+
     public async getReaderInfo() {
         let reader = await this.reader();
         return {
@@ -1212,6 +1231,11 @@ type ResolvedReader = {
     rowCount: number;
     totalBytes: number;
     keys: string[];
+    // Total key-slots across every loaded reader — every set AND every delete tombstone (a key stored in
+    // N files counts N times) — and how many readers there are. Already in memory after the join, so
+    // getKeyStats is ~free; rawKeyCount vs keys.length is how much duplication a compaction would collapse.
+    rawKeyCount: number;
+    readerCount: number;
     columns: { column: string; byteSize: number }[];
     getColumn: (column: string) => Promise<{ key: string; value: unknown; time: number }[]>;
     getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | undefined>;
@@ -1256,6 +1280,8 @@ async function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): Promise<R
         totalBytes: databases.reduce((acc, db) => acc + db.totalBytes, 0),
         rowCount: keys.length,
         keys,
+        rawKeyCount: databases.reduce((acc, db) => acc + db.keyTimes.size + (db.deleteTimes?.size ?? 0), 0),
+        readerCount: databases.length,
         columns,
         async getColumn(column) {
             const perReader = await Promise.all(databases.map(async db => {
