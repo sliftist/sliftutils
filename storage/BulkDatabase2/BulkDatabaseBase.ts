@@ -131,18 +131,18 @@ export type StorageFactory = (path: string) => Promise<FileStorage>;
 
 // Optional per-collection configuration.
 export type BulkDatabase2Config = {
-    // When set (> 0), the reactive change notifications writes/loads emit are throttled and BATCHED
-    // globally (across all keys), so a high-frequency write source doesn't re-run watchers on every single
-    // change. The throttle RAMPS like the write-flush one: the first change after a lull notifies
-    // immediately, then under sustained changes the delay doubles up to triggerThrottleMs, coalescing the
-    // burst into one notification. In-memory/async reads are always current — only the OBSERVABLE
-    // notification (the mobx re-render trigger) is delayed and merged.
-    triggerThrottleMs?: number;
+    // The MAXIMUM throttle (ms) for reactive change notifications; the actual delay RAMPS UP to it, it is
+    // never applied all at once. When set (> 0), the notifications writes/loads emit are batched globally
+    // (across all keys) so a high-frequency write source doesn't re-run watchers on every single change: a
+    // change after a lull notifies immediately, then under sustained changes the delay doubles up to this
+    // ceiling, coalescing the burst into one notification. In-memory/async reads are always current — only
+    // the OBSERVABLE notification (the mobx re-render trigger) is delayed and merged.
+    maxTriggerThrottleMs?: number;
 };
 
 // Trigger-throttle ramp: the first deferred notification waits this long, then the delay doubles on each
-// further change up to BulkDatabase2Config.triggerThrottleMs. ~16ms ≈ one animation frame, so an isolated
-// burst still notifies within a frame.
+// further change up to BulkDatabase2Config.maxTriggerThrottleMs. ~16ms ≈ one animation frame, so an
+// isolated burst still notifies within a frame.
 const TRIGGER_THROTTLE_FIRST_STEP_MS = 16;
 
 // The load/reset lifecycle shares one signal; every sync read observes it so it re-renders when the
@@ -310,7 +310,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // the cache and may swap the reader) can never leave a stale entry behind.
     private dataGen = 0;
 
-    // ---- trigger throttle (see BulkDatabase2Config.triggerThrottleMs) ----
+    // ---- trigger throttle (see BulkDatabase2Config.maxTriggerThrottleMs) ----
     // Signals whose notification is deferred, the pending flush timer, and the ramping delay. Data state is
     // already updated synchronously; only these observable notifications are batched/delayed.
     private pendingSignals = new Set<string>();
@@ -363,14 +363,14 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return this.readerKeys?.has(key) ?? false;
     }
 
-    // Notify observers of `signal`. With triggerThrottleMs set, notifications are batched and delayed on a
-    // ramping schedule so a high-frequency source can't re-run watchers on every change: a change after a
+    // Notify observers of `signal`. With maxTriggerThrottleMs set, notifications are batched and delayed on
+    // a ramping schedule so a high-frequency source can't re-run watchers on every change: a change after a
     // lull notifies on the next tick (no real delay, but all of one change's signals batch together);
     // under sustained changes the delay doubles up to the max, coalescing the burst into one notification.
     // Only the OBSERVABLE notification is delayed — the underlying data was already updated, so a read in
     // the meantime still sees current values.
     private invalidateSignal(signal: string) {
-        const maxMs = this.config.triggerThrottleMs ?? 0;
+        const maxMs = this.config.maxTriggerThrottleMs ?? 0;
         if (maxMs <= 0) { this.deps.invalidate(signal); return; }
         this.pendingSignals.add(signal);
         const now = Date.now();
