@@ -1898,6 +1898,15 @@ declare module "sliftutils/storage/remoteFileStorage" {
         stats: Connection["stats"];
     };
     export declare function getRemoteFileStorage(url: string, password: string, options?: RemoteFileStorageOptions): RemoteStorageFactory;
+    export type RemoteProbeResult = {
+        status: "ok";
+    } | {
+        status: "unauthorized";
+    } | {
+        status: "unreachable";
+        error: string;
+    };
+    export declare function probeRemoteConnection(url: string, password: string): Promise<RemoteProbeResult>;
     export {};
 
 }

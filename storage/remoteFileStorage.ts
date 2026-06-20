@@ -234,3 +234,27 @@ export function getRemoteFileStorage(url: string, password: string, options: Rem
     factory.stats = conn.stats;
     return factory;
 }
+
+export type RemoteProbeResult =
+    | { status: "ok" }
+    | { status: "unauthorized" }
+    // Couldn't reach the server at all — in the browser this is usually the self-signed certificate not
+    // being trusted yet (fetch throws with no detail), but also covers a wrong URL / server down / CORS.
+    | { status: "unreachable"; error: string };
+
+// Probes a remote server: distinguishes "connected" from "wrong password" from "couldn't reach it". The
+// browser can't tell a cert-distrust from other network failures (fetch just throws), so the UI treats
+// `unreachable` as "you probably need to accept the self-signed certificate first".
+export async function probeRemoteConnection(url: string, password: string): Promise<RemoteProbeResult> {
+    try {
+        await (await getRemoteFileStorage(url, password)("")).getKeys();
+        return { status: "ok" };
+    } catch (e) {
+        const msg = (e as Error)?.message || String(e);
+        // Our client throws "remote ... failed (NNN)" when it actually got an HTTP response (so the cert
+        // is trusted); a thrown fetch with no status means we never connected.
+        const m = msg.match(/\((\d{3})\)/);
+        if (m) return m[1] === "401" ? { status: "unauthorized" } : { status: "unreachable", error: msg };
+        return { status: "unreachable", error: msg };
+    }
+}

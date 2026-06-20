@@ -7,7 +7,7 @@ import { css, isNode } from "typesafecss";
 import { IStorageRaw } from "./IStorage";
 import { runInSerial } from "socket-function/src/batching";
 import { getFileStorageIndexDB } from "./IndexedDBFileFolderAPI";
-import { getRemoteFileStorage } from "./remoteFileStorage";
+import { getRemoteFileStorage, probeRemoteConnection } from "./remoteFileStorage";
 import fs from "fs";
 import path from "path";
 
@@ -128,20 +128,32 @@ class DirectoryPrompter extends preact.Component {
 // reloads so getFileStorageNested2 picks up the remote storage.
 @observer
 class ServerConnectForm extends preact.Component {
-    private obs = observable({ expanded: false, url: "", password: "", error: "", connecting: false });
+    private obs = observable({ expanded: false, url: "", password: "", error: "", connecting: false, needsCert: false });
+    private cleanUrl() { return this.obs.url.trim().replace(/\/+$/, ""); }
     private connect = async () => {
         const s = this.obs;
         s.error = "";
+        s.needsCert = false;
         s.connecting = true;
         try {
-            const url = s.url.trim().replace(/\/+$/, "");
-            if (!url) throw new Error("Enter a server URL");
-            // A successful listing proves the URL is reachable and the password is correct.
-            await (await getRemoteFileStorage(url, s.password.trim())("")).getKeys();
-            saveRemoteConfig({ url, password: s.password.trim() });
-            window.location.reload();
+            const url = this.cleanUrl();
+            if (!url) { s.error = "Enter a server URL"; return; }
+            const result = await probeRemoteConnection(url, s.password.trim());
+            if (result.status === "ok") {
+                saveRemoteConfig({ url, password: s.password.trim() });
+                window.location.reload();
+                return;
+            }
+            if (result.status === "unauthorized") {
+                s.error = "The server rejected that password.";
+            } else {
+                // Reached nothing back — almost always the self-signed certificate isn't trusted yet.
+                s.needsCert = true;
+                s.error = "Couldn't reach the server.";
+            }
         } catch (e) {
             s.error = "Could not connect: " + ((e as Error).message || String(e));
+        } finally {
             s.connecting = false;
         }
     };
@@ -158,12 +170,22 @@ class ServerConnectForm extends preact.Component {
                     onInput={e => s.url = (e.target as HTMLInputElement).value} />
                 <input className={inputCss} type="password" placeholder="password (six words)" value={s.password}
                     onInput={e => s.password = (e.target as HTMLInputElement).value} />
-                {s.error ? <div className={css.fontSize(20).color("red").maxWidth("80vw")}>{s.error}</div> : null}
+                {s.error ? <div className={css.fontSize(22).color("red").maxWidth("80vw")}>{s.error}</div> : null}
+                {s.needsCert ? (
+                    <div className={css.vbox(10).center.fontSize(20).maxWidth(620).maxWidth("80vw").textAlign("center").color("hsl(0, 0%, 25%)")}>
+                        <div>This server uses a self-signed certificate, so your browser has to trust it once:</div>
+                        <div>1. Open the server in a new tab (button below). &nbsp; 2. Accept the security warning (Advanced → Proceed). &nbsp; 3. Come back and click Retry.</div>
+                        <button className={css.fontSize(26).pad2(40, 20)}
+                            onClick={() => { const u = this.cleanUrl(); if (u) window.open(u + "/", "_blank"); }}>
+                            Open server &amp; accept certificate
+                        </button>
+                    </div>
+                ) : null}
                 <div className={css.hbox(16)}>
                     <button className={btnCss} disabled={s.connecting} onClick={this.connect}>
-                        {s.connecting ? "Connecting…" : "Connect"}
+                        {s.connecting ? "Connecting…" : s.needsCert ? "Retry" : "Connect"}
                     </button>
-                    <button className={btnCss} onClick={() => { s.expanded = false; s.error = ""; }}>Back</button>
+                    <button className={btnCss} onClick={() => { s.expanded = false; s.error = ""; s.needsCert = false; }}>Back</button>
                 </div>
             </div>
         );

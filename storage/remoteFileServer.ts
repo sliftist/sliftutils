@@ -257,6 +257,11 @@ function formatBytes(n: number): string {
     return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
 }
 
+// Public (no-auth) landing page. The browser can't trust a self-signed cert from a background fetch, so
+// the user opens this URL once, accepts the browser's security warning, and the cert becomes trusted for
+// the origin — then the app's fetches work. This page is what they see after accepting.
+const CERT_LANDING_HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>sliftutils file server</title></head><body style="font-family:system-ui,sans-serif;max-width:34em;margin:3em auto;padding:0 1em;line-height:1.5;color:#222"><h2>&#10003; Certificate accepted</h2><p>This is your <b>sliftutils file server</b>. Your browser now trusts its self-signed certificate for this address.</p><p>Return to the app and click <b>Retry</b> (or <b>Connect</b>) to finish connecting with your password.</p><p style="color:#888;font-size:.9em">You can close this tab.</p></body></html>`;
+
 export type RemoteFileServerOptions = {
     root: string;
     port?: number;
@@ -319,12 +324,18 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
         try {
             if (req.method === "OPTIONS") return send(204, {});
 
+            const url = new URL(req.url || "/", "https://localhost");
+            const op = url.pathname;
+
+            // Public landing page so the user can open the URL once to accept the self-signed cert.
+            if (req.method === "GET" && (op === "/" || op === "/index.html")) {
+                return send(200, { "Content-Type": "text/html; charset=utf-8" }, CERT_LANDING_HTML);
+            }
+
             const auth = (req.headers["authorization"] as string) || "";
             const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
             if (!timingSafeEqualStr(normalizePassword(token), normPassword)) return sendJson(401, { error: "unauthorized" });
 
-            const url = new URL(req.url || "/", "https://localhost");
-            const op = url.pathname;
             const relPath = url.searchParams.get("path") || "";
             const full = safeResolve(root, relPath);
             if (full === undefined) return sendJson(403, { error: "path escapes root" });
