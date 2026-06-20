@@ -637,7 +637,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
             syncBroadcastSeal(this.name);
             this.streamFileName = undefined;
             const { bulkFiles, streamFiles } = await this.listFiles();
-            if (bulkFiles.length + streamFiles.length >= 1) await this.mergeFileSet(bulkFiles, streamFiles);
+            // compact() merges every file on disk, so nothing older survives outside it — tombstones for
+            // fully-deleted keys can be dropped rather than carried into a fresh carry stream.
+            if (bulkFiles.length + streamFiles.length >= 1) await this.mergeFileSet(bulkFiles, streamFiles, true);
         } finally {
             releaseMergeLock(this.name, writerId);
         }
@@ -662,7 +664,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const selStream = streamFiles.filter(f =>
             f.timestamp <= timeHi && f.timestamp + bulkDatabase2Timing.streamSealAgeMs >= timeLo);
         if (selBulk.length + selStream.length < 2) return;
-        await this.mergeFileSet(selBulk, selStream);
+        // timeLo <= 0 reaches the start of time: every older file overlaps [timeLo, timeHi] and is in the
+        // merge, so no older set survives outside it and surviving tombstones can be dropped.
+        await this.mergeFileSet(selBulk, selStream, timeLo <= 0);
     }
 
     // Throws MissingFileError (not a generic error) when the file is gone, so callers can distinguish a
@@ -804,7 +808,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // merge removes them), never a gap. A bulk file is deleted only if we actually read it; a stream file
     // only if it's aged out (its writer has switched files) or — when cross-tab sync sealed it — its size
     // didn't change while we read it. Returns whether it produced anything.
-    private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[]): Promise<boolean> {
+    // `includesOldest` means this merge consumes every file at or before its time range — there is no
+    // file before it on disk. A surviving tombstone only exists to suppress an OLDER set in some file
+    // outside the merge; if nothing older exists, that older set can't exist either, so the tombstone has
+    // nothing left to suppress and we drop it instead of carrying it forward. (A full compact and a
+    // merge that reaches time 0 are the cases where this holds.)
+    private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false): Promise<boolean> {
         const storage = await this.storage();
         const timestamp = nextFileTime();
         const now = Date.now();
@@ -837,7 +846,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 newNames.push(name);
             }
         }
-        if (deletes.size) {
+        // Carry surviving tombstones forward only if older files exist outside this merge that they still
+        // need to suppress; when this merge includes the oldest data there's nothing older to suppress.
+        const carriedDeletes = includesOldest ? 0 : deletes.size;
+        if (carriedDeletes) {
             const carryName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
             await storage.set(carryName, frameDeletes([...deletes].map(([key, time]) => ({ time, key }))));
         }
@@ -849,7 +861,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
 
         this.resetReader();
-        return newNames.length > 0 || deletes.size > 0;
+        return newNames.length > 0 || carriedDeletes > 0;
     }
 
     // A stream file is safe to delete iff no writer will ever append to it again: it's aged past the seal
@@ -1177,6 +1189,25 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return reader.columns;
     }
 
+    // Raw vs. resolved key counts: how much duplicate/stale key data is sitting on disk that a compact()
+    // would collapse. rawKeys counts every key-slot across all loaded files — each set and each delete
+    // tombstone (a key written into N files counts N times); finalKeys is the number of live resolved
+    // keys (after newest-write-wins and tombstones). Both come straight from the already-loaded reader, so
+    // this is ~free. wastedKeys = rawKeys - finalKeys; duplication = rawKeys / finalKeys (well above 1 ⇒
+    // fragmented, compaction would shrink it).
+    public async getKeyStats(): Promise<{ rawKeys: number; finalKeys: number; wastedKeys: number; duplication: number; readers: number }> {
+        const reader = await this.reader();
+        const rawKeys = reader.rawKeyCount;
+        const finalKeys = reader.keys.length;
+        return {
+            rawKeys,
+            finalKeys,
+            wastedKeys: rawKeys - finalKeys,
+            duplication: finalKeys ? rawKeys / finalKeys : 0,
+            readers: reader.readerCount,
+        };
+    }
+
     public async getReaderInfo() {
         let reader = await this.reader();
         return {
@@ -1212,6 +1243,11 @@ type ResolvedReader = {
     rowCount: number;
     totalBytes: number;
     keys: string[];
+    // Total key-slots across every loaded reader — every set AND every delete tombstone (a key stored in
+    // N files counts N times) — and how many readers there are. Already in memory after the join, so
+    // getKeyStats is ~free; rawKeyCount vs keys.length is how much duplication a compaction would collapse.
+    rawKeyCount: number;
+    readerCount: number;
     columns: { column: string; byteSize: number }[];
     getColumn: (column: string) => Promise<{ key: string; value: unknown; time: number }[]>;
     getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | undefined>;
@@ -1256,6 +1292,8 @@ async function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): Promise<R
         totalBytes: databases.reduce((acc, db) => acc + db.totalBytes, 0),
         rowCount: keys.length,
         keys,
+        rawKeyCount: databases.reduce((acc, db) => acc + db.keyTimes.size + (db.deleteTimes?.size ?? 0), 0),
+        readerCount: databases.length,
         columns,
         async getColumn(column) {
             const perReader = await Promise.all(databases.map(async db => {
