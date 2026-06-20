@@ -36,7 +36,13 @@ declare global {
 // DO NOT enable this is isNode
 const USE_INDEXED_DB = false;
 
+// These mirror the subset of the native FileSystemFileHandle / FileSystemDirectoryHandle API we use, so
+// the native browser handles, the Node handles, and the remote handles are all interchangeable — and
+// code written against the native handle (e.g. a recursive walk over `handle.entries()`) works on any of
+// them. kind/name and entries() are part of that contract.
 export type FileWrapper = {
+    readonly kind: "file";
+    readonly name: string;
     getFile(): Promise<{
         size: number;
         lastModified: number;
@@ -52,18 +58,14 @@ export type FileWrapper = {
     }>;
 };
 export type DirectoryWrapper = {
+    readonly kind: "directory";
+    readonly name: string;
     removeEntry(key: string, options?: { recursive?: boolean }): Promise<void>;
     getFileHandle(key: string, options?: { create?: boolean }): Promise<FileWrapper>;
     getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper>;
-    [Symbol.asyncIterator](): AsyncIterableIterator<[string, {
-        kind: "file";
-        name: string;
-        getFile(): Promise<FileWrapper>;
-    } | {
-        kind: "directory";
-        name: string;
-        getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper>;
-    }]>;
+    // Each entry IS a handle (file or directory), so a recursive walk keeps working at every level.
+    entries(): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
+    [Symbol.asyncIterator](): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
 };
 
 let displayData = observable({
@@ -222,6 +224,8 @@ class ServerConnectForm extends preact.Component<{ onConnected: (config: RemoteC
 export class NodeJSFileHandleWrapper implements FileWrapper {
     constructor(private filePath: string) {
     }
+    readonly kind = "file" as const;
+    get name() { return path.basename(this.filePath); }
 
     async getFile() {
         const stats = await fs.promises.stat(this.filePath);
@@ -285,6 +289,9 @@ export class NodeJSFileHandleWrapper implements FileWrapper {
 export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
     constructor(private rootPath: string) {
     }
+    readonly kind = "directory" as const;
+    get name() { return path.basename(this.rootPath); }
+    entries() { return this[Symbol.asyncIterator](); }
 
     async removeEntry(key: string, options?: { recursive?: boolean }) {
         const entryPath = path.join(this.rootPath, key);
@@ -332,36 +339,18 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
         return new NodeJSDirectoryHandleWrapper(dirPath);
     }
 
-    async *[Symbol.asyncIterator](): AsyncIterableIterator<[string, {
-        kind: "file";
-        name: string;
-        getFile(): Promise<FileWrapper>;
-    } | {
-        kind: "directory";
-        name: string;
-        getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper>;
-    }]> {
+    async *[Symbol.asyncIterator](): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]> {
         // Ensure directory exists
         await fs.promises.mkdir(this.rootPath, { recursive: true });
 
         const entries = await fs.promises.readdir(this.rootPath, { withFileTypes: true });
 
         for (const entry of entries) {
+            const childPath = path.join(this.rootPath, entry.name);
             if (entry.isFile()) {
-                yield [entry.name, {
-                    kind: "file",
-                    name: entry.name,
-                    getFile: async () => new NodeJSFileHandleWrapper(path.join(this.rootPath, entry.name))
-                }];
+                yield [entry.name, new NodeJSFileHandleWrapper(childPath)];
             } else if (entry.isDirectory()) {
-                const dirPath = path.join(this.rootPath, entry.name);
-                yield [entry.name, {
-                    kind: "directory",
-                    name: entry.name,
-                    getDirectoryHandle: async (key: string, options?: { create?: boolean }) => {
-                        return new NodeJSDirectoryHandleWrapper(dirPath).getDirectoryHandle(key, options);
-                    }
-                }];
+                yield [entry.name, new NodeJSDirectoryHandleWrapper(childPath)];
             }
         }
     }

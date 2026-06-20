@@ -184,11 +184,15 @@ class RangeCache {
 }
 
 const joinPath = (base: string, key: string) => (base ? base + "/" + key : key);
+const baseName = (p: string) => p.split("/").filter(Boolean).pop() || "";
 
 class RemoteFileWrapper implements FileWrapper {
     // `stat` is supplied when the parent already statted us (avoids a second /info). `createIntent` means
     // this was opened with create:true, so a missing file reads as empty (it'll be created on write).
     constructor(private conn: Connection, private filePath: string, private stat?: Stat, private createIntent = false) { }
+    // Mirror the native FileSystemFileHandle shape so code written against it works unchanged.
+    readonly kind = "file" as const;
+    get name() { return baseName(this.filePath); }
     async getFile() {
         let stat = this.stat ?? await this.conn.stat(this.filePath);
         if (!stat) {
@@ -220,17 +224,21 @@ class RemoteFileWrapper implements FileWrapper {
 
 class RemoteDirectoryWrapper implements DirectoryWrapper {
     constructor(private conn: Connection, private dirPath: string) { }
+    // Mirror the native FileSystemDirectoryHandle shape (name/kind/entries) so code written against the
+    // native API — e.g. recursive walks using `handle.entries()` — works the same over the network.
+    readonly kind = "directory" as const;
+    get name() { return baseName(this.dirPath); }
     async removeEntry(key: string): Promise<void> {
         await this.conn.remove(joinPath(this.dirPath, key));
     }
-    async getFileHandle(key: string, options?: { create?: boolean }): Promise<FileWrapper> {
+    async getFileHandle(key: string, options?: { create?: boolean }): Promise<RemoteFileWrapper> {
         const p = joinPath(this.dirPath, key);
         if (options?.create) return new RemoteFileWrapper(this.conn, p, undefined, true);
         const stat = await this.conn.stat(p);                 // matches the File API: throw if missing
         if (!stat || stat.dir) throw enoent(p);
         return new RemoteFileWrapper(this.conn, p, stat, false);
     }
-    async getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper> {
+    async getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<RemoteDirectoryWrapper> {
         const p = joinPath(this.dirPath, key);
         if (!options?.create) {
             const stat = await this.conn.stat(p);
@@ -238,17 +246,22 @@ class RemoteDirectoryWrapper implements DirectoryWrapper {
         }
         return new RemoteDirectoryWrapper(this.conn, p);       // dirs are created lazily on first write
     }
-    async *[Symbol.asyncIterator](): AsyncIterableIterator<[string, { kind: "file"; name: string; getFile(): Promise<FileWrapper> } | { kind: "directory"; name: string; getDirectoryHandle(key: string, options?: { create?: boolean }): Promise<DirectoryWrapper> }]> {
+    // Each entry is itself a real handle (a sub-wrapper), so a recursive walk over .entries() keeps
+    // working at every level — exactly like the native API.
+    async *[Symbol.asyncIterator](): AsyncIterableIterator<[string, RemoteFileWrapper | RemoteDirectoryWrapper]> {
         const entries = await this.conn.list(this.dirPath);
         for (const e of entries) {
             const childPath = joinPath(this.dirPath, e.name);
-            if (e.dir) {
-                yield [e.name, { kind: "directory", name: e.name, getDirectoryHandle: (k, o) => new RemoteDirectoryWrapper(this.conn, childPath).getDirectoryHandle(k, o) }];
-            } else {
-                yield [e.name, { kind: "file", name: e.name, getFile: async () => new RemoteFileWrapper(this.conn, childPath) }];
-            }
+            yield [e.name, e.dir ? new RemoteDirectoryWrapper(this.conn, childPath) : new RemoteFileWrapper(this.conn, childPath)];
         }
     }
+    entries() { return this[Symbol.asyncIterator](); }
+    keys() { return mapAsync(this[Symbol.asyncIterator](), ([name]) => name); }
+    values() { return mapAsync(this[Symbol.asyncIterator](), ([, handle]) => handle); }
+}
+
+async function* mapAsync<T, U>(it: AsyncIterableIterator<T>, fn: (v: T) => U): AsyncIterableIterator<U> {
+    for await (const v of it) yield fn(v);
 }
 
 // A DirectoryWrapper rooted at a remote server. Drop-in for the Node / File-API handles.

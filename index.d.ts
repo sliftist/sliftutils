@@ -1343,6 +1343,8 @@ declare module "sliftutils/storage/FileFolderAPI" {
         }
     }
     export type FileWrapper = {
+        readonly kind: "file";
+        readonly name: string;
         getFile(): Promise<{
             size: number;
             lastModified: number;
@@ -1360,6 +1362,8 @@ declare module "sliftutils/storage/FileFolderAPI" {
         }>;
     };
     export type DirectoryWrapper = {
+        readonly kind: "directory";
+        readonly name: string;
         removeEntry(key: string, options?: {
             recursive?: boolean;
         }): Promise<void>;
@@ -1369,25 +1373,15 @@ declare module "sliftutils/storage/FileFolderAPI" {
         getDirectoryHandle(key: string, options?: {
             create?: boolean;
         }): Promise<DirectoryWrapper>;
-        [Symbol.asyncIterator](): AsyncIterableIterator<[
-            string,
-            {
-                kind: "file";
-                name: string;
-                getFile(): Promise<FileWrapper>;
-            } | {
-                kind: "directory";
-                name: string;
-                getDirectoryHandle(key: string, options?: {
-                    create?: boolean;
-                }): Promise<DirectoryWrapper>;
-            }
-        ]>;
+        entries(): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
+        [Symbol.asyncIterator](): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
     };
     export declare function setFileAPIKey(key: string): void;
     export declare class NodeJSFileHandleWrapper implements FileWrapper {
         private filePath;
         constructor(filePath: string);
+        readonly kind: "file";
+        get name(): string;
         getFile(): Promise<{
             size: number;
             lastModified: number;
@@ -1407,6 +1401,9 @@ declare module "sliftutils/storage/FileFolderAPI" {
     export declare class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
         private rootPath;
         constructor(rootPath: string);
+        readonly kind: "directory";
+        get name(): string;
+        entries(): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
         removeEntry(key: string, options?: {
             recursive?: boolean;
         }): Promise<void>;
@@ -1416,20 +1413,7 @@ declare module "sliftutils/storage/FileFolderAPI" {
         getDirectoryHandle(key: string, options?: {
             create?: boolean;
         }): Promise<DirectoryWrapper>;
-        [Symbol.asyncIterator](): AsyncIterableIterator<[
-            string,
-            {
-                kind: "file";
-                name: string;
-                getFile(): Promise<FileWrapper>;
-            } | {
-                kind: "directory";
-                name: string;
-                getDirectoryHandle(key: string, options?: {
-                    create?: boolean;
-                }): Promise<DirectoryWrapper>;
-            }
-        ]>;
+        [Symbol.asyncIterator](): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
     }
     export declare const getDirectoryHandle: {
         (): Promise<DirectoryWrapper>;
