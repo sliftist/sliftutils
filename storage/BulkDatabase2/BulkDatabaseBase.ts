@@ -86,6 +86,11 @@ export const bulkDatabase2Timing = {
     // throttle. The byte bound matters most over the network, where pulling the whole stream is expensive.
     streamFoldTriggerRows: 100,
     streamFoldTriggerBytes: 64 * 1024 * 1024,
+    // HARD limit: once the stream tier passes this, fold it NOW regardless of age (even un-sealed, recent
+    // streams) — a stream this large makes every read pull a huge file, i.e. the collection becomes
+    // essentially unreadable. We still only delete a stream whose size didn't change while we read it, so
+    // a writer mid-append never loses data (it just gets re-folded next pass).
+    streamFoldHardLimitBytes: 768 * 1024 * 1024,
     // Max delay (per collection) before buffered stream writes are flushed to disk; the delay ramps up to
     // this under sustained writing (see WRITE_FLUSH_FIRST_STEP_MS). 0 = flush every write immediately —
     // the default in Node, where append is real and cheap; the browser ramps to 15s to avoid rewriting
@@ -563,6 +568,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // buildReader. Does NOT touch the overlay — callers decide what to do with pending writes.
     private clearReaderState() {
         this.reader.reset();
+        // Preserve the last-known sync base values so a reload/compact serves them (not empty) while the
+        // fresh ones reload — observers transition old → new, never flashing through nothing.
+        for (const [k, v] of this.baseColumns) this.staleBaseColumns.set(k, v);
+        for (const [k, v] of this.baseFields) this.staleBaseFields.set(k, v);
         this.baseColumns.clear();
         this.baseColumnsLoading.clear();
         this.baseFields.clear();
@@ -1093,7 +1102,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // outside the merge; if nothing older exists, that older set can't exist either, so the tombstone has
     // nothing left to suppress and we drop it instead of carrying it forward. (A full compact and a
     // merge that reaches time 0 are the cases where this holds.)
-    private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false): Promise<boolean> {
+    private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false, forceDeleteStreams = false): Promise<boolean> {
         const storage = await this.storage();
         const timestamp = nextFileTime();
         const now = Date.now();
@@ -1155,7 +1164,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
         for (const f of consumedBulk) await remove(f.fileName);
         for (const f of streamFiles) {
-            if (await this.canDeleteStream(f, now, streamData.sizes)) await remove(f.fileName);
+            if (await this.canDeleteStream(f, now, streamData.sizes, forceDeleteStreams)) await remove(f.fileName);
         }
 
         this.resetReader();
@@ -1168,9 +1177,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // the merge). When neither holds we leave it: its data is now duplicated into bulk (resolved by time)
     // and a later merge deletes it once aged. (Recreate-on-append means even a wrong delete wouldn't lose
     // data, but the aged check also rules out the rare sparse-offset append race.)
-    private async canDeleteStream(f: StreamFileInfo, now: number, sizes: Map<string, number>): Promise<boolean> {
+    private async canDeleteStream(f: StreamFileInfo, now: number, sizes: Map<string, number>, force = false): Promise<boolean> {
         if (now - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs) return true;
-        if (!isSyncSupported()) return false;
+        // Without cross-tab sync we normally can't tell a writer is done before the seal age — UNLESS the
+        // caller forces it (the hard stream limit). Even then we only delete a stream whose size didn't
+        // change while we read it, so a writer mid-append never loses data (it's re-folded next pass).
+        if (!isSyncSupported() && !force) return false;
         const readSize = sizes.get(f.fileName);
         if (readSize === undefined) return false;
         let info;
@@ -1216,6 +1228,23 @@ export class BulkDatabaseBase<T extends { key: string }> {
             if (await this.mergeFileSet(bulk, stream)) merged = true;
             return true;
         };
+
+        // ── Hard stream limit: once the tier-0 stream has grown past the hard cap, fold ALL of it into bulk
+        //    NOW regardless of age — a stream this big makes every read pull a huge file, i.e. the collection
+        //    is essentially unreadable. Force-delete the folded streams (canDeleteStream still only deletes
+        //    size-stable ones, so an active writer never loses data; it's just re-folded next pass). ──
+        {
+            const { streamFiles } = await this.listFiles();
+            if (streamFiles.length) {
+                const storage = await this.storage();
+                const sizes = await Promise.all(streamFiles.map(async f => { try { return (await storage.getInfo(f.fileName))?.size ?? 0; } catch { return 0; } }));
+                const totalStreamBytes = sizes.reduce((a, b) => a + b, 0);
+                if (totalStreamBytes > bulkDatabase2Timing.streamFoldHardLimitBytes) {
+                    console.log(`${blue(this.name)} stream tier ${fmtBytes(totalStreamBytes)} over hard limit ${fmtBytes(bulkDatabase2Timing.streamFoldHardLimitBytes)} — folding all streams now`);
+                    if (await this.mergeFileSet([], streamFiles, false, true)) merged = true;
+                }
+            }
+        }
 
         // ── Pass 1: consolidate recent files. ──
         // Only seal (ask peers + ourselves to abandon current stream files) when cross-tab sync can
@@ -1420,6 +1449,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // (Map.has distinguishes "loaded" from "not loaded yet").
     private baseFields = new Map<string, { value: unknown; time: number } | undefined>();
     private baseFieldsLoading = new Set<string>();
+    // Last-known sync base values, kept across a reader reset so a reload/compact serves the previous data
+    // instead of flashing empty while the fresh value reloads in the background. Each entry is dropped once
+    // ensureBase* has the corresponding fresh value (so reads transition old → new, never old → empty → new).
+    private staleBaseColumns = new Map<string, { key: string; value: unknown; time: number }[]>();
+    private staleBaseFields = new Map<string, { value: unknown; time: number } | undefined>();
 
     private ensureBaseColumn(column: string) {
         if (this.baseColumns.has(column) || this.baseColumnsLoading.has(column)) return;
@@ -1429,6 +1463,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 const base = await this.readWithReload(reader => reader.getColumn(column));
                 this.deps.batch(() => {
                     this.baseColumns.set(column, base);
+                    this.staleBaseColumns.delete(column); // fresh value in hand; stop serving the stale one
                     this.baseColumnsLoading.delete(column);
                     this.invalidateSignal(LOAD_SIGNAL);
                 });
@@ -1450,6 +1485,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 const resolved = await this.readWithReload(reader => reader.getSingleField(key, column));
                 this.deps.batch(() => {
                     this.baseFields.set(cacheKey, resolved);
+                    this.staleBaseFields.delete(cacheKey); // fresh value in hand; stop serving the stale one
                     this.baseFieldsLoading.delete(cacheKey);
                     this.invalidateSignal(LOAD_SIGNAL);
                 });
@@ -1474,15 +1510,30 @@ export class BulkDatabaseBase<T extends { key: string }> {
         let entry = this.overlay.get(key);
         if (entry !== undefined) {
             if (entry.value === DELETED) return undefined;
-            if (col in entry.value) return { key, value: entry.value[col] as T[Column], time: entry.time };
+            if (col in entry.value) {
+                // Warm the disk-backed base in the background even though the overlay serves this now — so
+                // when the overlay is later cleared (e.g. compaction persists it), there's a value to serve
+                // and the read doesn't flash empty.
+                this.ensureBaseField(key, col);
+                return { key, value: entry.value[col] as T[Column], time: entry.time };
+            }
             // column not set in the overlay entry — fall through to the base field cache for this column
         }
         let cacheKey = nullJoin(col, key);
-        if (!this.baseFields.has(cacheKey)) {
+        // Use the fresh value if loaded; mid-reload fall back to the last-known one so we don't flash empty.
+        let src: Map<string, { value: unknown; time: number } | undefined> | undefined;
+        if (this.baseFields.has(cacheKey)) {
+            src = this.baseFields;
+        } else {
             this.ensureBaseField(key, col);
+            src = this.staleBaseFields.has(cacheKey) ? this.staleBaseFields : undefined;
+        }
+        if (!src) {
+            // Genuine first load (nothing known); but an overlay entry makes the key live with this column unset.
+            if (entry !== undefined && entry.value !== DELETED) return { key, value: undefined as T[Column], time: entry.time };
             return undefined;
         }
-        const base = this.baseFields.get(cacheKey);
+        const base = src.get(cacheKey);
         if (base === undefined) {
             // Not live on disk; but an overlay entry for the key (partial write) makes it live, column unset.
             if (entry !== undefined && entry.value !== DELETED) return { key, value: undefined as T[Column], time: entry.time };
@@ -1502,7 +1553,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
         let base = this.baseColumns.get(col);
         if (!base) {
             this.ensureBaseColumn(col);
-            return undefined;
+            // Mid-reload: serve the last-known value (patched with the current overlay) so we don't flash
+            // empty. Don't cache it — it's stale until ensureBaseColumn swaps in the fresh value.
+            const stale = this.staleBaseColumns.get(col);
+            if (stale) return this.patchColumn(stale, col) as { key: string; value: T[Column]; time: number }[];
+            return undefined; // genuine first load — nothing known yet
         }
         // Synchronous (no awaits) → reads the current overlay and caches it atomically; an observer re-runs
         // (and the cache is cleared) on any later change, so the frozen result is safe to share.
