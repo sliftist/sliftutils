@@ -65,6 +65,15 @@ export interface IBulkDatabase2<T extends { key: string }> {
     /** Synchronous, reactive read of a whole column ({ key, value, time }). undefined while still loading. */
     getColumnSync<Column extends keyof T>(column: Column): { key: string; value: T[Column]; time: number }[] | undefined;
 
+    /**
+     * Reactive: whether (key, column) is loaded yet — true once we know the answer (value, absent, or
+     * deleted), false while it's still loading. getSingleFieldObjSync returns undefined for BOTH "loading"
+     * and "absent", so use this to tell them apart (e.g. show a spinner only when this is false).
+     */
+    isFieldLoadedSync<Column extends keyof T>(key: string, column: Column): boolean;
+    /** Reactive: whether a whole column is loaded yet (see isFieldLoadedSync). */
+    isColumnLoadedSync<Column extends keyof T>(column: Column): boolean;
+
     /** The columns present on disk and their byte sizes (no row data read). */
     getColumnInfo(): Promise<BulkColumnInfo[]>;
     /** A cheap snapshot of the collection's shape (row/key counts, total bytes, columns) — no row data. */

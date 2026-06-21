@@ -1604,6 +1604,38 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return result;
     }
 
+    // Reactive: whether (key, column) is available to read synchronously yet. true once it's loaded — we
+    // know the answer, whether that's a value, absent, or deleted; false while it's still loading from disk.
+    // Pairs with getSingleFieldObjSync, which returns undefined for BOTH "loading" and "absent" — use this
+    // to tell them apart (e.g. show a spinner only when this is false). Triggers the load if not started,
+    // and (like the sync reads) counts the last-known value served during a reload as loaded.
+    public isFieldLoadedSync<Column extends keyof T>(key: string, column: Column): boolean {
+        void this.syncSetup();
+        this.deps.observe(LOAD_SIGNAL);
+        this.deps.observe(key);
+        const entry = this.overlay.get(key);
+        if (entry !== undefined) {
+            if (entry.value === DELETED) return true;          // known: deleted
+            if (String(column) in entry.value) return true;    // known: overlay holds this column
+            // else: this column falls through to disk — check the base caches below
+        }
+        const cacheKey = nullJoin(String(column), key);
+        if (this.baseFields.has(cacheKey) || this.staleBaseFields.has(cacheKey)) return true;
+        this.ensureBaseField(key, String(column));
+        return false;
+    }
+
+    // Reactive: whether a whole column is available to read synchronously yet (see isFieldLoadedSync).
+    public isColumnLoadedSync<Column extends keyof T>(column: Column): boolean {
+        void this.syncSetup();
+        this.deps.observe(LOAD_SIGNAL);
+        this.deps.observe(OVERLAY_SIGNAL);
+        const col = String(column);
+        if (this.columnCache.has(col) || this.baseColumns.has(col) || this.staleBaseColumns.has(col)) return true;
+        this.ensureBaseColumn(col);
+        return false;
+    }
+
     public async getColumnInfo() {
         let reader = await this.reader();
         return reader.columns;
