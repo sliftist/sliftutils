@@ -86,6 +86,11 @@ export const bulkDatabase2Timing = {
     // throttle. The byte bound matters most over the network, where pulling the whole stream is expensive.
     streamFoldTriggerRows: 100,
     streamFoldTriggerBytes: 64 * 1024 * 1024,
+    // Rolling cap on OUR OWN current stream file: once we've appended this much to it, we seal it (stop
+    // writing) and fold it into bulk immediately. Without this, many small appends grow a single stream
+    // file without bound (the per-batch ROLLOVER only catches one huge batch). We can fold our own file at
+    // once — the 10h seal-age rule is only for other writers' files; we know we're done with ours on seal.
+    streamFileMaxBytes: 50 * 1024 * 1024,
     // HARD limit: once the stream tier passes this, fold it NOW regardless of age (even un-sealed, recent
     // streams) — a stream this large makes every read pull a huge file, i.e. the collection becomes
     // essentially unreadable. We still only delete a stream whose size didn't change while we read it, so
@@ -374,6 +379,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // This instance's tier-0 stream file. Each instance (≈ each thread/tab) streams to its own file
     // so concurrent writers never touch the same file.
     private streamFileName: string | undefined;
+    // Rolling size of the current stream file, so we can seal+fold it once it passes STREAM_FILE_MAX_BYTES
+    // (reset whenever the file rotates). currentStreamFileName tracks which file the count belongs to.
+    private currentStreamFileName: string | undefined;
+    private currentStreamFileBytes = 0;
     // Seeded to construction time (not 0) so a fresh instance doesn't immediately seal+merge on its very
     // first write — the first background merge check waits a full interval after construction.
     private lastMergeCheck = Date.now();
@@ -735,13 +744,41 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const batch = this.pendingAppends.slice();
         const combined = Buffer.concat(batch.map(p => p.framed));
         const storage = await this.storage();
+        const fileName = this.getStreamFileName();
+        if (fileName !== this.currentStreamFileName) { // rotated (age-seal / first write) → reset the count
+            this.currentStreamFileName = fileName;
+            this.currentStreamFileBytes = 0;
+        }
         // Throws on failure -> we don't splice, so the data stays buffered and a later flush retries it.
-        await storage.append(this.getStreamFileName(), combined);
+        await storage.append(fileName, combined);
         // New writes added during the await are after `batch`, so removing the front is exactly the flushed set.
         this.pendingAppends.splice(0, batch.length);
         // Keep the stream-size estimate current so the fold trigger sees write-accumulation between reads.
         this.streamBytesOnDisk += combined.length;
         for (const p of batch) this.streamRowsOnDisk += p.rows;
+        this.currentStreamFileBytes += combined.length;
+        // Cap our own stream file: once it's grown past the limit, seal it (next write starts a fresh file)
+        // and fold this now-complete file into bulk in the background. New writes go to the new file, so the
+        // sealed one is stable and safe to fold+delete immediately — no 10h wait for our own files.
+        if (this.currentStreamFileBytes >= bulkDatabase2Timing.streamFileMaxBytes) {
+            this.streamFileName = undefined;
+            this.currentStreamFileName = undefined;
+            this.currentStreamFileBytes = 0;
+            void this.foldOwnStream(fileName);
+        }
+    }
+
+    // Fold one of OUR OWN sealed stream files into bulk and delete it. Safe to delete immediately (force):
+    // we've stopped appending to it (a new file is current now), and canDeleteStream still only deletes it
+    // if its size is unchanged since we read it, so an in-flight flush can never lose data.
+    private async foldOwnStream(fileName: string): Promise<void> {
+        const info = parseStreamFileName(fileName);
+        if (!info) return;
+        try {
+            await this.mergeFileSet([], [info], false, true);
+        } catch (e) {
+            console.warn(`${this.name}: folding own stream ${fileName} failed: ${(e as Error).message}`);
+        }
     }
 
     public async update(entry: Partial<T> & { key: string }): Promise<void> {
