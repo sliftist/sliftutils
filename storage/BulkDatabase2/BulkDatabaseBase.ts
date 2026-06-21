@@ -1249,12 +1249,16 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 if (recentBytes >= FIRST_MERGE_BYTES) break;
             }
             const span = recent.length ? recent[0].time - recent[recent.length - 1].time : 0;
-            // Fold when there's enough fragmentation to consolidate, OR when a foldable stream has grown too
-            // big to keep reading whole (even if it's the only recent file) — see streamNeedsFold.
-            const heavyStreamRecent = this.streamNeedsFold() && recent.some(i => i.kind === "stream");
+            // Fold when there's enough fragmentation to consolidate, OR when the foldable stream data here
+            // has grown past the byte threshold (stream data can't be read per-cell, so a big stream is
+            // costly to pull whole). The stream size is derived from THIS fresh listing — not a cached
+            // counter — so it's correct even for an instance that never built a reader (e.g. the host's
+            // autocompactor) and for streams that grew in place since the index was last loaded.
+            const recentStreamBytes = recent.reduce((a, it) => a + (it.kind === "stream" ? it.bytes : 0), 0);
+            const heavyStream = recentStreamBytes > bulkDatabase2Timing.streamFoldTriggerBytes;
             const triggered =
                 recent.length >= 2 && (recent.length > bulkDatabase2Timing.firstMergeTriggerFiles || span > bulkDatabase2Timing.firstMergeTriggerRangeMs)
-                || heavyStreamRecent && recent.length >= 1;
+                || heavyStream;
             if (triggered) {
                 const rb = recent.filter(i => i.kind === "bulk").map(i => (i.file as BulkFileInfo));
                 const rs = recent.filter(i => i.kind === "stream").map(i => (i.file as StreamFileInfo));
