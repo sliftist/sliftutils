@@ -110,6 +110,13 @@ function nullJoin(a: string, b: string): string {
     return a + NULL + b;
 }
 
+function fmtBytes(n: number): string {
+    if (n < 1024) return n + "B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + "KB";
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + "MB";
+    return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
+}
+
 // A tiny reactivity seam so this file has zero dependency on mobx (or any specific UI framework). The
 // reactive in-memory state (the overlay map + the load/reset lifecycle) is plain; whenever it's read
 // we "observe" a signal, and whenever it changes we "invalidate" that signal. A consumer that wants
@@ -1108,6 +1115,16 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const readers = streamReader ? [streamReader, ...bulkReaders] : bulkReaders;
         if (!readers.length) return false;
 
+        // Log the inputs of a REAL merge (files + on-disk sizes). Only here, never for the planning checks
+        // in testMerge/findDuplicateGroups, so the log marks actual rewrites and their before/after I/O.
+        const inputs = [
+            ...await Promise.all(consumedBulk.map(async f => ({ name: f.fileName, size: (await storage.getInfo(f.fileName).catch(() => undefined))?.size ?? 0 }))),
+            ...streamFiles.map(f => ({ name: f.fileName, size: streamData.sizes.get(f.fileName) ?? 0 })),
+        ];
+        const inTotal = inputs.reduce((a, f) => a + f.size, 0);
+        console.log(`${blue(this.name)} merge: reading ${inputs.length} files (${fmtBytes(inTotal)})`);
+        for (const f of inputs) console.log(`    in  ${f.name}  ${fmtBytes(f.size)}`);
+
         const { rows, times, deletes } = await this.resolveReaders(readers);
 
         // Write all outputs BEFORE deleting any input, so a throw mid-write just leaves duplicates.
@@ -1122,10 +1139,18 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // Carry surviving tombstones forward only if older files exist outside this merge that they still
         // need to suppress; when this merge includes the oldest data there's nothing older to suppress.
         const carriedDeletes = includesOldest ? 0 : deletes.size;
+        const outNames = [...newNames];
         if (carriedDeletes) {
             const carryName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
             await storage.set(carryName, frameDeletes([...deletes].map(([key, time]) => ({ time, key }))));
+            outNames.push(carryName);
         }
+
+        // Log the result (files + on-disk sizes), so the before→after of the merge is visible.
+        const outputs = await Promise.all(outNames.map(async n => ({ name: n, size: (await storage.getInfo(n).catch(() => undefined))?.size ?? 0 })));
+        const outTotal = outputs.reduce((a, f) => a + f.size, 0);
+        console.log(`${blue(this.name)} merge: wrote ${outputs.length} files (${fmtBytes(outTotal)}, from ${fmtBytes(inTotal)})${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""}`);
+        for (const f of outputs) console.log(`    out ${f.name}  ${fmtBytes(f.size)}`);
 
         const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
         for (const f of consumedBulk) await remove(f.fileName);
