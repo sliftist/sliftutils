@@ -1,5 +1,5 @@
 import { getFileStorageNested2 } from "../FileFolderAPI";
-import { observable, runInAction } from "../../render-utils/mobxTyped";
+import { observable, runInAction, onBecomeObserved, onBecomeUnobserved } from "../../render-utils/mobxTyped";
 import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config } from "./BulkDatabaseBase";
 
 export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
@@ -74,6 +74,19 @@ export interface IBulkDatabase2<T extends { key: string }> {
     /** Reactive: whether a whole column is loaded yet (see isFieldLoadedSync). */
     isColumnLoadedSync<Column extends keyof T>(column: Column): boolean;
 
+    /**
+     * Whether a row (key) is currently being watched by some reactive observer (getSingleFieldObjSync /
+     * getSingleFieldSync). Lets callers skip per-row work when nothing's watching. Non-reactive query;
+     * returns true if the backend can't tell.
+     */
+    isKeyWatched(key: string): boolean;
+
+    /**
+     * Drop all of this collection's in-memory loaded caches and re-trigger every watcher, which re-requests
+     * and reloads from disk. Pending un-flushed writes are kept. Per-collection.
+     */
+    reloadFromDisk(): void;
+
     /** The columns present on disk and their byte sizes (no row data read). */
     getColumnInfo(): Promise<BulkColumnInfo[]>;
     /** A cheap snapshot of the collection's shape (row/key counts, total bytes, columns) — no row data. */
@@ -121,13 +134,18 @@ export interface IBulkDatabase2<T extends { key: string }> {
 // observer/autorun that calls it tracks that box) and invalidate() bumps it (so those reactions re-run).
 // This reproduces the fine-grained per-key + load-version reactivity the class had when it used
 // observable.map/observable.box directly, while keeping all that logic in the mobx-free base.
-class MobxReactiveDeps implements ReactiveDeps {
+export class MobxReactiveDeps implements ReactiveDeps {
     private boxes = new Map<string, { get(): number; set(value: number): void }>();
+    // Signals that currently have at least one observer, kept current via mobx's onBecomeObserved/
+    // onBecomeUnobserved hooks. Lets isObserved() answer "is anything watching this row" cheaply.
+    private observed = new Set<string>();
     private box(signal: string) {
         let box = this.boxes.get(signal);
         if (!box) {
             box = observable.box(0);
             this.boxes.set(signal, box);
+            onBecomeObserved(box, () => this.observed.add(signal));
+            onBecomeUnobserved(box, () => this.observed.delete(signal));
         }
         return box;
     }
@@ -140,6 +158,9 @@ class MobxReactiveDeps implements ReactiveDeps {
     }
     batch(fn: () => void) {
         runInAction(fn);
+    }
+    isObserved(signal: string) {
+        return this.observed.has(signal);
     }
 }
 

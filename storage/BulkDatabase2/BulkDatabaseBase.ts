@@ -34,6 +34,10 @@ const FILE_EXTENSION = ".bulk";
 const ROLLOVER_ROWS = 5000;
 const ROLLOVER_BYTES = 5 * 1024 * 1024;
 
+// How often the global memory-pressure watchdog samples the heap (the ACTION it may take is throttled
+// separately, see bulkDatabase2Timing.memoryFlushThrottleMs).
+const MEMORY_WATCHDOG_INTERVAL_MS = 60 * 1000;
+
 // An unreadable (corrupt/torn, not merely missing) file might be a write still in progress, so we
 // can't delete it on sight. Once it's been unreadable for longer than this (by its name timestamp),
 // no writer is plausibly still working on it, so we delete it. Until then we just warn.
@@ -104,6 +108,13 @@ export const bulkDatabase2Timing = {
     // We proactively re-list files this often; if the set changed under us (another tab/process merged) we
     // reload the index, so reads pick up the change even without first hitting a missing-file error.
     fileSetPollIntervalMs: 30 * 60 * 1000,
+    // Memory-pressure auto-flush (browser only; needs performance.memory). When the JS heap exceeds
+    // memoryFlushHeapBytes, at most once per memoryFlushThrottleMs, drop the in-memory observable state of
+    // every collection whose loaded data exceeds memoryFlushMinCollectionBytes (they reload lazily). Tuned
+    // so it does nothing for a healthy app (heap fine) or small collections.
+    memoryFlushHeapBytes: 1500 * 1024 * 1024,
+    memoryFlushMinCollectionBytes: 100 * 1024 * 1024,
+    memoryFlushThrottleMs: 15 * 60 * 1000,
 };
 
 // Marks a key as deleted in the in-memory overlay.
@@ -139,14 +150,19 @@ export interface ReactiveDeps {
     invalidate(signal: string): void;
     // Run a group of mutations + invalidations as one batch, so observers re-run at most once.
     batch(fn: () => void): void;
+    // Whether `signal` currently has any observer watching it. Optional — a backend that can't tell
+    // returns undefined (treated as "assume watched"). Lets writes skip per-key notification work for rows
+    // nothing is watching (see isWatchedSync).
+    isObserved?(signal: string): boolean;
 }
 
 // A non-reactive ReactiveDeps: sync reads still return current values, they just never trigger
-// re-renders. Use this when you don't need a UI to react to writes.
+// re-renders. Use this when you don't need a UI to react to writes. Nothing is ever observed.
 export const noopReactiveDeps: ReactiveDeps = {
     observe() { },
     invalidate() { },
     batch(fn) { fn(); },
+    isObserved() { return false; },
 };
 
 // Provides the FileStorage for a given path (the caller decides where data physically lives, so this
@@ -264,6 +280,50 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // stay correct even without first hitting a missing-file error.
         this.fileSetPollTimer = setInterval(() => void this.pollFileSet(), bulkDatabase2Timing.fileSetPollIntervalMs);
         (this.fileSetPollTimer as { unref?: () => void }).unref?.();
+        // Register for the global memory-pressure watchdog (browser only — needs performance.memory).
+        BulkDatabaseBase.liveInstances.add(this);
+        BulkDatabaseBase.startMemoryWatchdog();
+    }
+
+    // ---- memory-pressure watchdog (global, browser-only) ----
+    // When the JS heap gets large, the biggest contributors are usually a few collections whose in-memory
+    // observable state (loaded reader + base column/field caches) has grown. Rather than cap every
+    // collection all the time, we watch the heap and, only when it's actually under pressure, drop the
+    // observable state of the large collections (they reload lazily on demand). Throttled hard so it never
+    // thrashes a healthy app.
+    private static liveInstances = new Set<BulkDatabaseBase<{ key: string }>>();
+    private static memoryWatchdogStarted = false;
+    private static lastMemoryFlushMs = 0;
+    private static startMemoryWatchdog() {
+        if (BulkDatabaseBase.memoryWatchdogStarted) return;
+        BulkDatabaseBase.memoryWatchdogStarted = true;
+        const usedHeap = (): number | undefined => {
+            try { return (performance as unknown as { memory?: { usedJSHeapSize?: number } })?.memory?.usedJSHeapSize; }
+            catch { return undefined; }
+        };
+        if (typeof performance === "undefined" || usedHeap() === undefined) return; // no heap API (Node / non-Chromium)
+        const timer = setInterval(() => {
+            const used = usedHeap();
+            if (used !== undefined) BulkDatabaseBase.checkMemoryPressure(used);
+        }, MEMORY_WATCHDOG_INTERVAL_MS);
+        (timer as { unref?: () => void }).unref?.();
+    }
+    // If the heap is over the limit (and we haven't flushed recently), drop the in-memory observable state
+    // of every collection whose loaded data exceeds the size threshold, so it reloads lazily and frees the
+    // rest. Exposed (with the heap value injected) so it's callable/testable without the real timer.
+    public static checkMemoryPressure(usedHeapBytes: number): void {
+        if (usedHeapBytes < bulkDatabase2Timing.memoryFlushHeapBytes) return;
+        const now = Date.now();
+        if (now - BulkDatabaseBase.lastMemoryFlushMs < bulkDatabase2Timing.memoryFlushThrottleMs) return;
+        BulkDatabaseBase.lastMemoryFlushMs = now;
+        const flushed: string[] = [];
+        for (const db of BulkDatabaseBase.liveInstances) {
+            if (db.loadedTotalBytes > bulkDatabase2Timing.memoryFlushMinCollectionBytes) {
+                flushed.push(`${db.name} (${fmtBytes(db.loadedTotalBytes)})`);
+                db.reloadFromDisk();
+            }
+        }
+        if (flushed.length) console.log(`[bulk2] heap ${fmtBytes(usedHeapBytes)} over ${fmtBytes(bulkDatabase2Timing.memoryFlushHeapBytes)} — flushed observable state of ${flushed.length} large collection(s) to reclaim memory: ${flushed.join(", ")}`);
     }
 
     // ---- buffered stream writes (per collection) ----
@@ -341,6 +401,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // under us; we notice either when a read hits a deleted file (readWithReload) or via the periodic poll
     // (pollFileSet), and reload the index — cheap, since a build only reads headers + key columns.
     private loadedFileSet: Set<string> | undefined; // file names the current reader was built from
+    // Total (uncompressed) size of the data the current reader spans, as a proxy for this collection's
+    // in-memory footprint — used by the memory-pressure watchdog. 0 when no reader is loaded.
+    private loadedTotalBytes = 0;
     // Bumped every time the index is cleared/reloaded. A failed read captures it before reading and only
     // triggers a reload if it's unchanged afterward — so N concurrent failures coalesce onto ONE rebuild
     // (the rest see the bumped epoch, skip their own reload, and just await the in-flight one).
@@ -406,8 +469,18 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.dataGen++;
         if (columns === "all") this.columnCache.clear();
         else for (const c of columns) this.columnCache.delete(c);
-        this.invalidateSignal(key);
+        // The per-key signal only re-runs getSingleFieldObjSync watchers of THIS key; skip it when nothing
+        // is watching the row (a new watcher reads the current overlay anyway). The overlay-wide signal +
+        // column-cache drop above still cover whole-column watchers and read correctness.
+        if (this.deps.isObserved?.(key) ?? true) this.invalidateSignal(key);
         this.invalidateSignal(OVERLAY_SIGNAL);
+    }
+
+    // Whether a row (key) is currently being watched — i.e. some reactive observer is subscribed to it via
+    // getSingleFieldObjSync / getSingleFieldSync. Useful for skipping per-row work when nothing's watching.
+    // Returns true if the backend can't tell (conservative).
+    public isKeyWatched(key: string): boolean {
+        return this.deps.isObserved?.(key) ?? true;
     }
 
     // Whether `key` is currently a live key in the resolved view (overlay wins over disk). A write to a key
@@ -526,6 +599,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.readerKeys = new Set(joined.keys);
         // The files this index was built from, so the poll can detect a concurrent merge changing the set.
         this.loadedFileSet = new Set([...bulkFiles.map(f => f.fileName), ...streamFiles.map(f => f.fileName)]);
+        this.loadedTotalBytes = joined.totalBytes; // footprint proxy for the memory-pressure watchdog
+
         // Evict cached sub-readers for files a merge removed, so the caches track the live file set.
         this.pruneFileCaches(bulkFiles, streamFiles);
 
@@ -588,6 +663,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.columnCache.clear();
         this.readerKeys = undefined;     // the next build repopulates it
         this.loadedFileSet = undefined;  // ditto
+        this.loadedTotalBytes = 0;       // nothing loaded ⇒ no footprint for the memory watchdog
         // The next build re-measures the stream; clear the estimate so a just-folded stream doesn't keep
         // looking "heavy" and re-trigger a fold before then.
         this.streamRowsOnDisk = 0;
@@ -615,6 +691,23 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private reloadReader() {
         this.deps.batch(() => {
             this.clearReaderState();
+            this.invalidateSignal(LOAD_SIGNAL);
+            this.invalidateSignal(OVERLAY_SIGNAL);
+        });
+    }
+
+    // Drop ALL of this collection's in-memory loaded caches (the resolved reader, the sync base column /
+    // field caches and their stale fallbacks, the per-file decoded readers) and re-trigger every watcher,
+    // so they re-request and reload from disk. Unlike the automatic reloads, this is a genuine full clear
+    // (no stale-fallback served — watchers go through a real loading state). Pending un-flushed writes (the
+    // overlay) are KEPT, so nothing not-yet-on-disk is lost. Per-collection (this instance only).
+    public reloadFromDisk(): void {
+        this.deps.batch(() => {
+            this.clearReaderState();       // drops reader + base caches (→ stale) + column cache; bumps gens
+            this.staleBaseColumns.clear(); // and the stale fallbacks — a genuine full clear, not a swap
+            this.staleBaseFields.clear();
+            this.bulkReaderCache.clear();  // force re-decode from disk
+            this.streamReaderCache.clear();
             this.invalidateSignal(LOAD_SIGNAL);
             this.invalidateSignal(OVERLAY_SIGNAL);
         });
@@ -1168,7 +1261,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
             ...streamFiles.map(f => ({ name: f.fileName, size: streamData.sizes.get(f.fileName) ?? 0 })),
         ];
         const inTotal = inputs.reduce((a, f) => a + f.size, 0);
-        console.log(`${blue(this.name)} merge: reading ${inputs.length} files (${fmtBytes(inTotal)})`);
+        const mergeStartMs = Date.now();
+        console.log(`${blue(this.name)} merge: reading ${inputs.length} files (${fmtBytes(inTotal)}) at ${new Date(mergeStartMs).toISOString()}`);
         for (const f of inputs) console.log(`    in  ${f.name}  ${fmtBytes(f.size)}`);
 
         const { rows, times, deletes } = await this.resolveReaders(readers);
@@ -1195,7 +1289,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // Log the result (files + on-disk sizes), so the before→after of the merge is visible.
         const outputs = await Promise.all(outNames.map(async n => ({ name: n, size: (await storage.getInfo(n).catch(() => undefined))?.size ?? 0 })));
         const outTotal = outputs.reduce((a, f) => a + f.size, 0);
-        console.log(`${blue(this.name)} merge: wrote ${outputs.length} files (${fmtBytes(outTotal)}, from ${fmtBytes(inTotal)})${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""}`);
+        console.log(`${blue(this.name)} merge: wrote ${outputs.length} files (${fmtBytes(outTotal)}, from ${fmtBytes(inTotal)})${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""} at ${new Date().toISOString()} (took ${formatTime(Date.now() - mergeStartMs)})`);
         for (const f of outputs) console.log(`    out ${f.name}  ${fmtBytes(f.size)}`);
 
         const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
