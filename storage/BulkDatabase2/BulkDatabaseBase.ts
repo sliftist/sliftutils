@@ -929,9 +929,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const timestamp = nextFileTime();
         const now = Date.now();
         const times = rows.map(() => now);
-        for (const buffer of buildFileBuffer(rows, times)) {
+        for (const built of buildFileBuffer(rows, times)) {
             const name = newFileName(timestamp);
-            await storage.set(name, encodeCompressedBlocks(buffer));
+            await storage.set(name, encodeCompressedBlocks(built.buffer));
         }
         this.resetReader();
         void this.maybeMerge();
@@ -1270,10 +1270,19 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // Write all outputs BEFORE deleting any input, so a throw mid-write just leaves duplicates.
         const newNames: string[] = [];
         if (rows.length) {
-            for (const buffer of buildFileBuffer(rows, times)) {
+            const built = buildFileBuffer(rows, times);
+            // When the result is big enough to split across several files, log each sub-write (its key
+            // range + start/finish), since each storage.set can be large/slow and we want to see progress.
+            const split = built.length > 1;
+            if (split) console.log(`${blue(this.name)} merge: output split into ${built.length} files (> ${fmtBytes(TARGET_FILE_BYTES)} each)`);
+            for (let i = 0; i < built.length; i++) {
+                const part = built[i];
                 const name = newFileName(timestamp);
-                await storage.set(name, encodeCompressedBlocks(buffer));
+                const subStart = Date.now();
+                if (split) console.log(`    [${i + 1}/${built.length}] writing ${formatNumber(part.rowCount)} rows [${part.minKey} .. ${part.maxKey}] → ${name} at ${new Date(subStart).toISOString()}`);
+                await storage.set(name, encodeCompressedBlocks(part.buffer));
                 newNames.push(name);
+                if (split) console.log(`    [${i + 1}/${built.length}] wrote ${name} (${fmtBytes((await storage.getInfo(name).catch(() => undefined))?.size ?? 0)}) in ${formatTime(Date.now() - subStart)}`);
             }
         }
         // Carry surviving tombstones forward only if older files exist outside this merge that they still

@@ -4,7 +4,13 @@ export declare const KEY_COLUMN = "key";
 export declare const EMPTY_BUFFER: Buffer;
 export declare const ABSENT: unique symbol;
 export declare const TARGET_FILE_BYTES: number;
-export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): Buffer[];
+export interface BuiltFile {
+    buffer: Buffer;
+    minKey: string;
+    maxKey: string;
+    rowCount: number;
+}
+export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): BuiltFile[];
 export type BaseBulkDatabaseReader = {
     rowCount: number;
     totalBytes: number;

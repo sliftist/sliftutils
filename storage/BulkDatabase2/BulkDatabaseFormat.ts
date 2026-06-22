@@ -226,14 +226,25 @@ function buildOneFile(rows: Record<string, unknown>[], times: number[]): Buffer 
     return Buffer.concat([lengthPrefix, headerBuf, ...blobs]);
 }
 
-// Returns one complete, independent file buffer per chunk of rows. Rows are first sorted by key, then
+// One complete, independent file: the encoded buffer plus its key range + row count (the caller logs the
+// range when a merge splits across several files).
+export interface BuiltFile { buffer: Buffer; minKey: string; maxKey: string; rowCount: number; }
+
+// Returns one complete, independent file per chunk of rows. Rows are first sorted by key, then
 // partitioned into key-contiguous chunks of ~targetBytes each — so every returned file is key-sorted
 // (tight minKey/maxKey for the read-skip + merge planner) and stays near the target size, and no
 // single column blob / Buffer.concat approaches the ~2GB limit. The chunks have disjoint key ranges,
-// so the caller just writes each as its own file. A normal-sized write returns a single buffer.
+// so the caller just writes each as its own file. A normal-sized write returns a single file.
 // `times[i]` is row i's write-time, stored per row so reads resolve a key to its latest value by time.
-export function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes = TARGET_FILE_BYTES): Buffer[] {
-    if (rows.length === 0) return [buildOneFile([], [])];
+export function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes = TARGET_FILE_BYTES): BuiltFile[] {
+    // A chunk is already key-sorted, so its first/last row are its min/max key.
+    const make = (rs: Record<string, unknown>[], ts: number[]): BuiltFile => ({
+        buffer: buildOneFile(rs, ts),
+        minKey: rs.length ? (rs[0][KEY_COLUMN] as string) : "",
+        maxKey: rs.length ? (rs[rs.length - 1][KEY_COLUMN] as string) : "",
+        rowCount: rs.length,
+    });
+    if (rows.length === 0) return [make([], [])];
     // Sort rows + their times together by key so each output file is key-contiguous.
     const order = rows.map((_, i) => i).sort((a, b) => {
         const ka = rows[a][KEY_COLUMN] as string;
@@ -242,19 +253,19 @@ export function buildFileBuffer(rows: Record<string, unknown>[], times: number[]
     });
     const sortedRows = order.map(i => rows[i]);
     const sortedTimes = order.map(i => times[i]);
-    const result: Buffer[] = [];
+    const result: BuiltFile[] = [];
     let chunkStart = 0;
     let chunkBytes = 0;
     for (let i = 0; i < sortedRows.length; i++) {
         const rowBytes = estimateRowBytes(sortedRows[i]);
         if (i > chunkStart && chunkBytes + rowBytes > targetBytes) {
-            result.push(buildOneFile(sortedRows.slice(chunkStart, i), sortedTimes.slice(chunkStart, i)));
+            result.push(make(sortedRows.slice(chunkStart, i), sortedTimes.slice(chunkStart, i)));
             chunkStart = i;
             chunkBytes = 0;
         }
         chunkBytes += rowBytes;
     }
-    result.push(buildOneFile(sortedRows.slice(chunkStart), sortedTimes.slice(chunkStart)));
+    result.push(make(sortedRows.slice(chunkStart), sortedTimes.slice(chunkStart)));
     return result;
 }
 
