@@ -1266,6 +1266,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
         for (const f of inputs) console.log(`    in  ${f.name}  ${fmtBytes(f.size)}`);
 
         const { rows, times, deletes } = await this.resolveReaders(readers);
+        // We've read everything we need from the input bulk files (and they're about to be deleted), so drop
+        // their decompressed blocks now instead of letting them sit in memory through the output + compress
+        // phase. The output below comes entirely from this single resolved set — never a per-output re-read.
+        for (const f of consumedBulk) blockCache.evict(nullJoin(this.name, f.fileName));
+        console.log(`${blue(this.name)} merge: resolved ${formatNumber(rows.length)} live rows + ${formatNumber(deletes.size)} tombstones from ${readers.length} readers; writing now`);
 
         // Write all outputs BEFORE deleting any input, so a throw mid-write just leaves duplicates.
         const newNames: string[] = [];
