@@ -68,15 +68,6 @@ export class BlockCache {
         this.indexes.clear();
     }
 
-    // Drop one file's cached index + decompressed blocks. Called when a file is being deleted (e.g. a merge
-    // consumed it) so its decompressed bytes don't linger through the rest of the merge's output/compress
-    // phase. Block keys are `${fileId}:${blockIdx}`.
-    public evict(fileId: string) {
-        this.indexes.delete(fileId);
-        const prefix = fileId + ":";
-        for (const key of this.blocks.keys()) if (key.startsWith(prefix)) this.blocks.delete(key);
-    }
-
     private touch(key: string, value: Promise<Buffer>) {
         this.blocks.delete(key);
         this.blocks.set(key, value);

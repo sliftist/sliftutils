@@ -1225,9 +1225,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 return { name: fname, size };
             },
         });
-        // We've finished reading the input bulk files (about to be deleted), so drop their decompressed
-        // blocks now instead of letting them sit in memory through any post-merge work.
-        for (const f of consumedBulk) blockCache.evict(nullJoin(this.name, f.fileName));
 
         // Carry surviving tombstones forward only if older files exist outside this merge that they still
         // need to suppress; when this merge includes the oldest data there's nothing older to suppress.

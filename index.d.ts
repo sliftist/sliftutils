@@ -1284,7 +1284,6 @@ declare module "sliftutils/storage/BulkDatabase2/blockCache" {
         private blocks;
         private indexes;
         clear(): void;
-        evict(fileId: string): void;
         private touch;
         private readIndex;
         open(fileId: string, fileSize: number, rawGetRange: GetRange): Promise<{
