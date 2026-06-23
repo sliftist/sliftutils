@@ -1,6 +1,6 @@
-import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config } from "./BulkDatabaseBase";
+import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing } from "./BulkDatabaseBase";
 export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-export type { ReactiveDeps, StorageFactory, BulkDatabase2Config } from "./BulkDatabaseBase";
+export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing } from "./BulkDatabaseBase";
 /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
 export type BulkColumnInfo = {
     column: string;
@@ -108,15 +108,7 @@ export interface IBulkDatabase2<T extends {
      * stream files still being appended). `bytes` is the actual on-disk size. Good for showing collection
      * size/fragmentation and deciding whether to call tryMergeNow()/compact().
      */
-    getFileInfo(): Promise<{
-        files: {
-            name: string;
-            type: "bulk" | "stream";
-            bytes: number;
-        }[];
-        count: number;
-        totalBytes: number;
-    }>;
+    getFileInfo(): Promise<BulkFileInfoListing>;
     /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
     compact(): Promise<void>;
     /**

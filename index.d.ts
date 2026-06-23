@@ -763,9 +763,9 @@ declare module "sliftutils/render-utils/observer" {
 }
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
-    import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config } from "./BulkDatabaseBase";
+    import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing } from "./BulkDatabaseBase";
     export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-    export type { ReactiveDeps, StorageFactory, BulkDatabase2Config } from "./BulkDatabaseBase";
+    export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing } from "./BulkDatabaseBase";
     /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
     export type BulkColumnInfo = {
         column: string;
@@ -873,15 +873,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
          * stream files still being appended). `bytes` is the actual on-disk size. Good for showing collection
          * size/fragmentation and deciding whether to call tryMergeNow()/compact().
          */
-        getFileInfo(): Promise<{
-            files: {
-                name: string;
-                type: "bulk" | "stream";
-                bytes: number;
-            }[];
-            count: number;
-            totalBytes: number;
-        }>;
+        getFileInfo(): Promise<BulkFileInfoListing>;
         /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
         compact(): Promise<void>;
         /**
@@ -1087,16 +1079,24 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
                 byteSize: number;
             }[];
         }>;
-        getFileInfo(): Promise<{
-            files: {
-                name: string;
-                type: "bulk" | "stream";
-                bytes: number;
-            }[];
-            count: number;
-            totalBytes: number;
-        }>;
+        getFileInfo(): Promise<BulkFileInfoListing>;
     }
+    export type BulkFileDetails = {
+        keys: string[];
+        minTime: number;
+        maxTime: number;
+    };
+    export type BulkFileEntry = {
+        name: string;
+        type: "bulk" | "stream";
+        bytes: number;
+        getDetails: () => Promise<BulkFileDetails>;
+    };
+    export type BulkFileInfoListing = {
+        files: BulkFileEntry[];
+        count: number;
+        totalBytes: number;
+    };
 
 }
 

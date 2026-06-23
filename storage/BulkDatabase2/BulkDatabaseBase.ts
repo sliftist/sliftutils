@@ -923,15 +923,55 @@ export class BulkDatabaseBase<T extends { key: string }> {
         };
     }
 
-    public async getFileInfo(): Promise<{ files: { name: string; type: "bulk" | "stream"; bytes: number }[]; count: number; totalBytes: number }> {
+    public async getFileInfo(): Promise<BulkFileInfoListing> {
         const { bulkFiles, streamFiles } = await this.listFiles();
         const storage = await this.storage();
         const sizeOf = async (name: string) => { try { return (await storage.getInfo(name))?.size ?? 0; } catch { return 0; } };
-        const files = [
-            ...await Promise.all(bulkFiles.map(async f => ({ name: f.fileName, type: "bulk" as const, bytes: await sizeOf(f.fileName) }))),
-            ...await Promise.all(streamFiles.map(async f => ({ name: f.fileName, type: "stream" as const, bytes: await sizeOf(f.fileName) }))),
-        ];
+        const bulkInfos = await Promise.all(bulkFiles.map(async f => ({
+            name: f.fileName,
+            type: "bulk" as const,
+            bytes: await sizeOf(f.fileName),
+            getDetails: async () => {
+                // Bulk: reader has keys + per-row keyTimes + header minTime/maxTime. Cached, so cheap.
+                const reader = await loadFileReader(this.name, storage, f, this.subCaches.bulk);
+                return { keys: reader.keys, minTime: reader.minTime, maxTime: reader.maxTime };
+            },
+        })));
+        const streamInfos = await Promise.all(streamFiles.map(async f => ({
+            name: f.fileName,
+            type: "stream" as const,
+            bytes: await sizeOf(f.fileName),
+            getDetails: async () => {
+                // Stream: must parse the file to walk every entry — header has no key/time bounds. Cached.
+                const data = await loadStreamEntries(this.name, storage, [f], this.subCaches.stream);
+                const keys = new Set<string>();
+                let minTime = Infinity, maxTime = -Infinity;
+                for (const e of data.entries) {
+                    if (e.time < minTime) minTime = e.time;
+                    if (e.time > maxTime) maxTime = e.time;
+                    if (e.entry.row) keys.add(e.entry.row.key as string);
+                    else if (e.entry.deletedKey !== undefined) keys.add(e.entry.deletedKey);
+                }
+                return {
+                    keys: [...keys],
+                    minTime: minTime === Infinity ? 0 : minTime,
+                    maxTime: maxTime === -Infinity ? 0 : maxTime,
+                };
+            },
+        })));
+        const files = [...bulkInfos, ...streamInfos];
         return { files, count: files.length, totalBytes: files.reduce((a, f) => a + f.bytes, 0) };
     }
 }
+
+export type BulkFileDetails = { keys: string[]; minTime: number; maxTime: number };
+export type BulkFileEntry = {
+    name: string;
+    type: "bulk" | "stream";
+    bytes: number;
+    // Lazy: pulled from the cached sub-reader for bulk (free if loaded), or from a parse of the stream
+    // file (small — tier-0 size-capped, also cached). Call only when you need the per-file detail.
+    getDetails: () => Promise<BulkFileDetails>;
+};
+export type BulkFileInfoListing = { files: BulkFileEntry[]; count: number; totalBytes: number };
 

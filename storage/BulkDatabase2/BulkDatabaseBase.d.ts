@@ -155,13 +155,21 @@ export declare class BulkDatabaseBase<T extends {
             byteSize: number;
         }[];
     }>;
-    getFileInfo(): Promise<{
-        files: {
-            name: string;
-            type: "bulk" | "stream";
-            bytes: number;
-        }[];
-        count: number;
-        totalBytes: number;
-    }>;
+    getFileInfo(): Promise<BulkFileInfoListing>;
 }
+export type BulkFileDetails = {
+    keys: string[];
+    minTime: number;
+    maxTime: number;
+};
+export type BulkFileEntry = {
+    name: string;
+    type: "bulk" | "stream";
+    bytes: number;
+    getDetails: () => Promise<BulkFileDetails>;
+};
+export type BulkFileInfoListing = {
+    files: BulkFileEntry[];
+    count: number;
+    totalBytes: number;
+};
