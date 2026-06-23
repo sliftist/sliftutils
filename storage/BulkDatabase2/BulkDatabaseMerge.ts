@@ -1,5 +1,5 @@
-import { formatNumber, formatTime } from "socket-function/src/formatting/format";
-import { blue, magenta, red } from "socket-function/src/formatting/logColors";
+import { formatNumber } from "socket-function/src/formatting/format";
+import { blue, magenta } from "socket-function/src/formatting/logColors";
 import {
     BaseBulkDatabaseReader,
     ColumnIndex,
@@ -98,8 +98,6 @@ export async function runPlannedMerge(config: {
     const log = config.log ?? (line => console.log(`${blue(config.collectionName)} ${line}`));
 
     // ─────────────────────────────────────────── Phase 1: plan ───────────────────────────────────────────
-    const planStart = Date.now();
-
     // Aggregate keyTimes + deleteTimes across all sources (max per key).
     const deleteTime = new Map<string, number>();
     const keyTime = new Map<string, number>();
@@ -222,8 +220,7 @@ export async function runPlannedMerge(config: {
     // Build per-file plans: offsets/types/copy-runs per column.
     const plans = fileKeyRanges.map(range => buildOutputPlan(range, liveKeys, cellsPerKey, allColumns, keyTime));
 
-    const planTime = Date.now() - planStart;
-    log(`${magenta("plan")}: ${formatNumber(liveKeys.length)} live keys, ${plans.length} output file(s), ${formatNumber(carriedDeletes.size)} tombstones carried, in ${red(formatTime(planTime))}`);
+    log(`${magenta("plan")}: ${formatNumber(liveKeys.length)} live keys, ${plans.length} output file(s), ${formatNumber(carriedDeletes.size)} tombstones carried`);
 
     // ───────────────────────────────────────── Phase 2: execute ──────────────────────────────────────────
     // Group output files into batches that fit within targetBatchBytes so we read inputs once per batch
@@ -244,7 +241,6 @@ export async function runPlannedMerge(config: {
     }
 
     const outputs: PlannedMergeOutput[] = [];
-    const execStart = Date.now();
     for (let bi = 0; bi < batches.length; bi++) {
         const batch = batches[bi];
         const batchBytes = batch.reduce((a, p) => a + p.estimatedFileBytes, 0);
@@ -252,9 +248,8 @@ export async function runPlannedMerge(config: {
         const batchOutputs = await executeBatch(batch, indexesPerSource, config.sources, config.sourceNames, config.writeFile, log);
         outputs.push(...batchOutputs);
     }
-    const execTime = Date.now() - execStart;
     const writtenBytes = outputs.reduce((a, o) => a + o.size, 0);
-    log(`${magenta("execute")}: ${outputs.length} file(s), ${fmtBytes(writtenBytes)} written, in ${red(formatTime(execTime))} (plan + execute: ${red(formatTime(Date.now() - planStart))})`);
+    log(`${magenta("execute")}: ${outputs.length} file(s), ${fmtBytes(writtenBytes)} written`);
 
     return { outputs, carriedDeletes };
 }
@@ -387,14 +382,12 @@ async function executeBatch(
     const outputs: PlannedMergeOutput[] = [];
     for (let fi = 0; fi < plans.length; fi++) {
         const plan = plans[fi];
-        const start = Date.now();
         const valueColumns = blobsPerFile[fi].map(b => ({ name: b.name, blob: b.blob }));
         const fileBuf = assemblePlannedFile({ valueColumns, keys: plan.keys, times: plan.times });
         const { name, size } = await writeFile(fileBuf);
-        const elapsed = Date.now() - start;
         const sourcesNamed = new Map<string, number>();
         for (const [si, n] of plan.sourceCounts) sourcesNamed.set(sourceNames[si], n);
-        log(`${magenta("output")}: ${formatNumber(plan.keys.length)} rows from ${plan.sourceCounts.size} input(s), ${fmtBytes(size)} in ${formatTime(elapsed)}`);
+        log(`${magenta("output")}: ${formatNumber(plan.keys.length)} rows from ${plan.sourceCounts.size} input(s), ${fmtBytes(size)}`);
         outputs.push({ name, minKey: plan.minKey, maxKey: plan.maxKey, rowCount: plan.keys.length, size, sources: sourcesNamed });
     }
     return outputs;
