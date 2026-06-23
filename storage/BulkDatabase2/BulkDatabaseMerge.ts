@@ -1,5 +1,5 @@
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
-import { blue, red } from "socket-function/src/formatting/logColors";
+import { blue, magenta, red } from "socket-function/src/formatting/logColors";
 import {
     BaseBulkDatabaseReader,
     ColumnIndex,
@@ -223,7 +223,7 @@ export async function runPlannedMerge(config: {
     const plans = fileKeyRanges.map(range => buildOutputPlan(range, liveKeys, cellsPerKey, allColumns, keyTime));
 
     const planTime = Date.now() - planStart;
-    log(`mapping done — ${formatNumber(liveKeys.length)} live keys, ${plans.length} output file(s), ${formatNumber(carriedDeletes.size)} tombstones carried, in ${red(formatTime(planTime))}`);
+    log(`${magenta("plan")}: ${formatNumber(liveKeys.length)} live keys, ${plans.length} output file(s), ${formatNumber(carriedDeletes.size)} tombstones carried, in ${red(formatTime(planTime))}`);
 
     // ───────────────────────────────────────── Phase 2: execute ──────────────────────────────────────────
     // Group output files into batches that fit within targetBatchBytes so we read inputs once per batch
@@ -248,13 +248,13 @@ export async function runPlannedMerge(config: {
     for (let bi = 0; bi < batches.length; bi++) {
         const batch = batches[bi];
         const batchBytes = batch.reduce((a, p) => a + p.estimatedFileBytes, 0);
-        log(`batch ${bi + 1}/${batches.length}: ${batch.length} output file(s), ~${fmtBytes(batchBytes)} budget`);
+        log(`${magenta("batch")} ${bi + 1}/${batches.length}: ${batch.length} output file(s), ~${fmtBytes(batchBytes)} budget`);
         const batchOutputs = await executeBatch(batch, indexesPerSource, config.sources, config.sourceNames, config.writeFile, log);
         outputs.push(...batchOutputs);
     }
     const execTime = Date.now() - execStart;
     const writtenBytes = outputs.reduce((a, o) => a + o.size, 0);
-    log(`execute done — ${outputs.length} file(s), ${fmtBytes(writtenBytes)} written, in ${red(formatTime(execTime))} (plan + execute: ${red(formatTime(Date.now() - planStart))})`);
+    log(`${magenta("execute")}: ${outputs.length} file(s), ${fmtBytes(writtenBytes)} written, in ${red(formatTime(execTime))} (plan + execute: ${red(formatTime(Date.now() - planStart))})`);
 
     return { outputs, carriedDeletes };
 }
@@ -394,7 +394,7 @@ async function executeBatch(
         const elapsed = Date.now() - start;
         const sourcesNamed = new Map<string, number>();
         for (const [si, n] of plan.sourceCounts) sourcesNamed.set(sourceNames[si], n);
-        log(`output: ${formatNumber(plan.keys.length)} rows from ${plan.sourceCounts.size} input(s), ${fmtBytes(size)} in ${formatTime(elapsed)}`);
+        log(`${magenta("output")}: ${formatNumber(plan.keys.length)} rows from ${plan.sourceCounts.size} input(s), ${fmtBytes(size)} in ${formatTime(elapsed)}`);
         outputs.push({ name, minKey: plan.minKey, maxKey: plan.maxKey, rowCount: plan.keys.length, size, sources: sourcesNamed });
     }
     return outputs;

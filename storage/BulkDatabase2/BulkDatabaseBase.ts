@@ -658,7 +658,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // expanded console.group so a merge takes one collapsible block, not a
         // screenful (and never the per-file name dump it used to spew).
         const steps: string[] = [];
-        steps.push(`read ${inputs.length} input file(s), ${fmtBytes(inTotal)}`);
+        steps.push(`${magenta("read")}: ${inputs.length} input file(s), ${fmtBytes(inTotal)}`);
 
         const newNames: string[] = [];
         const mergeResult = await runPlannedMerge({
@@ -688,7 +688,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
         const outputs = await Promise.all(outNames.map(async n => ({ name: n, size: (await storage.getInfo(n).catch(() => undefined))?.size ?? 0 })));
         const outTotal = outputs.reduce((a, f) => a + f.size, 0);
-        steps.push(`wrote ${outputs.length} output file(s), ${fmtBytes(outTotal)}${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""}`);
+        steps.push(`${magenta("wrote")}: ${outputs.length} output file(s), ${fmtBytes(outTotal)}${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""}`);
 
         console.group(`${blue(this.name)} ${magenta("merge")}: ${fmtBytes(inTotal)} → ${fmtBytes(outTotal)} (${inputs.length}→${outputs.length} files) in ${formatTime(Date.now() - mergeStartMs)}`);
         for (const line of steps) console.log(line);
