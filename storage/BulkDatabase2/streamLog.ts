@@ -1,5 +1,5 @@
 import cborx from "cbor-x";
-import { ABSENT, BaseBulkDatabaseReader } from "./BulkDatabaseFormat";
+import { ABSENT, BaseBulkDatabaseReader, encodeValue, RawCell } from "./BulkDatabaseFormat";
 
 // Tier-0 streaming format: an append log of whole-row writes and deletes (row-format, not columnar),
 // so small mutations are a single cheap append instead of rewriting a columnar file. Each block is:
@@ -125,6 +125,18 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
             let row = byKey.get(key);
             if (!row || !(column in row)) return ABSENT;
             return { value: row[column], time: times.get(key) || 0 };
+        },
+        // Stream values are decoded objects (CBOR), so unlike a bulk file we have to encode them to raw
+        // cells here. Stream data is small (tier-0, size-capped), so this is cheap. A column the row never
+        // set is omitted (ABSENT → fall through); a stored undefined is kept (a real clear).
+        async getRawColumn(column) {
+            let map = new Map<string, RawCell>();
+            for (let key of keys) {
+                let row = byKey.get(key);
+                if (!row || !(column in row)) continue;
+                map.set(key, encodeValue(row[column]));
+            }
+            return map;
         },
     };
     return { reader, times };

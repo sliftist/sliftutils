@@ -43,6 +43,13 @@ export const EMPTY_BUFFER = Buffer.alloc(0) as Buffer;
 // to an older reader for that column. Distinct from a stored undefined, which is a real clearing value.
 export const ABSENT = Symbol("absent");
 
+// One value exactly as it sits on disk: its type tag + raw bytes. A cell's encoding is position-
+// independent (nothing about it depends on which row/file it lives in), so a merge copies the winning
+// RawCell straight from an input column into the output — never decoding it to a JS value and
+// re-encoding. That's far less memory (no object materialization) and much faster (a byte copy, not a
+// JPEG/typed-array decode + re-encode).
+export type RawCell = { type: number; bytes: Buffer };
+
 // Hidden per-row column holding each row's write-time (so reads can resolve a key to its latest value
 // by actual time). NUL-prefixed so it can't collide with a user column; excluded from `columns`.
 const TIME_COLUMN = String.fromCharCode(0) + "t";
@@ -62,7 +69,7 @@ type FileHeader = {
     maxKey?: string;
 };
 
-function encodeValue(value: unknown): { type: number; bytes: Buffer } {
+export function encodeValue(value: unknown): { type: number; bytes: Buffer } {
     if (value === ABSENT) {
         return { type: TYPE_ABSENT, bytes: EMPTY_BUFFER };
     }
@@ -148,6 +155,26 @@ function encodeBulkData(data: unknown[]): Buffer {
     return Buffer.concat([offsets, types, ...parts]);
 }
 
+// Like encodeBulkData but the values are already encoded (a merge supplies the winning cells' raw bytes
+// straight from the input files). Lays out the same offsets / types / data section without touching the
+// values themselves.
+function encodeBulkDataRaw(cells: RawCell[]): Buffer {
+    const n = cells.length;
+    const offsets = Buffer.alloc(4 * (n + 1));
+    const types = Buffer.alloc(n);
+    const parts: Buffer[] = [];
+    let pos = 0;
+    for (let i = 0; i < n; i++) {
+        const { type, bytes } = cells[i];
+        offsets.writeUInt32LE(pos, 4 * i);
+        types[i] = type;
+        parts.push(bytes);
+        pos += bytes.length;
+    }
+    offsets.writeUInt32LE(pos, 4 * n);
+    return Buffer.concat([offsets, types, ...parts]);
+}
+
 function decodeBulkData(blob: Buffer, rowCount: number): unknown[] {
     const indexSize = 4 * (rowCount + 1) + rowCount;
     const values: unknown[] = [];
@@ -188,6 +215,32 @@ function estimateRowBytes(row: Record<string, unknown>): number {
     return total;
 }
 
+// Concatenates already-encoded column blobs into a complete file (4-byte header length + header JSON +
+// blobs), computing the header's time + key bounds from the per-row times and keys. Shared by the
+// object-based builder (buildOneFile) and the raw-splice builder (buildOneFileRaw).
+function assembleFile(columnNames: string[], blobs: Buffer[], rowCount: number, times: number[], keys: string[]): Buffer {
+    let offset = 0;
+    const columns = columnNames.map((name, i) => {
+        const entry = { name, offset, length: blobs[i].length };
+        offset += blobs[i].length;
+        return entry;
+    });
+    let minTime = times.length ? times[0] : 0;
+    let maxTime = minTime;
+    for (const t of times) { if (t < minTime) minTime = t; if (t > maxTime) maxTime = t; }
+    let minKey: string | undefined;
+    let maxKey: string | undefined;
+    for (const key of keys) {
+        if (minKey === undefined || key < minKey) minKey = key;
+        if (maxKey === undefined || key > maxKey) maxKey = key;
+    }
+    const header: FileHeader = { rowCount, columns, minTime, maxTime, minKey, maxKey };
+    const headerBuf = Buffer.from(JSON.stringify(header), "utf8");
+    const lengthPrefix = Buffer.alloc(4);
+    lengthPrefix.writeUInt32LE(headerBuf.length, 0);
+    return Buffer.concat([lengthPrefix, headerBuf, ...blobs]);
+}
+
 function buildOneFile(rows: Record<string, unknown>[], times: number[]): Buffer {
     const columnNames: string[] = [];
     const columnSet = new Set<string>();
@@ -203,27 +256,40 @@ function buildOneFile(rows: Record<string, unknown>[], times: number[]): Buffer 
     // The hidden per-row time column.
     columnNames.push(TIME_COLUMN);
     blobs.push(encodeBulkData(times));
-    let offset = 0;
-    const columns = columnNames.map((name, i) => {
-        const entry = { name, offset, length: blobs[i].length };
-        offset += blobs[i].length;
-        return entry;
-    });
-    let minTime = times.length ? times[0] : 0;
-    let maxTime = minTime;
-    for (const t of times) { if (t < minTime) minTime = t; if (t > maxTime) maxTime = t; }
-    let minKey: string | undefined;
-    let maxKey: string | undefined;
-    for (const row of rows) {
-        const key = row[KEY_COLUMN] as string;
-        if (minKey === undefined || key < minKey) minKey = key;
-        if (maxKey === undefined || key > maxKey) maxKey = key;
+    return assembleFile(columnNames, blobs, rows.length, times, rows.map(r => r[KEY_COLUMN] as string));
+}
+
+// A resolved output row for the raw-splice merge: its key, write-time, and the winning raw cell for each
+// column it has (a column it lacks is written ABSENT — fall-through). The cell bytes are copied straight
+// from the input files; no value is ever decoded.
+export type RawRow = { key: string; time: number; cells: Map<string, RawCell> };
+
+const ABSENT_CELL: RawCell = { type: TYPE_ABSENT, bytes: EMPTY_BUFFER };
+
+function buildOneFileRaw(rows: RawRow[]): Buffer {
+    // Columns present in this chunk, in first-seen order (matches buildOneFile, which only emits columns
+    // some row actually has).
+    const valueColumns: string[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) for (const col of row.cells.keys()) {
+        if (seen.has(col)) continue;
+        seen.add(col);
+        valueColumns.push(col);
     }
-    const header: FileHeader = { rowCount: rows.length, columns, minTime, maxTime, minKey, maxKey };
-    const headerBuf = Buffer.from(JSON.stringify(header), "utf8");
-    const lengthPrefix = Buffer.alloc(4);
-    lengthPrefix.writeUInt32LE(headerBuf.length, 0);
-    return Buffer.concat([lengthPrefix, headerBuf, ...blobs]);
+    const columnNames = [KEY_COLUMN, ...valueColumns, TIME_COLUMN];
+    const times = rows.map(r => r.time);
+    const blobs = [
+        encodeBulkData(rows.map(r => r.key)),
+        ...valueColumns.map(col => encodeBulkDataRaw(rows.map(r => r.cells.get(col) ?? ABSENT_CELL))),
+        encodeBulkData(times),
+    ];
+    return assembleFile(columnNames, blobs, rows.length, times, rows.map(r => r.key));
+}
+
+function estimateRawRowBytes(row: RawRow): number {
+    let total = row.key.length * 2 + PER_VALUE_OVERHEAD;
+    for (const cell of row.cells.values()) total += cell.bytes.length + PER_VALUE_OVERHEAD;
+    return total;
 }
 
 // One complete, independent file: the encoded buffer plus its key range + row count (the caller logs the
@@ -269,6 +335,34 @@ export function buildFileBuffer(rows: Record<string, unknown>[], times: number[]
     return result;
 }
 
+// The raw-splice counterpart of buildFileBuffer, used by merges: the rows already carry their winning
+// cells as raw on-disk bytes (no JS values), so this just sorts by key, chunks to ~targetBytes, and
+// concatenates the bytes. Same output guarantees: key-contiguous, disjoint, ascending files.
+export function buildFileBufferRaw(rows: RawRow[], targetBytes = TARGET_FILE_BYTES): BuiltFile[] {
+    const make = (rs: RawRow[]): BuiltFile => ({
+        buffer: buildOneFileRaw(rs),
+        minKey: rs.length ? rs[0].key : "",
+        maxKey: rs.length ? rs[rs.length - 1].key : "",
+        rowCount: rs.length,
+    });
+    if (rows.length === 0) return [make([])];
+    const sorted = rows.slice().sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    const result: BuiltFile[] = [];
+    let chunkStart = 0;
+    let chunkBytes = 0;
+    for (let i = 0; i < sorted.length; i++) {
+        const rowBytes = estimateRawRowBytes(sorted[i]);
+        if (i > chunkStart && chunkBytes + rowBytes > targetBytes) {
+            result.push(make(sorted.slice(chunkStart, i)));
+            chunkStart = i;
+            chunkBytes = 0;
+        }
+        chunkBytes += rowBytes;
+    }
+    result.push(make(sorted.slice(chunkStart)));
+    return result;
+}
+
 export type BaseBulkDatabaseReader = {
     rowCount: number;
     totalBytes: number;
@@ -290,6 +384,11 @@ export type BaseBulkDatabaseReader = {
     // Each key's value for the column plus the row's write-time. value may be ABSENT (the row never set
     // this column — the join then falls through to an older reader for that key/column).
     getColumn: (column: string) => Promise<{ key: string; value: unknown; time: number }[]>;
+    // Like getColumn but returns each cell's raw on-disk encoding (type tag + bytes) keyed by key, WITHOUT
+    // decoding the value — for merges, which splice the winning bytes straight into the output. ABSENT
+    // cells are omitted (a missing key means this reader didn't set this column, so the merge falls
+    // through to an older reader). Each cell's write-time is the reader's keyTimes value for that key.
+    getRawColumn: (column: string) => Promise<Map<string, RawCell>>;
     // The value + write-time for (key, column), or ABSENT if this reader has no such cell.
     getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | typeof ABSENT>;
 };
@@ -362,6 +461,21 @@ export async function loadBulkDatabase(config: {
         async getColumn(column) {
             const values = await readWholeColumn(column);
             return keys.map((key, i) => ({ key, value: values[i], time: times[i] }));
+        },
+        async getRawColumn(column) {
+            const map = new Map<string, RawCell>();
+            const col = colByName.get(column);
+            if (!col) return map; // file lacks this column → every cell ABSENT (fall through)
+            const blob = await config.getRange(dataBase + col.offset, dataBase + col.offset + col.length);
+            const indexSize = 4 * (rowCount + 1) + rowCount;
+            for (let i = 0; i < rowCount; i++) {
+                const type = blob[4 * (rowCount + 1) + i];
+                if (type === TYPE_ABSENT) continue; // omit ABSENT so the join falls through
+                const start = blob.readUInt32LE(4 * i);
+                const end = blob.readUInt32LE(4 * (i + 1));
+                map.set(keys[i], { type, bytes: blob.subarray(indexSize + start, indexSize + end) });
+            }
+            return map;
         },
         async getSingleField(key, column) {
             const row = keyIndex.get(key);

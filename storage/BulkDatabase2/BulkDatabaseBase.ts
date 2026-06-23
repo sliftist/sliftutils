@@ -1,6 +1,6 @@
 import { sort } from "socket-function/src/misc";
 import { getTimeUnique } from "socket-function/src/bits";
-import { ABSENT, BaseBulkDatabaseReader, buildFileBuffer, BulkHeaderInfo, EMPTY_BUFFER, KEY_COLUMN, loadBulkDatabase, loadBulkHeader, TARGET_FILE_BYTES } from "./BulkDatabaseFormat";
+import { ABSENT, BaseBulkDatabaseReader, buildFileBuffer, buildFileBufferRaw, BulkHeaderInfo, EMPTY_BUFFER, KEY_COLUMN, loadBulkDatabase, loadBulkHeader, RawCell, RawRow, TARGET_FILE_BYTES } from "./BulkDatabaseFormat";
 import { lazy } from "socket-function/src/caching";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import { blue, red } from "socket-function/src/formatting/logColors";
@@ -225,6 +225,10 @@ function newFileName(timestamp: number): string {
 }
 
 type StreamFileInfo = { fileName: string; timestamp: number };
+
+// A resolved merge output row: the raw cells to write (RawRow) plus, for logging only, a count of how
+// many of its fields were spliced from each input file (keyed by reader name).
+type MergeRow = RawRow & { sources: Map<string, number> };
 
 function parseStreamFileName(fileName: string): StreamFileInfo | undefined {
     if (!fileName.endsWith(STREAM_EXTENSION)) return undefined;
@@ -1165,15 +1169,19 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // value with the newest write-time across readers wins (non-ABSENT); the row's time is the newest of
     // those. A key is deleted iff its newest delete is newer than its newest set. This is the same
     // time-resolution reads use, captured so a merge can write the result back as bulk + a carry stream.
-    private async resolveReaders(readers: BaseBulkDatabaseReader[]): Promise<{ rows: Record<string, unknown>[]; times: number[]; deletes: Map<string, number> }> {
-        const loaded = await Promise.all(readers.map(async reader => {
-            const cols = new Map<string, Map<string, { value: unknown; time: number }>>();
+    // Resolves a set of readers into the merged output, splicing raw on-disk cell bytes rather than
+    // decoding every value to a JS object and re-encoding. For each live key we pick, per column, the cell
+    // from the reader with the newest write-time for that key that actually set the column (ABSENT cells
+    // are absent from getRawColumn, so they fall through). The winning cell's bytes are copied straight
+    // through. `readerNames[i]` labels readers[i] so the merge can log where each output field came from.
+    private async resolveReadersRaw(readers: BaseBulkDatabaseReader[], readerNames: string[]): Promise<{ rows: MergeRow[]; deletes: Map<string, number> }> {
+        const loaded = await Promise.all(readers.map(async (reader, idx) => {
+            const cols = new Map<string, Map<string, RawCell>>();
             for (const col of reader.columns) {
                 if (col.column === KEY_COLUMN) continue;
-                const entries = await reader.getColumn(col.column);
-                cols.set(col.column, new Map(entries.map(e => [e.key, { value: e.value, time: e.time }])));
+                cols.set(col.column, await reader.getRawColumn(col.column));
             }
-            return { keyTimes: reader.keyTimes, deleteTimes: reader.deleteTimes, cols };
+            return { name: readerNames[idx], keyTimes: reader.keyTimes, deleteTimes: reader.deleteTimes, cols };
         }));
 
         const deleteTime = new Map<string, number>();
@@ -1188,8 +1196,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const allCols = new Set<string>();
         for (const l of loaded) for (const c of l.cols.keys()) allCols.add(c);
 
-        const rows: Record<string, unknown>[] = [];
-        const times: number[] = [];
+        const rows: MergeRow[] = [];
         const deletes = new Map<string, number>();
         const allKeys = new Set<string>([...keyTime.keys(), ...deleteTime.keys()]);
         for (const key of allKeys) {
@@ -1201,23 +1208,23 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 if (delT > -Infinity) deletes.set(key, delT);
                 continue;
             }
-            const row: Record<string, unknown> = { [KEY_COLUMN]: key };
-            let rowTime = setT;
+            const cells = new Map<string, RawCell>();
+            const sources = new Map<string, number>();
             for (const col of allCols) {
                 let bestTime = -Infinity;
-                let bestVal: unknown;
-                let found = false;
+                let bestCell: RawCell | undefined;
+                let bestName = "";
                 for (const l of loaded) {
                     const cell = l.cols.get(col)?.get(key);
-                    if (!cell || cell.value === ABSENT) continue;
-                    if (cell.time > bestTime) { bestTime = cell.time; bestVal = cell.value; found = true; }
+                    if (!cell) continue; // ABSENT in this reader → fall through
+                    const t = l.keyTimes.get(key) ?? -Infinity;
+                    if (t > bestTime) { bestTime = t; bestCell = cell; bestName = l.name; }
                 }
-                if (found) { row[col] = bestVal; if (bestTime > rowTime) rowTime = bestTime; }
+                if (bestCell) { cells.set(col, bestCell); sources.set(bestName, (sources.get(bestName) ?? 0) + 1); }
             }
-            rows.push(row);
-            times.push(rowTime === -Infinity ? 0 : rowTime);
+            rows.push({ key, time: setT === -Infinity ? 0 : setT, cells, sources });
         }
-        return { rows, times, deletes };
+        return { rows, deletes };
     }
 
     // The one merge primitive. Reads the given bulk + stream files (skipping any that vanished or won't
@@ -1252,6 +1259,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const streamReader = ordered.length ? streamReaderFromEntries(ordered, 0).reader : undefined;
 
         const readers = streamReader ? [streamReader, ...bulkReaders] : bulkReaders;
+        // Labels aligned with `readers`, so the merge can log which input each output field was spliced
+        // from. bulkReaders[i] corresponds to consumedBulk[i] (pushed together above).
+        const readerNames = streamReader ? ["(streams)", ...consumedBulk.map(f => f.fileName)] : consumedBulk.map(f => f.fileName);
         if (!readers.length) return false;
 
         // Log the inputs of a REAL merge (files + on-disk sizes). Only here, never for the planning checks
@@ -1265,7 +1275,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         console.log(`${blue(this.name)} merge: reading ${inputs.length} files (${fmtBytes(inTotal)}) at ${new Date(mergeStartMs).toISOString()}`);
         for (const f of inputs) console.log(`    in  ${f.name}  ${fmtBytes(f.size)}`);
 
-        const { rows, times, deletes } = await this.resolveReaders(readers);
+        const { rows, deletes } = await this.resolveReadersRaw(readers, readerNames);
         // We've read everything we need from the input bulk files (and they're about to be deleted), so drop
         // their decompressed blocks now instead of letting them sit in memory through the output + compress
         // phase. The output below comes entirely from this single resolved set — never a per-output re-read.
@@ -1275,19 +1285,27 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // Write all outputs BEFORE deleting any input, so a throw mid-write just leaves duplicates.
         const newNames: string[] = [];
         if (rows.length) {
-            const built = buildFileBuffer(rows, times);
-            // When the result is big enough to split across several files, log each sub-write (its key
-            // range + start/finish), since each storage.set can be large/slow and we want to see progress.
+            const built = buildFileBufferRaw(rows);
+            // Walk the rows in key order alongside the (key-contiguous, ascending) output files so each
+            // file can log which input files its fields were spliced from — i.e. "where they came from".
+            const sorted = rows.slice().sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+            let ri = 0;
             const split = built.length > 1;
             if (split) console.log(`${blue(this.name)} merge: output split into ${built.length} files (> ${fmtBytes(TARGET_FILE_BYTES)} each)`);
             for (let i = 0; i < built.length; i++) {
                 const part = built[i];
+                const srcCounts = new Map<string, number>();
+                while (ri < sorted.length && sorted[ri].key <= part.maxKey) {
+                    for (const [src, n] of sorted[ri].sources) srcCounts.set(src, (srcCounts.get(src) ?? 0) + n);
+                    ri++;
+                }
+                const srcText = [...srcCounts.entries()].sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s}:${formatNumber(n)}`).join(", ") || "—";
                 const name = newFileName(timestamp);
                 const subStart = Date.now();
-                if (split) console.log(`    [${i + 1}/${built.length}] writing ${formatNumber(part.rowCount)} rows [${part.minKey} .. ${part.maxKey}] → ${name} at ${new Date(subStart).toISOString()}`);
+                console.log(`    [${i + 1}/${built.length}] writing ${formatNumber(part.rowCount)} rows [${part.minKey} .. ${part.maxKey}] from {${srcText}} → ${name} at ${new Date(subStart).toISOString()}`);
                 await storage.set(name, encodeCompressedBlocks(part.buffer));
                 newNames.push(name);
-                if (split) console.log(`    [${i + 1}/${built.length}] wrote ${name} (${fmtBytes((await storage.getInfo(name).catch(() => undefined))?.size ?? 0)}) in ${formatTime(Date.now() - subStart)}`);
+                console.log(`    [${i + 1}/${built.length}] wrote ${name} (${fmtBytes((await storage.getInfo(name).catch(() => undefined))?.size ?? 0)}) in ${formatTime(Date.now() - subStart)}`);
             }
         }
         // Carry surviving tombstones forward only if older files exist outside this merge that they still
