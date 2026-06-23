@@ -394,8 +394,7 @@ async function executeBatch(
         const elapsed = Date.now() - start;
         const sourcesNamed = new Map<string, number>();
         for (const [si, n] of plan.sourceCounts) sourcesNamed.set(sourceNames[si], n);
-        const srcText = [...sourcesNamed.entries()].sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s}:${formatNumber(n)}`).join(", ") || "—";
-        log(`output ${name}: ${formatNumber(plan.keys.length)} rows from {${srcText}}, ${fmtBytes(size)} in ${formatTime(elapsed)}`);
+        log(`output: ${formatNumber(plan.keys.length)} rows from ${plan.sourceCounts.size} input(s), ${fmtBytes(size)} in ${formatTime(elapsed)}`);
         outputs.push({ name, minKey: plan.minKey, maxKey: plan.maxKey, rowCount: plan.keys.length, size, sources: sourcesNamed });
     }
     return outputs;
