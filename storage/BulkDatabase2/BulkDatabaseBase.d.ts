@@ -35,16 +35,28 @@ export declare class BulkDatabaseBase<T extends {
     private storageFactory;
     private config;
     constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory, config?: BulkDatabase2Config);
-    private static liveInstances;
-    private static memoryWatchdogStarted;
-    private static lastMemoryFlushMs;
-    private static startMemoryWatchdog;
-    static checkMemoryPressure(usedHeapBytes: number): void;
+    private reader;
+    private subCaches;
     private pendingAppends;
     private flushTimer;
     private flushChain;
     private currentFlushDelay;
     private lastWriteTime;
+    private streamFileName;
+    private currentStreamFileName;
+    private currentStreamFileBytes;
+    private lastMergeCheck;
+    private streamRowsOnDisk;
+    private streamBytesOnDisk;
+    private fileSetPollTimer;
+    private rebuildPromise;
+    private rebuildDirty;
+    private rebuildOptions;
+    private static liveInstances;
+    private static memoryWatchdogStarted;
+    private static lastMemoryFlushMs;
+    private static startMemoryWatchdog;
+    static checkMemoryPressure(usedHeapBytes: number): void;
     static clearCache(): void;
     static enableNetworkCompaction(): void;
     storage: {
@@ -55,46 +67,15 @@ export declare class BulkDatabaseBase<T extends {
     isRemote(): Promise<boolean>;
     private streamNeedsFold;
     private automaticCompactionAllowed;
-    private overlay;
-    private streamTimes;
-    private columnCache;
-    private readerKeys;
-    private loadedFileSet;
-    private loadedTotalBytes;
-    private readerEpoch;
-    private fileSetPollTimer;
-    private bulkReaderCache;
-    private streamReaderCache;
-    private dataGen;
-    private pendingSignals;
-    private triggerTimer;
-    private currentTriggerDelay;
-    private lastTriggerTime;
-    private streamRowsOnDisk;
-    private streamBytesOnDisk;
-    private streamFileName;
-    private currentStreamFileName;
-    private currentStreamFileBytes;
-    private lastMergeCheck;
-    private getStreamFileName;
-    private invalidateOverlay;
     isKeyWatched(key: string): boolean;
-    private isLiveNow;
-    private invalidateSignal;
-    private flushSignals;
-    private setOverlayRow;
-    private setOverlayDeleted;
-    private reader;
-    private buildReader;
-    private syncSetup;
-    private localTime;
-    private applyRemote;
-    private clearReaderState;
-    private resetReader;
-    private reloadReader;
+    private ensureIndex;
+    private triggerRebuild;
+    private doOneRebuild;
     reloadFromDisk(): void;
-    private readWithReload;
     private pollFileSet;
+    private readWithRetry;
+    private syncSetup;
+    private applyRemote;
     write(entry: T): Promise<void>;
     writeBatch(entries: T[]): Promise<void>;
     delete(key: string): Promise<void>;
@@ -103,6 +84,7 @@ export declare class BulkDatabaseBase<T extends {
     flush(): Promise<void>;
     private flushPending;
     private doFlush;
+    private getStreamFileName;
     private foldOwnStream;
     update(entry: Partial<T> & {
         key: string;
@@ -112,8 +94,6 @@ export declare class BulkDatabaseBase<T extends {
     })[]): Promise<void>;
     private listFiles;
     private writeBulkFile;
-    private loadStreamEntries;
-    private orderStreamEntries;
     private maybeMerge;
     tryMergeNow(): Promise<{
         merged: boolean;
@@ -121,9 +101,6 @@ export declare class BulkDatabaseBase<T extends {
     }>;
     compact(): Promise<void>;
     merge(timeLo: number, timeHi: number): Promise<void>;
-    private makeRawGetRange;
-    private loadFileReader;
-    private pruneFileCaches;
     private readBulkHeader;
     private fileLogicalSize;
     private handleUnreadableFile;
@@ -132,41 +109,31 @@ export declare class BulkDatabaseBase<T extends {
     private mergeSpacingDelay;
     private testMerge;
     private findDuplicateGroups;
-    private formatInfo;
-    private patchColumn;
-    getSingleField<Column extends keyof T>(key: string, column: Column): Promise<T[Column] | undefined>;
-    getSingleFieldObj<Column extends keyof T>(key: string, column: Column): Promise<{
+    getSingleField<C extends keyof T>(key: string, column: C): Promise<T[C] | undefined>;
+    getSingleFieldObj<C extends keyof T>(key: string, column: C): Promise<{
         key: string;
-        value: T[Column];
+        value: T[C];
         time: number;
     } | undefined>;
-    getColumn<Column extends keyof T>(column: Column): Promise<{
+    getColumn<C extends keyof T>(column: C): Promise<{
         key: string;
-        value: T[Column];
+        value: T[C];
         time: number;
     }[]>;
     getKeys(): Promise<string[]>;
-    private baseColumns;
-    private baseColumnsLoading;
-    private baseFields;
-    private baseFieldsLoading;
-    private staleBaseColumns;
-    private staleBaseFields;
-    private ensureBaseColumn;
-    private ensureBaseField;
-    getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined;
-    getSingleFieldObjSync<Column extends keyof T>(key: string, column: Column): {
+    getSingleFieldSync<C extends keyof T>(key: string, column: C): T[C] | undefined;
+    getSingleFieldObjSync<C extends keyof T>(key: string, column: C): {
         key: string;
-        value: T[Column];
+        value: T[C];
         time: number;
     } | undefined;
-    getColumnSync<Column extends keyof T>(column: Column): {
+    getColumnSync<C extends keyof T>(column: C): {
         key: string;
-        value: T[Column];
+        value: T[C];
         time: number;
     }[] | undefined;
-    isFieldLoadedSync<Column extends keyof T>(key: string, column: Column): boolean;
-    isColumnLoadedSync<Column extends keyof T>(column: Column): boolean;
+    isFieldLoadedSync<C extends keyof T>(key: string, column: C): boolean;
+    isColumnLoadedSync<C extends keyof T>(column: C): boolean;
     getColumnInfo(): Promise<{
         column: string;
         byteSize: number;

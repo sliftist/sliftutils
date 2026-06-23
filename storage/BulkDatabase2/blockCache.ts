@@ -68,6 +68,12 @@ export class BlockCache {
         this.indexes.clear();
     }
 
+    public evict(fileId: string) {
+        this.indexes.delete(fileId);
+        const prefix = fileId + ":";
+        for (const key of this.blocks.keys()) if (key.startsWith(prefix)) this.blocks.delete(key);
+    }
+
     private touch(key: string, value: Promise<Buffer>) {
         this.blocks.delete(key);
         this.blocks.set(key, value);
