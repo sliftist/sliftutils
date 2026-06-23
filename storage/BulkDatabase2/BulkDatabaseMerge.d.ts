@@ -38,6 +38,7 @@ export declare function runPlannedMerge(config: {
     collectionName: string;
     targetFileBytes?: number;
     targetBatchBytes?: number;
+    log?: (line: string) => void;
     writeFile: (data: Buffer) => Promise<{
         name: string;
         size: number;

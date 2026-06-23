@@ -1231,6 +1231,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseMerge" {
         collectionName: string;
         targetFileBytes?: number;
         targetBatchBytes?: number;
+        log?: (line: string) => void;
         writeFile: (data: Buffer) => Promise<{
             name: string;
             size: number;

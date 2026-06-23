@@ -1,7 +1,11 @@
-TODO: Take the half finished apiServer code in vidfrontend, finish the todos, and move it here.
-    - Having an alternate version, where we run a server that does watching is nice, it's heavier and does require setting up certificates. but it makes hot reloading faster. And... It can be used to run an actual site that's public.  
 
-ALSO, go fix our typings in socket-function as well
 
-TODO:
-- vscode extension as well
+
+Compact face_frames3
+
+
+
+When detecting faces in the JavaScript code and the Python code. Let's make it so that we only store the face frames for the top 10 characters. We can show the store the embeddings for all of them, But for the face frames collection only store the top 10 faces. The other ones will just be blank, and that should be fine. Also, let's make sure when we're storing them the max dimension is 128 pixels and the quality is only 80. 
+
+
+Then go verify on the other site fixing up the bad data. It should be quite fast because there's so much overlap, but we will find out. 

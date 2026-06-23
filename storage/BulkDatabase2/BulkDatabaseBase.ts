@@ -665,7 +665,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
             sources: readers,
             sourceNames: readerNames,
             collectionName: this.name,
-            log: line => steps.push(line),
+            log: line => {
+                console.log(line);
+                steps.push(line);
+            },
             writeFile: async (data) => {
                 const fname = newFileName(timestamp);
                 await storage.set(fname, encodeCompressedBlocks(data));
