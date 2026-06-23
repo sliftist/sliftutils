@@ -13,7 +13,7 @@ import {
 import { runPlannedMerge } from "./BulkDatabaseMerge";
 import { blockCache, encodeCompressedBlocks } from "./blockCache";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
-import { blue } from "socket-function/src/formatting/logColors";
+import { blue, magenta } from "socket-function/src/formatting/logColors";
 import { STREAM_EXTENSION, frameDeletes, frameRows, streamReaderFromEntries } from "./streamLog";
 import { broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, connect as syncConnect, isSyncSupported, RemoteWrite } from "./syncClient";
 import { DELETED } from "./WriteOverlay";
@@ -654,14 +654,18 @@ export class BulkDatabaseBase<T extends { key: string }> {
         ];
         const inTotal = inputs.reduce((a, f) => a + f.size, 0);
         const mergeStartMs = Date.now();
-        console.log(`${blue(this.name)} merge: reading ${inputs.length} files (${fmtBytes(inTotal)}) at ${new Date(mergeStartMs).toISOString()}`);
-        for (const f of inputs) console.log(`    in  ${f.name}  ${fmtBytes(f.size)}`);
+        // Collect each step instead of logging it live; emitted at the end as one
+        // expanded console.group so a merge takes one collapsible block, not a
+        // screenful (and never the per-file name dump it used to spew).
+        const steps: string[] = [];
+        steps.push(`read ${inputs.length} input file(s), ${fmtBytes(inTotal)}`);
 
         const newNames: string[] = [];
         const mergeResult = await runPlannedMerge({
             sources: readers,
             sourceNames: readerNames,
             collectionName: this.name,
+            log: line => steps.push(line),
             writeFile: async (data) => {
                 const fname = newFileName(timestamp);
                 await storage.set(fname, encodeCompressedBlocks(data));
@@ -681,8 +685,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
         const outputs = await Promise.all(outNames.map(async n => ({ name: n, size: (await storage.getInfo(n).catch(() => undefined))?.size ?? 0 })));
         const outTotal = outputs.reduce((a, f) => a + f.size, 0);
-        console.log(`${blue(this.name)} merge: wrote ${outputs.length} files (${fmtBytes(outTotal)}, from ${fmtBytes(inTotal)})${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""} at ${new Date().toISOString()} (took ${formatTime(Date.now() - mergeStartMs)})`);
-        for (const f of outputs) console.log(`    out ${f.name}  ${fmtBytes(f.size)}`);
+        steps.push(`wrote ${outputs.length} output file(s), ${fmtBytes(outTotal)}${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""}`);
+
+        console.group(`${blue(this.name)} ${magenta("merge")}: ${fmtBytes(inTotal)} → ${fmtBytes(outTotal)} (${inputs.length}→${outputs.length} files) in ${formatTime(Date.now() - mergeStartMs)}`);
+        for (const line of steps) console.log(line);
+        console.groupEnd();
 
         const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
         for (const f of consumedBulk) await remove(f.fileName);
@@ -746,7 +753,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 const sizes = await Promise.all(streamFiles.map(async f => { try { return (await storage.getInfo(f.fileName))?.size ?? 0; } catch { return 0; } }));
                 const totalStreamBytes = sizes.reduce((a, b) => a + b, 0);
                 if (totalStreamBytes > bulkDatabase2Timing.streamFoldHardLimitBytes) {
-                    console.log(`${blue(this.name)} stream tier ${fmtBytes(totalStreamBytes)} over hard limit ${fmtBytes(bulkDatabase2Timing.streamFoldHardLimitBytes)} — folding all streams now`);
+                    console.log(`${blue(this.name)} ${magenta("fold")} stream tier ${fmtBytes(totalStreamBytes)} over hard limit ${fmtBytes(bulkDatabase2Timing.streamFoldHardLimitBytes)} — folding all streams now`);
                     if (await this.mergeFileSet([], streamFiles, false, true)) merged = true;
                 }
             }

@@ -88,10 +88,14 @@ export async function runPlannedMerge(config: {
     collectionName: string;
     targetFileBytes?: number;
     targetBatchBytes?: number;
+    // Sink for step lines. When omitted, falls back to a blue-prefixed
+    // console.log so standalone callers still get identifiable output.
+    log?: (line: string) => void;
     writeFile: (data: Buffer) => Promise<{ name: string; size: number }>;
 }): Promise<{ outputs: PlannedMergeOutput[]; carriedDeletes: Map<string, number> }> {
     const targetFileBytes = config.targetFileBytes ?? TARGET_FILE_BYTES;
     const targetBatchBytes = config.targetBatchBytes ?? DEFAULT_OUTPUT_BATCH_BYTES;
+    const log = config.log ?? (line => console.log(`${blue(config.collectionName)} ${line}`));
 
     // ─────────────────────────────────────────── Phase 1: plan ───────────────────────────────────────────
     const planStart = Date.now();
@@ -219,7 +223,7 @@ export async function runPlannedMerge(config: {
     const plans = fileKeyRanges.map(range => buildOutputPlan(range, liveKeys, cellsPerKey, allColumns, keyTime));
 
     const planTime = Date.now() - planStart;
-    console.log(`${blue(config.collectionName)} planned merge: mapping done — ${formatNumber(liveKeys.length)} live keys, ${plans.length} output file(s), ${formatNumber(carriedDeletes.size)} tombstones carried, in ${red(formatTime(planTime))}`);
+    log(`mapping done — ${formatNumber(liveKeys.length)} live keys, ${plans.length} output file(s), ${formatNumber(carriedDeletes.size)} tombstones carried, in ${red(formatTime(planTime))}`);
 
     // ───────────────────────────────────────── Phase 2: execute ──────────────────────────────────────────
     // Group output files into batches that fit within targetBatchBytes so we read inputs once per batch
@@ -244,13 +248,13 @@ export async function runPlannedMerge(config: {
     for (let bi = 0; bi < batches.length; bi++) {
         const batch = batches[bi];
         const batchBytes = batch.reduce((a, p) => a + p.estimatedFileBytes, 0);
-        console.log(`${blue(config.collectionName)} merge batch ${bi + 1}/${batches.length}: ${batch.length} output file(s), ~${fmtBytes(batchBytes)} budget`);
-        const batchOutputs = await executeBatch(batch, indexesPerSource, config.sources, config.sourceNames, config.collectionName, config.writeFile);
+        log(`batch ${bi + 1}/${batches.length}: ${batch.length} output file(s), ~${fmtBytes(batchBytes)} budget`);
+        const batchOutputs = await executeBatch(batch, indexesPerSource, config.sources, config.sourceNames, config.writeFile, log);
         outputs.push(...batchOutputs);
     }
     const execTime = Date.now() - execStart;
     const writtenBytes = outputs.reduce((a, o) => a + o.size, 0);
-    console.log(`${blue(config.collectionName)} planned merge: done — ${outputs.length} file(s), ${fmtBytes(writtenBytes)} written, in ${red(formatTime(execTime))} (planning + execute: ${red(formatTime(Date.now() - planStart))})`);
+    log(`execute done — ${outputs.length} file(s), ${fmtBytes(writtenBytes)} written, in ${red(formatTime(execTime))} (plan + execute: ${red(formatTime(Date.now() - planStart))})`);
 
     return { outputs, carriedDeletes };
 }
@@ -334,8 +338,8 @@ async function executeBatch(
     indexesPerSource: Map<string, ColumnIndex>[],
     sources: BaseBulkDatabaseReader[],
     sourceNames: string[],
-    collectionName: string,
     writeFile: (data: Buffer) => Promise<{ name: string; size: number }>,
+    log: (line: string) => void,
 ): Promise<PlannedMergeOutput[]> {
     // Allocate one big buffer per (output file, column) — offsets + types are written immediately from
     // the plan, the data section is filled below by the per-source copy loop.
@@ -391,7 +395,7 @@ async function executeBatch(
         const sourcesNamed = new Map<string, number>();
         for (const [si, n] of plan.sourceCounts) sourcesNamed.set(sourceNames[si], n);
         const srcText = [...sourcesNamed.entries()].sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s}:${formatNumber(n)}`).join(", ") || "—";
-        console.log(`    ${blue(collectionName)} output ${name}: ${formatNumber(plan.keys.length)} rows [${plan.minKey} .. ${plan.maxKey}] from {${srcText}}, ${fmtBytes(size)} in ${formatTime(elapsed)}`);
+        log(`output ${name}: ${formatNumber(plan.keys.length)} rows from {${srcText}}, ${fmtBytes(size)} in ${formatTime(elapsed)}`);
         outputs.push({ name, minKey: plan.minKey, maxKey: plan.maxKey, rowCount: plan.keys.length, size, sources: sourcesNamed });
     }
     return outputs;
