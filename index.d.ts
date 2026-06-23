@@ -715,7 +715,7 @@ declare module "sliftutils/render-utils/colors" {
 }
 
 declare module "sliftutils/render-utils/mobxTyped" {
-    export { observable, runInAction, computed, autorun } from "mobx";
+    export { observable, runInAction, computed, autorun, onBecomeObserved, onBecomeUnobserved } from "mobx";
     export declare function configureMobxNextFrameScheduler(): void;
 
 }
@@ -763,9 +763,9 @@ declare module "sliftutils/render-utils/observer" {
 }
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
-    import { BulkDatabaseBase } from "./BulkDatabaseBase";
+    import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config } from "./BulkDatabaseBase";
     export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-    export type { ReactiveDeps, StorageFactory } from "./BulkDatabaseBase";
+    export type { ReactiveDeps, StorageFactory, BulkDatabase2Config } from "./BulkDatabaseBase";
     /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
     export type BulkColumnInfo = {
         column: string;
@@ -845,6 +845,25 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
             value: T[Column];
             time: number;
         }[] | undefined;
+        /**
+         * Reactive: whether (key, column) is loaded yet — true once we know the answer (value, absent, or
+         * deleted), false while it's still loading. getSingleFieldObjSync returns undefined for BOTH "loading"
+         * and "absent", so use this to tell them apart (e.g. show a spinner only when this is false).
+         */
+        isFieldLoadedSync<Column extends keyof T>(key: string, column: Column): boolean;
+        /** Reactive: whether a whole column is loaded yet (see isFieldLoadedSync). */
+        isColumnLoadedSync<Column extends keyof T>(column: Column): boolean;
+        /**
+         * Whether a row (key) is currently being watched by some reactive observer (getSingleFieldObjSync /
+         * getSingleFieldSync). Lets callers skip per-row work when nothing's watching. Non-reactive query;
+         * returns true if the backend can't tell.
+         */
+        isKeyWatched(key: string): boolean;
+        /**
+         * Drop all of this collection's in-memory loaded caches and re-trigger every watcher, which re-requests
+         * and reloads from disk. Pending un-flushed writes are kept. Per-collection.
+         */
+        reloadFromDisk(): void;
         /** The columns present on disk and their byte sizes (no row data read). */
         getColumnInfo(): Promise<BulkColumnInfo[]>;
         /** A cheap snapshot of the collection's shape (row/key counts, total bytes, columns) — no row data. */
@@ -866,6 +885,13 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
         compact(): Promise<void>;
         /**
+         * Whether this collection's storage is served over the network (a remote server) rather than local
+         * disk. Apps can branch on this to adapt to the higher latency. Note: over the network the database
+         * skips automatic background compaction by default — call the static
+         * `BulkDatabase2.enableNetworkCompaction()` once to opt in.
+         */
+        isRemote(): Promise<boolean>;
+        /**
          * Flush buffered stream writes to disk now. Writes are coalesced and flushed on a ramping delay (to
          * avoid the browser rewriting the whole stream file per write), so a write's promise resolving means
          * "accepted" (in memory + cross-tab), not necessarily "on disk". Call this to force durability — it's
@@ -886,55 +912,108 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
          * most callers want compact() or tryMergeNow(). */
         merge(timeLo: number, timeHi: number): Promise<void>;
     }
+    export declare class MobxReactiveDeps implements ReactiveDeps {
+        private boxes;
+        private observed;
+        private box;
+        observe(signal: string): void;
+        invalidate(signal: string): void;
+        batch(fn: () => void): void;
+        isObserved(signal: string): boolean;
+    }
     export declare class BulkDatabase2<T extends {
         key: string;
     }> extends BulkDatabaseBase<T> implements IBulkDatabase2<T> {
-        constructor(name: string);
+        constructor(name: string, config?: BulkDatabase2Config);
     }
 
 }
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     import type { FileStorage } from "../FileFolderAPI";
+    export declare const BULK_ROOT_FOLDER = "bulkDatabases2";
     export declare const bulkDatabase2Timing: {
         streamSealAgeMs: number;
         mergeCheckIntervalMs: number;
         mergeSpacingMs: number;
         firstMergeTriggerFiles: number;
         firstMergeTriggerRangeMs: number;
+        streamFoldTriggerRows: number;
+        streamFoldTriggerBytes: number;
+        streamFileMaxBytes: number;
+        streamFoldHardLimitBytes: number;
         writeFlushMaxDelayMs: number;
+        fileSetPollIntervalMs: number;
+        memoryFlushHeapBytes: number;
+        memoryFlushMinCollectionBytes: number;
+        memoryFlushThrottleMs: number;
     };
     export interface ReactiveDeps {
         observe(signal: string): void;
         invalidate(signal: string): void;
         batch(fn: () => void): void;
+        isObserved?(signal: string): boolean;
     }
     export declare const noopReactiveDeps: ReactiveDeps;
     export type StorageFactory = (path: string) => Promise<FileStorage>;
+    export type BulkDatabase2Config = {
+        maxTriggerThrottleMs?: number;
+    };
     export declare class BulkDatabaseBase<T extends {
         key: string;
     }> {
         readonly name: string;
         protected deps: ReactiveDeps;
         private storageFactory;
-        constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory);
+        private config;
+        constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory, config?: BulkDatabase2Config);
+        private static liveInstances;
+        private static memoryWatchdogStarted;
+        private static lastMemoryFlushMs;
+        private static startMemoryWatchdog;
+        static checkMemoryPressure(usedHeapBytes: number): void;
         private pendingAppends;
         private flushTimer;
         private flushChain;
         private currentFlushDelay;
         private lastWriteTime;
         static clearCache(): void;
+        static enableNetworkCompaction(): void;
         storage: {
             (): Promise<FileStorage>;
             reset(): void;
             set(newValue: Promise<FileStorage>): void;
         };
+        isRemote(): Promise<boolean>;
+        private streamNeedsFold;
+        private automaticCompactionAllowed;
         private overlay;
         private streamTimes;
+        private columnCache;
+        private readerKeys;
+        private loadedFileSet;
+        private loadedTotalBytes;
+        private readerEpoch;
+        private fileSetPollTimer;
+        private bulkReaderCache;
+        private streamReaderCache;
+        private dataGen;
+        private pendingSignals;
+        private triggerTimer;
+        private currentTriggerDelay;
+        private lastTriggerTime;
+        private streamRowsOnDisk;
+        private streamBytesOnDisk;
         private streamFileName;
+        private currentStreamFileName;
+        private currentStreamFileBytes;
         private lastMergeCheck;
         private getStreamFileName;
         private invalidateOverlay;
+        isKeyWatched(key: string): boolean;
+        private isLiveNow;
+        private invalidateSignal;
+        private flushSignals;
         private setOverlayRow;
         private setOverlayDeleted;
         private reader;
@@ -942,7 +1021,12 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private syncSetup;
         private localTime;
         private applyRemote;
+        private clearReaderState;
         private resetReader;
+        private reloadReader;
+        reloadFromDisk(): void;
+        private readWithReload;
+        private pollFileSet;
         write(entry: T): Promise<void>;
         writeBatch(entries: T[]): Promise<void>;
         delete(key: string): Promise<void>;
@@ -951,6 +1035,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         flush(): Promise<void>;
         private flushPending;
         private doFlush;
+        private foldOwnStream;
         update(entry: Partial<T> & {
             key: string;
         }): Promise<void>;
@@ -970,10 +1055,10 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         merge(timeLo: number, timeHi: number): Promise<void>;
         private makeRawGetRange;
         private loadFileReader;
+        private pruneFileCaches;
         private readBulkHeader;
         private fileLogicalSize;
         private handleUnreadableFile;
-        private resolveReaders;
         private mergeFileSet;
         private canDeleteStream;
         private mergeSpacingDelay;
@@ -997,6 +1082,8 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private baseColumnsLoading;
         private baseFields;
         private baseFieldsLoading;
+        private staleBaseColumns;
+        private staleBaseFields;
         private ensureBaseColumn;
         private ensureBaseField;
         getSingleFieldSync<Column extends keyof T>(key: string, column: Column): T[Column] | undefined;
@@ -1010,10 +1097,19 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
             value: T[Column];
             time: number;
         }[] | undefined;
+        isFieldLoadedSync<Column extends keyof T>(key: string, column: Column): boolean;
+        isColumnLoadedSync<Column extends keyof T>(column: Column): boolean;
         getColumnInfo(): Promise<{
             column: string;
             byteSize: number;
         }[]>;
+        getKeyStats(): Promise<{
+            rawKeys: number;
+            finalKeys: number;
+            wastedKeys: number;
+            duplication: number;
+            readers: number;
+        }>;
         getReaderInfo(): Promise<{
             rowCount: number;
             totalBytes: number;
@@ -1043,8 +1139,43 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     export declare const KEY_COLUMN = "key";
     export declare const EMPTY_BUFFER: Buffer;
     export declare const ABSENT: unique symbol;
+    export type RawCell = {
+        type: number;
+        bytes: Buffer;
+    };
+    export declare const TYPE_ABSENT_TAG = 14;
+    export type ColumnIndex = {
+        offsets: Uint32Array;
+        types: Uint8Array;
+        readValueBytes: (startRow: number, endRow: number) => Promise<Buffer>;
+    };
+    export declare function encodeValue(value: unknown): {
+        type: number;
+        bytes: Buffer;
+    };
     export declare const TARGET_FILE_BYTES: number;
-    export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): Buffer[];
+    export type RawRow = {
+        key: string;
+        time: number;
+        cells: Map<string, RawCell>;
+    };
+    export declare function columnIndexByteLength(rowCount: number): number;
+    export declare function assemblePlannedFile(config: {
+        valueColumns: {
+            name: string;
+            blob: Buffer;
+        }[];
+        keys: string[];
+        times: number[];
+    }): Buffer;
+    export interface BuiltFile {
+        buffer: Buffer;
+        minKey: string;
+        maxKey: string;
+        rowCount: number;
+    }
+    export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): BuiltFile[];
+    export declare function buildFileBufferRaw(rows: RawRow[], targetBytes?: number): BuiltFile[];
     export type BaseBulkDatabaseReader = {
         rowCount: number;
         totalBytes: number;
@@ -1064,6 +1195,9 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
             value: unknown;
             time: number;
         }[]>;
+        getRawColumn: (column: string) => Promise<Map<string, RawCell>>;
+        getColumnIndex: (column: string) => Promise<ColumnIndex>;
+        rowOfKey: (key: string) => number | undefined;
         getSingleField: (key: string, column: string) => Promise<{
             value: unknown;
             time: number;
@@ -1088,6 +1222,59 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
 
 }
 
+declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseMerge" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { BaseBulkDatabaseReader } from "./BulkDatabaseFormat";
+    type CopyRun = {
+        sourceIdx: number;
+        sourceStartRow: number;
+        sourceEndRow: number;
+        outputByteStart: number;
+        byteLength: number;
+    };
+    type PlannedOutputColumn = {
+        name: string;
+        offsets: Uint32Array;
+        types: Uint8Array;
+        dataLength: number;
+        runs: CopyRun[];
+    };
+    export type PlannedOutputFile = {
+        keys: string[];
+        times: number[];
+        minKey: string;
+        maxKey: string;
+        columns: PlannedOutputColumn[];
+        estimatedFileBytes: number;
+        sourceCounts: Map<number, number>;
+    };
+    export type PlannedMergeOutput = {
+        name: string;
+        minKey: string;
+        maxKey: string;
+        rowCount: number;
+        size: number;
+        sources: Map<string, number>;
+    };
+    export declare function runPlannedMerge(config: {
+        sources: BaseBulkDatabaseReader[];
+        sourceNames: string[];
+        collectionName: string;
+        targetFileBytes?: number;
+        targetBatchBytes?: number;
+        writeFile: (data: Buffer) => Promise<{
+            name: string;
+            size: number;
+        }>;
+    }): Promise<{
+        outputs: PlannedMergeOutput[];
+        carriedDeletes: Map<string, number>;
+    }>;
+    export {};
+
+}
+
 declare module "sliftutils/storage/BulkDatabase2/blockCache" {
     /// <reference types="node" />
     /// <reference types="node" />
@@ -1097,6 +1284,7 @@ declare module "sliftutils/storage/BulkDatabase2/blockCache" {
         private blocks;
         private indexes;
         clear(): void;
+        evict(fileId: string): void;
         private touch;
         private readIndex;
         open(fileId: string, fileSize: number, rawGetRange: GetRange): Promise<{
@@ -1360,10 +1548,13 @@ declare module "sliftutils/storage/FileFolderAPI" {
             write(value: Buffer): Promise<void>;
             close(): Promise<void>;
         }>;
+        getURL?(): Promise<string>;
     };
     export type DirectoryWrapper = {
         readonly kind: "directory";
         readonly name: string;
+        readonly fullPath?: string;
+        readonly isRemote?: boolean;
         removeEntry(key: string, options?: {
             recursive?: boolean;
         }): Promise<void>;
@@ -1390,6 +1581,7 @@ declare module "sliftutils/storage/FileFolderAPI" {
                 arrayBuffer: () => Promise<ArrayBuffer>;
             };
         }>;
+        getURL(): Promise<string>;
         createWritable(config?: {
             keepExistingData?: boolean;
         }): Promise<{
@@ -1403,6 +1595,7 @@ declare module "sliftutils/storage/FileFolderAPI" {
         constructor(rootPath: string);
         readonly kind: "directory";
         get name(): string;
+        get fullPath(): string;
         entries(): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
         removeEntry(key: string, options?: {
             recursive?: boolean;
@@ -1450,8 +1643,11 @@ declare module "sliftutils/storage/FileFolderAPI" {
     };
     export type FileStorage = IStorageRaw & {
         folder: NestedFileStorage;
+        isRemote?: boolean;
     };
     export declare function wrapHandle(handle: DirectoryWrapper): FileStorage;
+    export declare function getFileURL(file: FileWrapper): Promise<string>;
+    export declare function disposeFileURL(url: string): void;
     export declare function getRemoteFileStorageFactory(url: string, password: string, options?: RemoteOptions): (pathStr: string) => Promise<FileStorage>;
     export declare function tryToLoadPointer(pointer: string): Promise<DirectoryWrapper | undefined>;
 
@@ -1841,6 +2037,7 @@ declare module "sliftutils/storage/remoteFileServer" {
         close: () => Promise<void>;
     };
     export declare function startRemoteFileServer(options: RemoteFileServerOptions): Promise<RemoteFileServerHandle>;
+    export declare function autocompactBulkDatabases(root: string): Promise<void>;
     export declare function runFileHoster(): Promise<void>;
 
 }
@@ -1850,6 +2047,7 @@ declare module "sliftutils/storage/remoteFileStorage" {
     export type RemoteOptions = {
         chunkBytes?: number;
         cacheBytes?: number;
+        maxFetchBytes?: number;
         latencyMs?: number;
         stats?: {
             requestCount: number;

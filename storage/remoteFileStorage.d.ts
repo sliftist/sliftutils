@@ -2,6 +2,7 @@ import type { DirectoryWrapper } from "./FileFolderAPI";
 export type RemoteOptions = {
     chunkBytes?: number;
     cacheBytes?: number;
+    maxFetchBytes?: number;
     latencyMs?: number;
     stats?: {
         requestCount: number;

@@ -1,5 +1,5 @@
 import cborx from "cbor-x";
-import { ABSENT, BaseBulkDatabaseReader, encodeValue, RawCell } from "./BulkDatabaseFormat";
+import { ABSENT, BaseBulkDatabaseReader, ColumnIndex, EMPTY_BUFFER, encodeValue, RawCell, TYPE_ABSENT_TAG } from "./BulkDatabaseFormat";
 
 // Tier-0 streaming format: an append log of whole-row writes and deletes (row-format, not columnar),
 // so small mutations are a single cheap append instead of rewriting a columnar file. Each block is:
@@ -104,6 +104,7 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
         if (t < minTime) minTime = t;
         if (t > maxTime) maxTime = t;
     }
+    const keyIndexMap = buildKeyIndex(keys);
     let reader: BaseBulkDatabaseReader = {
         totalBytes,
         rowCount: keys.length,
@@ -138,6 +139,70 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
             }
             return map;
         },
+        // Per-column index in the same shape a bulk file exposes, materialized in memory once (stream data
+        // is tier-0, size-capped, so the encode is cheap). Lets the planned merge treat stream + bulk
+        // sources uniformly: it loads each (source, column) index, uses offsets/types to plan the output's
+        // byte layout, and reads contiguous runs from this index's in-memory data buffer during execute.
+        async getColumnIndex(column) {
+            return getStreamColumnIndex(keys, byKey, column);
+        },
+        rowOfKey(key) {
+            return keyIndexMap.get(key);
+        },
     };
     return { reader, times };
 }
+
+// keys[] is the column-side row order for this stream reader; rowOfKey is used by the planner to look up
+// a winning cell's source row without going through a column read. Stays consistent with getColumnIndex,
+// which builds its offsets/types over the same `keys` array in the same order.
+function buildKeyIndex(keys: string[]): Map<string, number> {
+    const m = new Map<string, number>();
+    for (let i = 0; i < keys.length; i++) m.set(keys[i], i);
+    return m;
+}
+
+// Build a stream-side ColumnIndex (offsets + types + a contiguous-row byte slicer) over the in-memory
+// merged rows. Encodes each row's value for this column once into a single backing buffer; readValueBytes
+// then slices it. Cached per (reader, column) so a merge planning + execution pass doesn't re-encode.
+function getStreamColumnIndex(keys: string[], byKey: Map<string, Record<string, unknown>>, column: string): ColumnIndex {
+    let cached = columnIndexCache.get(byKey)?.get(column);
+    if (cached) return cached;
+    const offsets = new Uint32Array(keys.length + 1);
+    const types = new Uint8Array(keys.length);
+    const parts: Buffer[] = [];
+    let pos = 0;
+    for (let i = 0; i < keys.length; i++) {
+        const row = byKey.get(keys[i]);
+        offsets[i] = pos;
+        if (!row || !(column in row)) {
+            types[i] = TYPE_ABSENT_TAG;
+            continue;
+        }
+        const { type, bytes } = encodeValue(row[column]);
+        types[i] = type;
+        parts.push(bytes);
+        pos += bytes.length;
+    }
+    offsets[keys.length] = pos;
+    const data = parts.length ? Buffer.concat(parts) : EMPTY_BUFFER;
+    const idx: ColumnIndex = {
+        offsets,
+        types,
+        async readValueBytes(startRow, endRow) {
+            if (endRow <= startRow) return EMPTY_BUFFER;
+            const start = offsets[startRow];
+            const end = offsets[endRow];
+            if (end <= start) return EMPTY_BUFFER;
+            return data.subarray(start, end);
+        },
+    };
+    let perReader = columnIndexCache.get(byKey);
+    if (!perReader) { perReader = new Map(); columnIndexCache.set(byKey, perReader); }
+    perReader.set(column, idx);
+    return idx;
+}
+
+// Per stream-reader cache of its column indexes. Keyed by the reader's byKey map (a fresh
+// streamReaderFromEntries call produces a fresh map, so this is effectively per-reader).
+const columnIndexCache = new WeakMap<Map<string, Record<string, unknown>>, Map<string, ColumnIndex>>();

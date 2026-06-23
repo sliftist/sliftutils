@@ -3,15 +3,35 @@
 export declare const KEY_COLUMN = "key";
 export declare const EMPTY_BUFFER: Buffer;
 export declare const ABSENT: unique symbol;
-export declare type RawCell = {
+export type RawCell = {
     type: number;
     bytes: Buffer;
+};
+export declare const TYPE_ABSENT_TAG = 14;
+export type ColumnIndex = {
+    offsets: Uint32Array;
+    types: Uint8Array;
+    readValueBytes: (startRow: number, endRow: number) => Promise<Buffer>;
 };
 export declare function encodeValue(value: unknown): {
     type: number;
     bytes: Buffer;
 };
 export declare const TARGET_FILE_BYTES: number;
+export type RawRow = {
+    key: string;
+    time: number;
+    cells: Map<string, RawCell>;
+};
+export declare function columnIndexByteLength(rowCount: number): number;
+export declare function assemblePlannedFile(config: {
+    valueColumns: {
+        name: string;
+        blob: Buffer;
+    }[];
+    keys: string[];
+    times: number[];
+}): Buffer;
 export interface BuiltFile {
     buffer: Buffer;
     minKey: string;
@@ -19,11 +39,6 @@ export interface BuiltFile {
     rowCount: number;
 }
 export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): BuiltFile[];
-export declare type RawRow = {
-    key: string;
-    time: number;
-    cells: Map<string, RawCell>;
-};
 export declare function buildFileBufferRaw(rows: RawRow[], targetBytes?: number): BuiltFile[];
 export type BaseBulkDatabaseReader = {
     rowCount: number;
@@ -45,6 +60,8 @@ export type BaseBulkDatabaseReader = {
         time: number;
     }[]>;
     getRawColumn: (column: string) => Promise<Map<string, RawCell>>;
+    getColumnIndex: (column: string) => Promise<ColumnIndex>;
+    rowOfKey: (key: string) => number | undefined;
     getSingleField: (key: string, column: string) => Promise<{
         value: unknown;
         time: number;

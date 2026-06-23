@@ -46,10 +46,13 @@ export type FileWrapper = {
         write(value: Buffer): Promise<void>;
         close(): Promise<void>;
     }>;
+    getURL?(): Promise<string>;
 };
 export type DirectoryWrapper = {
     readonly kind: "directory";
     readonly name: string;
+    readonly fullPath?: string;
+    readonly isRemote?: boolean;
     removeEntry(key: string, options?: {
         recursive?: boolean;
     }): Promise<void>;
@@ -76,6 +79,7 @@ export declare class NodeJSFileHandleWrapper implements FileWrapper {
             arrayBuffer: () => Promise<ArrayBuffer>;
         };
     }>;
+    getURL(): Promise<string>;
     createWritable(config?: {
         keepExistingData?: boolean;
     }): Promise<{
@@ -89,6 +93,7 @@ export declare class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
     constructor(rootPath: string);
     readonly kind: "directory";
     get name(): string;
+    get fullPath(): string;
     entries(): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
     removeEntry(key: string, options?: {
         recursive?: boolean;
@@ -136,7 +141,10 @@ export type NestedFileStorage = {
 };
 export type FileStorage = IStorageRaw & {
     folder: NestedFileStorage;
+    isRemote?: boolean;
 };
 export declare function wrapHandle(handle: DirectoryWrapper): FileStorage;
+export declare function getFileURL(file: FileWrapper): Promise<string>;
+export declare function disposeFileURL(url: string): void;
 export declare function getRemoteFileStorageFactory(url: string, password: string, options?: RemoteOptions): (pathStr: string) => Promise<FileStorage>;
 export declare function tryToLoadPointer(pointer: string): Promise<DirectoryWrapper | undefined>;

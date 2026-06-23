@@ -50,6 +50,28 @@ export const ABSENT = Symbol("absent");
 // JPEG/typed-array decode + re-encode).
 export type RawCell = { type: number; bytes: Buffer };
 
+// The type tag a cell carries when its row never set this column — read it from the column's `types`
+// array to detect ABSENT without decoding. Re-exported so the merge planner (which works at the
+// column-index level, no value materialization) can check it.
+export const TYPE_ABSENT_TAG = TYPE_ABSENT;
+
+// A column's index alone (offsets + types — small, ~5 bytes/row) plus a primitive to read a CONTIGUOUS
+// row range's raw value bytes. Used by the planned merge: it loads the index across every (source,
+// column) once (cheap), uses types to detect ABSENT and offsets to size each cell, plans the byte
+// layout of every output file from those — then in the execute phase reads only the runs of bytes it
+// actually needs, copying them straight into pre-laid-out output buffers. No cell value is ever
+// materialized as a JS object.
+export type ColumnIndex = {
+    // offsets[i]..offsets[i+1] is row i's value byte range within the column's data section.
+    offsets: Uint32Array;
+    // Per-row type tag; TYPE_ABSENT_TAG marks "this row never set this column" (fall-through).
+    types: Uint8Array;
+    // Read the contiguous bytes of value(s) for rows [startRow, endRow). Length is exactly
+    // offsets[endRow] - offsets[startRow] — the cells in that range concatenated. The caller composes
+    // larger reads from consecutive rows (one source-side getRange per run).
+    readValueBytes: (startRow: number, endRow: number) => Promise<Buffer>;
+};
+
 // Hidden per-row column holding each row's write-time (so reads can resolve a key to its latest value
 // by actual time). NUL-prefixed so it can't collide with a user column; excluded from `columns`.
 const TIME_COLUMN = String.fromCharCode(0) + "t";
@@ -264,6 +286,30 @@ function buildOneFile(rows: Record<string, unknown>[], times: number[]): Buffer 
 // from the input files; no value is ever decoded.
 export type RawRow = { key: string; time: number; cells: Map<string, RawCell> };
 
+// Size of a column blob's INDEX section (offsets array + types array) for a column of N rows. The data
+// section follows immediately after. The planned merge uses this to size output buffers exactly.
+export function columnIndexByteLength(rowCount: number): number {
+    return 4 * (rowCount + 1) + rowCount;
+}
+
+// Assembles a complete bulk file from a set of pre-built value column blobs plus the keys + times. Auto-
+// adds the KEY_COLUMN (keys) and hidden TIME_COLUMN (times) — they're small enough to encode in one shot
+// here. Used by the planned merge: it builds each value column's blob by-hand (offsets/types + raw bytes
+// copied directly from inputs, no value materialization) and hands the result here for header + bounds.
+export function assemblePlannedFile(config: {
+    valueColumns: { name: string; blob: Buffer }[];
+    keys: string[];
+    times: number[];
+}): Buffer {
+    const columnNames = [KEY_COLUMN, ...config.valueColumns.map(c => c.name), TIME_COLUMN];
+    const blobs = [
+        encodeBulkData(config.keys),
+        ...config.valueColumns.map(c => c.blob),
+        encodeBulkData(config.times),
+    ];
+    return assembleFile(columnNames, blobs, config.keys.length, config.times, config.keys);
+}
+
 const ABSENT_CELL: RawCell = { type: TYPE_ABSENT, bytes: EMPTY_BUFFER };
 
 function buildOneFileRaw(rows: RawRow[]): Buffer {
@@ -389,6 +435,13 @@ export type BaseBulkDatabaseReader = {
     // cells are omitted (a missing key means this reader didn't set this column, so the merge falls
     // through to an older reader). Each cell's write-time is the reader's keyTimes value for that key.
     getRawColumn: (column: string) => Promise<Map<string, RawCell>>;
+    // Returns the column's INDEX (offsets + types) plus a contiguous row-range byte reader. The planned
+    // merge loads this for every (source, column) once — small (~5B/row), no value bytes pulled — and
+    // uses types/offsets to plan the output's byte layout. Execute then reads only the needed runs.
+    getColumnIndex: (column: string) => Promise<ColumnIndex>;
+    // Maps a key to its row index in this reader (and undefined if absent). The planned merge uses this
+    // to look up a winning cell's source row without going through a column read.
+    rowOfKey: (key: string) => number | undefined;
     // The value + write-time for (key, column), or ABSENT if this reader has no such cell.
     getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | typeof ABSENT>;
 };
@@ -476,6 +529,44 @@ export async function loadBulkDatabase(config: {
                 map.set(keys[i], { type, bytes: blob.subarray(indexSize + start, indexSize + end) });
             }
             return map;
+        },
+        async getColumnIndex(column) {
+            const col = colByName.get(column);
+            if (!col) {
+                // File lacks this column — present an all-ABSENT index so the planner can treat it
+                // uniformly with files that have the column.
+                const offsets = new Uint32Array(rowCount + 1);
+                const types = new Uint8Array(rowCount).fill(TYPE_ABSENT);
+                return {
+                    offsets,
+                    types,
+                    async readValueBytes() { return EMPTY_BUFFER; },
+                };
+            }
+            const colBase = dataBase + col.offset;
+            const indexSize = 4 * (rowCount + 1) + rowCount;
+            // One read pulls offsets + types (small — ~5 B/row). Block cache makes subsequent value reads
+            // of nearby rows cheap. Decoded into aligned typed arrays so the executor can do O(1) lookups.
+            const indexBuf = await config.getRange(colBase, colBase + indexSize);
+            const offsets = new Uint32Array(rowCount + 1);
+            for (let i = 0; i <= rowCount; i++) offsets[i] = indexBuf.readUInt32LE(4 * i);
+            const types = new Uint8Array(rowCount);
+            for (let i = 0; i < rowCount; i++) types[i] = indexBuf[4 * (rowCount + 1) + i];
+            const dataStart = colBase + indexSize;
+            return {
+                offsets,
+                types,
+                async readValueBytes(startRow, endRow) {
+                    if (endRow <= startRow) return EMPTY_BUFFER;
+                    const start = offsets[startRow];
+                    const end = offsets[endRow];
+                    if (end <= start) return EMPTY_BUFFER;
+                    return config.getRange(dataStart + start, dataStart + end);
+                },
+            };
+        },
+        rowOfKey(key) {
+            return keyIndex.get(key);
         },
         async getSingleField(key, column) {
             const row = keyIndex.get(key);

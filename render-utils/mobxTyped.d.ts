@@ -1,2 +1,2 @@
-export { observable, runInAction, computed, autorun } from "mobx";
+export { observable, runInAction, computed, autorun, onBecomeObserved, onBecomeUnobserved } from "mobx";
 export declare function configureMobxNextFrameScheduler(): void;

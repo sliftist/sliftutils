@@ -1,6 +1,6 @@
-import { BulkDatabaseBase } from "./BulkDatabaseBase";
+import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config } from "./BulkDatabaseBase";
 export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-export type { ReactiveDeps, StorageFactory } from "./BulkDatabaseBase";
+export type { ReactiveDeps, StorageFactory, BulkDatabase2Config } from "./BulkDatabaseBase";
 /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
 export type BulkColumnInfo = {
     column: string;
@@ -80,6 +80,25 @@ export interface IBulkDatabase2<T extends {
         value: T[Column];
         time: number;
     }[] | undefined;
+    /**
+     * Reactive: whether (key, column) is loaded yet — true once we know the answer (value, absent, or
+     * deleted), false while it's still loading. getSingleFieldObjSync returns undefined for BOTH "loading"
+     * and "absent", so use this to tell them apart (e.g. show a spinner only when this is false).
+     */
+    isFieldLoadedSync<Column extends keyof T>(key: string, column: Column): boolean;
+    /** Reactive: whether a whole column is loaded yet (see isFieldLoadedSync). */
+    isColumnLoadedSync<Column extends keyof T>(column: Column): boolean;
+    /**
+     * Whether a row (key) is currently being watched by some reactive observer (getSingleFieldObjSync /
+     * getSingleFieldSync). Lets callers skip per-row work when nothing's watching. Non-reactive query;
+     * returns true if the backend can't tell.
+     */
+    isKeyWatched(key: string): boolean;
+    /**
+     * Drop all of this collection's in-memory loaded caches and re-trigger every watcher, which re-requests
+     * and reloads from disk. Pending un-flushed writes are kept. Per-collection.
+     */
+    reloadFromDisk(): void;
     /** The columns present on disk and their byte sizes (no row data read). */
     getColumnInfo(): Promise<BulkColumnInfo[]>;
     /** A cheap snapshot of the collection's shape (row/key counts, total bytes, columns) — no row data. */
@@ -101,6 +120,13 @@ export interface IBulkDatabase2<T extends {
     /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
     compact(): Promise<void>;
     /**
+     * Whether this collection's storage is served over the network (a remote server) rather than local
+     * disk. Apps can branch on this to adapt to the higher latency. Note: over the network the database
+     * skips automatic background compaction by default — call the static
+     * `BulkDatabase2.enableNetworkCompaction()` once to opt in.
+     */
+    isRemote(): Promise<boolean>;
+    /**
      * Flush buffered stream writes to disk now. Writes are coalesced and flushed on a ramping delay (to
      * avoid the browser rewriting the whole stream file per write), so a write's promise resolving means
      * "accepted" (in memory + cross-tab), not necessarily "on disk". Call this to force durability — it's
@@ -121,8 +147,17 @@ export interface IBulkDatabase2<T extends {
      * most callers want compact() or tryMergeNow(). */
     merge(timeLo: number, timeHi: number): Promise<void>;
 }
+export declare class MobxReactiveDeps implements ReactiveDeps {
+    private boxes;
+    private observed;
+    private box;
+    observe(signal: string): void;
+    invalidate(signal: string): void;
+    batch(fn: () => void): void;
+    isObserved(signal: string): boolean;
+}
 export declare class BulkDatabase2<T extends {
     key: string;
 }> extends BulkDatabaseBase<T> implements IBulkDatabase2<T> {
-    constructor(name: string);
+    constructor(name: string, config?: BulkDatabase2Config);
 }

@@ -13,4 +13,5 @@ export type RemoteFileServerHandle = {
     close: () => Promise<void>;
 };
 export declare function startRemoteFileServer(options: RemoteFileServerOptions): Promise<RemoteFileServerHandle>;
+export declare function autocompactBulkDatabases(root: string): Promise<void>;
 export declare function runFileHoster(): Promise<void>;
