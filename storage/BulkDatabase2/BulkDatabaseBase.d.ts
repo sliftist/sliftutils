@@ -166,6 +166,7 @@ export type BulkFileEntry = {
     name: string;
     type: "bulk" | "stream";
     bytes: number;
+    lastModified: number;
     getDetails: () => Promise<BulkFileDetails>;
 };
 export type BulkFileInfoListing = {

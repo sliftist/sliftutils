@@ -1090,6 +1090,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         name: string;
         type: "bulk" | "stream";
         bytes: number;
+        lastModified: number;
         getDetails: () => Promise<BulkFileDetails>;
     };
     export type BulkFileInfoListing = {
