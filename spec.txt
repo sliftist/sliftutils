@@ -1,11 +1,5 @@
 
 
 
-Compact face_frames3
 
-
-
-When detecting faces in the JavaScript code and the Python code. Let's make it so that we only store the face frames for the top 10 characters. We can show the store the embeddings for all of them, But for the face frames collection only store the top 10 faces. The other ones will just be blank, and that should be fine. Also, let's make sure when we're storing them the max dimension is 128 pixels and the quality is only 80. 
-
-
-Then go verify on the other site fixing up the bad data. It should be quite fast because there's so much overlap, but we will find out. 
+Create a companion large data storage thing.  which updates the data less frequently, Where we reference it with unique IDs so we don't have to merge as much and it doesn't have to be as strict. This should allow our large databases to be merged faster, even though they are pretty fast to merge at the moment, but they probably will get slower if we make them 10 times bigger. 
