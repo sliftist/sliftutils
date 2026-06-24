@@ -92,5 +92,5 @@ async function main() {
     console.log(`Web build completed in ${formatTime(duration)}`);
     console.log(`file://${path.resolve(indexHtmlOutput).replaceAll("\\", "/")}`);
 }
-main().catch(console.error).finally(() => process.exit());
+main().catch(err => { console.error(err); process.exitCode = 1; }).finally(() => process.exit());
 

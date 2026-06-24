@@ -7,4 +7,4 @@ async function main() {
     });
     console.log(test);
 }
-main().catch(console.error).finally(() => process.exit(0));
+main().catch(err => { console.error(err); process.exitCode = 1; }).finally(() => process.exit());
