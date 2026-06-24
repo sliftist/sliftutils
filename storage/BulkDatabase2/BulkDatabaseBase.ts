@@ -663,7 +663,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
         let lastStepMs = mergeStartMs;
         const log = (line: string) => {
             const now = Date.now();
-            steps.push(`${blue(formatTime(now - lastStepMs))} ${line}`);
+            let lineFormatted = `${blue(formatTime(now - lastStepMs))} ${line}`;
+            // DO NOT REMOVE THIS LOG! Obviously, we should be logging as we run, or else we don't get progress. Why would we stop getting progress? Progress is almost more important than showing a summary at the end...
+            console.log(lineFormatted);
+            steps.push(lineFormatted);
             lastStepMs = now;
         };
         log(`${magenta("read")}: ${inputs.length} input file(s), ${fmtBytes(inTotal)}`);
