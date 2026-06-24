@@ -372,6 +372,71 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
 }
 
 
+// When set, getDirectoryHandle skips every prompt + remote check and serves from the browser's Origin
+// Private File System (OPFS). One named subfolder is "current" per fileAPIKey; pickPrivateFolder /
+// resetStorageLocation switch which one. Set this in app startup BEFORE the first getDirectoryHandle.
+let opfsEnabled = false;
+const OPFS_FOLDERS_DIR = "folders";
+const OPFS_DEFAULT_FOLDER = "default";
+function opfsCurrentKey() { return getFileAPIKey() + ":opfs:current"; }
+function getCurrentOpfsFolder(): string {
+    return localStorage.getItem(opfsCurrentKey()) || OPFS_DEFAULT_FOLDER;
+}
+function setCurrentOpfsFolder(name: string): void {
+    localStorage.setItem(opfsCurrentKey(), name);
+}
+
+// Switches getDirectoryHandle to the Origin Private File System. No directory picker, no permission
+// prompt, no remote server check. Persists nothing — call on every app start before reading storage.
+export function usePrivateFileSystem(): void {
+    opfsEnabled = true;
+}
+
+// Whether the OPFS branch is in effect (so other callers can adapt — e.g. skip the "find data subdir"
+// hack in getFileStorageNested2 since OPFS is always a clean root we own end-to-end).
+export function isPrivateFileSystemActive(): boolean {
+    return opfsEnabled;
+}
+
+async function getOpfsFoldersDir(): Promise<FileSystemDirectoryHandle> {
+    if (!navigator.storage?.getDirectory) {
+        throw new Error("Private File System Access API not supported in this browser");
+    }
+    if (location.protocol === "file:") {
+        throw new Error("Private File System API is disallowed in file:// locations. Host on an actual origin.");
+    }
+    const root = await navigator.storage.getDirectory();
+    const keyed = await root.getDirectoryHandle(getFileAPIKey(), { create: true });
+    return await keyed.getDirectoryHandle(OPFS_FOLDERS_DIR, { create: true });
+}
+
+async function getCurrentOpfsHandle(): Promise<DirectoryWrapper> {
+    const folders = await getOpfsFoldersDir();
+    const folder = await folders.getDirectoryHandle(getCurrentOpfsFolder(), { create: true });
+    return folder as unknown as DirectoryWrapper;
+}
+
+// All previously-used OPFS subfolders under this fileAPIKey, sorted alphabetically (timestamp-named
+// auto-generated folders therefore sort chronologically). Use this to surface a list, then call
+// pickPrivateFolder(name) to switch.
+export async function listPrivateFolders(): Promise<string[]> {
+    if (!navigator.storage?.getDirectory) return [];
+    let folders: FileSystemDirectoryHandle;
+    try { folders = await getOpfsFoldersDir(); } catch { return []; }
+    const names: string[] = [];
+    for await (const [name, handle] of (folders as unknown as AsyncIterable<[string, { kind: string }]>)) {
+        if (handle.kind === "directory") names.push(name);
+    }
+    return names.sort();
+}
+
+// Switch to a specific OPFS subfolder and reload so getDirectoryHandle re-resolves to it. The folder
+// is created if it doesn't exist yet.
+export function pickPrivateFolder(name: string): void {
+    setCurrentOpfsFolder(name);
+    window.location.reload();
+}
+
 // Returns the directory handle to use — local (Node / picked folder) OR a remote server, both as the
 // same DirectoryWrapper, so callers don't know or care which it is. A remembered server is VERIFIED
 // (we actually connect) before use; if it no longer works we re-prompt, just like a local folder whose
@@ -379,6 +444,9 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
 export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Promise<DirectoryWrapper> {
     if (isNode()) {
         return new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
+    }
+    if (opfsEnabled) {
+        return getCurrentOpfsHandle();
     }
 
     // A server connected in a previous session: only reuse it if it still actually works.
@@ -479,17 +547,21 @@ export const getFileStorageNested2 = cache(async function getFileStorage(pathStr
         base = new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
     } else {
         base = await getDirectoryHandle();
-        let dirs: string[] = [];
-        let alls: string[] = [];
-        for await (const [name, entry] of base) {
-            if (entry.kind === "directory") {
-                dirs.push(name);
+        // Skip the "find data subdir" hack under OPFS — that's for picked directories where the user
+        // might have selected a folder with unrelated files; OPFS is a clean root we own end-to-end.
+        if (!opfsEnabled) {
+            let dirs: string[] = [];
+            let alls: string[] = [];
+            for await (const [name, entry] of base) {
+                if (entry.kind === "directory") {
+                    dirs.push(name);
+                }
+                alls.push(name);
             }
-            alls.push(name);
-        }
-        // HACK: If there are enough files, it's almost certainly not a directory that contains collections. It's probably the user's data instead
-        if (dirs.includes(".git") || dirs.includes("data") || alls.length > 100) {
-            base = await base.getDirectoryHandle("data", { create: true });
+            // HACK: If there are enough files, it's almost certainly not a directory that contains collections. It's probably the user's data instead
+            if (dirs.includes(".git") || dirs.includes("data") || alls.length > 100) {
+                base = await base.getDirectoryHandle("data", { create: true });
+            }
         }
     }
     for (let part of pathStr.split("/")) {
@@ -506,6 +578,13 @@ export const getFileStorage = lazy(async function getFileStorage(): Promise<File
     return wrapHandle(handle);
 });
 export function resetStorageLocation() {
+    if (opfsEnabled) {
+        // Don't delete previous folder — listPrivateFolders / pickPrivateFolder still need it. Just point
+        // "current" at a fresh timestamp-named one so the next reload starts clean.
+        setCurrentOpfsFolder(new Date().toISOString().replace(/[:.]/g, "-"));
+        window.location.reload();
+        return;
+    }
     localStorage.removeItem(getFileAPIKey());
     try { localStorage.removeItem(remoteConfigKey()); } catch { /* ignore */ }
     window.location.reload();

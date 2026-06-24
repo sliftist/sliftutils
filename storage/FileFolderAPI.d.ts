@@ -106,6 +106,10 @@ export declare class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
     }): Promise<DirectoryWrapper>;
     [Symbol.asyncIterator](): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
 }
+export declare function usePrivateFileSystem(): void;
+export declare function isPrivateFileSystemActive(): boolean;
+export declare function listPrivateFolders(): Promise<string[]>;
+export declare function pickPrivateFolder(name: string): void;
 export declare const getDirectoryHandle: {
     (): Promise<DirectoryWrapper>;
     reset(): void;
