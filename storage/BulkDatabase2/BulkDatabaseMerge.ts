@@ -359,6 +359,7 @@ async function executeBatch(
         }
         if (!contributes) continue;
 
+        let bytesRead = 0;
         for (let fi = 0; fi < plans.length; fi++) {
             const plan = plans[fi];
             for (let ci = 0; ci < plan.columns.length; ci++) {
@@ -373,9 +374,11 @@ async function executeBatch(
                         throw new Error(`Expected ${run.byteLength} bytes from source #${si} (${sourceNames[si]}) column ${col.name} rows [${run.sourceStartRow}, ${run.sourceEndRow}), got ${bytes.length}`);
                     }
                     bytes.copy(target.blob, target.dataStart + run.outputByteStart);
+                    bytesRead += bytes.length;
                 }
             }
         }
+        log(`${magenta("input")} ${sourceNames[si]}: ${fmtBytes(bytesRead)} read`);
     }
 
     // Assemble + write each output file in this batch.
