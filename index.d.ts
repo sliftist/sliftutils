@@ -936,6 +936,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         streamFoldHardLimitBytes: number;
         writeFlushMaxDelayMs: number;
         fileSetPollIntervalMs: number;
+        deleteDeferMs: number;
         memoryFlushHeapBytes: number;
         memoryFlushMinCollectionBytes: number;
         memoryFlushThrottleMs: number;

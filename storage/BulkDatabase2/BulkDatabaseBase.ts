@@ -57,6 +57,12 @@ export const bulkDatabase2Timing = {
     // the whole stream file per write.
     writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
     fileSetPollIntervalMs: 30 * 60 * 1000,
+    // Defer deletion of a merge's consumed inputs by this long. The OS may not durably flush the new
+    // outputs immediately, so if we deleted the inputs and crashed before the writes settled we'd lose
+    // data. Within the window the inputs sit as duplicates of the outputs; if we never crash, the timer
+    // fires and removes them. If we DO crash before the timer, the duplicates stay until the next
+    // key-stratify pass (high duplicate-key fraction → it merges them again, dedup completes).
+    deleteDeferMs: 15 * 60 * 1000,
     memoryFlushHeapBytes: 1500 * 1024 * 1024,
     memoryFlushMinCollectionBytes: 100 * 1024 * 1024,
     memoryFlushThrottleMs: 15 * 60 * 1000,
@@ -628,7 +634,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false, forceDeleteStreams = false): Promise<boolean> {
         const storage = await this.storage();
         const timestamp = nextFileTime();
-        const now = Date.now();
 
         const consumedBulk: BulkFileInfo[] = [];
         const bulkReaders: BaseBulkDatabaseReader[] = [];
@@ -702,15 +707,30 @@ export class BulkDatabaseBase<T extends { key: string }> {
         for (const line of steps) console.log(line);
         console.groupEnd();
 
-        const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
-        for (const f of consumedBulk) await remove(f.fileName);
-        for (const f of streamFiles) {
-            if (await this.canDeleteStream(f, now, streamData.sizes, forceDeleteStreams)) await remove(f.fileName);
-        }
-
-        // File set changed — rebuild + swap. After the swap, consumed files' block-cache entries are
-        // evicted (no reader will request them now).
+        // Rebuild + swap NOW so the index sees the new outputs; the old inputs are still on disk until
+        // the deferred-delete timer fires (the index briefly serves both, resolved by time so reads are
+        // correct). Block-cache eviction for inputs happens on the SECOND rebuild after deletion.
         await this.triggerRebuild();
+
+        // Deferred delete: give the FS time to durably flush new writes before removing the inputs.
+        // If we crash before the timer fires, the inputs survive as duplicates and a later key-stratify
+        // pass dedupes them. We DON'T await this — the merge returns "done" as soon as the new outputs
+        // are written and the index is swapped in.
+        const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
+        const timer = setTimeout(() => {
+            void (async () => {
+                try {
+                    for (const f of consumedBulk) await remove(f.fileName);
+                    for (const f of streamFiles) {
+                        if (await this.canDeleteStream(f, Date.now(), streamData.sizes, forceDeleteStreams)) await remove(f.fileName);
+                    }
+                    await this.triggerRebuild();
+                } catch (e) {
+                    console.warn(`${this.name}: deferred delete of consumed merge inputs failed: ${(e as Error).message}`);
+                }
+            })();
+        }, bulkDatabase2Timing.deleteDeferMs);
+        (timer as { unref?: () => void }).unref?.();
         return newNames.length > 0 || carriedDeletes > 0;
     }
 

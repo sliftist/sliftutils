@@ -12,6 +12,7 @@ export declare const bulkDatabase2Timing: {
     streamFoldHardLimitBytes: number;
     writeFlushMaxDelayMs: number;
     fileSetPollIntervalMs: number;
+    deleteDeferMs: number;
     memoryFlushHeapBytes: number;
     memoryFlushMinCollectionBytes: number;
     memoryFlushThrottleMs: number;
