@@ -46,5 +46,6 @@ export declare function runPlannedMerge(config: {
 }): Promise<{
     outputs: PlannedMergeOutput[];
     carriedDeletes: Map<string, number>;
+    usedSourceNames: Set<string>;
 }>;
 export {};

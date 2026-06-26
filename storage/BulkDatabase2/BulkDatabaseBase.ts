@@ -657,6 +657,23 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const storage = await this.storage();
         const timestamp = nextFileTime();
 
+        // The caller's bulkFiles came from a `listFiles()` snapshot. Between then and now any file
+        // could be gone (another tab's deferred delete, manual cleanup). The subCaches reader for a
+        // deleted file is silently stale — its in-memory metadata still resolves, but the very next
+        // getRange against disk throws. Re-verify existence up-front and drop the cache entry for
+        // anything that vanished, so we don't even try to plan around a ghost file.
+        const verifiedBulkFiles = (await Promise.all(bulkFiles.map(async f => {
+            try {
+                const info = await storage.getInfo(f.fileName);
+                if (!info) { this.subCaches.bulk.delete(f.fileName); return undefined; }
+                return f;
+            } catch {
+                this.subCaches.bulk.delete(f.fileName);
+                return undefined;
+            }
+        }))).filter((f): f is BulkFileInfo => f !== undefined);
+        bulkFiles = verifiedBulkFiles;
+
         const consumedBulk: BulkFileInfo[] = [];
         const bulkReaders: BaseBulkDatabaseReader[] = [];
         await Promise.all(bulkFiles.map(async f => {
@@ -734,6 +751,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // correct). Block-cache eviction for inputs happens on the SECOND rebuild after deletion.
         await this.triggerRebuild();
 
+        // Only the sources runPlannedMerge actually used are safe to delete — a source it dropped
+        // mid-plan (file gone, corruption) still holds data we couldn't merge in, so leave it on disk
+        // and let a future merge re-attempt it.
+        const usedConsumedBulk = consumedBulk.filter(f => mergeResult.usedSourceNames.has(f.fileName));
+        const usedStreamFiles = streamFiles.filter(f => mergeResult.usedSourceNames.has(f.fileName) || mergeResult.usedSourceNames.has("(streams)"));
+
         // Deferred delete: give the FS time to durably flush new writes before removing the inputs.
         // If we crash before the timer fires, the inputs survive as duplicates and a later key-stratify
         // pass dedupes them. We DON'T await this — the merge returns "done" as soon as the new outputs
@@ -742,8 +765,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const timer = setTimeout(() => {
             void (async () => {
                 try {
-                    for (const f of consumedBulk) await remove(f.fileName);
-                    for (const f of streamFiles) {
+                    for (const f of usedConsumedBulk) await remove(f.fileName);
+                    for (const f of usedStreamFiles) {
                         if (await this.canDeleteStream(f, Date.now(), streamData.sizes, forceDeleteStreams)) await remove(f.fileName);
                     }
                     await this.triggerRebuild();

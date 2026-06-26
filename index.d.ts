@@ -1249,6 +1249,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseMerge" {
     }): Promise<{
         outputs: PlannedMergeOutput[];
         carriedDeletes: Map<string, number>;
+        usedSourceNames: Set<string>;
     }>;
     export {};
 

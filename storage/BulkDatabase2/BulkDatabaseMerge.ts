@@ -92,16 +92,42 @@ export async function runPlannedMerge(config: {
     // console.log so standalone callers still get identifiable output.
     log?: (line: string) => void;
     writeFile: (data: Buffer) => Promise<{ name: string; size: number }>;
-}): Promise<{ outputs: PlannedMergeOutput[]; carriedDeletes: Map<string, number> }> {
+}): Promise<{ outputs: PlannedMergeOutput[]; carriedDeletes: Map<string, number>; usedSourceNames: Set<string> }> {
     const targetFileBytes = config.targetFileBytes ?? TARGET_FILE_BYTES;
     const targetBatchBytes = config.targetBatchBytes ?? DEFAULT_OUTPUT_BATCH_BYTES;
     const log = config.log ?? (line => console.log(`${blue(config.collectionName)} ${line}`));
 
     // ─────────────────────────────────────────── Phase 1: plan ───────────────────────────────────────────
-    // Aggregate keyTimes + deleteTimes across all sources (max per key).
+    // Load per-source column indexes FIRST so a file that's gone (deleted between caller's listFiles and
+    // now) gets caught here and excluded from the merge entirely. Each source's load is wrapped in a
+    // try/catch; on failure we mark the source bad, log a "skipped" line, and the rest of planning +
+    // execute pretends the source doesn't exist. The caller only deletes inputs that were actually used.
+    const sourceOk = new Array<boolean>(config.sources.length).fill(true);
+    const indexesPerSource: Map<string, ColumnIndex>[] = await Promise.all(config.sources.map(async (src, si) => {
+        const map = new Map<string, ColumnIndex>();
+        try {
+            await Promise.all(src.columns
+                .filter(c => c.column !== KEY_COLUMN)
+                .map(async c => { map.set(c.column, await src.getColumnIndex(c.column)); }));
+        } catch (e) {
+            sourceOk[si] = false;
+            log(`${magenta("skipped")} ${config.sourceNames[si]}: ${(e as Error).message}`);
+        }
+        return map;
+    }));
+    const usedSourceNames = new Set<string>();
+    for (let si = 0; si < config.sources.length; si++) {
+        if (sourceOk[si]) usedSourceNames.add(config.sourceNames[si]);
+    }
+
+    // Aggregate keyTimes + deleteTimes across GOOD sources only (max per key). A bad source's cached
+    // metadata might claim a key as newest, but we can't actually read its cells — letting it win the
+    // time resolution would just drop that key out of the output.
     const deleteTime = new Map<string, number>();
     const keyTime = new Map<string, number>();
-    for (const src of config.sources) {
+    for (let si = 0; si < config.sources.length; si++) {
+        if (!sourceOk[si]) continue;
+        const src = config.sources[si];
         for (const [k, t] of src.keyTimes) {
             const prev = keyTime.get(k);
             if (prev === undefined || t > prev) keyTime.set(k, t);
@@ -127,27 +153,18 @@ export async function runPlannedMerge(config: {
         if (dT >= sT) carriedDeletes.set(k, dT);
     }
 
-    // All distinct value columns (KEY_COLUMN excluded — it's added at file-assembly time). Order: first-
-    // seen across sources, matching the existing builders.
+    // All distinct value columns from GOOD sources (KEY_COLUMN excluded — it's added at file-assembly
+    // time). Order: first-seen, matching the existing builders.
     const allColumns: string[] = [];
     const seenCols = new Set<string>();
-    for (const src of config.sources) {
-        for (const c of src.columns) {
+    for (let si = 0; si < config.sources.length; si++) {
+        if (!sourceOk[si]) continue;
+        for (const c of config.sources[si].columns) {
             if (c.column === KEY_COLUMN || seenCols.has(c.column)) continue;
             seenCols.add(c.column);
             allColumns.push(c.column);
         }
     }
-
-    // Load every (source, column) index in parallel — small data (offsets+types), no values pulled. Each
-    // index is kept for the executor too, so it can read contiguous row-ranges from the right source.
-    const indexesPerSource: Map<string, ColumnIndex>[] = await Promise.all(config.sources.map(async src => {
-        const map = new Map<string, ColumnIndex>();
-        await Promise.all(allColumns.map(async col => {
-            map.set(col, await src.getColumnIndex(col));
-        }));
-        return map;
-    }));
 
     // For each live key, for each column, find the winning source: among sources that have this key, the
     // one whose keyTime is largest AND whose column-index reports non-ABSENT. Record source + sourceRow +
@@ -161,6 +178,7 @@ export async function runPlannedMerge(config: {
             let bestTime = -Infinity;
             let best: CellChoice | undefined;
             for (let si = 0; si < config.sources.length; si++) {
+                if (!sourceOk[si]) continue;
                 const src = config.sources[si];
                 const t = src.keyTimes.get(key);
                 if (t === undefined) continue;
@@ -251,7 +269,7 @@ export async function runPlannedMerge(config: {
     const writtenBytes = outputs.reduce((a, o) => a + o.size, 0);
     log(`${magenta("execute")}: ${outputs.length} file(s), ${fmtBytes(writtenBytes)} written`);
 
-    return { outputs, carriedDeletes };
+    return { outputs, carriedDeletes, usedSourceNames };
 }
 
 function buildOutputPlan(
