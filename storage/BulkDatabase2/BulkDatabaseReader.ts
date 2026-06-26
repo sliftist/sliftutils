@@ -7,6 +7,7 @@ import { blue, red } from "socket-function/src/formatting/logColors";
 const NULL = String.fromCharCode(0);
 const LOAD_SIGNAL = NULL + "load";
 const OVERLAY_SIGNAL = NULL + "overlay";
+const COMPACTING_SIGNAL = NULL + "compacting";
 const TRIGGER_THROTTLE_FIRST_STEP_MS = 16;
 
 function nullJoin(a: string, b: string): string {
@@ -86,6 +87,22 @@ export class BulkDatabaseReader<T extends { key: string }> {
         const st = this.index?.streamTimes.get(key);
         if (st !== undefined) return st;
         return -Infinity;
+    }
+
+    // Counter (so concurrent / nested merges in the same instance compose correctly). Signal fires
+    // immediately, not through the trigger throttle — UI spinners should show right away.
+    private compactingCount = 0;
+    beginCompaction(): void {
+        this.compactingCount++;
+        if (this.compactingCount === 1) this.cfg.deps.invalidate(COMPACTING_SIGNAL);
+    }
+    endCompaction(): void {
+        this.compactingCount--;
+        if (this.compactingCount === 0) this.cfg.deps.invalidate(COMPACTING_SIGNAL);
+    }
+    isCompactingSync(): boolean {
+        this.cfg.deps.observe(COMPACTING_SIGNAL);
+        return this.compactingCount > 0;
     }
 
     private notifyOverlayMutation(key: string, columns: Iterable<string> | "all"): void {

@@ -854,6 +854,13 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
         /** Reactive: whether a whole column is loaded yet (see isFieldLoadedSync). */
         isColumnLoadedSync<Column extends keyof T>(column: Column): boolean;
         /**
+         * Reactive: true while a merge is rewriting this collection's files (background `maybeMerge` or
+         * an explicit `compact`/`merge`/`tryMergeNow`). Becomes false as soon as the new index is swapped
+         * in — the deferred-delete cleanup window is NOT counted. Use this in a UI to show a per-database
+         * "compacting…" indicator.
+         */
+        isCompactingSync(): boolean;
+        /**
          * Whether a row (key) is currently being watched by some reactive observer (getSingleFieldObjSync /
          * getSingleFieldSync). Lets callers skip per-row work when nothing's watching. Non-reactive query;
          * returns true if the backend can't tell.
@@ -1030,6 +1037,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private fileLogicalSize;
         private handleUnreadableFile;
         private mergeFileSet;
+        private mergeFileSetInner;
         private canDeleteStream;
         private mergeSpacingDelay;
         private testMerge;
@@ -1059,6 +1067,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         }[] | undefined;
         isFieldLoadedSync<C extends keyof T>(key: string, column: C): boolean;
         isColumnLoadedSync<C extends keyof T>(column: C): boolean;
+        isCompactingSync(): boolean;
         getColumnInfo(): Promise<{
             column: string;
             byteSize: number;
@@ -1279,6 +1288,10 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseReader" {
         isKeyWatched(key: string): boolean;
         isLiveNow(key: string): boolean;
         localTime(key: string): number;
+        private compactingCount;
+        beginCompaction(): void;
+        endCompaction(): void;
+        isCompactingSync(): boolean;
         private notifyOverlayMutation;
         getKeys(): Promise<string[]>;
         getColumn<C extends keyof T>(column: C): Promise<{

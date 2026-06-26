@@ -632,6 +632,15 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // we trigger an index rebuild + atomic swap; once swap completes, the consumed files' block-cache
     // entries are evicted (no consumer can ask for them now).
     private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false, forceDeleteStreams = false): Promise<boolean> {
+        this.reader.beginCompaction();
+        try {
+            return await this.mergeFileSetInner(bulkFiles, streamFiles, includesOldest, forceDeleteStreams);
+        } finally {
+            this.reader.endCompaction();
+        }
+    }
+
+    private async mergeFileSetInner(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest: boolean, forceDeleteStreams: boolean): Promise<boolean> {
         const storage = await this.storage();
         const timestamp = nextFileTime();
 
@@ -930,6 +939,13 @@ export class BulkDatabaseBase<T extends { key: string }> {
     public isColumnLoadedSync<C extends keyof T>(column: C): boolean {
         void this.syncSetup();
         return this.reader.isColumnLoadedSync(column);
+    }
+
+    // Reactive: true while a merge is rewriting this collection's files. Use this in UI to show a
+    // "compacting…" indicator. Counts both background merges (maybeMerge) and explicit compact/merge
+    // calls. Becomes false once the new index is swapped in (the deferred-delete window is NOT counted).
+    public isCompactingSync(): boolean {
+        return this.reader.isCompactingSync();
     }
 
     public async getColumnInfo() {

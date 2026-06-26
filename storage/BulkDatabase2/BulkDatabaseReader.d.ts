@@ -31,6 +31,10 @@ export declare class BulkDatabaseReader<T extends {
     isKeyWatched(key: string): boolean;
     isLiveNow(key: string): boolean;
     localTime(key: string): number;
+    private compactingCount;
+    beginCompaction(): void;
+    endCompaction(): void;
+    isCompactingSync(): boolean;
     private notifyOverlayMutation;
     getKeys(): Promise<string[]>;
     getColumn<C extends keyof T>(column: C): Promise<{

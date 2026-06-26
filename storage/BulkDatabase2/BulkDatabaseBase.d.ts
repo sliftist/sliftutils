@@ -106,6 +106,7 @@ export declare class BulkDatabaseBase<T extends {
     private fileLogicalSize;
     private handleUnreadableFile;
     private mergeFileSet;
+    private mergeFileSetInner;
     private canDeleteStream;
     private mergeSpacingDelay;
     private testMerge;
@@ -135,6 +136,7 @@ export declare class BulkDatabaseBase<T extends {
     }[] | undefined;
     isFieldLoadedSync<C extends keyof T>(key: string, column: C): boolean;
     isColumnLoadedSync<C extends keyof T>(column: C): boolean;
+    isCompactingSync(): boolean;
     getColumnInfo(): Promise<{
         column: string;
         byteSize: number;
