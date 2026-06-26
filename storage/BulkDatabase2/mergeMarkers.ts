@@ -15,6 +15,7 @@
 //      the marker itself (kept around briefly so a concurrent reader still excludes the files consistently).
 
 import type { FileStorage } from "../FileFolderAPI";
+import { blue, magenta } from "socket-function/src/formatting/logColors";
 
 const MARKER_PREFIX = ".delete-marker_";
 const MARKER_GRACE_MS = 5 * 60 * 1000;
@@ -67,7 +68,7 @@ export function markerExclusions(markers: DeleteMarker[]): Set<string> {
 
 // Act on each marker (see file header). Idempotent and best-effort: every removal is guarded, so two
 // processes (or two reads) running this at once just race to the same already-correct end state.
-export async function processDeleteMarkers(storage: FileStorage, markers: DeleteMarker[], allNames: string[]): Promise<void> {
+export async function processDeleteMarkers(name: string, storage: FileStorage, markers: DeleteMarker[], allNames: string[]): Promise<void> {
     const present = new Set(allNames);
     const now = Date.now();
     for (const marker of markers) {
@@ -81,9 +82,12 @@ export async function processDeleteMarkers(storage: FileStorage, markers: Delete
         }
         const replacedExists = marker.replacedBy.length > 0 && marker.replacedBy.every(n => present.has(n));
         if (replacedExists || now - marker.time > MARKER_GRACE_MS) {
+            const reason = replacedExists ? `replacements landed` : `marker aged ${Math.round((now - marker.time) / 1000)}s`;
+            let deleted = 0;
             for (const n of stillPresent) {
-                try { await storage.remove(n); } catch { /* already gone */ }
+                try { await storage.remove(n); deleted++; } catch { /* already gone */ }
             }
+            if (deleted) console.log(`${blue(name)} ${magenta("retire")}: deleted ${deleted} merged-away input file(s) (${reason})`);
         }
     }
 }

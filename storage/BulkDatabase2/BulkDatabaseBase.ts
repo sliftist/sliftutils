@@ -573,7 +573,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const storage = await this.storage();
         const names = await storage.getKeys();
         const markers = await readDeleteMarkers(storage, names);
-        if (markers.length) await processDeleteMarkers(storage, markers, names);
+        if (markers.length) await processDeleteMarkers(this.name, storage, markers, names);
     });
 
     private async writeBulkFile(rows: Record<string, unknown>[]): Promise<void> {
