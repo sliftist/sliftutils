@@ -903,10 +903,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
          * whether it bailed because another tab/process holds the merge lock — so a scheduler can call this
          * (e.g. every 30 minutes) and tell "nothing to do" from "someone else is already merging".
          */
-        tryMergeNow(): Promise<{
-            merged: boolean;
-            lockFailed: boolean;
-        }>;
+        tryMergeNow(): Promise<void>;
         /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
          * most callers want compact() or tryMergeNow(). */
         merge(timeLo: number, timeHi: number): Promise<void>;
@@ -943,7 +940,6 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         streamFoldHardLimitBytes: number;
         writeFlushMaxDelayMs: number;
         fileSetPollIntervalMs: number;
-        deleteDeferMs: number;
         memoryFlushHeapBytes: number;
         memoryFlushMinCollectionBytes: number;
         memoryFlushThrottleMs: number;
@@ -1026,12 +1022,10 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
             key: string;
         })[]): Promise<void>;
         private listFiles;
+        private processMarkers;
         private writeBulkFile;
         private maybeMerge;
-        tryMergeNow(): Promise<{
-            merged: boolean;
-            lockFailed: boolean;
-        }>;
+        tryMergeNow: () => Promise<void>;
         compact(): Promise<void>;
         merge(timeLo: number, timeHi: number): Promise<void>;
         private readBulkHeader;
@@ -1041,7 +1035,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private mergeFileSetInner;
         private canDeleteStream;
         private mergeSpacingDelay;
-        private testMerge;
+        private testMergeINTERNAL_DO_NOT_CALL;
         private findDuplicateGroups;
         getSingleField<C extends keyof T>(key: string, column: C): Promise<T[C] | undefined>;
         getSingleFieldObj<C extends keyof T>(key: string, column: C): Promise<{
@@ -1535,6 +1529,25 @@ declare module "sliftutils/storage/BulkDatabase2/mergeLock" {
     export declare function tryAcquireMergeFileLock(storage: FileStorage, holderId: string): Promise<boolean>;
     export declare function startMergeFileLockHeartbeat(storage: FileStorage, holderId: string): () => void;
     export declare function releaseMergeFileLock(storage: FileStorage, holderId: string): Promise<void>;
+
+}
+
+declare module "sliftutils/storage/BulkDatabase2/mergeMarkers" {
+    import type { FileStorage } from "../FileFolderAPI";
+    export type DeleteMarker = {
+        fileName: string;
+        deleteFiles: string[];
+        replacedBy: string[];
+        time: number;
+    };
+    export declare function isMarkerFile(name: string): boolean;
+    export declare function writeDeleteMarker(storage: FileStorage, config: {
+        deleteFiles: string[];
+        replacedBy: string[];
+    }): Promise<void>;
+    export declare function readDeleteMarkers(storage: FileStorage, allNames: string[]): Promise<DeleteMarker[]>;
+    export declare function markerExclusions(markers: DeleteMarker[]): Set<string>;
+    export declare function processDeleteMarkers(storage: FileStorage, markers: DeleteMarker[], allNames: string[]): Promise<void>;
 
 }
 

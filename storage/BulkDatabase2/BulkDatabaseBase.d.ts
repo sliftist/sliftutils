@@ -12,7 +12,6 @@ export declare const bulkDatabase2Timing: {
     streamFoldHardLimitBytes: number;
     writeFlushMaxDelayMs: number;
     fileSetPollIntervalMs: number;
-    deleteDeferMs: number;
     memoryFlushHeapBytes: number;
     memoryFlushMinCollectionBytes: number;
     memoryFlushThrottleMs: number;
@@ -95,12 +94,10 @@ export declare class BulkDatabaseBase<T extends {
         key: string;
     })[]): Promise<void>;
     private listFiles;
+    private processMarkers;
     private writeBulkFile;
     private maybeMerge;
-    tryMergeNow(): Promise<{
-        merged: boolean;
-        lockFailed: boolean;
-    }>;
+    tryMergeNow: () => Promise<void>;
     compact(): Promise<void>;
     merge(timeLo: number, timeHi: number): Promise<void>;
     private readBulkHeader;
@@ -110,7 +107,7 @@ export declare class BulkDatabaseBase<T extends {
     private mergeFileSetInner;
     private canDeleteStream;
     private mergeSpacingDelay;
-    private testMerge;
+    private testMergeINTERNAL_DO_NOT_CALL;
     private findDuplicateGroups;
     getSingleField<C extends keyof T>(key: string, column: C): Promise<T[C] | undefined>;
     getSingleFieldObj<C extends keyof T>(key: string, column: C): Promise<{

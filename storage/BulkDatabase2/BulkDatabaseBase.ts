@@ -19,6 +19,7 @@ import { STREAM_EXTENSION, frameDeletes, frameRows, streamReaderFromEntries } fr
 import { broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, connect as syncConnect, isSyncSupported, RemoteWrite } from "./syncClient";
 import { DELETED } from "./WriteOverlay";
 import { releaseMergeFileLock, releaseMergeLock, startMergeFileLockHeartbeat, tryAcquireMergeFileLock, tryAcquireMergeLock } from "./mergeLock";
+import { markerExclusions, processDeleteMarkers, readDeleteMarkers, writeDeleteMarker } from "./mergeMarkers";
 import {
     BulkFileInfo,
     LoadedIndex,
@@ -66,12 +67,6 @@ export const bulkDatabase2Timing = {
     // the whole stream file per write.
     writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
     fileSetPollIntervalMs: 30 * 60 * 1000,
-    // Defer deletion of a merge's consumed inputs by this long. The OS may not durably flush the new
-    // outputs immediately, so if we deleted the inputs and crashed before the writes settled we'd lose
-    // data. Within the window the inputs sit as duplicates of the outputs; if we never crash, the timer
-    // fires and removes them. If we DO crash before the timer, the duplicates stay until the next
-    // key-stratify pass (high duplicate-key fraction → it merges them again, dedup completes).
-    deleteDeferMs: 15 * 60 * 1000,
     memoryFlushHeapBytes: 1500 * 1024 * 1024,
     memoryFlushMinCollectionBytes: 100 * 1024 * 1024,
     memoryFlushThrottleMs: 15 * 60 * 1000,
@@ -550,9 +545,16 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private async listFiles(): Promise<{ bulkFiles: BulkFileInfo[]; streamFiles: StreamFileInfo[] }> {
         const storage = await this.storage();
         const names = await storage.getKeys();
+        // A consumed-merge input is hidden from reads the instant its deletion marker exists — that's
+        // what stops it from being re-read and re-merged. Physical deletion + marker cleanup runs on a
+        // throttle (not inline) so a read isn't slowed by it.
+        const markers = await readDeleteMarkers(storage, names);
+        const excluded = markerExclusions(markers);
+        if (markers.length) void this.processMarkers();
         const bulkFiles: BulkFileInfo[] = [];
         const streamFiles: StreamFileInfo[] = [];
         for (const n of names) {
+            if (excluded.has(n)) continue;
             if (n.endsWith(FILE_EXTENSION)) { const p = parseFileName(n); if (p) bulkFiles.push(p); }
             else if (n.endsWith(STREAM_EXTENSION)) { const p = parseStreamFileName(n); if (p) streamFiles.push(p); }
         }
@@ -563,6 +565,16 @@ export class BulkDatabaseBase<T extends { key: string }> {
         sort(streamFiles, f => f.timestamp);
         return { bulkFiles, streamFiles };
     }
+
+    // Throttled marker housekeeping: delete inputs whose replacement outputs have landed (or whose
+    // marker has aged out) and retire fulfilled markers. Triggered from listFiles, so it's gated to
+    // avoid a delete storm under heavy reads.
+    private processMarkers = throttleFunction(30 * 1000, async () => {
+        const storage = await this.storage();
+        const names = await storage.getKeys();
+        const markers = await readDeleteMarkers(storage, names);
+        if (markers.length) await processDeleteMarkers(storage, markers, names);
+    });
 
     private async writeBulkFile(rows: Record<string, unknown>[]): Promise<void> {
         const storage = await this.storage();
@@ -809,36 +821,29 @@ export class BulkDatabaseBase<T extends { key: string }> {
         for (const line of steps) console.log(line);
         console.groupEnd();
 
-        // Rebuild + swap NOW so the index sees the new outputs; the old inputs are still on disk until
-        // the deferred-delete timer fires (the index briefly serves both, resolved by time so reads are
-        // correct). Block-cache eviction for inputs happens on the SECOND rebuild after deletion.
-        await this.triggerRebuild();
-
-        // Only the sources runPlannedMerge actually used are safe to delete — a source it dropped
-        // mid-plan (file gone, corruption) still holds data we couldn't merge in, so leave it on disk
-        // and let a future merge re-attempt it.
+        // Only the sources runPlannedMerge actually used can be retired — a source it dropped mid-plan
+        // (file gone, corruption) still holds data we couldn't merge in, so leave it on disk and let a
+        // future merge re-attempt it.
         const usedConsumedBulk = consumedBulk.filter(f => mergeResult.usedSourceNames.has(f.fileName));
         const usedStreamFiles = streamFiles.filter(f => mergeResult.usedSourceNames.has(f.fileName) || mergeResult.usedSourceNames.has("(streams)"));
+        // A stream may still be appended to after we read it (the writer hasn't sealed/moved on); only
+        // retire streams canDeleteStream clears — the rest stay live and a later merge re-folds them
+        // once sealed. Bulk files are immutable, so a used one is always safe to retire.
+        const deletableStreams: string[] = [];
+        for (const f of usedStreamFiles) {
+            if (await this.canDeleteStream(f, Date.now(), streamData.sizes, forceDeleteStreams)) deletableStreams.push(f.fileName);
+        }
+        const deleteFiles = [...usedConsumedBulk.map(f => f.fileName), ...deletableStreams];
 
-        // Deferred delete: give the FS time to durably flush new writes before removing the inputs.
-        // If we crash before the timer fires, the inputs survive as duplicates and a later key-stratify
-        // pass dedupes them. We DON'T await this — the merge returns "done" as soon as the new outputs
-        // are written and the index is swapped in.
-        const remove = async (name: string) => { try { await storage.remove(name); } catch { /* already gone */ } };
-        const timer = setTimeout(() => {
-            void (async () => {
-                try {
-                    for (const f of usedConsumedBulk) await remove(f.fileName);
-                    for (const f of usedStreamFiles) {
-                        if (await this.canDeleteStream(f, Date.now(), streamData.sizes, forceDeleteStreams)) await remove(f.fileName);
-                    }
-                    await this.triggerRebuild();
-                } catch (e) {
-                    console.warn(`${this.name}: deferred delete of consumed merge inputs failed: ${(e as Error).message}`);
-                }
-            })();
-        }, bulkDatabase2Timing.deleteDeferMs);
-        (timer as { unref?: () => void }).unref?.();
+        // Write a deletion marker instead of deleting inline. From the next read on, listFiles hides
+        // these inputs (so they're never re-merged — the loop fix), and processMarkers removes them
+        // physically once the outputs have landed or the marker ages out. Marker BEFORE the rebuild so
+        // the freshly-swapped index already excludes the retired inputs.
+        if (deleteFiles.length) await writeDeleteMarker(storage, { deleteFiles, replacedBy: outNames });
+
+        // Rebuild + swap so the index sees the new outputs and drops the retired inputs. Block-cache
+        // eviction for the dropped inputs happens here (they're no longer in the new index's fileSet).
+        await this.triggerRebuild();
         return newNames.length > 0 || carriedDeletes > 0;
     }
 

@@ -138,10 +138,7 @@ export interface IBulkDatabase2<T extends {
      * whether it bailed because another tab/process holds the merge lock — so a scheduler can call this
      * (e.g. every 30 minutes) and tell "nothing to do" from "someone else is already merging".
      */
-    tryMergeNow(): Promise<{
-        merged: boolean;
-        lockFailed: boolean;
-    }>;
+    tryMergeNow(): Promise<void>;
     /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
      * most callers want compact() or tryMergeNow(). */
     merge(timeLo: number, timeHi: number): Promise<void>;
