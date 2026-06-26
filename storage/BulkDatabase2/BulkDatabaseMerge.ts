@@ -396,7 +396,7 @@ async function executeBatch(
                 }
             }
         }
-        log(`${magenta("input")} ${sourceNames[si]}: ${fmtBytes(bytesRead)} read`);
+        log(`${magenta("input")} ${si + 1}/${sources.length} ${sourceNames[si]}: ${fmtBytes(bytesRead)} read`);
     }
 
     // Assemble + write each output file in this batch.
@@ -408,7 +408,7 @@ async function executeBatch(
         const { name, size } = await writeFile(fileBuf);
         const sourcesNamed = new Map<string, number>();
         for (const [si, n] of plan.sourceCounts) sourcesNamed.set(sourceNames[si], n);
-        log(`${magenta("output")}: ${formatNumber(plan.keys.length)} rows from ${plan.sourceCounts.size} input(s), ${fmtBytes(size)}`);
+        log(`${magenta("output")} ${fi + 1}/${plans.length}: ${formatNumber(plan.keys.length)} rows from ${plan.sourceCounts.size} input(s), ${fmtBytes(size)}`);
         outputs.push({ name, minKey: plan.minKey, maxKey: plan.maxKey, rowCount: plan.keys.length, size, sources: sourcesNamed });
     }
     return outputs;
