@@ -2,7 +2,7 @@ import type { FileStorage } from "../FileFolderAPI";
 export declare const BULK_ROOT_FOLDER = "bulkDatabases2";
 export declare const bulkDatabase2Timing: {
     streamSealAgeMs: number;
-    mergeCheckIntervalMs: number;
+    visibleMergeIntervalMs: number;
     mergeSpacingMs: number;
     firstMergeTriggerFiles: number;
     firstMergeTriggerRangeMs: number;
@@ -36,6 +36,7 @@ export declare class BulkDatabaseBase<T extends {
     private storageFactory;
     private config;
     constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory, config?: BulkDatabase2Config);
+    private setupVisibilityMergeCheck;
     private reader;
     private subCaches;
     private pendingAppends;
@@ -46,7 +47,7 @@ export declare class BulkDatabaseBase<T extends {
     private streamFileName;
     private currentStreamFileName;
     private currentStreamFileBytes;
-    private lastMergeCheck;
+    private mergeInFlight;
     private streamRowsOnDisk;
     private streamBytesOnDisk;
     private fileSetPollTimer;
@@ -96,7 +97,7 @@ export declare class BulkDatabaseBase<T extends {
     private listFiles;
     private writeBulkFile;
     private maybeMerge;
-    tryMergeNow: () => Promise<{
+    tryMergeNow(): Promise<{
         merged: boolean;
         lockFailed: boolean;
     }>;

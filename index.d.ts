@@ -933,7 +933,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     export declare const BULK_ROOT_FOLDER = "bulkDatabases2";
     export declare const bulkDatabase2Timing: {
         streamSealAgeMs: number;
-        mergeCheckIntervalMs: number;
+        visibleMergeIntervalMs: number;
         mergeSpacingMs: number;
         firstMergeTriggerFiles: number;
         firstMergeTriggerRangeMs: number;
@@ -967,6 +967,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private storageFactory;
         private config;
         constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory, config?: BulkDatabase2Config);
+        private setupVisibilityMergeCheck;
         private reader;
         private subCaches;
         private pendingAppends;
@@ -977,7 +978,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private streamFileName;
         private currentStreamFileName;
         private currentStreamFileBytes;
-        private lastMergeCheck;
+        private mergeInFlight;
         private streamRowsOnDisk;
         private streamBytesOnDisk;
         private fileSetPollTimer;
@@ -1027,7 +1028,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private listFiles;
         private writeBulkFile;
         private maybeMerge;
-        tryMergeNow: () => Promise<{
+        tryMergeNow(): Promise<{
             merged: boolean;
             lockFailed: boolean;
         }>;
@@ -1528,8 +1529,12 @@ declare module "sliftutils/storage/BulkDatabase2/blockCache" {
 }
 
 declare module "sliftutils/storage/BulkDatabase2/mergeLock" {
+    import type { FileStorage } from "../FileFolderAPI";
     export declare function tryAcquireMergeLock(collection: string, holderId: string): boolean;
     export declare function releaseMergeLock(collection: string, holderId: string): void;
+    export declare function tryAcquireMergeFileLock(storage: FileStorage, holderId: string): Promise<boolean>;
+    export declare function startMergeFileLockHeartbeat(storage: FileStorage, holderId: string): () => void;
+    export declare function releaseMergeFileLock(storage: FileStorage, holderId: string): Promise<void>;
 
 }
 

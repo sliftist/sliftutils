@@ -18,7 +18,7 @@ import { blue, magenta } from "socket-function/src/formatting/logColors";
 import { STREAM_EXTENSION, frameDeletes, frameRows, streamReaderFromEntries } from "./streamLog";
 import { broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, connect as syncConnect, isSyncSupported, RemoteWrite } from "./syncClient";
 import { DELETED } from "./WriteOverlay";
-import { releaseMergeLock, tryAcquireMergeLock } from "./mergeLock";
+import { releaseMergeFileLock, releaseMergeLock, startMergeFileLockHeartbeat, tryAcquireMergeFileLock, tryAcquireMergeLock } from "./mergeLock";
 import {
     BulkFileInfo,
     LoadedIndex,
@@ -51,7 +51,10 @@ const WRITE_FLUSH_FIRST_STEP_MS = 250;
 
 export const bulkDatabase2Timing = {
     streamSealAgeMs: 10 * 60 * 60 * 1000,
-    mergeCheckIntervalMs: 30 * 60 * 1000,
+    // Wait this long after the tab becomes visible before the first merge check, then check this often
+    // afterwards. Tab being hidden cancels the timers (no merges while in background). Browser-only;
+    // Node compactors (e.g. remoteFileServer) drive their own polling.
+    visibleMergeIntervalMs: 5 * 60 * 1000,
     mergeSpacingMs: 5 * 60 * 1000,
     firstMergeTriggerFiles: 20,
     firstMergeTriggerRangeMs: 3 * 24 * 60 * 60 * 1000,
@@ -170,8 +173,41 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
         this.fileSetPollTimer = setInterval(() => void this.pollFileSet(), bulkDatabase2Timing.fileSetPollIntervalMs);
         (this.fileSetPollTimer as { unref?: () => void }).unref?.();
+        this.setupVisibilityMergeCheck();
         BulkDatabaseBase.liveInstances.add(this);
         BulkDatabaseBase.startMemoryWatchdog();
+    }
+
+    // Every `visibleMergeIntervalMs` of being-visible time, run a merge check. First check fires
+    // `visibleMergeIntervalMs` after the tab becomes visible (not on initial load — gives the user a
+    // moment of session commitment before we start churning the FS), then every interval after. Tab
+    // hiding cancels the timers; visible-again restarts. Node has no document — there we consider
+    // ourselves always-visible and just install the interval directly.
+    private setupVisibilityMergeCheck(): void {
+        let firstTimer: ReturnType<typeof setTimeout> | undefined;
+        let intervalTimer: ReturnType<typeof setInterval> | undefined;
+        const stop = () => {
+            if (firstTimer) { clearTimeout(firstTimer); firstTimer = undefined; }
+            if (intervalTimer) { clearInterval(intervalTimer); intervalTimer = undefined; }
+        };
+        const start = () => {
+            if (firstTimer || intervalTimer) return;
+            firstTimer = setTimeout(() => {
+                firstTimer = undefined;
+                void this.maybeMerge();
+                intervalTimer = setInterval(() => void this.maybeMerge(), bulkDatabase2Timing.visibleMergeIntervalMs);
+                (intervalTimer as { unref?: () => void }).unref?.();
+            }, bulkDatabase2Timing.visibleMergeIntervalMs);
+            (firstTimer as { unref?: () => void }).unref?.();
+        };
+        if (typeof document === "undefined") { start(); return; }
+        try {
+            document.addEventListener("visibilitychange", () => {
+                if (document.visibilityState === "visible") start();
+                else stop();
+            });
+            if (document.visibilityState === "visible") start();
+        } catch { /* not in a DOM context */ }
     }
 
     private reader: BulkDatabaseReader<T>;
@@ -186,7 +222,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private streamFileName: string | undefined;
     private currentStreamFileName: string | undefined;
     private currentStreamFileBytes = 0;
-    private lastMergeCheck = Date.now();
+    // In-process re-entry guard: if a merge is running, additional triggers (visibility timer, writes,
+    // tryMergeNow calls) return immediately instead of queueing. Keeps the visibility-timer firings
+    // from stacking behind a long merge.
+    private mergeInFlight = false;
     // Running counters of stream-tier rows + bytes on disk. Seeded from each LoadedIndex build, then
     // incremented per flush so the fold-trigger checks current data without an extra directory listing.
     private streamRowsOnDisk = 0;
@@ -386,7 +425,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         });
         for (const { time, row } of stamped) syncBroadcast(this.name, { key: row.key as string, time, value: row });
         await this.streamAppend(framed, stamped.length);
-        void this.maybeMerge();
+        void this.maybeMerge({ onlyIfStreamHeavy: true });
     }
 
     public async delete(key: string): Promise<void> {
@@ -402,7 +441,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         });
         for (const { time, key } of stamped) syncBroadcast(this.name, { key, time, deleted: true });
         await this.streamAppend(frameDeletes(stamped), stamped.length);
-        void this.maybeMerge();
+        void this.maybeMerge({ onlyIfStreamHeavy: true });
     }
 
     // Coalesce stream appends on a ramping per-collection schedule (the browser rewrites the whole
@@ -539,11 +578,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     // ── merge policy ─────────────────────────────────────────────────────────────────────────────────
-    private async maybeMerge(): Promise<void> {
+    // Called both periodically (visibility timer) and on writes (with the streamNeedsFold gate so a
+    // small write doesn't drag the merge through). The mergeInFlight check in tryMergeNow skips any
+    // call that arrives while a previous one is still running — so 5-min timer ticks don't pile up.
+    private async maybeMerge(opts: { onlyIfStreamHeavy?: boolean } = {}): Promise<void> {
         if (!await this.automaticCompactionAllowed()) return;
-        const now = Date.now();
-        if (!this.streamNeedsFold() && now - this.lastMergeCheck < bulkDatabase2Timing.mergeCheckIntervalMs) return;
-        this.lastMergeCheck = now;
+        if (opts.onlyIfStreamHeavy && !this.streamNeedsFold()) return;
         try {
             await this.tryMergeNow();
         } catch (e) {
@@ -551,20 +591,38 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
     }
 
-    // Serialized so two concurrent callers (e.g. autocompactor + maybeMerge + user code) never run a
-    // merge in parallel. The merge lock already gives cross-process safety; this is the in-process
-    // sibling. runInSerial queues calls and preserves each one's return value.
-    public tryMergeNow = runInSerial(async (): Promise<{ merged: boolean; lockFailed: boolean }> => {
+    // Returns immediately with { lockFailed: true } if another call is already in flight (same
+    // instance), if the localStorage lock is held by another tab, or if the cross-process file lock
+    // says another process owns it. Otherwise: acquires both locks, runs testMerge, releases.
+    public async tryMergeNow(): Promise<{ merged: boolean; lockFailed: boolean }> {
+        if (this.mergeInFlight) return { merged: false, lockFailed: true };
         if (!tryAcquireMergeLock(this.name, writerId)) return { merged: false, lockFailed: true };
+        const storage = await this.storage();
+        const haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
+        if (!haveFileLock) {
+            releaseMergeLock(this.name, writerId);
+            return { merged: false, lockFailed: true };
+        }
+        this.mergeInFlight = true;
+        const stopHeartbeat = startMergeFileLockHeartbeat(storage, writerId);
         try {
             return { merged: await this.testMerge(), lockFailed: false };
         } finally {
+            stopHeartbeat();
+            await releaseMergeFileLock(storage, writerId);
             releaseMergeLock(this.name, writerId);
+            this.mergeInFlight = false;
         }
-    });
+    }
 
     public async compact(): Promise<void> {
+        if (this.mergeInFlight) return;
         if (!tryAcquireMergeLock(this.name, writerId)) return;
+        const storage = await this.storage();
+        const haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
+        if (!haveFileLock) { releaseMergeLock(this.name, writerId); return; }
+        this.mergeInFlight = true;
+        const stopHeartbeat = startMergeFileLockHeartbeat(storage, writerId);
         try {
             await this.flushPending();
             syncBroadcastSeal(this.name);
@@ -574,7 +632,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
             // can be dropped (nothing left to suppress).
             if (bulkFiles.length + streamFiles.length >= 1) await this.mergeFileSet(bulkFiles, streamFiles, true);
         } finally {
+            stopHeartbeat();
+            await releaseMergeFileLock(storage, writerId);
             releaseMergeLock(this.name, writerId);
+            this.mergeInFlight = false;
         }
     }
 
