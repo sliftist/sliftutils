@@ -1,4 +1,4 @@
-import { sort } from "socket-function/src/misc";
+import { sort, throttleFunction } from "socket-function/src/misc";
 import { runInSerial } from "socket-function/src/batching";
 import { getTimeUnique } from "socket-function/src/bits";
 import { lazy } from "socket-function/src/caching";
@@ -594,26 +594,28 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // Returns immediately with { lockFailed: true } if another call is already in flight (same
     // instance), if the localStorage lock is held by another tab, or if the cross-process file lock
     // says another process owns it. Otherwise: acquires both locks, runs testMerge, releases.
-    public async tryMergeNow(): Promise<{ merged: boolean; lockFailed: boolean }> {
-        if (this.mergeInFlight) return { merged: false, lockFailed: true };
-        if (!tryAcquireMergeLock(this.name, writerId)) return { merged: false, lockFailed: true };
+    public tryMergeNow = throttleFunction(1000, async () => {
+        if (this.mergeInFlight) return;
+        if (!tryAcquireMergeLock(this.name, writerId)) return;
         const storage = await this.storage();
         const haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
         if (!haveFileLock) {
             releaseMergeLock(this.name, writerId);
-            return { merged: false, lockFailed: true };
+            return;
         }
         this.mergeInFlight = true;
         const stopHeartbeat = startMergeFileLockHeartbeat(storage, writerId);
         try {
-            return { merged: await this.testMerge(), lockFailed: false };
+            let t = Date.now();
+            await this.testMergeINTERNAL_DO_NOT_CALL();
+            console.log(`  [autocompact] ${this.name}: merged (${Date.now() - t}ms)`);
         } finally {
             stopHeartbeat();
             await releaseMergeFileLock(storage, writerId);
             releaseMergeLock(this.name, writerId);
             this.mergeInFlight = false;
         }
-    }
+    });
 
     public async compact(): Promise<void> {
         if (this.mergeInFlight) return;
@@ -872,7 +874,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
     //      into one when they fragment or span too wide a time range.
     //   2) Key-stratify: walk all keys in ~KEY_GROUP_BYTES groups; rewrite groups whose duplicate-key
     //      fraction passes DUP_THRESHOLD, highest first.
-    private async testMerge(): Promise<boolean> {
+    // Use tryMerge instead
+    private async testMergeINTERNAL_DO_NOT_CALL(): Promise<boolean> {
         let merged = false;
         await this.flushPending();
         const runMerge = async (bulk: BulkFileInfo[], stream: StreamFileInfo[]): Promise<boolean> => {
