@@ -111,7 +111,10 @@ export async function runPlannedMerge(config: {
                 .map(async c => { map.set(c.column, await src.getColumnIndex(c.column)); }));
         } catch (e) {
             sourceOk[si] = false;
-            log(`${magenta("skipped")} ${config.sourceNames[si]}: ${(e as Error).stack || (e as Error).message}`);
+            log(`${magenta("skipped")} ${config.sourceNames[si]}: ${(e as Error).message}`);
+            // Stack goes straight to console (not the buffered step log) so the merge summary stays
+            // readable but we can still trace where the failure came from.
+            console.log(`${config.collectionName} skipped ${config.sourceNames[si]}:`, (e as Error).stack || e);
         }
         return map;
     }));
