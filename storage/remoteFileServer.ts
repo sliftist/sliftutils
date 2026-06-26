@@ -608,10 +608,13 @@ export async function autocompactBulkDatabases(root: string): Promise<void> {
                 .filter(d => d.isDirectory()).map(d => d.name);
         } catch { continue; } // no bulkDatabases2 here
         for (const name of names) {
+            const start = Date.now();
+            console.log(`  [autocompact] ${name}: starting merge…`);
             try {
                 await getCompactor(baseDir, name).tryMergeNow();
+                console.log(`  [autocompact] ${name}: done (${Date.now() - start}ms)`);
             } catch (e) {
-                console.warn(`  [autocompact] ${name}: failed — ${(e as Error).message}`);
+                console.warn(`  [autocompact] ${name}: failed after ${Date.now() - start}ms — ${(e as Error).message}`);
             }
         }
     }

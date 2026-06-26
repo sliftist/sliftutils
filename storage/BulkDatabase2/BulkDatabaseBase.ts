@@ -618,9 +618,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         this.mergeInFlight = true;
         const stopHeartbeat = startMergeFileLockHeartbeat(storage, writerId);
         try {
-            let t = Date.now();
             await this.testMergeINTERNAL_DO_NOT_CALL();
-            console.log(`  [autocompact] ${this.name}: merged (${Date.now() - t}ms)`);
         } finally {
             stopHeartbeat();
             await releaseMergeFileLock(storage, writerId);
