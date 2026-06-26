@@ -1,4 +1,5 @@
 import { sort } from "socket-function/src/misc";
+import { runInSerial } from "socket-function/src/batching";
 import { getTimeUnique } from "socket-function/src/bits";
 import { lazy } from "socket-function/src/caching";
 import { isNode } from "typesafecss";
@@ -41,6 +42,11 @@ const MAX_INDEX_RELOAD_ATTEMPTS = 3;
 const FIRST_MERGE_BYTES = TARGET_FILE_BYTES / 2;
 const KEY_GROUP_BYTES = 800 * 1024 * 1024;
 const DUP_THRESHOLD = 0.4;
+// Emergency Pass 2 short-circuit: once Pass 1 has had a chance to fold streams, if the bulk tier is
+// big enough AND the overall key duplication fraction is high, do ONE merge across every bulk file
+// instead of the per-key-group walk (which spaces merges 5 min apart — 16 hours for 200 groups).
+const EMERGENCY_DEDUP_BYTES = 512 * 1024 * 1024;
+const EMERGENCY_DEDUP_FRACTION = 0.5;
 const WRITE_FLUSH_FIRST_STEP_MS = 250;
 
 export const bulkDatabase2Timing = {
@@ -545,14 +551,17 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
     }
 
-    public async tryMergeNow(): Promise<{ merged: boolean; lockFailed: boolean }> {
+    // Serialized so two concurrent callers (e.g. autocompactor + maybeMerge + user code) never run a
+    // merge in parallel. The merge lock already gives cross-process safety; this is the in-process
+    // sibling. runInSerial queues calls and preserves each one's return value.
+    public tryMergeNow = runInSerial(async (): Promise<{ merged: boolean; lockFailed: boolean }> => {
         if (!tryAcquireMergeLock(this.name, writerId)) return { merged: false, lockFailed: true };
         try {
             return { merged: await this.testMerge(), lockFailed: false };
         } finally {
             releaseMergeLock(this.name, writerId);
         }
-    }
+    });
 
     public async compact(): Promise<void> {
         if (!tryAcquireMergeLock(this.name, writerId)) return;
@@ -631,14 +640,18 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // leaves duplicates (next merge dedupes) rather than a gap. After the file set changes on disk,
     // we trigger an index rebuild + atomic swap; once swap completes, the consumed files' block-cache
     // entries are evicted (no consumer can ask for them now).
-    private async mergeFileSet(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false, forceDeleteStreams = false): Promise<boolean> {
+    //
+    // Serialized: foldOwnStream + merge(timeLo, timeHi) + testMerge's runMerge all hit this; the lock
+    // covers tryMergeNow/compact but those two paths bypass it. runInSerial queues so they never
+    // collide on the file set.
+    private mergeFileSet = runInSerial(async (bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false, forceDeleteStreams = false): Promise<boolean> => {
         this.reader.beginCompaction();
         try {
             return await this.mergeFileSetInner(bulkFiles, streamFiles, includesOldest, forceDeleteStreams);
         } finally {
             this.reader.endCompaction();
         }
-    }
+    });
 
     private async mergeFileSetInner(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest: boolean, forceDeleteStreams: boolean): Promise<boolean> {
         const storage = await this.storage();
@@ -838,6 +851,33 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 const rb = recent.filter(i => i.kind === "bulk").map(i => (i.file as BulkFileInfo));
                 const rs = recent.filter(i => i.kind === "stream").map(i => (i.file as StreamFileInfo));
                 if (!await runMerge(rb, rs)) return merged;
+            }
+        }
+
+        // Pass 1.5 (emergency dedup): Pass 1 has had its chance. If the bulk tier is fat AND mostly
+        // duplicates, the per-group walk below (5 min spacing per group) takes hours for an extreme
+        // state (1000+ files, 99% dup) — fold every bulk file in one merge and skip the walk.
+        {
+            const { bulkFiles } = await this.listFiles();
+            if (bulkFiles.length >= 2) {
+                const storage = await this.storage();
+                let totalBytes = 0;
+                let totalSlots = 0;
+                const uniqueKeys = new Set<string>();
+                for (const f of bulkFiles) {
+                    try {
+                        const reader = await loadFileReader(this.name, storage, f, this.subCaches.bulk);
+                        totalBytes += reader.totalBytes;
+                        totalSlots += reader.keys.length;
+                        for (const k of reader.keys) uniqueKeys.add(k);
+                    } catch { /* skip unreadable */ }
+                }
+                const dupFraction = totalSlots ? (totalSlots - uniqueKeys.size) / totalSlots : 0;
+                if (totalBytes > EMERGENCY_DEDUP_BYTES && dupFraction > EMERGENCY_DEDUP_FRACTION) {
+                    console.log(`${blue(this.name)} ${magenta("emergency-dedup")}: ${fmtBytes(totalBytes)} across ${bulkFiles.length} bulk file(s), ${Math.round(dupFraction * 100)}% duplicate key-slots — folding all at once`);
+                    if (!await runMerge(bulkFiles, [])) return merged;
+                    return merged;
+                }
             }
         }
 

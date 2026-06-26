@@ -96,7 +96,7 @@ export declare class BulkDatabaseBase<T extends {
     private listFiles;
     private writeBulkFile;
     private maybeMerge;
-    tryMergeNow(): Promise<{
+    tryMergeNow: () => Promise<{
         merged: boolean;
         lockFailed: boolean;
     }>;

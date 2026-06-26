@@ -1027,7 +1027,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private listFiles;
         private writeBulkFile;
         private maybeMerge;
-        tryMergeNow(): Promise<{
+        tryMergeNow: () => Promise<{
             merged: boolean;
             lockFailed: boolean;
         }>;
