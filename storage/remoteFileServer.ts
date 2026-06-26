@@ -616,7 +616,7 @@ export async function autocompactBulkDatabases(root: string): Promise<void> {
     console.log(`  [autocompact] iterating over ${total} collection(s)`);
     for (let i = 0; i < total; i++) {
         const { baseDir, name } = collections[i];
-        const at = `${i + 1} of ${total}`;
+        const at = `${i + 1} / ${total}`;
         const start = Date.now();
         console.log(`  [autocompact] ${at} ${name}: starting merge`);
         try {
