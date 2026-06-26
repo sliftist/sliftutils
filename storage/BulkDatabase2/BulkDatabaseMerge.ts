@@ -111,7 +111,7 @@ export async function runPlannedMerge(config: {
                 .map(async c => { map.set(c.column, await src.getColumnIndex(c.column)); }));
         } catch (e) {
             sourceOk[si] = false;
-            log(`${magenta("skipped")} ${config.sourceNames[si]}: ${(e as Error).message}`);
+            log(`${magenta("skipped")} ${config.sourceNames[si]}: ${(e as Error).stack || (e as Error).message}`);
         }
         return map;
     }));
