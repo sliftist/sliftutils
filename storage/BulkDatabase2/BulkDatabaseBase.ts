@@ -262,7 +262,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 db.reloadFromDisk();
             }
         }
-        if (flushed.length) console.log(`[bulk2] heap ${fmtBytes(usedHeapBytes)} over ${fmtBytes(bulkDatabase2Timing.memoryFlushHeapBytes)} — flushed ${flushed.length} large collection(s): ${flushed.join(", ")}`);
+        if (flushed.length) console.log(`[bulk2] heap ${fmtBytes(usedHeapBytes)} over ${fmtBytes(bulkDatabase2Timing.memoryFlushHeapBytes)} - flushed ${flushed.length} large collection(s): ${flushed.join(", ")}`);
     }
 
     public static clearCache() {
@@ -706,7 +706,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
             return;
         }
-        console.warn(`${this.name}: skipping unreadable bulk file ${file.fileName} (recent — may be in-progress): ${message}`);
+        console.warn(`${this.name}: skipping unreadable bulk file ${file.fileName} (recent - may be in-progress): ${message}`);
     }
 
     // The one merge primitive. Reads + plans + writes outputs before deleting any input, so a crash
@@ -815,7 +815,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const outTotal = outputs.reduce((a, f) => a + f.size, 0);
         log(`${magenta("wrote")}: ${outputs.length} output file(s), ${fmtBytes(outTotal)}${carriedDeletes ? `, ${carriedDeletes} tombstones carried` : ""}`);
 
-        console.group(`${blue(this.name)} ${magenta("merge")}: ${fmtBytes(inTotal)} → ${fmtBytes(outTotal)} (${inputs.length}→${outputs.length} files) in ${formatTime(Date.now() - mergeStartMs)}`);
+        console.group(`${blue(this.name)} ${magenta("merge")}: ${fmtBytes(inTotal)} -> ${fmtBytes(outTotal)} (${inputs.length}->${outputs.length} files) in ${formatTime(Date.now() - mergeStartMs)}`);
         for (const line of steps) console.log(line);
         console.groupEnd();
 
@@ -896,7 +896,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 const sizes = await Promise.all(streamFiles.map(async f => { try { return (await storage.getInfo(f.fileName))?.size ?? 0; } catch { return 0; } }));
                 const totalStreamBytes = sizes.reduce((a, b) => a + b, 0);
                 if (totalStreamBytes > bulkDatabase2Timing.streamFoldHardLimitBytes) {
-                    console.log(`${blue(this.name)} ${magenta("fold")} stream tier ${fmtBytes(totalStreamBytes)} over hard limit ${fmtBytes(bulkDatabase2Timing.streamFoldHardLimitBytes)} — folding all streams now`);
+                    console.log(`${blue(this.name)} ${magenta("fold")} stream tier ${fmtBytes(totalStreamBytes)} over hard limit ${fmtBytes(bulkDatabase2Timing.streamFoldHardLimitBytes)} - folding all streams now`);
                     if (await this.mergeFileSet([], streamFiles, false, true)) merged = true;
                 }
             }
@@ -964,7 +964,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 }
                 const dupFraction = totalSlots ? (totalSlots - uniqueKeys.size) / totalSlots : 0;
                 if (totalBytes > DEDUP_TRIGGER_BYTES && dupFraction > DEDUP_TRIGGER_FRACTION) {
-                    console.log(`${blue(this.name)} ${magenta("dedup")}: ${fmtBytes(totalBytes)} across ${bulkFiles.length} bulk file(s), ${Math.round(dupFraction * 100)}% duplicate key-slots — folding all at once`);
+                    console.log(`${blue(this.name)} ${magenta("dedup")}: ${fmtBytes(totalBytes)} across ${bulkFiles.length} bulk file(s), ${Math.round(dupFraction * 100)}% duplicate key-slots - folding all at once`);
                     if (!await runMerge(bulkFiles, [])) return merged;
                     return merged;
                 }
