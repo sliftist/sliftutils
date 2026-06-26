@@ -42,11 +42,11 @@ const MAX_INDEX_RELOAD_ATTEMPTS = 3;
 const FIRST_MERGE_BYTES = TARGET_FILE_BYTES / 2;
 const KEY_GROUP_BYTES = 800 * 1024 * 1024;
 const DUP_THRESHOLD = 0.4;
-// Emergency Pass 2 short-circuit: once Pass 1 has had a chance to fold streams, if the bulk tier is
-// big enough AND the overall key duplication fraction is high, do ONE merge across every bulk file
-// instead of the per-key-group walk (which spaces merges 5 min apart — 16 hours for 200 groups).
-const EMERGENCY_DEDUP_BYTES = 512 * 1024 * 1024;
-const EMERGENCY_DEDUP_FRACTION = 0.5;
+// Whole-tier dedup short-circuit (after Pass 1): when the bulk tier is over this size AND the overall
+// key duplication fraction is over this threshold, fold every bulk file in one merge instead of the
+// per-key-group walk (which spaces merges 5 min apart — 16 h for 200 groups).
+const DEDUP_TRIGGER_BYTES = 512 * 1024 * 1024;
+const DEDUP_TRIGGER_FRACTION = 0.5;
 const WRITE_FLUSH_FIRST_STEP_MS = 250;
 
 export const bulkDatabase2Timing = {
@@ -941,9 +941,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
         }
 
-        // Pass 1.5 (emergency dedup): Pass 1 has had its chance. If the bulk tier is fat AND mostly
-        // duplicates, the per-group walk below (5 min spacing per group) takes hours for an extreme
-        // state (1000+ files, 99% dup) — fold every bulk file in one merge and skip the walk.
+        // Whole-tier dedup short-circuit (between Pass 1 and the per-group Pass 2): when the bulk tier
+        // is big enough AND mostly duplicates, fold every bulk file in one merge. Avoids the per-group
+        // walk's 5-min spacing × N-groups latency.
         {
             const { bulkFiles } = await this.listFiles();
             if (bulkFiles.length >= 2) {
@@ -960,8 +960,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
                     } catch { /* skip unreadable */ }
                 }
                 const dupFraction = totalSlots ? (totalSlots - uniqueKeys.size) / totalSlots : 0;
-                if (totalBytes > EMERGENCY_DEDUP_BYTES && dupFraction > EMERGENCY_DEDUP_FRACTION) {
-                    console.log(`${blue(this.name)} ${magenta("emergency-dedup")}: ${fmtBytes(totalBytes)} across ${bulkFiles.length} bulk file(s), ${Math.round(dupFraction * 100)}% duplicate key-slots — folding all at once`);
+                if (totalBytes > DEDUP_TRIGGER_BYTES && dupFraction > DEDUP_TRIGGER_FRACTION) {
+                    console.log(`${blue(this.name)} ${magenta("dedup")}: ${fmtBytes(totalBytes)} across ${bulkFiles.length} bulk file(s), ${Math.round(dupFraction * 100)}% duplicate key-slots — folding all at once`);
                     if (!await runMerge(bulkFiles, [])) return merged;
                     return merged;
                 }
