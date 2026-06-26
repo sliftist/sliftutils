@@ -601,23 +601,32 @@ function getCompactor(baseDir: string, name: string): BulkDatabaseBase<{ key: st
 export async function autocompactBulkDatabases(root: string): Promise<void> {
     // Collections live under <baseDir>/bulkDatabases2/<name>/. The app may nest its data under a "data"
     // subfolder (see getFileStorageNested2's heuristic), so look in both <root> and <root>/data.
+    const collections: { baseDir: string; name: string }[] = [];
     for (const baseDir of [root, path.join(root, "data")]) {
-        let names: string[];
         try {
-            names = fs.readdirSync(path.join(baseDir, BULK_ROOT_FOLDER), { withFileTypes: true })
-                .filter(d => d.isDirectory()).map(d => d.name);
-        } catch { continue; } // no bulkDatabases2 here
-        for (const name of names) {
-            const start = Date.now();
-            console.log(`  [autocompact] ${name}: starting merge`);
-            try {
-                await getCompactor(baseDir, name).tryMergeNow();
-                console.log(`  [autocompact] ${name}: done (${Date.now() - start}ms)`);
-            } catch (e) {
-                console.warn(`  [autocompact] ${name}: failed after ${Date.now() - start}ms - ${(e as Error).message}`);
+            for (const d of fs.readdirSync(path.join(baseDir, BULK_ROOT_FOLDER), { withFileTypes: true })) {
+                if (d.isDirectory()) collections.push({ baseDir, name: d.name });
             }
+        } catch { continue; } // no bulkDatabases2 here
+    }
+
+    const total = collections.length;
+    if (!total) return;
+    const passStart = Date.now();
+    console.log(`  [autocompact] iterating over ${total} collection(s)`);
+    for (let i = 0; i < total; i++) {
+        const { baseDir, name } = collections[i];
+        const at = `${i + 1} of ${total}`;
+        const start = Date.now();
+        console.log(`  [autocompact] ${at} ${name}: starting merge`);
+        try {
+            await getCompactor(baseDir, name).tryMergeNow();
+            console.log(`  [autocompact] ${at} ${name}: done (${Date.now() - start}ms)`);
+        } catch (e) {
+            console.warn(`  [autocompact] ${at} ${name}: failed after ${Date.now() - start}ms - ${(e as Error).message}`);
         }
     }
+    console.log(`  [autocompact] done all ${total} collection(s) (${Date.now() - passStart}ms)`);
 }
 
 // CLI entry (invoked by bin/filehoster.js or `yarn filehoster <folder>`). Starts the server, logs the
