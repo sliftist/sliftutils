@@ -39,10 +39,12 @@ function decodeBuffers(buffers: Uint8Array[]): Transaction[] {
 function readTransactionFiles<Value>(
     database: Database<TransactionSetStore<Value>>,
 ): { fileKeys: string[]; transactions: Transaction[] } | undefined {
-    const snapshot = database.readData(store => ({
-        fileKeys: Object.keys(store),
-        buffers: Object.values(store),
-    }));
+    const snapshot = database.readData(store => {
+        // A never-written / deleted set reads as empty (vs the whole readData being undefined = not synced).
+        const present = store as TransactionSetStore<Value> | undefined;
+        if (!present) return { fileKeys: [] as string[], buffers: [] as Uint8Array[] };
+        return { fileKeys: Object.keys(present), buffers: Object.values(present) };
+    });
     if (!snapshot) return undefined;
     return { fileKeys: snapshot.fileKeys, transactions: decodeBuffers(snapshot.buffers) };
 }
