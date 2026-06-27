@@ -44,8 +44,6 @@ export type StoredEmbedding = {
     scales: Uint8Array;
 };
 
-type QuantEmbedding = Extract<StoredEmbedding, { kind: "quant" }>;
-
 // Float16Array isn't in our TypeScript lib and isn't guaranteed at runtime, so we read it off
 // globalThis and fall back to a manual half<->float conversion when it's missing.
 interface Float16ArrayLike {
@@ -214,22 +212,6 @@ export function embeddingToFloat32(input: Float32Array | StoredEmbedding, usePoo
     return out;
 }
 
-// Returns a closure giving the value at a dimension for this embedding's specific type. Lets a generic loop
-// compare any two formats without materializing a float array.
-export function embeddingAccessor(input: Float32Array | StoredEmbedding): (index: number) => number {
-    if (input instanceof Float32Array) {
-        return index => input[index];
-    }
-    if (input.kind === "float32") {
-        let values = input.values;
-        return index => values[index];
-    }
-    let int8 = asInt8(input.data);
-    let scales = asFloat16Indexable(input.scales);
-    let groupSize = input.groupSize;
-    return index => int8[index] * scales[(index / groupSize) | 0];
-}
-
 function closenessFromDot(dot: number): number {
     // Inputs are unit vectors, so euclidean^2 = 2 - 2*dot; clamp away tiny negatives from float error.
     return 1 - Math.sqrt(Math.max(0, 2 - 2 * dot));
@@ -244,55 +226,17 @@ function dotFloat32(a: Float32Array, b: Float32Array): number {
     return dot;
 }
 
-// --- three closeness strategies, kept separate so embeddingBench can race them ---
-
-// Decode both to pooled float32 buffers, dot, return them. No allocation in steady state.
-export function closenessByDecode(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
+// Closeness = 1 - euclidean distance of two unit vectors. Always decode both to (pooled) float32 and dot:
+// simple, and once the decodes are pooled it's the fastest per-call path. Batch callers (k-means) decode
+// every vector once themselves instead of going through here.
+export const getCloseness = measureWrap(function getCloseness(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
     let va = embeddingToFloat32(a, true);
     let vb = embeddingToFloat32(b, true);
     let result = closenessFromDot(dotFloat32(va, vb));
     releaseFloat32(va);
     releaseFloat32(vb);
     return result;
-}
-
-// Generic: a value-at-index closure per side, iterate. No allocation, but a function call per dimension.
-export function closenessByAccessor(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
-    let getA = embeddingAccessor(a);
-    let getB = embeddingAccessor(b);
-    let length = Math.min(embeddingLength(a), embeddingLength(b));
-    let dot = 0;
-    for (let index = 0; index < length; index++) {
-        dot += getA(index) * getB(index);
-    }
-    return closenessFromDot(dot);
-}
-
-// Hard-coded: when both are same-group quant, dot straight from int8 + scales (no float, no closures).
-export function closenessByType(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
-    if (!(a instanceof Float32Array) && !(b instanceof Float32Array) && a.kind === "quant" && b.kind === "quant" && a.groupSize === b.groupSize) {
-        let aInt8 = asInt8(a.data);
-        let bInt8 = asInt8(b.data);
-        let aScales = asFloat16Indexable(a.scales);
-        let bScales = asFloat16Indexable(b.scales);
-        let length = Math.min(aInt8.length, bInt8.length);
-        let groupSize = a.groupSize;
-        let dot = 0;
-        for (let start = 0; start < length; start += groupSize) {
-            let end = Math.min(start + groupSize, length);
-            let groupSum = 0;
-            for (let index = start; index < end; index++) {
-                groupSum += aInt8[index] * bInt8[index];
-            }
-            dot += groupSum * aScales[start / groupSize] * bScales[start / groupSize];
-        }
-        return closenessFromDot(dot);
-    }
-    return closenessByDecode(a, b);
-}
-
-// Production closeness. (Set to the embeddingBench winner.)
-export const getCloseness = measureWrap(closenessByType);
+});
 
 // Encode a vector (or re-encode an embedding) into the requested format. This is THE place we normalize:
 // the (truncated) vector is made unit length here, so anything that's been encoded is reliably normalized
@@ -413,10 +357,11 @@ export function averageEmbeddings(embeddings: StoredEmbedding[], config: { forma
     let sum = acquireFloat32(length);
     sum.fill(0);
     for (let embedding of embeddings) {
-        let get = embeddingAccessor(embedding);
+        let vector = embeddingToFloat32(embedding, true);
         for (let dimension = 0; dimension < length; dimension++) {
-            sum[dimension] += get(dimension);
+            sum[dimension] += vector[dimension];
         }
+        releaseFloat32(vector);
     }
     let result = encodeEmbedding({ input: sum.subarray(0, length), format: config.format, model: config.model });
     releaseFloat32(sum);
@@ -426,15 +371,16 @@ export function averageEmbeddings(embeddings: StoredEmbedding[], config: { forma
 // A stable 16-byte (base64) content hash of an embedding's values, for use as a cell id derived from its
 // centroid. Iterates via the accessor (the value bits are hashed, so any format hashes consistently).
 export function hashEmbedding(stored: StoredEmbedding): string {
-    let get = embeddingAccessor(stored);
-    let length = embeddingLength(stored);
+    let vector = embeddingToFloat32(stored, true);
+    let length = vector.length;
     let lanes = new Uint32Array([2166136261, 2654435761, 40503, 3266489917]);
     for (let index = 0; index < length; index++) {
-        f32Scratch[0] = get(index);
+        f32Scratch[0] = vector[index];
         let bits = i32Scratch[0];
         for (let lane = 0; lane < lanes.length; lane++) {
             lanes[lane] = Math.imul(lanes[lane] ^ (bits + lane * 131 + index), 16777619);
         }
     }
+    releaseFloat32(vector);
     return Buffer.from(lanes.buffer).toString("base64");
 }

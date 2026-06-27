@@ -1,5 +1,5 @@
 import fs from "fs";
-import { encodeEmbedding, averageEmbeddings, embeddingToFloat32, releaseFloat32, StoredEmbedding, EmbeddingFormat, closenessByDecode, closenessByType, closenessByAccessor } from "./embeddingFormats";
+import { encodeEmbedding, averageEmbeddings, embeddingToFloat32, releaseFloat32, getCloseness, StoredEmbedding, EmbeddingFormat } from "./embeddingFormats";
 
 // Runs a generic k-means parameterized by an arbitrary getCloseness, so we can race the closeness
 // implementations (all exported from embeddingFormats) on a real clustering workload — plus a variant that
@@ -141,11 +141,9 @@ function main() {
     const iterations = 4;
     console.log(`k-means: ${members.length} members, ${clusterCount} clusters, ${iterations} iterations\n`);
 
-    kmeans(members.slice(0, 500), 8, 1, closenessByType); // warm up the JIT
+    kmeans(members.slice(0, 500), 8, 1, getCloseness); // warm up the JIT
 
-    time("type", () => kmeans(members, clusterCount, iterations, closenessByType));
-    time("accessor", () => kmeans(members, clusterCount, iterations, closenessByAccessor));
-    time("decode", () => kmeans(members, clusterCount, iterations, closenessByDecode));
+    time("getCloseness", () => kmeans(members, clusterCount, iterations, getCloseness));
     time("f32-once", () => kmeansFloat32Once(members, clusterCount, iterations));
 }
 
