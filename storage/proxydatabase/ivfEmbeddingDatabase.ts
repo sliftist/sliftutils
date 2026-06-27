@@ -71,8 +71,7 @@ function rebalanceProbability(fillRatio: number): number {
     return Math.min(1, over * over * over * 0.25);
 }
 
-// k-means over every member into clusterCount clusters. getCloseness decodes both embeddings per call, so
-// this is the heavy part of a rebuild (kept rare by rebalanceProbability / the step gates).
+// k-means over the members using getCloseness; centroids are the running cluster means.
 function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfConfig): { centroid: StoredEmbedding; members: CellEntry[] }[] {
     let centroids: StoredEmbedding[] = [];
     const seedStep = members.length / clusterCount;

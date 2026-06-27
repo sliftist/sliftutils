@@ -44,6 +44,8 @@ export type StoredEmbedding = {
     scales: Uint8Array;
 };
 
+type QuantEmbedding = Extract<StoredEmbedding, { kind: "quant" }>;
+
 // Float16Array isn't in our TypeScript lib and isn't guaranteed at runtime, so we read it off
 // globalThis and fall back to a manual half<->float conversion when it's missing.
 interface Float16ArrayLike {
@@ -64,25 +66,25 @@ const f32Scratch = new Float32Array(1);
 const i32Scratch = new Int32Array(f32Scratch.buffer);
 function floatToHalf(value: number): number {
     f32Scratch[0] = value;
-    let x = i32Scratch[0];
-    let bits = (x >> 16) & 0x8000;
-    let m = (x >> 12) & 0x07ff;
-    let e = (x >> 23) & 0xff;
-    if (e < 103) return bits;
-    if (e > 142) {
+    let bitsIn = i32Scratch[0];
+    let bits = (bitsIn >> 16) & 0x8000;
+    let mantissa = (bitsIn >> 12) & 0x07ff;
+    let exponent = (bitsIn >> 23) & 0xff;
+    if (exponent < 103) return bits;
+    if (exponent > 142) {
         bits |= 0x7c00;
-        if (e !== 255) {
-            bits |= (x & 0x007fffff);
+        if (exponent !== 255) {
+            bits |= (bitsIn & 0x007fffff);
         }
         return bits;
     }
-    if (e < 113) {
-        m |= 0x0800;
-        bits |= (m >> (114 - e)) + ((m >> (113 - e)) & 1);
+    if (exponent < 113) {
+        mantissa |= 0x0800;
+        bits |= (mantissa >> (114 - exponent)) + ((mantissa >> (113 - exponent)) & 1);
         return bits;
     }
-    bits |= ((e - 112) << 10) | (m >> 1);
-    bits += m & 1;
+    bits |= ((exponent - 112) << 10) | (mantissa >> 1);
+    bits += mantissa & 1;
     return bits;
 }
 function halfToFloat(half: number): number {
@@ -110,8 +112,8 @@ function encodeFloat16(values: Float32Array): Uint8Array {
     }
     let out = new Uint8Array(values.length * 2);
     let view = new DataView(out.buffer);
-    for (let i = 0; i < values.length; i++) {
-        view.setUint16(i * 2, floatToHalf(values[i]), true);
+    for (let index = 0; index < values.length; index++) {
+        view.setUint16(index * 2, floatToHalf(values[index]), true);
     }
     return out;
 }
@@ -126,58 +128,116 @@ function asFloat16Indexable(bytes: Uint8Array): { readonly length: number;[index
     }
     let halves = new Uint16Array(bytes.buffer, bytes.byteOffset, count);
     let out = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-        out[i] = halfToFloat(halves[i]);
+    for (let index = 0; index < count; index++) {
+        out[index] = halfToFloat(halves[index]);
     }
     return out;
 }
 
-function normalizeInPlace(vector: Float32Array): Float32Array {
-    let sum = 0;
-    for (let i = 0; i < vector.length; i++) {
-        sum += vector[i] * vector[i];
-    }
-    let magnitude = Math.sqrt(sum);
-    if (!magnitude) return vector;
-    for (let i = 0; i < vector.length; i++) {
-        vector[i] /= magnitude;
-    }
-    return vector;
-}
-
-function embeddingLength(input: Float32Array | StoredEmbedding): number {
+export function embeddingLength(input: Float32Array | StoredEmbedding): number {
     if (input instanceof Float32Array) return input.length;
     if (input.kind === "float32") return input.values.length;
     return input.data.length;
 }
 
-// Decode any accepted input to a fresh, mutable Float32Array of exactly `length` dimensions
-// (truncating). Always allocates, so callers can normalize it in place without touching stored data.
-function decodeToLength(input: Float32Array | StoredEmbedding, length: number): Float32Array {
-    let out = new Float32Array(length);
-    if (input instanceof Float32Array) {
-        for (let i = 0; i < length; i++) {
-            out[i] = input[i];
-        }
-        return out;
-    }
-    if (input.kind === "float32") {
-        let values = input.values;
-        for (let i = 0; i < length; i++) {
-            out[i] = values[i];
-        }
-        return out;
-    }
+// Decode to a Float32Array (full length). Inputs are assumed already unit-normalized, so this only
+// de-quantizes — it never normalizes or truncates. A float input is returned as-is (no copy); don't mutate.
+export function embeddingToFloat32(input: Float32Array | StoredEmbedding): Float32Array {
+    if (input instanceof Float32Array) return input;
+    if (input.kind === "float32") return input.values;
     let int8 = asInt8(input.data);
     let scales = asFloat16Indexable(input.scales);
     let groupSize = input.groupSize;
-    for (let i = 0; i < length; i++) {
-        out[i] = int8[i] * scales[Math.floor(i / groupSize)];
+    let length = int8.length;
+    let out = new Float32Array(length);
+    let group = 0;
+    for (let start = 0; start < length; start += groupSize) {
+        let scale = scales[group++];
+        let end = Math.min(start + groupSize, length);
+        for (let index = start; index < end; index++) {
+            out[index] = int8[index] * scale;
+        }
     }
     return out;
 }
 
-// Convert a raw float32 vector (or re-encode an existing StoredEmbedding) into the requested format.
+// Returns a closure giving the value at a dimension for this embedding's specific type. Lets a generic loop
+// compare any two formats without materializing a float array.
+export function embeddingAccessor(input: Float32Array | StoredEmbedding): (index: number) => number {
+    if (input instanceof Float32Array) {
+        return index => input[index];
+    }
+    if (input.kind === "float32") {
+        let values = input.values;
+        return index => values[index];
+    }
+    let int8 = asInt8(input.data);
+    let scales = asFloat16Indexable(input.scales);
+    let groupSize = input.groupSize;
+    return index => int8[index] * scales[(index / groupSize) | 0];
+}
+
+function closenessFromDot(dot: number): number {
+    // Inputs are unit vectors, so euclidean^2 = 2 - 2*dot; clamp away tiny negatives from float error.
+    return 1 - Math.sqrt(Math.max(0, 2 - 2 * dot));
+}
+
+function dotFloat32(a: Float32Array, b: Float32Array): number {
+    let length = Math.min(a.length, b.length);
+    let dot = 0;
+    for (let index = 0; index < length; index++) {
+        dot += a[index] * b[index];
+    }
+    return dot;
+}
+
+// --- three closeness strategies, kept separate so embeddingBench can race them ---
+
+// Decode both to float32 then dot (allocates two arrays per call).
+export function closenessByDecode(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
+    return closenessFromDot(dotFloat32(embeddingToFloat32(a), embeddingToFloat32(b)));
+}
+
+// Generic: a value-at-index closure per side, iterate. No allocation, but a function call per dimension.
+export function closenessByAccessor(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
+    let getA = embeddingAccessor(a);
+    let getB = embeddingAccessor(b);
+    let length = Math.min(embeddingLength(a), embeddingLength(b));
+    let dot = 0;
+    for (let index = 0; index < length; index++) {
+        dot += getA(index) * getB(index);
+    }
+    return closenessFromDot(dot);
+}
+
+// Hard-coded: when both are same-group quant, dot straight from int8 + scales (no float, no closures).
+export function closenessByType(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
+    if (!(a instanceof Float32Array) && !(b instanceof Float32Array) && a.kind === "quant" && b.kind === "quant" && a.groupSize === b.groupSize) {
+        let aInt8 = asInt8(a.data);
+        let bInt8 = asInt8(b.data);
+        let aScales = asFloat16Indexable(a.scales);
+        let bScales = asFloat16Indexable(b.scales);
+        let length = Math.min(aInt8.length, bInt8.length);
+        let groupSize = a.groupSize;
+        let dot = 0;
+        for (let start = 0; start < length; start += groupSize) {
+            let end = Math.min(start + groupSize, length);
+            let groupSum = 0;
+            for (let index = start; index < end; index++) {
+                groupSum += aInt8[index] * bInt8[index];
+            }
+            dot += groupSum * aScales[start / groupSize] * bScales[start / groupSize];
+        }
+        return closenessFromDot(dot);
+    }
+    return closenessByDecode(a, b);
+}
+
+// Production closeness. (Set to the embeddingBench winner.)
+export const getCloseness = measureWrap(closenessByType);
+
+// Re-encode an embedding (or raw float32 vector) into the requested format. Input is assumed already
+// unit-normalized; this only de-quantizes + truncates + re-quantizes, never normalizes.
 export function encodeEmbedding(config: {
     input: Float32Array | StoredEmbedding;
     format: EmbeddingFormat;
@@ -185,36 +245,36 @@ export function encodeEmbedding(config: {
 }): StoredEmbedding {
     let { input, format, model } = config;
     let formatConfig = FORMAT_CONFIGS[format];
-    let length = embeddingLength(input);
-    if (formatConfig.truncation !== undefined) {
-        length = Math.min(formatConfig.truncation, length);
+    let decoded = embeddingToFloat32(input);
+    let length = decoded.length;
+    if (formatConfig.truncation !== undefined && formatConfig.truncation < length) {
+        length = formatConfig.truncation;
     }
-    // Truncate to a fresh array, then renormalize so the shortened vector is unit length again.
-    let vector = normalizeInPlace(decodeToLength(input, length));
+    let vector = decoded.subarray(0, length);
 
     if (!formatConfig.quant) {
-        return { kind: "float32", model, values: vector };
+        return { kind: "float32", model, values: new Float32Array(vector) };
     }
     let { type, groupSize } = formatConfig.quant;
     let groupCount = Math.ceil(length / groupSize);
     let int8 = new Int8Array(length);
     let scales = new Float32Array(groupCount);
-    for (let g = 0; g < groupCount; g++) {
-        let start = g * groupSize;
+    for (let group = 0; group < groupCount; group++) {
+        let start = group * groupSize;
         let end = Math.min(start + groupSize, length);
         let maxAbs = 0;
-        for (let i = start; i < end; i++) {
-            let magnitude = Math.abs(vector[i]);
+        for (let index = start; index < end; index++) {
+            let magnitude = Math.abs(vector[index]);
             if (magnitude > maxAbs) maxAbs = magnitude;
         }
         let scale = maxAbs / INT8_MAX;
-        scales[g] = scale;
+        scales[group] = scale;
         if (!scale) continue;
-        for (let i = start; i < end; i++) {
-            let quantized = Math.round(vector[i] / scale);
+        for (let index = start; index < end; index++) {
+            let quantized = Math.round(vector[index] / scale);
             if (quantized > INT8_MAX) quantized = INT8_MAX;
             if (quantized < -INT8_MAX) quantized = -INT8_MAX;
-            int8[i] = quantized;
+            int8[index] = quantized;
         }
     }
     return {
@@ -273,8 +333,7 @@ export function deserializeStoredEmbedding(base64: string): StoredEmbedding {
     };
 }
 
-// Mean of several embeddings (decoded to their common length), re-encoded into the requested format
-// (which renormalizes). Used to build and split IVF cell centroids.
+// Mean of several embeddings, normalized to unit (a centroid must be unit for fair dot ranking) and encoded.
 export function averageEmbeddings(embeddings: StoredEmbedding[], config: { format: EmbeddingFormat; model: string }): StoredEmbedding {
     let length = Infinity;
     for (let embedding of embeddings) {
@@ -282,43 +341,34 @@ export function averageEmbeddings(embeddings: StoredEmbedding[], config: { forma
     }
     let sum = new Float32Array(length);
     for (let embedding of embeddings) {
-        let decoded = decodeToLength(embedding, length);
+        let get = embeddingAccessor(embedding);
         for (let dimension = 0; dimension < length; dimension++) {
-            sum[dimension] += decoded[dimension];
+            sum[dimension] += get(dimension);
         }
     }
+    let norm = 0;
     for (let dimension = 0; dimension < length; dimension++) {
-        sum[dimension] /= embeddings.length;
+        norm += sum[dimension] * sum[dimension];
+    }
+    let magnitude = Math.sqrt(norm) || 1;
+    for (let dimension = 0; dimension < length; dimension++) {
+        sum[dimension] /= magnitude;
     }
     return encodeEmbedding({ input: sum, format: config.format, model: config.model });
 }
 
-// A stable 16-byte (base64) content hash of an embedding, for use as a cell id derived from its centroid.
+// A stable 16-byte (base64) content hash of an embedding's values, for use as a cell id derived from its
+// centroid. Iterates via the accessor (the value bits are hashed, so any format hashes consistently).
 export function hashEmbedding(stored: StoredEmbedding): string {
-    let serialized = serializeStoredEmbedding(stored);
+    let get = embeddingAccessor(stored);
+    let length = embeddingLength(stored);
     let lanes = new Uint32Array([2166136261, 2654435761, 40503, 3266489917]);
-    for (let charIndex = 0; charIndex < serialized.length; charIndex++) {
-        let code = serialized.charCodeAt(charIndex);
+    for (let index = 0; index < length; index++) {
+        f32Scratch[0] = get(index);
+        let bits = i32Scratch[0];
         for (let lane = 0; lane < lanes.length; lane++) {
-            lanes[lane] = Math.imul(lanes[lane] ^ (code + lane * 131 + charIndex), 16777619);
+            lanes[lane] = Math.imul(lanes[lane] ^ (bits + lane * 131 + index), 16777619);
         }
     }
     return Buffer.from(lanes.buffer).toString("base64");
 }
-
-// Compare two embeddings in any format / truncation. Both are decoded, truncated to their common
-// length, and unit-normalized, then scored as 1 minus their euclidean distance.
-export const getCloseness = measureWrap(function getCloseness(
-    embedding1: Float32Array | StoredEmbedding,
-    embedding2: Float32Array | StoredEmbedding,
-): number {
-    let length = Math.min(embeddingLength(embedding1), embeddingLength(embedding2));
-    let vector1 = normalizeInPlace(decodeToLength(embedding1, length));
-    let vector2 = normalizeInPlace(decodeToLength(embedding2, length));
-    let sum = 0;
-    for (let i = 0; i < length; i++) {
-        let diff = vector1[i] - vector2[i];
-        sum += diff * diff;
-    }
-    return 1 - Math.sqrt(sum);
-});
