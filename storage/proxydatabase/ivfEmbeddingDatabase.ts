@@ -150,12 +150,19 @@ function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfC
 export function rebuildStructure(database: Database<IvfEmbeddingRoot>): void {
     const config = database.readData(root => root.config);
     if (!config) return;
+    const steps = database.readData(root => root.steps);
+    if (!steps) return;
 
     const allMembers: CellEntry[] = [];
-    const flat = transactionRead(flatStore(database));
-    if (!flat) return;
-    for (const ref of flat.keys()) {
-        allMembers.push({ ref, embedding: flat.get(ref)! });
+    // Only the one-time flat->IVF upgrade pulls from the flat tier. Once STEP_IVF is set the flat data has
+    // already been folded into cells, so later rebuilds ignore it. It's left in place, never deleted: deleteData
+    // only removes primitive leaves, not a whole store, and the flat tier is small enough not to matter.
+    if (!steps[STEP_IVF]) {
+        const flat = transactionRead(flatStore(database));
+        if (!flat) return;
+        for (const ref of flat.keys()) {
+            allMembers.push({ ref, embedding: flat.get(ref)! });
+        }
     }
     const centroids = transactionRead(centroidStore(database));
     if (!centroids) return;
@@ -190,7 +197,6 @@ export function rebuildStructure(database: Database<IvfEmbeddingRoot>): void {
         database.deleteData(root => root.cells[oldCellId]);
     }
     transactionMutate(centroidStore(database), centroidWrites);
-    database.deleteData(root => root.flat);
     database.writeData(root => root.count, allMembers.length);
     database.writeData(root => root.steps[STEP_IVF], true);
 }
