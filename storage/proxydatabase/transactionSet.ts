@@ -62,7 +62,8 @@ function compactTransactions(
 ): void {
     const finalState = replay(allTransactions);
     const merged: Transaction[] = [...finalState].map(([key, value], index) => ({ sequence: index, key, value }));
-    database.writeData(store => store[String(newFileNumber)], transactionCbor.encode(merged) as Uint8Array);
+    const encoded = transactionCbor.encode(merged) as Uint8Array;
+    database.writeData(store => store[String(newFileNumber)], encoded);
     for (const fileKey of oldFileKeys) {
         database.deleteData(store => store[fileKey]);
     }
@@ -96,7 +97,8 @@ export function transactionMutate<Value>(
     if (files.fileKeys.length + 1 >= compactAfterFiles) {
         compactTransactions(database, [...files.transactions, ...incoming], files.fileKeys, nextFileNumber);
     } else {
-        database.writeData(store => store[String(nextFileNumber)], transactionCbor.encode(incoming) as Uint8Array);
+        const encoded = transactionCbor.encode(incoming) as Uint8Array;
+        database.writeData(store => store[String(nextFileNumber)], encoded);
     }
     return true;
 }
