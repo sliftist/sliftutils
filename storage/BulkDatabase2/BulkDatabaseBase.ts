@@ -286,6 +286,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
     private async automaticCompactionAllowed(): Promise<boolean> {
         if (networkCompactionEnabled) return true;
+        if (isNode()) return true;
         return !(await this.storage()).isRemote;
     }
 
