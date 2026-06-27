@@ -12,4 +12,4 @@ export declare function writeDeleteMarker(storage: FileStorage, config: {
 }): Promise<void>;
 export declare function readDeleteMarkers(storage: FileStorage, allNames: string[]): Promise<DeleteMarker[]>;
 export declare function markerExclusions(markers: DeleteMarker[]): Set<string>;
-export declare function processDeleteMarkers(storage: FileStorage, markers: DeleteMarker[], allNames: string[]): Promise<void>;
+export declare function processDeleteMarkers(name: string, storage: FileStorage, markers: DeleteMarker[], allNames: string[]): Promise<void>;
