@@ -2,26 +2,28 @@ import fs from "fs";
 import { InMemoryDatabase } from "./inMemoryDatabase";
 import { IvfEmbeddingRoot, IvfConfig, EmbeddingInput, insertEmbeddings, searchEmbeddings } from "./ivfEmbeddingDatabase";
 import { encodeEmbedding, EmbeddingFormat } from "../embeddingFormats";
+import { ensureFaceData } from "../faceFramesData";
 
 // Exercises the tiered IVF embedding database through the in-memory Database wrapper, which counts every
 // read/write/delete call and the bytes through each, across dataset sizes and load patterns, with timing.
 
 const DIM = 512;
-const SRC = "/root/claude-work/face-embeddings/faceFrames2_full.f32";
+const FILE_NAME = "faceFrames2_full.f32";
 const MODEL = "buffalo_l";
 const FORMAT: EmbeddingFormat = "q8g8_2048";
 
-function loadFloats(count: number): Float32Array {
+async function loadFloats(count: number): Promise<Float32Array> {
     const byteLength = count * DIM * 4;
+    const filePath = await ensureFaceData(FILE_NAME, byteLength);
     const buffer = Buffer.alloc(byteLength);
-    const handle = fs.openSync(SRC, "r");
+    const handle = fs.openSync(filePath, "r");
     fs.readSync(handle, buffer, 0, byteLength, 0);
     fs.closeSync(handle);
     return new Float32Array(buffer.buffer, buffer.byteOffset, count * DIM);
 }
 
-function buildInputs(count: number): EmbeddingInput[] {
-    const floats = loadFloats(count);
+async function buildInputs(count: number): Promise<EmbeddingInput[]> {
+    const floats = await loadFloats(count);
     const inputs: EmbeddingInput[] = [];
     for (let index = 0; index < count; index++) {
         const slice = floats.subarray(index * DIM, (index + 1) * DIM);
@@ -39,7 +41,7 @@ function pad(value: string | number, width: number): string {
     return String(value).padStart(width);
 }
 
-function main() {
+async function main() {
     const config: IvfConfig = { model: MODEL, format: FORMAT, cellTargetSize: 128 };
     const runs: { size: number; batch: number }[] = [
         { size: 10000, batch: 1 },
@@ -54,7 +56,7 @@ function main() {
         }
     }
     const loadStart = Date.now();
-    const allInputs = buildInputs(maxSize);
+    const allInputs = await buildInputs(maxSize);
     console.log(`loaded + encoded ${maxSize} embeddings in ${((Date.now() - loadStart) / 1000).toFixed(1)}s\n`);
 
     console.log(`${pad("added", 7)} ${pad("batch", 5)} | ${pad("secs", 7)} ${pad("reads", 8)} ${pad("writes", 8)} ${pad("deletes", 8)} ${pad("readMB", 9)} ${pad("writeMB", 8)} | recall`);

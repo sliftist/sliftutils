@@ -1,4 +1,5 @@
 import fs from "fs";
+import { ensureFaceData } from "./faceFramesData";
 import { encodeEmbedding, averageEmbeddings, embeddingToFloat32, releaseFloat32, getCloseness, StoredEmbedding, EmbeddingFormat } from "./embeddingFormats";
 
 // Runs a generic k-means parameterized by an arbitrary getCloseness, so we can race the closeness
@@ -6,15 +7,16 @@ import { encodeEmbedding, averageEmbeddings, embeddingToFloat32, releaseFloat32,
 // decodes every embedding to float32 once and uses plain float dots. Push + run with: typenode storage/embeddingBench.ts
 
 const DIM = 512;
-const SRC = "/root/claude-work/face-embeddings/faceEntry2.f32";
+const FILE_NAME = "faceEntry2.f32";
 const MODEL = "buffalo_l";
 const FORMAT: EmbeddingFormat = "q8g8_2048";
 const CONFIG = { format: FORMAT, model: MODEL };
 
-function loadEmbeddings(count: number): StoredEmbedding[] {
+async function loadEmbeddings(count: number): Promise<StoredEmbedding[]> {
     const byteLength = count * DIM * 4;
+    const filePath = await ensureFaceData(FILE_NAME, byteLength);
     const buffer = Buffer.alloc(byteLength);
-    const handle = fs.openSync(SRC, "r");
+    const handle = fs.openSync(filePath, "r");
     fs.readSync(handle, buffer, 0, byteLength, 0);
     fs.closeSync(handle);
     const floats = new Float32Array(buffer.buffer, buffer.byteOffset, count * DIM);
@@ -135,8 +137,8 @@ function time(name: string, run: () => number): number {
     return seconds;
 }
 
-function main() {
-    const members = loadEmbeddings(5000);
+async function main() {
+    const members = await loadEmbeddings(5000);
     const clusterCount = 40;
     const iterations = 4;
     console.log(`k-means: ${members.length} members, ${clusterCount} clusters, ${iterations} iterations\n`);
