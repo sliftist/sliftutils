@@ -963,8 +963,11 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private storageFactory;
         private config;
         constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory, config?: BulkDatabase2Config);
+        private _reader;
+        private get reader();
+        private activated;
+        private activate;
         private setupVisibilityMergeCheck;
-        private reader;
         private subCaches;
         private pendingAppends;
         private flushTimer;
@@ -2282,6 +2285,11 @@ declare module "sliftutils/storage/embeddingFormats" {
     }): StoredEmbedding;
     export declare function serializeStoredEmbedding(stored: StoredEmbedding): string;
     export declare function deserializeStoredEmbedding(base64: string): StoredEmbedding;
+    export declare function averageEmbeddings(embeddings: StoredEmbedding[], config: {
+        format: EmbeddingFormat;
+        model: string;
+    }): StoredEmbedding;
+    export declare function hashEmbedding(stored: StoredEmbedding): string;
     export declare const getCloseness: (embedding1: Float32Array | StoredEmbedding, embedding2: Float32Array | StoredEmbedding) => number;
 
 }
@@ -2311,12 +2319,48 @@ declare module "sliftutils/storage/proxydatabase/Database" {
 
 }
 
+declare module "sliftutils/storage/proxydatabase/ivfEmbeddingDatabase" {
+    import { Database } from "./Database";
+    import { TransactionSetStore } from "./transactionSet";
+    import { StoredEmbedding, EmbeddingFormat } from "../embeddingFormats";
+    export type IvfConfig = {
+        model: string;
+        format: EmbeddingFormat;
+        cellTarget: number;
+        splitAt: number;
+    };
+    export type IvfEmbeddingRoot = {
+        config: IvfConfig;
+        centroids: TransactionSetStore;
+        cells: {
+            [cellId: string]: TransactionSetStore;
+        };
+        refIndex: TransactionSetStore;
+    };
+    export type EmbeddingInput = {
+        ref: string;
+        embedding: StoredEmbedding;
+    };
+    export type SearchHit = {
+        ref: string;
+        closeness: number;
+    };
+    export declare function searchEmbeddings(database: Database<IvfEmbeddingRoot>, query: StoredEmbedding, options: {
+        probeBudget: number;
+        resultCount: number;
+    }): SearchHit[] | undefined;
+    export declare function insertEmbeddings(database: Database<IvfEmbeddingRoot>, items: EmbeddingInput[]): true | undefined;
+    export declare function removeEmbeddings(database: Database<IvfEmbeddingRoot>, refs: string[]): true | undefined;
+
+}
+
 declare module "sliftutils/storage/proxydatabase/transactionSet" {
     import { Database } from "./Database";
     export type TransactionSetStore = {
         [fileNumber: string]: Uint8Array;
     };
     export declare function transactionRead<Value>(database: Database<TransactionSetStore>): Map<string, Value> | undefined;
+    export declare function replayTransactionStore<Value>(store: TransactionSetStore | undefined): Map<string, Value>;
     export declare function transactionMutate<Value>(database: Database<TransactionSetStore>, transactions: {
         key: string;
         value: Value | undefined;

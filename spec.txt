@@ -40,3 +40,21 @@ unknown
 
     BUT... how do we update IVF
 
+
+
+
+1) Converting once is faster, so we should investigate if we can have a pool of memory. If we can reuse it, then the allocations are free. 
+
+1) Fix embedding formats. It's really, really stupid. decodeToLength was just absolutely retarded. 
+
+
+
+
+
+
+0) Make sure the AI stops trying to stop when a read didn't work because it doesn't fucking matter. I don't think there's a single place that's doing it where it actually matters. 
+    - I mean, I guess there are a few places. Like when we're rebalancing, that's one place.
+    - I guess some of the returns are valid, but I guess we have to check all of them. 
+
+1) Make sure the AI gets rid of all those four each's. I mean, what the fuck? 
+1)  Ensure the AI efficiently switches from the hard-coded stuff to the regular stuff and correctly regenerates the codebook. 

@@ -35,8 +35,11 @@ export declare class BulkDatabaseBase<T extends {
     private storageFactory;
     private config;
     constructor(name: string, deps: ReactiveDeps, storageFactory: StorageFactory, config?: BulkDatabase2Config);
+    private _reader;
+    private get reader();
+    private activated;
+    private activate;
     private setupVisibilityMergeCheck;
-    private reader;
     private subCaches;
     private pendingAppends;
     private flushTimer;

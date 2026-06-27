@@ -45,13 +45,6 @@ function cellStore(database: Database<IvfEmbeddingRoot>, cellId: string): Databa
     return namespaceDatabase(database, root => root.cells[cellId]);
 }
 
-function readSteps(database: Database<IvfEmbeddingRoot>): { [step: string]: boolean } {
-    return database.readData(root => root.steps) ?? {};
-}
-function readCount(database: Database<IvfEmbeddingRoot>): number {
-    return database.readData(root => root.count) ?? 0;
-}
-
 function rankCellsByCloseness(embedding: StoredEmbedding, centroids: Map<string, StoredEmbedding>): string[] {
     const ranked: { cellId: string; closeness: number }[] = [];
     for (const cellId of centroids.keys()) {
@@ -209,7 +202,8 @@ export function searchEmbeddings(
 ): SearchHit[] | undefined {
     const config = database.readData(root => root.config);
     if (!config) return undefined;
-    const steps = readSteps(database);
+    const steps = database.readData(root => root.steps);
+    if (!steps) return undefined;
 
     const hits: SearchHit[] = [];
     if (!steps[STEP_IVF]) {
@@ -242,12 +236,15 @@ export function searchEmbeddings(
 export function insertEmbeddings(
     database: Database<IvfEmbeddingRoot>,
     items: EmbeddingInput[],
-): true | undefined {
-    if (!items.length) return true;
+) {
+    if (!items.length) return;
     const config = database.readData(root => root.config);
-    if (!config) return undefined;
-    const steps = readSteps(database);
-    const newCount = readCount(database) + items.length;
+    const steps = database.readData(root => root.steps);
+    let count = database.readData(root => root.count);
+    if (!config) return;
+    if (!steps) return;
+    if (count === undefined) return;
+    const newCount = count + items.length;
 
     if (!steps[STEP_IVF]) {
         const flatWrites = items.map(item => ({ key: item.ref, value: item.embedding }));
@@ -278,21 +275,27 @@ export function insertEmbeddings(
     }
     database.writeData(root => root.count, newCount);
 
-    let regenerated = false;
-    for (const threshold of REGENERATE_AT) {
-        const stepName = "regen" + threshold;
-        if (!steps[stepName] && newCount > threshold) {
-            rebuildStructure(database);
-            database.writeData(root => root.steps[stepName], true);
-            regenerated = true;
+
+    const shouldRegenerate = (database: Database<IvfEmbeddingRoot>) => {
+        let steps = database.readData(root => root.steps);
+        if (!steps) return;
+        for (const threshold of REGENERATE_AT) {
+            const stepName = "regen" + threshold;
+            if (!steps[stepName] && newCount > threshold) {
+                database.writeData(root => root.steps[stepName], true);
+                return true;
+            }
         }
-    }
-    if (!regenerated) {
         const averageFill = newCount / Math.max(1, centroids.size) / config.cellTargetSize;
         if (Math.random() < rebalanceProbability(averageFill)) {
             rebuildStructure(database);
         }
+        return true;
+    };
+    if (shouldRegenerate(database)) {
+        rebuildStructure(database);
     }
+
     return true;
 }
 
@@ -301,8 +304,10 @@ export function removeEmbeddings(
     items: EmbeddingInput[],
 ): true | undefined {
     if (!items.length) return true;
-    const steps = readSteps(database);
-    const count = readCount(database);
+    const steps = database.readData(root => root.steps);
+    const count = database.readData(root => root.count);
+    if (!steps) return undefined;
+    if (count === undefined) return undefined;
 
     if (!steps[STEP_IVF]) {
         const flatDeletes = items.map(item => ({ key: item.ref, value: undefined }));

@@ -21,4 +21,9 @@ export declare function encodeEmbedding(config: {
 }): StoredEmbedding;
 export declare function serializeStoredEmbedding(stored: StoredEmbedding): string;
 export declare function deserializeStoredEmbedding(base64: string): StoredEmbedding;
+export declare function averageEmbeddings(embeddings: StoredEmbedding[], config: {
+    format: EmbeddingFormat;
+    model: string;
+}): StoredEmbedding;
+export declare function hashEmbedding(stored: StoredEmbedding): string;
 export declare const getCloseness: (embedding1: Float32Array | StoredEmbedding, embedding2: Float32Array | StoredEmbedding) => number;
