@@ -1,5 +1,5 @@
 import { Database, namespaceDatabase } from "./Database";
-import { TransactionSetStore, transactionRead, transactionMutate, replayTransactionStore } from "./transactionSet";
+import { TransactionSetStore, transactionRead, transactionMutate, transactionDelete, replayTransactionStore } from "./transactionSet";
 import { StoredEmbedding, EmbeddingFormat, getCloseness, embeddingToFloat32, releaseFloat32, encodeEmbedding, hashEmbedding } from "../embeddingFormats";
 
 export type IvfConfig = {
@@ -194,7 +194,7 @@ export function rebuildStructure(database: Database<IvfEmbeddingRoot>): void {
             continue;
         }
         centroidWrites.push({ key: oldCellId, value: undefined });
-        database.deleteData(root => root.cells[oldCellId]);
+        transactionDelete(cellStore(database, oldCellId));
     }
     transactionMutate(centroidStore(database), centroidWrites);
     database.writeData(root => root.count, allMembers.length);

@@ -120,3 +120,16 @@ export function transactionMutate<Value>(
         database.writeData(store => store[String(nextFileNumber)], encoded);
     }
 }
+
+// Fire-and-forget like transactionMutate: clears the whole set by deleting every file. deleteData only removes
+// a primitive leaf (not a store object), so we delete each file key individually. No-ops (the retry re-runs)
+// if the store isn't synced yet.
+export function transactionDelete<Value>(
+    database: Database<TransactionSetStore<Value>>,
+): void {
+    const files = readTransactionFiles(database);
+    if (!files) return;
+    for (const fileKey of files.fileKeys) {
+        database.deleteData(store => store[fileKey]);
+    }
+}
