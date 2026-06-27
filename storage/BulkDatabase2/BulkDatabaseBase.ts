@@ -148,14 +148,31 @@ export class BulkDatabaseBase<T extends { key: string }> {
         protected deps: ReactiveDeps,
         private storageFactory: StorageFactory,
         private config: BulkDatabase2Config = {},
-    ) {
-        this.reader = new BulkDatabaseReader<T>({
-            name,
-            deps,
-            maxTriggerThrottleMs: config.maxTriggerThrottleMs,
-        });
-        this.reader.setEnsureIndex(() => this.ensureIndex());
+    ) { }
 
+    // The reader (and the background machinery that rides along with it) must NOT be set up just
+    // because the collection was constructed. Many collections are constructed and never touched, and
+    // in Node a merge tick would poke the storage factory (e.g. indexedDB) and throw. We build it
+    // lazily on first access to `this.reader`: every read, write, and merge goes through the reader,
+    // while pure construction never touches it.
+    private _reader: BulkDatabaseReader<T> | undefined;
+    private get reader(): BulkDatabaseReader<T> {
+        if (this._reader) return this._reader;
+        const reader = new BulkDatabaseReader<T>({
+            name: this.name,
+            deps: this.deps,
+            maxTriggerThrottleMs: this.config.maxTriggerThrottleMs,
+        });
+        reader.setEnsureIndex(() => this.ensureIndex());
+        this._reader = reader;
+        this.activate();
+        return reader;
+    }
+
+    private activated = false;
+    private activate(): void {
+        if (this.activated) return;
+        this.activated = true;
         if (typeof window !== "undefined") {
             try {
                 window.addEventListener("pagehide", () => void this.flushPending());
@@ -205,7 +222,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
         } catch { /* not in a DOM context */ }
     }
 
-    private reader: BulkDatabaseReader<T>;
     private subCaches: SubReaderCaches = { bulk: new Map(), stream: new Map() };
 
     private pendingAppends: { framed: Buffer; rows: number }[] = [];
