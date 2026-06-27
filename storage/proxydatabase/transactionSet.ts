@@ -70,9 +70,9 @@ function compactTransactions<Value>(
 ): void {
     const finalState = replay(allTransactions);
     const merged: Transaction[] = [];
-    finalState.forEach((value, key) => {
-        merged.push({ sequence: merged.length, key, value });
-    });
+    for (const key of finalState.keys()) {
+        merged.push({ sequence: merged.length, key, value: finalState.get(key) });
+    }
     const encoded = transactionCbor.encode(merged) as Uint8Array;
     database.writeData(store => store[String(newFileNumber)], encoded);
     for (const fileKey of oldFileKeys) {
@@ -88,21 +88,22 @@ export function transactionRead<Value>(
     return replay(files.transactions) as Map<string, Value>;
 }
 
-// Replay an already-read store object (no read of its own), so a caller can fetch many sets in one batched read and then materialize each.
+// Replay an already-read store (no read of its own), so a caller can fetch many sets in one batched read and materialize each.
 export function replayTransactionStore<Value>(store: TransactionSetStore<Value> | undefined): Map<string, Value> {
     if (!store) return new Map();
     return replay(decodeBuffers(Object.values(store))) as Map<string, Value>;
 }
 
+// Fire-and-forget: no caller should care whether this "succeeded". If the set isn't synced for reading
+// yet it simply does nothing this pass and the caller's retry wrapper re-runs the whole operation later.
 export function transactionMutate<Value>(
     database: Database<TransactionSetStore<Value>>,
     transactions: { key: string; value: Value | undefined }[],
     compactAfterFiles: number = DEFAULT_COMPACT_AFTER_FILES,
-): true | undefined {
+): void {
+    if (!transactions.length) return;
     const files = readTransactionFiles(database);
-    if (!files) return undefined;
-    if (!transactions.length) return true;
-
+    if (!files) return;
     const baseSequence = maxNumber(files.transactions.map(transaction => transaction.sequence), -1) + 1;
     const incoming: Transaction[] = transactions.map((transaction, index) => ({
         sequence: baseSequence + index,
@@ -110,12 +111,10 @@ export function transactionMutate<Value>(
         value: transaction.value,
     }));
     const nextFileNumber = maxNumber(files.fileKeys.map(fileKey => Number(fileKey)), -1) + 1;
-
     if (files.fileKeys.length + 1 >= compactAfterFiles) {
-        compactTransactions(database, [...files.transactions, ...incoming], files.fileKeys, nextFileNumber);
+        compactTransactions(database, files.transactions.concat(incoming), files.fileKeys, nextFileNumber);
     } else {
         const encoded = transactionCbor.encode(incoming) as Uint8Array;
         database.writeData(store => store[String(nextFileNumber)], encoded);
     }
-    return true;
 }
