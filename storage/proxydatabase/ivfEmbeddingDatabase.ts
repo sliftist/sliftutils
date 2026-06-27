@@ -5,69 +5,73 @@ import { StoredEmbedding, EmbeddingFormat, getCloseness, averageEmbeddings, hash
 export type IvfConfig = {
     model: string;
     format: EmbeddingFormat;
-    cellTarget: number;
-    splitAt: number;
+    // Target number of embeddings per cell.
+    cellTargetSize: number;
+    // Split a cell once it reaches this multiple of cellTargetSize members (e.g. 2 => at 2x the target).
+    splitAtSizeMultiple: number;
 };
 
 // Cell ids ARE the hash of the cell's centroid, so there's no id counter. centroids maps that id to the
 // centroid embedding (read whole as the preload, ranked in RAM). Each cell is its own transaction set of
-// ref → member embedding. refIndex maps a ref to the cell holding it, so a remove can find it.
+// ref => member embedding. refIndex maps a ref to the cell holding it, so a remove can find it.
 export type IvfEmbeddingRoot = {
     config: IvfConfig;
-    centroids: TransactionSetStore;
-    cells: { [cellId: string]: TransactionSetStore };
-    refIndex: TransactionSetStore;
+    centroids: TransactionSetStore<StoredEmbedding>;
+    cells: { [cellId: string]: TransactionSetStore<StoredEmbedding> };
+    refIndex: TransactionSetStore<string>;
 };
 
 export type EmbeddingInput = { ref: string; embedding: StoredEmbedding };
 export type SearchHit = { ref: string; closeness: number };
 
-function centroidStore(database: Database<IvfEmbeddingRoot>): Database<TransactionSetStore> {
+type CellEntry = { ref: string; embedding: StoredEmbedding };
+
+function centroidStore(database: Database<IvfEmbeddingRoot>): Database<TransactionSetStore<StoredEmbedding>> {
     return namespaceDatabase(database, root => root.centroids);
 }
-function cellStore(database: Database<IvfEmbeddingRoot>, cellId: string): Database<TransactionSetStore> {
+function cellStore(database: Database<IvfEmbeddingRoot>, cellId: string): Database<TransactionSetStore<StoredEmbedding>> {
     return namespaceDatabase(database, root => root.cells[cellId]);
 }
-function refIndexStore(database: Database<IvfEmbeddingRoot>): Database<TransactionSetStore> {
+function refIndexStore(database: Database<IvfEmbeddingRoot>): Database<TransactionSetStore<string>> {
     return namespaceDatabase(database, root => root.refIndex);
 }
 
 function nearestCell(embedding: StoredEmbedding, centroids: Map<string, StoredEmbedding>): string {
     let bestCellId = "";
     let bestCloseness = -Infinity;
-    for (const [cellId, centroid] of centroids) {
+    centroids.forEach((centroid, cellId) => {
         const closeness = getCloseness(embedding, centroid);
         if (closeness > bestCloseness) {
             bestCloseness = closeness;
             bestCellId = cellId;
         }
-    }
+    });
     return bestCellId;
 }
 
 // 2-means on a cell's members so an overgrown cell can split in place. Seeds with one member and the one
 // farthest from it, then alternates assign / recompute-centroid a few times.
 function splitInTwo(
-    members: [string, StoredEmbedding][],
+    members: CellEntry[],
     config: IvfConfig,
-): { centroid: StoredEmbedding; members: [string, StoredEmbedding][] }[] {
-    let centroidA = members[0][1];
-    let centroidB = members[0][1];
+): { centroid: StoredEmbedding; members: CellEntry[] }[] {
+    let centroidA = members[0].embedding;
+    let centroidB = members[0].embedding;
     let worst = Infinity;
-    for (const [, embedding] of members) {
-        const closeness = getCloseness(centroidA, embedding);
+    for (const member of members) {
+        const closeness = getCloseness(centroidA, member.embedding);
         if (closeness < worst) {
             worst = closeness;
-            centroidB = embedding;
+            centroidB = member.embedding;
         }
     }
-    let groupA: [string, StoredEmbedding][] = [];
-    let groupB: [string, StoredEmbedding][] = [];
+    let groupA: CellEntry[] = [];
+    let groupB: CellEntry[] = [];
     for (let iteration = 0; iteration < 5; iteration++) {
         groupA = [];
         groupB = [];
         for (const member of members) {
-            if (getCloseness(centroidA, member[1]) >= getCloseness(centroidB, member[1])) {
+            if (getCloseness(centroidA, member.embedding) >= getCloseness(centroidB, member.embedding)) {
                 groupA.push(member);
             } else {
                 groupB.push(member);
@@ -76,10 +80,10 @@ function splitInTwo(
         if (!groupA.length || !groupB.length) {
             break;
         }
-        centroidA = averageEmbeddings(groupA.map(member => member[1]), config);
-        centroidB = averageEmbeddings(groupB.map(member => member[1]), config);
+        centroidA = averageEmbeddings(groupA.map(member => member.embedding), config);
+        centroidB = averageEmbeddings(groupB.map(member => member.embedding), config);
     }
-    const result: { centroid: StoredEmbedding; members: [string, StoredEmbedding][] }[] = [];
+    const result: { centroid: StoredEmbedding; members: CellEntry[] }[] = [];
     if (groupA.length) {
         result.push({ centroid: centroidA, members: groupA });
     }
@@ -98,33 +102,35 @@ export function searchEmbeddings(
 ): SearchHit[] | undefined {
     const config = database.readData(root => root.config);
     if (!config) return undefined;
-    const centroids = transactionRead<StoredEmbedding>(centroidStore(database));
+    const centroids = transactionRead(centroidStore(database));
     if (!centroids) return undefined;
     if (!centroids.size) return [];
 
-    const rankedCellIds = [...centroids.entries()]
-        .map(([cellId, centroid]) => ({ cellId, closeness: getCloseness(query, centroid) }))
-        .sort((left, right) => right.closeness - left.closeness)
-        .map(ranked => ranked.cellId);
+    const rankedCells: { cellId: string; closeness: number }[] = [];
+    centroids.forEach((centroid, cellId) => {
+        rankedCells.push({ cellId, closeness: getCloseness(query, centroid) });
+    });
+    rankedCells.sort((left, right) => right.closeness - left.closeness);
 
-    const probeCellCount = Math.max(1, Math.ceil(options.probeBudget / config.cellTarget));
-    const probeCellIds = rankedCellIds.slice(0, probeCellCount);
+    const probeCellCount = Math.max(1, Math.ceil(options.probeBudget / config.cellTargetSize));
+    const probeCellIds = rankedCells.slice(0, probeCellCount).map(ranked => ranked.cellId);
     const stores = database.readData(root => probeCellIds.map(cellId => root.cells[cellId]));
     if (!stores) return undefined;
 
     const hits: SearchHit[] = [];
     for (const store of stores) {
-        const members = replayTransactionStore<StoredEmbedding>(store);
-        for (const [ref, embedding] of members) {
+        const members = replayTransactionStore(store);
+        members.forEach((embedding, ref) => {
             hits.push({ ref, closeness: getCloseness(query, embedding) });
-        }
+        });
     }
     hits.sort((left, right) => right.closeness - left.closeness);
     return hits.slice(0, options.resultCount);
 }
 
 // Assign each embedding to its nearest cell and add it. An empty index bootstraps a first cell from the
-// inserted batch; a cell that crosses splitAt*cellTarget splits in place. undefined while not synced.
+// inserted batch; a cell that crosses splitAtSizeMultiple*cellTargetSize splits in place. undefined while
+// not synced.
 export function insertEmbeddings(
     database: Database<IvfEmbeddingRoot>,
     items: EmbeddingInput[],
@@ -132,7 +138,7 @@ export function insertEmbeddings(
     if (!items.length) return true;
     const config = database.readData(root => root.config);
     if (!config) return undefined;
-    const centroids = transactionRead<StoredEmbedding>(centroidStore(database));
+    const centroids = transactionRead(centroidStore(database));
     if (!centroids) return undefined;
 
     const newCentroids: { key: string; value: StoredEmbedding | undefined }[] = [];
@@ -158,12 +164,12 @@ export function insertEmbeddings(
     const existingStores = database.readData(root => targetCellIds.map(cellId => root.cells[cellId]));
     if (!existingStores) return undefined;
 
-    const splitThreshold = config.splitAt * config.cellTarget;
-    const refWrites: { key: string; value: string | undefined }[] = [];
+    const splitThreshold = config.splitAtSizeMultiple * config.cellTargetSize;
+    const refWrites: { key: string; value: string }[] = [];
     for (let cellIndex = 0; cellIndex < targetCellIds.length; cellIndex++) {
         const cellId = targetCellIds[cellIndex];
         const group = itemsByCell.get(cellId)!;
-        const combined = replayTransactionStore<StoredEmbedding>(existingStores[cellIndex]);
+        const combined = replayTransactionStore(existingStores[cellIndex]);
         for (const item of group) {
             combined.set(item.ref, item.embedding);
         }
@@ -177,14 +183,18 @@ export function insertEmbeddings(
             continue;
         }
 
-        const subCells = splitInTwo([...combined.entries()], config);
+        const memberList: CellEntry[] = [];
+        combined.forEach((embedding, ref) => {
+            memberList.push({ ref, embedding });
+        });
+        const subCells = splitInTwo(memberList, config);
         for (const subCell of subCells) {
             const subCellId = hashEmbedding(subCell.centroid);
             newCentroids.push({ key: subCellId, value: subCell.centroid });
-            const memberWrites = subCell.members.map(([ref, embedding]) => ({ key: ref, value: embedding }));
+            const memberWrites = subCell.members.map(member => ({ key: member.ref, value: member.embedding }));
             if (!transactionMutate(cellStore(database, subCellId), memberWrites)) return undefined;
-            for (const [ref] of subCell.members) {
-                refWrites.push({ key: ref, value: subCellId });
+            for (const member of subCell.members) {
+                refWrites.push({ key: member.ref, value: subCellId });
             }
         }
         newCentroids.push({ key: cellId, value: undefined });
@@ -202,7 +212,7 @@ export function removeEmbeddings(
     refs: string[],
 ): true | undefined {
     if (!refs.length) return true;
-    const refIndex = transactionRead<string>(refIndexStore(database));
+    const refIndex = transactionRead(refIndexStore(database));
     if (!refIndex) return undefined;
 
     const refsByCell = new Map<string, string[]>();
@@ -217,11 +227,12 @@ export function removeEmbeddings(
         group.push(ref);
     }
 
-    for (const [cellId, group] of refsByCell) {
+    for (const cellId of refsByCell.keys()) {
+        const group = refsByCell.get(cellId)!;
         const memberDeletes = group.map(ref => ({ key: ref, value: undefined }));
-        if (!transactionMutate<StoredEmbedding>(cellStore(database, cellId), memberDeletes)) return undefined;
+        if (!transactionMutate(cellStore(database, cellId), memberDeletes)) return undefined;
     }
     const refDeletes = refs.map(ref => ({ key: ref, value: undefined }));
-    if (!transactionMutate<string>(refIndexStore(database), refDeletes)) return undefined;
+    if (!transactionMutate(refIndexStore(database), refDeletes)) return undefined;
     return true;
 }
