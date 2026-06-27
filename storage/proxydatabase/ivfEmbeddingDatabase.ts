@@ -253,7 +253,7 @@ export function insertEmbeddings(
         if (newCount > FLAT_LIMIT) {
             rebuildStructure(database);
         }
-        return true;
+        return;
     }
 
     const centroids = transactionRead(centroidStore(database));
@@ -295,30 +295,28 @@ export function insertEmbeddings(
     if (shouldRegenerate(database)) {
         rebuildStructure(database);
     }
-
-    return true;
 }
 
 export function removeEmbeddings(
     database: Database<IvfEmbeddingRoot>,
     items: EmbeddingInput[],
-): true | undefined {
-    if (!items.length) return true;
+) {
+    if (!items.length) return;
     const steps = database.readData(root => root.steps);
     const count = database.readData(root => root.count);
-    if (!steps) return undefined;
-    if (count === undefined) return undefined;
+    if (!steps) return;
+    if (count === undefined) return;
 
     if (!steps[STEP_IVF]) {
         const flatDeletes = items.map(item => ({ key: item.ref, value: undefined }));
         transactionMutate(flatStore(database), flatDeletes);
         database.writeData(root => root.count, Math.max(0, count - items.length));
-        return true;
+        return;
     }
 
     const centroids = transactionRead(centroidStore(database));
-    if (!centroids) return undefined;
-    if (!centroids.size) return true;
+    if (!centroids) return;
+    if (!centroids.size) return;
 
     const candidatesByItem: { ref: string; cellIds: string[] }[] = [];
     const candidateSet = new Set<string>();
@@ -332,7 +330,7 @@ export function removeEmbeddings(
 
     const candidateCellIds = Array.from(candidateSet);
     const stores = database.readData(root => candidateCellIds.map(cellId => root.cells[cellId]));
-    if (!stores) return undefined;
+    if (!stores) return;
     const membersByCell = new Map<string, Map<string, StoredEmbedding>>();
     for (let index = 0; index < candidateCellIds.length; index++) {
         membersByCell.set(candidateCellIds[index], replayTransactionStore(stores[index]));
@@ -365,5 +363,4 @@ export function removeEmbeddings(
     if (deletedCount) {
         database.writeData(root => root.count, Math.max(0, count - deletedCount));
     }
-    return true;
 }
