@@ -143,11 +143,16 @@ export function embeddingLength(input: Float32Array | StoredEmbedding): number {
 // A pool of reusable Float32 buffers keyed by length. Most embeddings share a size, so internal hot paths
 // borrow a buffer (embeddingToFloat32 with usePool) and return it (releaseFloat32) to avoid per-op
 // allocations and GC thrashing. A borrowed buffer holds stale data; whoever borrows it overwrites it fully.
-const float32Pool = new Map<number, Float32Array[]>();
+//
+// Each free buffer records when it was last released; an hourly sweep drops any that have sat idle for over
+// an hour, so the runtime can free buffers a burst of work allocated but isn't actually reusing anymore.
+const POOL_MAX_IDLE_MS = 60 * 60 * 1000;
+type PooledFloat32 = { buffer: Float32Array; releasedAt: number };
+const float32Pool = new Map<number, PooledFloat32[]>();
 function acquireFloat32(length: number): Float32Array {
     let free = float32Pool.get(length);
     if (free && free.length) {
-        return free.pop()!;
+        return free.pop()!.buffer;
     }
     return new Float32Array(length);
 }
@@ -157,7 +162,23 @@ export function releaseFloat32(buffer: Float32Array): void {
         free = [];
         float32Pool.set(buffer.length, free);
     }
-    free.push(buffer);
+    free.push({ buffer, releasedAt: Date.now() });
+}
+function sweepFloat32Pool(): void {
+    let cutoff = Date.now() - POOL_MAX_IDLE_MS;
+    for (let free of float32Pool.values()) {
+        let writeIndex = 0;
+        for (let readIndex = 0; readIndex < free.length; readIndex++) {
+            if (free[readIndex].releasedAt > cutoff) {
+                free[writeIndex++] = free[readIndex];
+            }
+        }
+        free.length = writeIndex;
+    }
+}
+const poolSweepTimer = setInterval(sweepFloat32Pool, POOL_MAX_IDLE_MS) as unknown as { unref?: () => void };
+if (typeof poolSweepTimer.unref === "function") {
+    poolSweepTimer.unref();
 }
 
 // Decode to a Float32Array (full length). Stored values are already unit-normalized (encodeEmbedding does
