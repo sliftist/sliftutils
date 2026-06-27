@@ -1,14 +1,15 @@
 import fs from "fs";
-import { encodeEmbedding, StoredEmbedding, EmbeddingFormat, embeddingToFloat32, closenessByDecode, closenessByType, closenessByAccessor } from "./embeddingFormats";
+import { encodeEmbedding, averageEmbeddings, embeddingToFloat32, StoredEmbedding, EmbeddingFormat, closenessByDecode, closenessByType, closenessByAccessor } from "./embeddingFormats";
 
-// Races the closeness strategies (decode-to-float / hard-coded-by-type / generic-accessor) on a k-means-
-// shaped workload, to decide which getCloseness should use. The accessor path is simplest; per the rule we
-// keep it if it's within 50% of the fastest.
+// Runs a generic k-means parameterized by an arbitrary getCloseness, so we can race the closeness
+// implementations (all exported from embeddingFormats) on a real clustering workload — plus a variant that
+// decodes every embedding to float32 once and uses plain float dots. Push + run with: typenode storage/embeddingBench.ts
 
 const DIM = 512;
 const SRC = "/root/claude-work/face-embeddings/faceEntry2.f32";
 const MODEL = "buffalo_l";
 const FORMAT: EmbeddingFormat = "q8g8_2048";
+const CONFIG = { format: FORMAT, model: MODEL };
 
 function loadEmbeddings(count: number): StoredEmbedding[] {
     const byteLength = count * DIM * 4;
@@ -24,77 +25,125 @@ function loadEmbeddings(count: number): StoredEmbedding[] {
     return out;
 }
 
-function timeStrategy(
-    name: string,
-    closeness: (a: StoredEmbedding, b: StoredEmbedding) => number,
-    members: StoredEmbedding[],
-    centroids: StoredEmbedding[],
-    repeats: number,
-): number {
-    let checksum = 0;
-    const start = Date.now();
-    for (let repeat = 0; repeat < repeats; repeat++) {
+// Plain k-means: assign each member to the nearest centroid via `closeness`, recompute centroids as the
+// (re-encoded) mean. The closeness function is the only thing that varies.
+function kmeans(members: StoredEmbedding[], clusterCount: number, iterations: number, closeness: (a: StoredEmbedding, b: StoredEmbedding) => number): number {
+    let centroids: StoredEmbedding[] = [];
+    const seedStride = members.length / clusterCount;
+    for (let index = 0; index < clusterCount; index++) {
+        centroids.push(members[Math.floor(index * seedStride)]);
+    }
+    for (let iteration = 0; iteration < iterations; iteration++) {
+        const groups: StoredEmbedding[][] = [];
+        for (let index = 0; index < centroids.length; index++) {
+            groups.push([]);
+        }
         for (const member of members) {
-            for (const centroid of centroids) {
-                checksum += closeness(member, centroid);
+            let bestIndex = 0;
+            let bestCloseness = -Infinity;
+            for (let centroidIndex = 0; centroidIndex < centroids.length; centroidIndex++) {
+                const value = closeness(member, centroids[centroidIndex]);
+                if (value > bestCloseness) {
+                    bestCloseness = value;
+                    bestIndex = centroidIndex;
+                }
+            }
+            groups[bestIndex].push(member);
+        }
+        const next: StoredEmbedding[] = [];
+        for (const group of groups) {
+            if (group.length) {
+                next.push(averageEmbeddings(group, CONFIG));
             }
         }
+        centroids = next;
     }
-    const seconds = (Date.now() - start) / 1000;
-    const calls = repeats * members.length * centroids.length;
-    console.log(`  ${name.padEnd(9)} ${seconds.toFixed(3)}s   ${(calls / seconds / 1e6).toFixed(1)} M/s   (checksum ${checksum.toFixed(0)})`);
-    return seconds;
+    return centroids.length;
 }
 
-// Convert every embedding to a float32 array ONCE, then do plain float dots. This is the batch-friendly
-// path (the per-call decode cost amortizes over the whole member x centroid grid).
-function timeFloat32Once(members: StoredEmbedding[], centroids: StoredEmbedding[], repeats: number): number {
-    let checksum = 0;
-    const start = Date.now();
-    for (let repeat = 0; repeat < repeats; repeat++) {
-        const memberFloats: Float32Array[] = [];
-        for (const member of members) {
-            memberFloats.push(embeddingToFloat32(member));
+// The same k-means but every embedding is decoded to a float32 array ONCE up front; centroids stay float
+// arrays and assignment is a plain float dot. No per-comparison decode, no centroid re-encode.
+function kmeansFloat32Once(members: StoredEmbedding[], clusterCount: number, iterations: number): number {
+    const memberFloats: Float32Array[] = [];
+    for (const member of members) {
+        memberFloats.push(embeddingToFloat32(member));
+    }
+    let centroids: Float32Array[] = [];
+    const seedStride = members.length / clusterCount;
+    for (let index = 0; index < clusterCount; index++) {
+        centroids.push(memberFloats[Math.floor(index * seedStride)]);
+    }
+    for (let iteration = 0; iteration < iterations; iteration++) {
+        const groups: number[][] = [];
+        for (let index = 0; index < centroids.length; index++) {
+            groups.push([]);
         }
-        const centroidFloats: Float32Array[] = [];
-        for (const centroid of centroids) {
-            centroidFloats.push(embeddingToFloat32(centroid));
-        }
-        for (const memberFloat of memberFloats) {
-            for (const centroidFloat of centroidFloats) {
+        for (let memberIndex = 0; memberIndex < memberFloats.length; memberIndex++) {
+            const memberFloat = memberFloats[memberIndex];
+            let bestIndex = 0;
+            let bestDot = -Infinity;
+            for (let centroidIndex = 0; centroidIndex < centroids.length; centroidIndex++) {
+                const centroidFloat = centroids[centroidIndex];
                 const length = Math.min(memberFloat.length, centroidFloat.length);
                 let dot = 0;
-                for (let index = 0; index < length; index++) {
-                    dot += memberFloat[index] * centroidFloat[index];
+                for (let dim = 0; dim < length; dim++) {
+                    dot += memberFloat[dim] * centroidFloat[dim];
                 }
-                checksum += 1 - Math.sqrt(Math.max(0, 2 - 2 * dot));
+                if (dot > bestDot) {
+                    bestDot = dot;
+                    bestIndex = centroidIndex;
+                }
             }
+            groups[bestIndex].push(memberIndex);
         }
+        const next: Float32Array[] = [];
+        for (const group of groups) {
+            if (!group.length) {
+                continue;
+            }
+            const length = memberFloats[group[0]].length;
+            const sum = new Float32Array(length);
+            for (const memberIndex of group) {
+                const memberFloat = memberFloats[memberIndex];
+                for (let dim = 0; dim < length; dim++) {
+                    sum[dim] += memberFloat[dim];
+                }
+            }
+            let norm = 0;
+            for (let dim = 0; dim < length; dim++) {
+                norm += sum[dim] * sum[dim];
+            }
+            const magnitude = Math.sqrt(norm) || 1;
+            for (let dim = 0; dim < length; dim++) {
+                sum[dim] /= magnitude;
+            }
+            next.push(sum);
+        }
+        centroids = next;
     }
+    return centroids.length;
+}
+
+function time(name: string, run: () => number): number {
+    const start = Date.now();
+    const clusters = run();
     const seconds = (Date.now() - start) / 1000;
-    const calls = repeats * members.length * centroids.length;
-    console.log(`  ${"f32-once".padEnd(9)} ${seconds.toFixed(3)}s   ${(calls / seconds / 1e6).toFixed(1)} M/s   (checksum ${checksum.toFixed(0)})`);
+    console.log(`  ${name.padEnd(10)} ${seconds.toFixed(3)}s   (${clusters} clusters)`);
     return seconds;
 }
 
 function main() {
-    const members = loadEmbeddings(2000);
-    const centroids = members.slice(0, 100);
-    const repeats = 3;
-    console.log(`closeness: ${members.length} x ${centroids.length} x ${repeats} = ${(members.length * centroids.length * repeats / 1e6).toFixed(1)}M q8g8 comparisons`);
+    const members = loadEmbeddings(5000);
+    const clusterCount = 40;
+    const iterations = 4;
+    console.log(`k-means: ${members.length} members, ${clusterCount} clusters, ${iterations} iterations\n`);
 
-    // warm up the JIT on a small slice
-    timeStrategy("warmup", closenessByType, members.slice(0, 200), centroids, 1);
-    console.log("");
+    kmeans(members.slice(0, 500), 8, 1, closenessByType); // warm up the JIT
 
-    const decode = timeStrategy("decode", closenessByDecode, members, centroids, repeats);
-    const byType = timeStrategy("type", closenessByType, members, centroids, repeats);
-    const accessor = timeStrategy("accessor", closenessByAccessor, members, centroids, repeats);
-    const float32Once = timeFloat32Once(members, centroids, repeats);
-
-    const fastest = Math.min(decode, byType, accessor, float32Once);
-    const ratio = accessor / fastest;
-    console.log(`\nfastest = ${fastest.toFixed(3)}s; accessor is ${ratio.toFixed(2)}x of it -> ${ratio <= 1.5 ? "accessor OK for getCloseness" : "getCloseness keeps the hard-coded type path"}`);
+    time("type", () => kmeans(members, clusterCount, iterations, closenessByType));
+    time("accessor", () => kmeans(members, clusterCount, iterations, closenessByAccessor));
+    time("decode", () => kmeans(members, clusterCount, iterations, closenessByDecode));
+    time("f32-once", () => kmeansFloat32Once(members, clusterCount, iterations));
 }
 
 main();
