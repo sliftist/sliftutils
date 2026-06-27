@@ -33,7 +33,7 @@ async function buildInputs(count: number): Promise<EmbeddingInput[]> {
 }
 
 function freshDatabase(config: IvfConfig): InMemoryDatabase<IvfEmbeddingRoot> {
-    const root: IvfEmbeddingRoot = { config, count: 0, flat: {}, steps: {}, centroids: {}, cells: {} };
+    const root: IvfEmbeddingRoot = { config, count: 0, flat: {}, byRef: {}, steps: {}, centroids: {}, cells: {} };
     return new InMemoryDatabase<IvfEmbeddingRoot>(root);
 }
 

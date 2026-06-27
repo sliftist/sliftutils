@@ -1,3 +1,4 @@
+import cborx from "cbor-x";
 import { Database, namespaceDatabase } from "./Database";
 import { TransactionSetStore, transactionRead, transactionMutate, transactionDelete, replayTransactionStore } from "./transactionSet";
 import { StoredEmbedding, EmbeddingFormat, getCloseness, embeddingToFloat32, releaseFloat32, encodeEmbedding, hashEmbedding } from "../embeddingFormats";
@@ -17,6 +18,10 @@ export type IvfEmbeddingRoot = {
     config: IvfConfig;
     count: number;
     flat: TransactionSetStore<StoredEmbedding>;
+    // Direct ref -> embedding index. Each entry is one CBOR blob at its own key, so a lookup or delete is a
+    // single key-value op (no transaction-set replay) and deleteData can drop it (it's a primitive leaf). Refs
+    // and their embeddings never move, so a rebuild leaves this untouched.
+    byRef: { [ref: string]: Uint8Array };
     steps: { [step: string]: boolean };
     centroids: TransactionSetStore<StoredEmbedding>;
     cells: { [cellId: string]: TransactionSetStore<StoredEmbedding> };
@@ -25,6 +30,14 @@ export type IvfEmbeddingRoot = {
 export type EmbeddingInput = { ref: string; embedding: StoredEmbedding };
 export type SearchHit = { ref: string; closeness: number };
 type CellEntry = { ref: string; embedding: StoredEmbedding };
+
+const embeddingCbor = new cborx.Encoder({ structuredClone: true });
+function encodeRefValue(embedding: StoredEmbedding): Uint8Array {
+    return embeddingCbor.encode(embedding) as Uint8Array;
+}
+function decodeRefValue(value: Uint8Array): StoredEmbedding {
+    return embeddingCbor.decode(value) as StoredEmbedding;
+}
 
 // Below this many embeddings we skip the IVF entirely (flat store). 1024 = a clean power of two.
 const FLAT_LIMIT = 1024;
@@ -239,6 +252,24 @@ export function searchEmbeddings(
     return hits.slice(0, options.resultCount);
 }
 
+// Direct ref -> stored embedding lookup through the byRef index: one key-value read per ref, no cell scan. A
+// search returns refs; this fetches the data behind them. Skips refs that aren't present; undefined if not synced.
+export function lookupEmbeddings(
+    database: Database<IvfEmbeddingRoot>,
+    refs: string[],
+): Map<string, StoredEmbedding> | undefined {
+    const values = database.readData(root => refs.map(ref => root.byRef[ref]));
+    if (!values) return undefined;
+    const result = new Map<string, StoredEmbedding>();
+    for (let index = 0; index < refs.length; index++) {
+        const value = values[index];
+        if (value) {
+            result.set(refs[index], decodeRefValue(value));
+        }
+    }
+    return result;
+}
+
 export function insertEmbeddings(
     database: Database<IvfEmbeddingRoot>,
     items: EmbeddingInput[],
@@ -255,6 +286,9 @@ export function insertEmbeddings(
     if (!steps[STEP_IVF]) {
         const flatWrites = items.map(item => ({ key: item.ref, value: item.embedding }));
         transactionMutate(flatStore(database), flatWrites);
+        for (const item of items) {
+            database.writeData(root => root.byRef[item.ref], encodeRefValue(item.embedding));
+        }
         database.writeData(root => root.count, newCount);
         if (newCount > FLAT_LIMIT) {
             rebuildStructure(database);
@@ -278,6 +312,9 @@ export function insertEmbeddings(
         const group = itemsByCell.get(cellId)!;
         const memberWrites = group.map(item => ({ key: item.ref, value: item.embedding }));
         transactionMutate(cellStore(database, cellId), memberWrites);
+    }
+    for (const item of items) {
+        database.writeData(root => root.byRef[item.ref], encodeRefValue(item.embedding));
     }
     database.writeData(root => root.count, newCount);
 
@@ -305,18 +342,21 @@ export function insertEmbeddings(
 
 export function removeEmbeddings(
     database: Database<IvfEmbeddingRoot>,
-    items: EmbeddingInput[],
+    refs: string[],
 ) {
-    if (!items.length) return;
+    if (!refs.length) return;
     const steps = database.readData(root => root.steps);
     const count = database.readData(root => root.count);
     if (!steps) return;
     if (count === undefined) return;
 
     if (!steps[STEP_IVF]) {
-        const flatDeletes = items.map(item => ({ key: item.ref, value: undefined }));
+        const flatDeletes = refs.map(ref => ({ key: ref, value: undefined }));
         transactionMutate(flatStore(database), flatDeletes);
-        database.writeData(root => root.count, Math.max(0, count - items.length));
+        for (const ref of refs) {
+            database.deleteData(root => root.byRef[ref]);
+        }
+        database.writeData(root => root.count, Math.max(0, count - refs.length));
         return;
     }
 
@@ -324,11 +364,20 @@ export function removeEmbeddings(
     if (!centroids) return;
     if (!centroids.size) return;
 
+    // Look up each ref's embedding through byRef, then rank its cells the way an insert would, so we delete from
+    // the cell it actually landed in (plus a few neighbours, in case a rebuild nudged it across a boundary).
+    const refValues = database.readData(root => refs.map(ref => root.byRef[ref]));
+    if (!refValues) return;
     const candidatesByItem: { ref: string; cellIds: string[] }[] = [];
     const candidateSet = new Set<string>();
-    for (const item of items) {
-        const cellIds = rankCellsByCloseness(item.embedding, centroids).slice(0, 1 + DELETE_FALLBACK_CELLS);
-        candidatesByItem.push({ ref: item.ref, cellIds });
+    for (let index = 0; index < refs.length; index++) {
+        const value = refValues[index];
+        if (!value) {
+            continue;
+        }
+        const embedding = decodeRefValue(value);
+        const cellIds = rankCellsByCloseness(embedding, centroids).slice(0, 1 + DELETE_FALLBACK_CELLS);
+        candidatesByItem.push({ ref: refs[index], cellIds });
         for (const cellId of cellIds) {
             candidateSet.add(cellId);
         }
@@ -343,30 +392,33 @@ export function removeEmbeddings(
     }
 
     const deletesByCell = new Map<string, string[]>();
+    const deletedRefs: string[] = [];
     for (const candidate of candidatesByItem) {
         for (const cellId of candidate.cellIds) {
             const members = membersByCell.get(cellId);
             if (!members || !members.has(candidate.ref)) {
                 continue;
             }
-            let refs = deletesByCell.get(cellId);
-            if (!refs) {
-                refs = [];
-                deletesByCell.set(cellId, refs);
+            let cellRefs = deletesByCell.get(cellId);
+            if (!cellRefs) {
+                cellRefs = [];
+                deletesByCell.set(cellId, cellRefs);
             }
-            refs.push(candidate.ref);
+            cellRefs.push(candidate.ref);
+            deletedRefs.push(candidate.ref);
             break;
         }
     }
 
-    let deletedCount = 0;
     for (const cellId of deletesByCell.keys()) {
-        const refs = deletesByCell.get(cellId)!;
-        deletedCount += refs.length;
-        const memberDeletes = refs.map(ref => ({ key: ref, value: undefined }));
+        const cellRefs = deletesByCell.get(cellId)!;
+        const memberDeletes = cellRefs.map(ref => ({ key: ref, value: undefined }));
         transactionMutate(cellStore(database, cellId), memberDeletes);
     }
-    if (deletedCount) {
-        database.writeData(root => root.count, Math.max(0, count - deletedCount));
+    for (const ref of deletedRefs) {
+        database.deleteData(root => root.byRef[ref]);
+    }
+    if (deletedRefs.length) {
+        database.writeData(root => root.count, Math.max(0, count - deletedRefs.length));
     }
 }
