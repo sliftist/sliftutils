@@ -12,6 +12,13 @@ import { WebSocketServer, WebSocket } from "ws";
 import { BulkDatabaseBase, bulkDatabase2Timing, noopReactiveDeps, BULK_ROOT_FOLDER } from "./BulkDatabase2/BulkDatabaseBase";
 import { wrapHandle, NodeJSDirectoryHandleWrapper, DirectoryWrapper } from "./FileFolderAPI";
 
+process.on("uncaughtException", err => {
+    console.error(`[writeServer] uncaughtException (continuing):`, (err as Error).stack ?? err);
+});
+process.on("unhandledRejection", reason => {
+    console.error(`[writeServer] unhandledRejection (continuing):`, (reason as Error)?.stack ?? reason);
+});
+
 // Remote file server for sliftutils getRemoteFileStorage / BulkDatabase2. Serves one folder on disk over
 // self-signed HTTPS, authenticated with an auto-generated 6-word password (sent as
 // `Authorization: Bearer <password>`). Run it with `yarn filehoster <folder>` (or the `filehoster` bin).

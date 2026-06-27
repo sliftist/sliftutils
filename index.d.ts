@@ -2258,6 +2258,34 @@ declare module "sliftutils/storage/backblaze" {
 
 }
 
+declare module "sliftutils/storage/embeddingFormats" {
+    export type EmbeddingFormat = "q8g8_2048" | "q8_g16_2048" | "q8_g16_1024" | "float32";
+    export declare const EMBEDDING_FORMATS: EmbeddingFormat[];
+    export declare const DEFAULT_EMBEDDING_FORMAT: EmbeddingFormat;
+    export type QuantType = "q8";
+    export type StoredEmbedding = {
+        kind: "float32";
+        model: string;
+        values: Float32Array;
+    } | {
+        kind: "quant";
+        model: string;
+        type: QuantType;
+        groupSize: number;
+        data: Uint8Array;
+        scales: Uint8Array;
+    };
+    export declare function encodeEmbedding(config: {
+        input: Float32Array | StoredEmbedding;
+        format: EmbeddingFormat;
+        model: string;
+    }): StoredEmbedding;
+    export declare function serializeStoredEmbedding(stored: StoredEmbedding): string;
+    export declare function deserializeStoredEmbedding(base64: string): StoredEmbedding;
+    export declare const getCloseness: (embedding1: Float32Array | StoredEmbedding, embedding2: Float32Array | StoredEmbedding) => number;
+
+}
+
 declare module "sliftutils/storage/fileSystemPointer" {
     export type FileSystemPointer = string;
     export declare function storeFileSystemPointer(config: {
@@ -2270,6 +2298,29 @@ declare module "sliftutils/storage/fileSystemPointer" {
     }): Promise<{
         onUserActivation(modeOverride?: "read" | "readwrite"): Promise<FileSystemFileHandle | FileSystemDirectoryHandle>;
     } | undefined>;
+
+}
+
+declare module "sliftutils/storage/proxydatabase/Database" {
+    export interface Database<Root> {
+        readData: <Value>(deref: (root: Root) => Value) => Value | undefined;
+        writeData: <Value>(deref: (root: Root) => Value, newValue: Value) => void;
+        deleteData: (deref: (root: Root) => unknown) => void;
+    }
+    export declare function namespaceDatabase<Root, Sub>(database: Database<Root>, into: (root: Root) => Sub): Database<Sub>;
+
+}
+
+declare module "sliftutils/storage/proxydatabase/transactionSet" {
+    import { Database } from "./Database";
+    export type TransactionSetStore = {
+        [fileNumber: string]: Uint8Array;
+    };
+    export declare function transactionRead<Value>(database: Database<TransactionSetStore>): Map<string, Value> | undefined;
+    export declare function transactionMutate<Value>(database: Database<TransactionSetStore>, transactions: {
+        key: string;
+        value: Value | undefined;
+    }[], compactAfterFiles?: number): true | undefined;
 
 }
 

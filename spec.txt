@@ -1,5 +1,42 @@
 
+Searching
+    1) We want to create something that's database agnostic
+        - So I think we need like multiple phases for reading. And for applying it? We need to be able to know all of our reads ahead of time, which we should be able to roughly know. Or at least we'll have multiple stages. That should be fine. I guess we could do it so it actually understands our database. Like it reads, and then if it's not there, it returns. That might be fine too. 
+
+interface Database<Root> {
+    readData: <T>(fnc: (root: Root) => T) => T | undefined;
+    writeData: <T>(fnc: (root: Root) => T, newValue: T) => void;
+}
+I guess this works. We need multiple stages, so it's gonna have to read in the index, In parallel, and then once it has the full index, then it can do the next step in parallel, etc. 
 
 
+remaining
+    1) The code book creation. We kind of do want to recreate it sometimes. Maybe we can have something that does a full expensive recreation at certain early on points?
+    2) The searching there's a few different stages. Like, we want to search more IVF cells, but then even within the cells, we kind of want to download more of the final embeddings.  because the codes aren't gonna to be perfect. So we have to do both at the same time?
 
-Create a companion large data storage thing.  which updates the data less frequently, Where we reference it with unique IDs so we don't have to merge as much and it doesn't have to be as strict. This should allow our large databases to be merged faster, even though they are pretty fast to merge at the moment, but they probably will get slower if we make them 10 times bigger. 
+parts
+    p8g8 format (q8), so we can store 2048 dimensions is a bit over 2KB
+    IVF cell size 32? PQ index reduces by 32X, and if IVF cells reduce by 32X... then 500K 2KB values (1GB) would still just be... 1MB IVF index, so... that's good.
+    0) In IVF, sample 32, then keep sampling more, up to 128 cells
+    1) Pq 64 index (byte values each, break into 64 groups, always... should work well, For face vectors, they're already really optimized. They have so few dimensions, and so we don't compress it by that much. But for text vectors, they're less compressed, so we compress it more. So it should work in all cases)
+    2) Retraining index on a subset
+        - Or... just don't. Freeze after a certain point, and... it might be fine? HMM... Although no, we could allow retraining. It should be cheap enough. 
+    3) Split into transaction logs, so we can read the PQ index efficiently, but still update it
+        UGH... I mean basically you would just be replicating some of what we actually store on disk, but in our database, which is stupid, but I think we'll probably do it anyway. Basically, just a transaction log. We have to read everything every time, but it should help the speed a little bit...
+            - And I think it's fair because it's us saying, hey, we're going to read all this data every time, which the database can't know, so it can't optimize for that, but we can know, and then we can optimize for it
+    4) IVF the pq index to vastly decrease the initial access time
+    5.0) automatically split cells when they get big enough (2X their initial size)
+    5) occasionally regenerate the entire IVF.
+    5.1) Have something to store a subset of the data codes?
+    5.1) Have something that stores some of the data randomly so we can easily access a subset. We won't represent deletions in it. That's fine. This will allow us to rebalance the IVF fairly efficiently. 
+        - And maybe even slowly move stuff over to the new IVF as we access stuff, we see if it's in the new IVF, and if not, we move it?
+        - 10% of the data? And... maybe just the pq index values?
+        - Should make retraining the IVF ten times faster and shouldn't affect the recall by too much, especially if we have more cells
+        - AND, Maybe we can actually sample less the more data we have. Ramping up to 10%. 
+unknown
+    exactly how we're going to update the IVF. 
+    IVF pq index, so we can read part of it
+        mini transaction logs in each cell?
+
+    BUT... how do we update IVF
+
