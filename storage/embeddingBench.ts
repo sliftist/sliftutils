@@ -1,5 +1,5 @@
 import fs from "fs";
-import { encodeEmbedding, averageEmbeddings, embeddingToFloat32, StoredEmbedding, EmbeddingFormat, closenessByDecode, closenessByType, closenessByAccessor } from "./embeddingFormats";
+import { encodeEmbedding, averageEmbeddings, embeddingToFloat32, releaseFloat32, StoredEmbedding, EmbeddingFormat, closenessByDecode, closenessByType, closenessByAccessor } from "./embeddingFormats";
 
 // Runs a generic k-means parameterized by an arbitrary getCloseness, so we can race the closeness
 // implementations (all exported from embeddingFormats) on a real clustering workload — plus a variant that
@@ -66,7 +66,7 @@ function kmeans(members: StoredEmbedding[], clusterCount: number, iterations: nu
 function kmeansFloat32Once(members: StoredEmbedding[], clusterCount: number, iterations: number): number {
     const memberFloats: Float32Array[] = [];
     for (const member of members) {
-        memberFloats.push(embeddingToFloat32(member));
+        memberFloats.push(embeddingToFloat32(member, true));
     }
     let centroids: Float32Array[] = [];
     const seedStride = members.length / clusterCount;
@@ -120,6 +120,9 @@ function kmeansFloat32Once(members: StoredEmbedding[], clusterCount: number, ite
             next.push(sum);
         }
         centroids = next;
+    }
+    for (const memberFloat of memberFloats) {
+        releaseFloat32(memberFloat);
     }
     return centroids.length;
 }

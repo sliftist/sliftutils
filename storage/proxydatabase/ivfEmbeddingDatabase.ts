@@ -1,6 +1,6 @@
 import { Database, namespaceDatabase } from "./Database";
 import { TransactionSetStore, transactionRead, transactionMutate, replayTransactionStore } from "./transactionSet";
-import { StoredEmbedding, EmbeddingFormat, getCloseness, averageEmbeddings, hashEmbedding } from "../embeddingFormats";
+import { StoredEmbedding, EmbeddingFormat, getCloseness, embeddingToFloat32, releaseFloat32, encodeEmbedding, hashEmbedding } from "../embeddingFormats";
 
 export type IvfConfig = {
     model: string;
@@ -71,43 +71,81 @@ function rebalanceProbability(fillRatio: number): number {
     return Math.min(1, over * over * over * 0.25);
 }
 
-// k-means over the members using getCloseness; centroids are the running cluster means.
+// k-means. Decodes every member to a pooled float32 buffer ONCE, then assigns with a plain internal float
+// dot (no getCloseness call — comparing two float vectors is trivial) and keeps centroids as float means,
+// encoding them to StoredEmbedding only at the end. Releases the borrowed buffers when done.
 function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfConfig): { centroid: StoredEmbedding; members: CellEntry[] }[] {
-    let centroids: StoredEmbedding[] = [];
+    const memberFloats: Float32Array[] = [];
+    for (const member of members) {
+        memberFloats.push(embeddingToFloat32(member.embedding, true));
+    }
+    const length = memberFloats.length ? memberFloats[0].length : 0;
+    let centroids: Float32Array[] = [];
     const seedStep = members.length / clusterCount;
     for (let clusterIndex = 0; clusterIndex < clusterCount; clusterIndex++) {
-        centroids.push(members[Math.floor(clusterIndex * seedStep)].embedding);
+        centroids.push(new Float32Array(memberFloats[Math.floor(clusterIndex * seedStep)]));
     }
-    let groups: CellEntry[][] = [];
+    let groups: number[][] = [];
     for (let iteration = 0; iteration < REBALANCE_ITERATIONS; iteration++) {
-        groups = centroids.map(() => []);
-        for (const member of members) {
+        groups = [];
+        for (let clusterIndex = 0; clusterIndex < centroids.length; clusterIndex++) {
+            groups.push([]);
+        }
+        for (let memberIndex = 0; memberIndex < memberFloats.length; memberIndex++) {
+            const memberFloat = memberFloats[memberIndex];
             let bestIndex = 0;
-            let bestCloseness = -Infinity;
+            let bestDot = -Infinity;
             for (let centroidIndex = 0; centroidIndex < centroids.length; centroidIndex++) {
-                const closeness = getCloseness(member.embedding, centroids[centroidIndex]);
-                if (closeness > bestCloseness) {
-                    bestCloseness = closeness;
+                const centroidFloat = centroids[centroidIndex];
+                let dot = 0;
+                for (let dim = 0; dim < length; dim++) {
+                    dot += memberFloat[dim] * centroidFloat[dim];
+                }
+                if (dot > bestDot) {
+                    bestDot = dot;
                     bestIndex = centroidIndex;
                 }
             }
-            groups[bestIndex].push(member);
+            groups[bestIndex].push(memberIndex);
         }
-        const nextCentroids: StoredEmbedding[] = [];
-        const nextGroups: CellEntry[][] = [];
+        const nextCentroids: Float32Array[] = [];
+        const nextGroups: number[][] = [];
         for (const group of groups) {
             if (!group.length) {
                 continue;
             }
-            nextCentroids.push(averageEmbeddings(group.map(member => member.embedding), config));
+            const mean = new Float32Array(length);
+            for (const memberIndex of group) {
+                const memberFloat = memberFloats[memberIndex];
+                for (let dim = 0; dim < length; dim++) {
+                    mean[dim] += memberFloat[dim];
+                }
+            }
+            let norm = 0;
+            for (let dim = 0; dim < length; dim++) {
+                norm += mean[dim] * mean[dim];
+            }
+            const magnitude = Math.sqrt(norm) || 1;
+            for (let dim = 0; dim < length; dim++) {
+                mean[dim] /= magnitude;
+            }
+            nextCentroids.push(mean);
             nextGroups.push(group);
         }
         centroids = nextCentroids;
         groups = nextGroups;
     }
     const result: { centroid: StoredEmbedding; members: CellEntry[] }[] = [];
-    for (let clusterIndex = 0; clusterIndex < groups.length; clusterIndex++) {
-        result.push({ centroid: centroids[clusterIndex], members: groups[clusterIndex] });
+    for (let clusterIndex = 0; clusterIndex < centroids.length; clusterIndex++) {
+        const centroid = encodeEmbedding({ input: centroids[clusterIndex], format: config.format, model: config.model });
+        const cellMembers: CellEntry[] = [];
+        for (const memberIndex of groups[clusterIndex]) {
+            cellMembers.push(members[memberIndex]);
+        }
+        result.push({ centroid, members: cellMembers });
+    }
+    for (const memberFloat of memberFloats) {
+        releaseFloat32(memberFloat);
     }
     return result;
 }

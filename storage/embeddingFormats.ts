@@ -140,16 +140,48 @@ export function embeddingLength(input: Float32Array | StoredEmbedding): number {
     return input.data.length;
 }
 
-// Decode to a Float32Array (full length). Inputs are assumed already unit-normalized, so this only
-// de-quantizes — it never normalizes or truncates. A float input is returned as-is (no copy); don't mutate.
-export function embeddingToFloat32(input: Float32Array | StoredEmbedding): Float32Array {
-    if (input instanceof Float32Array) return input;
-    if (input.kind === "float32") return input.values;
+// A pool of reusable Float32 buffers keyed by length. Most embeddings share a size, so internal hot paths
+// borrow a buffer (embeddingToFloat32 with usePool) and return it (releaseFloat32) to avoid per-op
+// allocations and GC thrashing. A borrowed buffer holds stale data; whoever borrows it overwrites it fully.
+const float32Pool = new Map<number, Float32Array[]>();
+function acquireFloat32(length: number): Float32Array {
+    let free = float32Pool.get(length);
+    if (free && free.length) {
+        return free.pop()!;
+    }
+    return new Float32Array(length);
+}
+export function releaseFloat32(buffer: Float32Array): void {
+    let free = float32Pool.get(buffer.length);
+    if (!free) {
+        free = [];
+        float32Pool.set(buffer.length, free);
+    }
+    free.push(buffer);
+}
+
+// Decode to a Float32Array (full length). Stored values are already unit-normalized (encodeEmbedding does
+// that), so this only de-quantizes. By default it allocates a fresh array (a float input is returned as-is,
+// no copy). With usePool it borrows a pooled buffer the caller must releaseFloat32 — used by hot internal
+// paths so repeated decodes don't allocate.
+export function embeddingToFloat32(input: Float32Array | StoredEmbedding, usePool = false): Float32Array {
+    if (input instanceof Float32Array) {
+        if (!usePool) return input;
+        let out = acquireFloat32(input.length);
+        out.set(input);
+        return out;
+    }
+    if (input.kind === "float32") {
+        if (!usePool) return input.values;
+        let out = acquireFloat32(input.values.length);
+        out.set(input.values);
+        return out;
+    }
     let int8 = asInt8(input.data);
     let scales = asFloat16Indexable(input.scales);
     let groupSize = input.groupSize;
     let length = int8.length;
-    let out = new Float32Array(length);
+    let out = usePool ? acquireFloat32(length) : new Float32Array(length);
     let group = 0;
     for (let start = 0; start < length; start += groupSize) {
         let scale = scales[group++];
@@ -193,9 +225,14 @@ function dotFloat32(a: Float32Array, b: Float32Array): number {
 
 // --- three closeness strategies, kept separate so embeddingBench can race them ---
 
-// Decode both to float32 then dot (allocates two arrays per call).
+// Decode both to pooled float32 buffers, dot, return them. No allocation in steady state.
 export function closenessByDecode(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
-    return closenessFromDot(dotFloat32(embeddingToFloat32(a), embeddingToFloat32(b)));
+    let va = embeddingToFloat32(a, true);
+    let vb = embeddingToFloat32(b, true);
+    let result = closenessFromDot(dotFloat32(va, vb));
+    releaseFloat32(va);
+    releaseFloat32(vb);
+    return result;
 }
 
 // Generic: a value-at-index closure per side, iterate. No allocation, but a function call per dimension.
@@ -236,8 +273,9 @@ export function closenessByType(a: Float32Array | StoredEmbedding, b: Float32Arr
 // Production closeness. (Set to the embeddingBench winner.)
 export const getCloseness = measureWrap(closenessByType);
 
-// Re-encode an embedding (or raw float32 vector) into the requested format. Input is assumed already
-// unit-normalized; this only de-quantizes + truncates + re-quantizes, never normalizes.
+// Encode a vector (or re-encode an embedding) into the requested format. This is THE place we normalize:
+// the (truncated) vector is made unit length here, so anything that's been encoded is reliably normalized
+// and the comparison/decoding paths never have to re-normalize.
 export function encodeEmbedding(config: {
     input: Float32Array | StoredEmbedding;
     format: EmbeddingFormat;
@@ -245,46 +283,57 @@ export function encodeEmbedding(config: {
 }): StoredEmbedding {
     let { input, format, model } = config;
     let formatConfig = FORMAT_CONFIGS[format];
-    let decoded = embeddingToFloat32(input);
+    let decoded = embeddingToFloat32(input, true);
     let length = decoded.length;
     if (formatConfig.truncation !== undefined && formatConfig.truncation < length) {
         length = formatConfig.truncation;
     }
-    let vector = decoded.subarray(0, length);
+    let norm = 0;
+    for (let index = 0; index < length; index++) {
+        norm += decoded[index] * decoded[index];
+    }
+    let magnitude = Math.sqrt(norm) || 1;
+    for (let index = 0; index < length; index++) {
+        decoded[index] /= magnitude;
+    }
 
+    let result: StoredEmbedding;
     if (!formatConfig.quant) {
-        return { kind: "float32", model, values: new Float32Array(vector) };
-    }
-    let { type, groupSize } = formatConfig.quant;
-    let groupCount = Math.ceil(length / groupSize);
-    let int8 = new Int8Array(length);
-    let scales = new Float32Array(groupCount);
-    for (let group = 0; group < groupCount; group++) {
-        let start = group * groupSize;
-        let end = Math.min(start + groupSize, length);
-        let maxAbs = 0;
-        for (let index = start; index < end; index++) {
-            let magnitude = Math.abs(vector[index]);
-            if (magnitude > maxAbs) maxAbs = magnitude;
+        result = { kind: "float32", model, values: new Float32Array(decoded.subarray(0, length)) };
+    } else {
+        let { type, groupSize } = formatConfig.quant;
+        let groupCount = Math.ceil(length / groupSize);
+        let int8 = new Int8Array(length);
+        let scales = new Float32Array(groupCount);
+        for (let group = 0; group < groupCount; group++) {
+            let start = group * groupSize;
+            let end = Math.min(start + groupSize, length);
+            let maxAbs = 0;
+            for (let index = start; index < end; index++) {
+                let absValue = Math.abs(decoded[index]);
+                if (absValue > maxAbs) maxAbs = absValue;
+            }
+            let scale = maxAbs / INT8_MAX;
+            scales[group] = scale;
+            if (!scale) continue;
+            for (let index = start; index < end; index++) {
+                let quantized = Math.round(decoded[index] / scale);
+                if (quantized > INT8_MAX) quantized = INT8_MAX;
+                if (quantized < -INT8_MAX) quantized = -INT8_MAX;
+                int8[index] = quantized;
+            }
         }
-        let scale = maxAbs / INT8_MAX;
-        scales[group] = scale;
-        if (!scale) continue;
-        for (let index = start; index < end; index++) {
-            let quantized = Math.round(vector[index] / scale);
-            if (quantized > INT8_MAX) quantized = INT8_MAX;
-            if (quantized < -INT8_MAX) quantized = -INT8_MAX;
-            int8[index] = quantized;
-        }
+        result = {
+            kind: "quant",
+            model,
+            type,
+            groupSize,
+            data: new Uint8Array(int8.buffer, int8.byteOffset, int8.byteLength),
+            scales: encodeFloat16(scales),
+        };
     }
-    return {
-        kind: "quant",
-        model,
-        type,
-        groupSize,
-        data: new Uint8Array(int8.buffer, int8.byteOffset, int8.byteLength),
-        scales: encodeFloat16(scales),
-    };
+    releaseFloat32(decoded);
+    return result;
 }
 
 type SerializedHeader =
@@ -333,28 +382,24 @@ export function deserializeStoredEmbedding(base64: string): StoredEmbedding {
     };
 }
 
-// Mean of several embeddings, normalized to unit (a centroid must be unit for fair dot ranking) and encoded.
+// Mean of several embeddings (encodeEmbedding normalizes the result to a unit centroid). Borrows a pooled
+// accumulator.
 export function averageEmbeddings(embeddings: StoredEmbedding[], config: { format: EmbeddingFormat; model: string }): StoredEmbedding {
     let length = Infinity;
     for (let embedding of embeddings) {
         length = Math.min(length, embeddingLength(embedding));
     }
-    let sum = new Float32Array(length);
+    let sum = acquireFloat32(length);
+    sum.fill(0);
     for (let embedding of embeddings) {
         let get = embeddingAccessor(embedding);
         for (let dimension = 0; dimension < length; dimension++) {
             sum[dimension] += get(dimension);
         }
     }
-    let norm = 0;
-    for (let dimension = 0; dimension < length; dimension++) {
-        norm += sum[dimension] * sum[dimension];
-    }
-    let magnitude = Math.sqrt(norm) || 1;
-    for (let dimension = 0; dimension < length; dimension++) {
-        sum[dimension] /= magnitude;
-    }
-    return encodeEmbedding({ input: sum, format: config.format, model: config.model });
+    let result = encodeEmbedding({ input: sum.subarray(0, length), format: config.format, model: config.model });
+    releaseFloat32(sum);
+    return result;
 }
 
 // A stable 16-byte (base64) content hash of an embedding's values, for use as a cell id derived from its
