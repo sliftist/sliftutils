@@ -273,6 +273,39 @@ export function deserializeStoredEmbedding(base64: string): StoredEmbedding {
     };
 }
 
+// Mean of several embeddings (decoded to their common length), re-encoded into the requested format
+// (which renormalizes). Used to build and split IVF cell centroids.
+export function averageEmbeddings(embeddings: StoredEmbedding[], config: { format: EmbeddingFormat; model: string }): StoredEmbedding {
+    let length = Infinity;
+    for (let embedding of embeddings) {
+        length = Math.min(length, embeddingLength(embedding));
+    }
+    let sum = new Float32Array(length);
+    for (let embedding of embeddings) {
+        let decoded = decodeToLength(embedding, length);
+        for (let dimension = 0; dimension < length; dimension++) {
+            sum[dimension] += decoded[dimension];
+        }
+    }
+    for (let dimension = 0; dimension < length; dimension++) {
+        sum[dimension] /= embeddings.length;
+    }
+    return encodeEmbedding({ input: sum, format: config.format, model: config.model });
+}
+
+// A stable 16-byte (base64) content hash of an embedding, for use as a cell id derived from its centroid.
+export function hashEmbedding(stored: StoredEmbedding): string {
+    let serialized = serializeStoredEmbedding(stored);
+    let lanes = new Uint32Array([2166136261, 2654435761, 40503, 3266489917]);
+    for (let charIndex = 0; charIndex < serialized.length; charIndex++) {
+        let code = serialized.charCodeAt(charIndex);
+        for (let lane = 0; lane < lanes.length; lane++) {
+            lanes[lane] = Math.imul(lanes[lane] ^ (code + lane * 131 + charIndex), 16777619);
+        }
+    }
+    return Buffer.from(lanes.buffer).toString("base64");
+}
+
 // Compare two embeddings in any format / truncation. Both are decoded, truncated to their common
 // length, and unit-normalized, then scored as 1 minus their euclidean distance.
 export const getCloseness = measureWrap(function getCloseness(

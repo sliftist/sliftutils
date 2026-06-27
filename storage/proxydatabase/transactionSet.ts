@@ -21,6 +21,17 @@ function maxNumber(values: number[], fallback: number): number {
     return result;
 }
 
+function decodeBuffers(buffers: Uint8Array[]): Transaction[] {
+    const transactions: Transaction[] = [];
+    for (const buffer of buffers) {
+        const decoded = transactionCbor.decode(buffer) as Transaction[];
+        for (const transaction of decoded) {
+            transactions.push(transaction);
+        }
+    }
+    return transactions;
+}
+
 function readTransactionFiles(
     database: Database<TransactionSetStore>,
 ): { fileKeys: string[]; transactions: Transaction[] } | undefined {
@@ -29,14 +40,7 @@ function readTransactionFiles(
         buffers: Object.values(store),
     }));
     if (!snapshot) return undefined;
-    const transactions: Transaction[] = [];
-    for (const buffer of snapshot.buffers) {
-        const decoded = transactionCbor.decode(buffer) as Transaction[];
-        for (const transaction of decoded) {
-            transactions.push(transaction);
-        }
-    }
-    return { fileKeys: snapshot.fileKeys, transactions };
+    return { fileKeys: snapshot.fileKeys, transactions: decodeBuffers(snapshot.buffers) };
 }
 
 function replay(transactions: Transaction[]): Map<string, unknown> {
@@ -75,6 +79,12 @@ export function transactionRead<Value>(
     const files = readTransactionFiles(database);
     if (!files) return undefined;
     return replay(files.transactions) as Map<string, Value>;
+}
+
+// Replay an already-read store object (no read of its own), so a caller can fetch many sets in one batched read and then materialize each.
+export function replayTransactionStore<Value>(store: TransactionSetStore | undefined): Map<string, Value> {
+    if (!store) return new Map();
+    return replay(decodeBuffers(Object.values(store))) as Map<string, Value>;
 }
 
 export function transactionMutate<Value>(
