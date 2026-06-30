@@ -257,7 +257,7 @@ export async function loadFileReader(name: string, storage: FileStorage, f: Bulk
     const raw = await makeRawGetRange(storage, f.fileName);
     const fileId = nullJoin(name, f.fileName);
     const opened = await blockCache.open(fileId, raw.size, raw.rawGetRange);
-    const reader = await loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange });
+    const reader = await loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange, name: f.fileName });
     cache.set(f.fileName, reader);
     return reader;
 }
@@ -327,6 +327,19 @@ function pruneSubCaches(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[]
     for (const n of subCaches.stream.keys()) if (!liveStream.has(n)) subCaches.stream.delete(n);
 }
 
+// A corrupt/unreadable column in ONE underlying file must not break the whole joined read. When a
+// source's column read throws, we drop that source for that column (falling through to older readers,
+// exactly as if the file never set the column) and warn once per (file, column) so the corruption is
+// visible without flooding the log on every rebuild.
+const warnedCorruptReads = new Set<string>();
+function warnCorruptRead(db: BaseBulkDatabaseReader, column: string, e: unknown): void {
+    const fileName = db.name || "(unknown source)";
+    const dedupeKey = nullJoin(fileName, column);
+    if (warnedCorruptReads.has(dedupeKey)) return;
+    warnedCorruptReads.add(dedupeKey);
+    console.warn(`${red("corrupt read")}: file ${fileName} column ${JSON.stringify(column)} could not be read - skipping it (its data is dropped from results): ${(e as Error).message}`);
+}
+
 function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): ResolvedReader {
     const deleteTime = new Map<string, number>();
     for (const db of databases) {
@@ -367,8 +380,13 @@ function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): ResolvedReader 
         async getColumn(column) {
             const perReader = await Promise.all(databases.map(async db => {
                 if (!db.columns.some(c => c.column === column)) return undefined;
-                const entries = await db.getColumn(column);
-                return new Map(entries.map(e => [e.key, { value: e.value, time: e.time }]));
+                try {
+                    const entries = await db.getColumn(column);
+                    return new Map(entries.map(e => [e.key, { value: e.value, time: e.time }]));
+                } catch (e) {
+                    warnCorruptRead(db, column, e);
+                    return undefined;
+                }
             }));
             return keys.map(key => {
                 let bestTime = -Infinity;
@@ -391,7 +409,13 @@ function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): ResolvedReader 
             let found = false;
             for (const db of databases) {
                 if (!db.columns.some(c => c.column === column)) continue;
-                const r = await db.getSingleField(key, column);
+                let r;
+                try {
+                    r = await db.getSingleField(key, column);
+                } catch (e) {
+                    warnCorruptRead(db, column, e);
+                    continue;
+                }
                 if (r === ABSENT) continue;
                 if (r.time > bestTime) { bestTime = r.time; bestVal = r.value; found = true; }
             }

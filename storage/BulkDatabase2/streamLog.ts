@@ -106,6 +106,7 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
     }
     const keyIndexMap = buildKeyIndex(keys);
     let reader: BaseBulkDatabaseReader = {
+        name: "(streams)",
         totalBytes,
         rowCount: keys.length,
         minTime: times.size ? minTime : 0,
