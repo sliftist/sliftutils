@@ -410,6 +410,9 @@ export function buildFileBufferRaw(rows: RawRow[], targetBytes = TARGET_FILE_BYT
 }
 
 export type BaseBulkDatabaseReader = {
+    // Identifies the source this reader came from (the bulk file name, or "(streams)") so the join can
+    // name the offending file when one of its reads fails. Undefined for readers built without one.
+    name?: string;
     rowCount: number;
     totalBytes: number;
     // Write-time bounds of this reader's data (0 if unknown — old bulk files).
@@ -468,6 +471,7 @@ export async function loadBulkHeader(getRange: (start: number, end: number) => P
 export async function loadBulkDatabase(config: {
     totalBytes: number;
     getRange: (start: number, end: number) => Promise<Buffer>;
+    name?: string;
 }): Promise<BaseBulkDatabaseReader> {
     const headerLength = (await config.getRange(0, 4)).readUInt32LE(0);
     if (headerLength <= 0 || headerLength > config.totalBytes) {
@@ -502,6 +506,7 @@ export async function loadBulkDatabase(config: {
         : keys.map(() => header.maxTime || 0);
 
     return {
+        name: config.name,
         rowCount,
         totalBytes: config.totalBytes,
         minTime: header.minTime || 0,
