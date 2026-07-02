@@ -27,7 +27,7 @@ const timeInDay = 1000 * 60 * 60 * 24;
 
 export const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
 
-export const identityStorageKey = "machineCA_12";
+export const identityStorageKey = "machineCA_13";
 export type IdentityStorageType = { domain: string; certB64: string; keyB64: string };
 
 function getIdentityStore(domain: string) {
@@ -164,7 +164,11 @@ export function getPublicIdentifier(PEMorDER: string | Buffer): Buffer {
     if ("publicKeyBytes" in publicKey) {
         return Buffer.from(publicKey.publicKeyBytes as any);
     }
-    return Buffer.from(new Uint32Array((publicKey as any).n.data).buffer);
+    // NOTE: Must use toByteArray (the canonical big-endian value), NEVER n.data. n.data is
+    //  jsbn's internal limb array, and the limb width varies by environment (26 bits in
+    //  node 21+ where navigator.appName is undefined, 28 bits in browsers), so n.data
+    //  encodes the same modulus differently in node vs the browser.
+    return Buffer.from((publicKey as any).n.toByteArray());
 }
 
 function isED25519(key: string | Buffer) {
@@ -240,7 +244,8 @@ function getDomainPartFromPublicKey(publicKey: { publicKeyBytes: Buffer } | forg
     } else if (publicKey instanceof Buffer) {
         bytes = publicKey;
     } else {
-        bytes = Buffer.from(new Uint32Array((publicKey as any).n.data).buffer);
+        // NOTE: toByteArray is canonical, n.data is NOT (see getPublicIdentifier)
+        bytes = Buffer.from((publicKey as any).n.toByteArray());
     }
     return "b" + encodeBase32(Buffer.from(sha265.sha256.array(Buffer.from(bytes)))).slice(0, 20);
 }

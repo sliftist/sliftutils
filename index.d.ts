@@ -71,7 +71,7 @@ declare module "sliftutils/misc/https/certs" {
     /// <reference types="node" />
     import * as forge from "node-forge";
     export declare const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
-    export declare const identityStorageKey = "machineCA_12";
+    export declare const identityStorageKey = "machineCA_13";
     export type IdentityStorageType = {
         domain: string;
         certB64: string;
