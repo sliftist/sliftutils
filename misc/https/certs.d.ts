@@ -3,7 +3,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import * as forge from "node-forge";
-import { MaybePromise } from "socket-function/src/types";
 export declare const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
 export declare const identityStorageKey = "machineCA_12";
 export type IdentityStorageType = {
@@ -54,7 +53,7 @@ export declare function encodeNodeId(parts: NodeIdParts): string;
 export declare function setIdentityCARaw(domain: string, json: string): Promise<void>;
 export declare function loadIdentityCA(domain: string): Promise<void>;
 export declare function getIdentityCA(domain: string): X509KeyPair;
-export declare function getIdentityCAPromise(domain: string): MaybePromise<X509KeyPair>;
+export declare function getIdentityCAPromise(domain: string): X509KeyPair;
 export declare function getOwnMachineId(domain: string): string;
 export declare function getOwnThreadId(domain: string): string;
 /** Part of the machineId comes from the publicKey, so we can use it to verify */
