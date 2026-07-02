@@ -1,3 +1,5 @@
+module.allowclient = true;
+
 import * as preact from "preact";
 import { observable, Reaction } from "mobx";
 import { measureBlock } from "socket-function/src/profiling/measure";
