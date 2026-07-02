@@ -72,7 +72,7 @@ declare module "sliftutils/misc/https/certs" {
     import * as forge from "node-forge";
     import { MaybePromise } from "socket-function/src/types";
     export declare const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
-    export declare const identityStorageKey = "machineCA_11";
+    export declare const identityStorageKey = "machineCA_12";
     export type IdentityStorageType = {
         domain: string;
         certB64: string;
