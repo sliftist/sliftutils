@@ -114,16 +114,32 @@ export async function addRecord(type: string, key: string, value: string, proxie
 }
 
 
-const getCloudflareCreds = lazy(async (): Promise<{ key: string; }> => {
+let credsOverride: { key: string } | undefined;
+/** Provide Cloudflare credentials directly (an API token, or a path to a file containing one), instead of relying on ./cloudflare.json */
+export function setCloudflareCredentials(config: { key?: string; path?: string }) {
+    let key = config.key;
+    if (!key && config.path) {
+        key = fs.readFileSync(config.path, "utf8").trim();
+    }
+    if (!key) {
+        throw new Error(`Must provide either key or path in setCloudflareCredentials, received ${JSON.stringify(Object.keys(config))}`);
+    }
+    credsOverride = { key };
+}
+
+const getCloudflareCredsFromFile = lazy(async (): Promise<{ key: string; }> => {
     const path = "cloudflare.json";
     if (!fs.existsSync(path)) {
-        throw new Error(`Must add cloudflare.json file to root of project.`);
+        throw new Error(`Must add cloudflare.json file to root of project (or call setCloudflareCredentials).`);
     }
     let creds = JSON.parse(fs.readFileSync(path, "utf8")) as { key: string; };
     return {
         key: creds.key,
     };
 });
+async function getCloudflareCreds() {
+    return credsOverride || await getCloudflareCredsFromFile();
+}
 
 async function cloudflareGETCall<T>(path: string, params?: { [key: string]: string }): Promise<T> {
     let url = new URL(`https://api.cloudflare.com/client/v4` + path);
