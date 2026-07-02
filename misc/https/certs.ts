@@ -18,7 +18,7 @@ import { getNodeIdDomain, getNodeIdDomainMaybeUndefined, getNodeIdLocation } fro
 import { MaybePromise } from "socket-function/src/types";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { resetAllNodeCallFactories } from "socket-function/src/nodeCache";
-import { getKeyStore } from "./persistentLocalStorage";
+import { getKeyStore, getIDBKeyStore } from "./persistentLocalStorage";
 import { ellipsize } from "../strings";
 
 setFlag(require, "node-forge", "allowclient", true);
@@ -30,12 +30,20 @@ export const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
 
 export const identityStorageKey = "machineCA_11";
 export type IdentityStorageType = { domain: string; certB64: string; keyB64: string };
+// In the browser the private key is a non-extractable CryptoKey. IndexedDB structured-clones
+//  it, so it persists, but the raw key bytes can never be read by JavaScript (only used
+//  via crypto.subtle.sign). This protects against exfiltration of stored keys.
+export type BrowserIdentityStorageType = { domain: string; certB64: string; privateKey: CryptoKey };
 
 function getIdentityStore(domain: string) {
     return getKeyStore<IdentityStorageType>(domain, identityStorageKey);
 }
+function getBrowserIdentityStore(domain: string) {
+    return getIDBKeyStore<BrowserIdentityStorageType>(domain, identityStorageKey);
+}
 
-export interface X509KeyPair { domain: string; cert: Buffer; key: Buffer; }
+export interface X509KeyPair { domain: string; cert: Buffer; key: Buffer | CryptoKey; }
+export type NonExtractableKeyPair = { publicKeyBytes: Buffer; privateKey: CryptoKey };
 
 export function getCommonName(cert: Buffer | string) {
     let subject = new crypto.X509Certificate(cert).subject;
@@ -53,14 +61,18 @@ export function createX509(
         keyPair: {
             publicKey: forge.Ed25519PublicKey;
             privateKey: forge.Ed25519PrivateKey;
-        } | forge.pki.KeyPair;
+        } | forge.pki.KeyPair | NonExtractableKeyPair;
     }
-): X509KeyPair {
-    return measureBlock(function createX509() {
+): MaybePromise<X509KeyPair> {
+    return measureBlock(function createX509(): MaybePromise<X509KeyPair> {
         let { domain, issuer, lifeSpan, keyPair } = config;
 
         let certObj = forge.pki.createCertificate();
-        certObj.publicKey = keyPair.publicKey;
+        if ("publicKeyBytes" in keyPair) {
+            certObj.publicKey = { publicKeyBytes: keyPair.publicKeyBytes, keyType: forge.pki.oids["EdDSA25519"] } as unknown as forge.pki.PublicKey;
+        } else {
+            certObj.publicKey = keyPair.publicKey;
+        }
         certObj.serialNumber = "01";
         // Give it 5 minutes before now. If we give it too much time, it can look like the cert is really
         //  old, which will trigger various processes to try to get a fresher one (as if it lasts for
@@ -115,7 +127,18 @@ export function createX509(
         certObj.setExtensions(extensions);
 
 
-        measureBlock(function sign() {
+        let signResult = measureBlock(function sign(): MaybePromise<void> {
+            let signingCryptoKey: CryptoKey | undefined;
+            if (issuer === "self") {
+                if ("publicKeyBytes" in keyPair) {
+                    signingCryptoKey = keyPair.privateKey;
+                }
+            } else if (issuer.key instanceof CryptoKey) {
+                signingCryptoKey = issuer.key;
+            }
+            if (signingCryptoKey) {
+                return signCertWithCryptoKey(certObj, signingCryptoKey);
+            }
             if (issuer === "self") {
                 certObj.sign(keyPair.privateKey as any, forge.md.sha256.create());
             } else {
@@ -123,14 +146,43 @@ export function createX509(
             }
         });
 
-        return measureBlock(function toPems() {
-            return {
-                domain,
-                cert: Buffer.from(forge.pki.certificateToPem(certObj)),
-                key: Buffer.from(privateKeyToPem(keyPair.privateKey)),
-            };
-        });
+        function toPems() {
+            return measureBlock(function toPems() {
+                let key: Buffer | CryptoKey;
+                if ("publicKeyBytes" in keyPair) {
+                    key = keyPair.privateKey;
+                } else {
+                    key = Buffer.from(privateKeyToPem(keyPair.privateKey));
+                }
+                return {
+                    domain,
+                    cert: Buffer.from(forge.pki.certificateToPem(certObj)),
+                    key,
+                };
+            });
+        }
+        if (signResult instanceof Promise) {
+            return signResult.then(toPems);
+        }
+        return toPems();
     });
+}
+
+// Replicates the forked forge's ed25519 cert.sign, except the signature is produced by
+//  crypto.subtle, so the private key can be a non-extractable CryptoKey.
+async function signCertWithCryptoKey(certObj: forge.pki.Certificate, privateKey: CryptoKey): Promise<void> {
+    certObj.signatureOid = certObj.siginfo.algorithmOid = forge.pki.oids["EdDSA25519"];
+    let tbs = forge.pki.getTBSCertificate(certObj);
+    let tbsDer = forge.asn1.toDer(tbs).getBytes();
+    let signature = await globalThis.crypto.subtle.sign("Ed25519", privateKey, Buffer.from(tbsDer, "binary"));
+    certObj.tbsCertificate = tbs;
+    certObj.signature = Buffer.from(signature).toString("binary");
+}
+
+export async function generateNonExtractableKeyPair(): Promise<NonExtractableKeyPair> {
+    let keyPair = await globalThis.crypto.subtle.generateKey("Ed25519", false, ["sign", "verify"]) as CryptoKeyPair;
+    let publicKeyBytes = Buffer.from(await globalThis.crypto.subtle.exportKey("raw", keyPair.publicKey));
+    return { publicKeyBytes, privateKey: keyPair.privateKey };
 }
 export function privateKeyToPem(buffer: forge.pki.PrivateKey | forge.Ed25519PrivateKey) {
     if ("privateKeyBytes" in buffer) {
@@ -173,8 +225,13 @@ function isED25519(key: string | Buffer) {
 }
 
 // EQUIVALENT TO: `crypto.createSign("SHA256").update(JSON.stringify(payload)).sign(keyCert.key, "binary")`
-export const sign = measureWrap(function sign(keyPair: { key: string | Buffer }, data: unknown): string {
+export const sign = measureWrap(function sign(keyPair: { key: string | Buffer | CryptoKey }, data: unknown): MaybePromise<string> {
     let dataStr = JSON.stringify(data);
+    if (keyPair.key instanceof CryptoKey) {
+        // "binary" encoding matches how forge interprets the string on the verify side
+        return globalThis.crypto.subtle.sign("Ed25519", keyPair.key, Buffer.from(dataStr, "binary"))
+            .then(signature => Buffer.from(signature).toString("binary"));
+    }
     if (isED25519(keyPair.key)) {
         let privateKey = (forge.pki.ed25519 as any).privateKeyFromPem(keyPair.key.toString());
         return privateKey.sign(dataStr);
@@ -384,6 +441,31 @@ export function generateTestCA(domain: string) {
 
 let identityCA = cache((domain: string) => {
     let identityCA = lazy((async (): Promise<X509KeyPair> => {
+        if (!isNode()) {
+            let store = getBrowserIdentityStore(domain);
+            let caCached = await store.get();
+            if (!caCached) {
+                console.log(`Generating new identity CA (non-extractable browser key)`);
+                const keyPair = await generateNonExtractableKeyPair();
+                let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKeyBytes);
+                let fullDomain = `${caPublicKeyPart}.${domain}`;
+                let value = await createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
+                caCached = {
+                    domain: value.domain,
+                    certB64: value.cert.toString("base64"),
+                    privateKey: keyPair.privateKey,
+                };
+                await store.set(caCached);
+            }
+            let result = {
+                domain: caCached.domain,
+                cert: Buffer.from(caCached.certB64, "base64"),
+                key: caCached.privateKey,
+            };
+            trustCertificate(result.cert.toString());
+            identityCA.set(result);
+            return result;
+        }
         let identityCACached = getIdentityStore(domain);
         let caCached = await identityCACached.get();
         if (!caCached) {
@@ -391,16 +473,13 @@ let identityCA = cache((domain: string) => {
             const keyPair = generateKeyPair();
             let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
             let fullDomain = `${caPublicKeyPart}.${domain}`;
-            if (!isNode()) {
-                fullDomain = `${caPublicKeyPart}.${domain}`;
-            }
 
-            let value = createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
+            let value = await createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
 
             caCached = {
                 domain: value.domain,
                 certB64: value.cert.toString("base64"),
-                keyB64: value.key.toString("base64"),
+                keyB64: keyPairKeyToBuffer(value.key).toString("base64"),
             };
             await identityCACached.set(caCached);
         }
@@ -416,6 +495,13 @@ let identityCA = cache((domain: string) => {
     return identityCA;
 });
 
+function keyPairKeyToBuffer(key: Buffer | CryptoKey): Buffer {
+    if (key instanceof CryptoKey) {
+        throw new Error(`Cannot serialize a non-extractable CryptoKey`);
+    }
+    return key;
+}
+
 // IMPORTANT! We do not embed any debug info in this domain. If we did, it would be useful,
 //  but... potentally a security vulnerability, as if the debug info (such as a prefix)
 //  is used to identify what a certificate is for, it would be easy for an attack to
@@ -424,9 +510,22 @@ let identityCA = cache((domain: string) => {
 //  (and hopefully stored in a UI, showing IP, time, etc).
 export function createCertFromCA(config: {
     CAKeyPair: X509KeyPair;
-}): X509KeyPair {
-    return measureBlock(function createCertFromCA() {
+}): MaybePromise<X509KeyPair> {
+    return measureBlock(function createCertFromCA(): MaybePromise<X509KeyPair> {
         let { CAKeyPair } = config;
+        if (!isNode()) {
+            return (async () => {
+                const keyPair = await generateNonExtractableKeyPair();
+                let domainKeyPart = getDomainPartFromPublicKey(keyPair.publicKeyBytes);
+                let fullDomain = `${domainKeyPart}.${CAKeyPair.domain}`;
+                return await createX509({
+                    domain: fullDomain,
+                    issuer: CAKeyPair,
+                    keyPair,
+                    lifeSpan: timeInDay * 365 * 10,
+                });
+            })();
+        }
         const keyPair = generateKeyPair();
         let domainKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
         let fullDomain = `${domainKeyPart}.${config.CAKeyPair.domain}`;
@@ -491,12 +590,27 @@ export function encodeNodeId(parts: NodeIdParts) {
 }
 
 export async function setIdentityCARaw(domain: string, json: string) {
-    let identityCACached = getIdentityStore(domain);
     let obj = JSON.parse(json) as {
         domain: string;
         certB64: string;
         keyB64: string;
     };
+    if (!isNode()) {
+        // Import into a non-extractable CryptoKey, so once stored the key can't be exfiltrated
+        let privateKey = await importEd25519PrivateKey(Buffer.from(obj.keyB64, "base64").toString());
+        let ca = {
+            domain: obj.domain,
+            cert: Buffer.from(obj.certB64, "base64"),
+            key: privateKey,
+        };
+        trustCertificate(ca.cert.toString());
+        identityCA(domain).set(ca);
+        getThreadKeyCertBase(domain).reset();
+        await getBrowserIdentityStore(domain).set({ domain: obj.domain, certB64: obj.certB64, privateKey });
+        resetAllNodeCallFactories();
+        return;
+    }
+    let identityCACached = getIdentityStore(domain);
     let ca = {
         domain: obj.domain,
         cert: Buffer.from(obj.certB64, "base64"),
@@ -507,6 +621,21 @@ export async function setIdentityCARaw(domain: string, json: string) {
     getThreadKeyCertBase(domain).reset();
     await identityCACached.set(obj);
     resetAllNodeCallFactories();
+}
+
+async function importEd25519PrivateKey(pem: string): Promise<CryptoKey> {
+    let parsed = forge.ed25519.privateKeyFromPem(pem);
+    let bytes = Buffer.from(parsed.privateKeyBytes || parsed);
+    let seed = bytes;
+    if (seed.length === 64) {
+        // NaCl layout is seed || publicKey
+        seed = seed.subarray(0, 32);
+    }
+    if (seed.length !== 32) {
+        throw new Error(`Expected a 32 or 64 byte ed25519 private key, was ${bytes.length} bytes`);
+    }
+    let pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+    return await globalThis.crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, ["sign"]);
 }
 
 export async function loadIdentityCA(domain: string) {
@@ -531,7 +660,11 @@ export function getOwnMachineId(domain: string) {
     return getMachineId(getIdentityCA(domain).domain, domain);
 }
 export function getOwnThreadId(domain: string) {
-    return decodeNodeIdAssert(getThreadKeyCert(domain).domain, domain).threadId;
+    let threadKeyCert = getThreadKeyCert(domain);
+    if (threadKeyCert instanceof Promise) {
+        throw new Error("Thread key cert is not yet loaded. Await getThreadKeyCert() in your startup before accessing the threadId");
+    }
+    return decodeNodeIdAssert(threadKeyCert.domain, domain).threadId;
 }
 
 /** Part of the machineId comes from the publicKey, so we can use it to verify */
