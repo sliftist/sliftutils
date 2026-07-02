@@ -78,11 +78,20 @@ declare module "sliftutils/misc/https/certs" {
         certB64: string;
         keyB64: string;
     };
+    export type BrowserIdentityStorageType = {
+        domain: string;
+        certB64: string;
+        privateKey: CryptoKey;
+    };
     export interface X509KeyPair {
         domain: string;
         cert: Buffer;
-        key: Buffer;
+        key: Buffer | CryptoKey;
     }
+    export type NonExtractableKeyPair = {
+        publicKeyBytes: Buffer;
+        privateKey: CryptoKey;
+    };
     export declare function getCommonName(cert: Buffer | string): string;
     export declare function createX509(config: {
         domain: string;
@@ -91,23 +100,24 @@ declare module "sliftutils/misc/https/certs" {
         keyPair: {
             publicKey: forge.Ed25519PublicKey;
             privateKey: forge.Ed25519PrivateKey;
-        } | forge.pki.KeyPair;
-    }): X509KeyPair;
+        } | forge.pki.KeyPair | NonExtractableKeyPair;
+    }): MaybePromise<X509KeyPair>;
+    export declare function generateNonExtractableKeyPair(): Promise<NonExtractableKeyPair>;
     export declare function privateKeyToPem(buffer: forge.pki.PrivateKey | forge.Ed25519PrivateKey): string;
     export declare function parseCert(PEMorDER: string | Buffer): forge.pki.Certificate;
     export declare function getPublicIdentifier(PEMorDER: string | Buffer): Buffer;
     export declare const sign: (keyPair: {
-        key: string | Buffer;
-    }, data: unknown) => string;
+        key: string | Buffer | CryptoKey;
+    }, data: unknown) => MaybePromise<string>;
     export declare function verify(cert: string, signature: string, data: unknown): void;
     export declare function validateCACert(domain: string, cert: string | Buffer): void;
     export declare function validateCertificate(domain: string, cert: Buffer | string, issuerCert: Buffer | string): void;
     export declare function generateKeyPair(): forge.pki.rsa.KeyPair;
     export declare function generateRSAKeyPair(): forge.pki.rsa.KeyPair;
-    export declare function generateTestCA(domain: string): X509KeyPair;
+    export declare function generateTestCA(domain: string): MaybePromise<X509KeyPair>;
     export declare function createCertFromCA(config: {
         CAKeyPair: X509KeyPair;
-    }): X509KeyPair;
+    }): MaybePromise<X509KeyPair>;
     export declare function getMachineId(domainNameOrNodeId: string, domain: string): string;
     export type NodeIdParts = {
         threadId: string;
@@ -129,7 +139,7 @@ declare module "sliftutils/misc/https/certs" {
         machineId: string;
         publicKey: Buffer;
     }): boolean;
-    export declare function getThreadKeyCert(domain: string): X509KeyPair;
+    export declare function getThreadKeyCert(domain: string): MaybePromise<X509KeyPair>;
     export declare const createTestBrowserKeyCert: {
         (): Promise<X509KeyPair>;
         reset(): void;
@@ -213,11 +223,18 @@ declare module "sliftutils/misc/https/node-forge-ed25519" {
             static publicKeyToPem(key: Ed25519PublicKey): string;
             static publicKeyFromPem(pem: string): Ed25519PublicKey;
         }
+        namespace pki {
+            function getTBSCertificate(cert: pki.Certificate): asn1.Asn1;
+        }
     }
 }
 
 declare module "sliftutils/misc/https/persistentLocalStorage" {
     import { MaybePromise } from "socket-function/src/types";
+    export declare function getIDBKeyStore<T>(appName: string, key: string): {
+        get(): Promise<T | undefined>;
+        set(value: T | undefined): Promise<void>;
+    };
     export declare function getKeyStore<T>(appName: string, key: string): {
         get(): MaybePromise<T | undefined>;
         set(value: T | null): MaybePromise<void>;
