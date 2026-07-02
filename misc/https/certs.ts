@@ -28,7 +28,7 @@ const timeInDay = 1000 * 60 * 60 * 24;
 
 export const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
 
-export const identityStorageKey = "machineCA_10";
+export const identityStorageKey = "machineCA_11";
 export type IdentityStorageType = { domain: string; certB64: string; keyB64: string };
 
 function getIdentityStore(domain: string) {
@@ -100,21 +100,17 @@ export function createX509(
                     //{ type: 7, ip: "127.0.0.1" }
                 ]
             },
-            // NOTE: nameConstraints are supported with our branch. But... chrome doesn't support them, so there's no point in using them.
+            // NOTE: nameConstraints require our forked node-forge:
             //      "node-forge": "https://github.com/sliftist/forge#e618181b469b07bdc70b968b0391beb8ef5fecd6",
-            // {
-            //     name: "nameConstraints",
-            //     permittedSubtrees: [
-            //         // Chrome doesn't respect nameConstraints per https://bugs.chromium.org/p/chromium/issues/detail?id=1072083,
-            //         //  as the spec decided that "free to process or ignore such information" (when present in self
-            //         //  signed certificates), and therefore the chrome implementation decided "The first order is to behave predictably",
-            //         //  so... they're not going to support it, because why have a feature in one place, if it isn't
-            //         //  on android as well... ugh...
-            //         // Works fine on Edge though
-            //         { type: 2, value: forge.util.encodeUtf8(domain) },
-            //         { type: 2, value: forge.util.encodeUtf8(localHostDomain) },
-            //     ]
-            // },
+            //  Chrome ignores them (https://bugs.chromium.org/p/chromium/issues/detail?id=1072083),
+            //  but our own validation (validateCACert/validateCertificate) enforces them.
+            {
+                name: "nameConstraints",
+                permittedSubtrees: [
+                    { type: 2, value: forge.util.encodeUtf8(domain) },
+                    { type: 2, value: forge.util.encodeUtf8(localHostDomain) },
+                ]
+            },
         ]);
         certObj.setExtensions(extensions);
 
@@ -214,7 +210,7 @@ function getDomainPartFromPublicKey(publicKey: { publicKeyBytes: Buffer } | forg
     } else {
         bytes = Buffer.from(new Uint32Array((publicKey as any).n.data).buffer);
     }
-    return "b" + sha265.sha256(Buffer.from(bytes)).slice(0, 16).replaceAll("+", "-").replaceAll("/", "_");
+    return "b" + Buffer.from(sha265.sha256.array(Buffer.from(bytes))).toString("base64").slice(0, 16).replaceAll("+", "-").replaceAll("/", "_");
 }
 
 export function validateCACert(domain: string, cert: string | Buffer) {
