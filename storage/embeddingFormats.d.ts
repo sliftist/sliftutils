@@ -14,6 +14,10 @@ export type StoredEmbedding = {
     data: Uint8Array;
     scales: Uint8Array;
 };
+export declare function embeddingLength(input: Float32Array | StoredEmbedding): number;
+export declare function releaseFloat32(buffer: Float32Array): void;
+export declare function embeddingToFloat32(input: Float32Array | StoredEmbedding, usePool?: boolean): Float32Array;
+export declare const getCloseness: (a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding) => number;
 export declare function encodeEmbedding(config: {
     input: Float32Array | StoredEmbedding;
     format: EmbeddingFormat;
@@ -26,4 +30,3 @@ export declare function averageEmbeddings(embeddings: StoredEmbedding[], config:
     model: string;
 }): StoredEmbedding;
 export declare function hashEmbedding(stored: StoredEmbedding): string;
-export declare const getCloseness: (embedding1: Float32Array | StoredEmbedding, embedding2: Float32Array | StoredEmbedding) => number;

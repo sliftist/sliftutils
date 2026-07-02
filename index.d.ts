@@ -291,6 +291,11 @@ declare module "sliftutils/misc/random" {
 
 }
 
+declare module "sliftutils/misc/strings" {
+    export declare function ellipsize(text: string, maxLength: number): string;
+
+}
+
 declare module "sliftutils/misc/types" {
     export declare function isDefined<T>(value: T | undefined | null): value is T;
     export declare function freezeObject(value: unknown): unknown;
@@ -1153,6 +1158,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): BuiltFile[];
     export declare function buildFileBufferRaw(rows: RawRow[], targetBytes?: number): BuiltFile[];
     export type BaseBulkDatabaseReader = {
+        name?: string;
         rowCount: number;
         totalBytes: number;
         minTime: number;
@@ -1194,6 +1200,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseFormat" {
     export declare function loadBulkDatabase(config: {
         totalBytes: number;
         getRange: (start: number, end: number) => Promise<Buffer>;
+        name?: string;
     }): Promise<BaseBulkDatabaseReader>;
 
 }
@@ -2261,6 +2268,11 @@ declare module "sliftutils/storage/backblaze" {
 
 }
 
+declare module "sliftutils/storage/embeddingBench" {
+    export {};
+
+}
+
 declare module "sliftutils/storage/embeddingFormats" {
     export type EmbeddingFormat = "q8g8_2048" | "q8_g16_2048" | "q8_g16_1024" | "float32";
     export declare const EMBEDDING_FORMATS: EmbeddingFormat[];
@@ -2278,6 +2290,10 @@ declare module "sliftutils/storage/embeddingFormats" {
         data: Uint8Array;
         scales: Uint8Array;
     };
+    export declare function embeddingLength(input: Float32Array | StoredEmbedding): number;
+    export declare function releaseFloat32(buffer: Float32Array): void;
+    export declare function embeddingToFloat32(input: Float32Array | StoredEmbedding, usePool?: boolean): Float32Array;
+    export declare const getCloseness: (a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding) => number;
     export declare function encodeEmbedding(config: {
         input: Float32Array | StoredEmbedding;
         format: EmbeddingFormat;
@@ -2290,7 +2306,16 @@ declare module "sliftutils/storage/embeddingFormats" {
         model: string;
     }): StoredEmbedding;
     export declare function hashEmbedding(stored: StoredEmbedding): string;
-    export declare const getCloseness: (embedding1: Float32Array | StoredEmbedding, embedding2: Float32Array | StoredEmbedding) => number;
+
+}
+
+declare module "sliftutils/storage/faceFramesData" {
+    export declare function ensureFaceData(fileName: string, byteLength: number): Promise<string>;
+
+}
+
+declare module "sliftutils/storage/faceFramesServer" {
+    export {};
 
 }
 
@@ -2319,6 +2344,28 @@ declare module "sliftutils/storage/proxydatabase/Database" {
 
 }
 
+declare module "sliftutils/storage/proxydatabase/inMemoryDatabase" {
+    import { Database } from "./Database";
+    export declare class InMemoryDatabase<Root> implements Database<Root> {
+        readCalls: number;
+        writeCalls: number;
+        deleteCalls: number;
+        bytesRead: number;
+        bytesWritten: number;
+        private root;
+        constructor(initial: Root);
+        readData<Value>(deref: (root: Root) => Value): Value | undefined;
+        writeData<Value>(deref: (root: Root) => Value, newValue: Value): void;
+        deleteData(deref: (root: Root) => unknown): void;
+    }
+
+}
+
+declare module "sliftutils/storage/proxydatabase/ivfDbCheck" {
+    export {};
+
+}
+
 declare module "sliftutils/storage/proxydatabase/ivfEmbeddingDatabase" {
     import { Database } from "./Database";
     import { TransactionSetStore } from "./transactionSet";
@@ -2326,16 +2373,22 @@ declare module "sliftutils/storage/proxydatabase/ivfEmbeddingDatabase" {
     export type IvfConfig = {
         model: string;
         format: EmbeddingFormat;
-        cellTarget: number;
-        splitAt: number;
+        cellTargetSize: number;
     };
     export type IvfEmbeddingRoot = {
         config: IvfConfig;
-        centroids: TransactionSetStore;
-        cells: {
-            [cellId: string]: TransactionSetStore;
+        count: number;
+        flat: TransactionSetStore<StoredEmbedding>;
+        byRef: {
+            [ref: string]: Uint8Array;
         };
-        refIndex: TransactionSetStore;
+        steps: {
+            [step: string]: boolean;
+        };
+        centroids: TransactionSetStore<StoredEmbedding>;
+        cells: {
+            [cellId: string]: TransactionSetStore<StoredEmbedding>;
+        };
     };
     export type EmbeddingInput = {
         ref: string;
@@ -2345,26 +2398,32 @@ declare module "sliftutils/storage/proxydatabase/ivfEmbeddingDatabase" {
         ref: string;
         closeness: number;
     };
+    export declare function rebuildStructure(database: Database<IvfEmbeddingRoot>): void;
     export declare function searchEmbeddings(database: Database<IvfEmbeddingRoot>, query: StoredEmbedding, options: {
         probeBudget: number;
         resultCount: number;
     }): SearchHit[] | undefined;
-    export declare function insertEmbeddings(database: Database<IvfEmbeddingRoot>, items: EmbeddingInput[]): true | undefined;
-    export declare function removeEmbeddings(database: Database<IvfEmbeddingRoot>, refs: string[]): true | undefined;
+    export declare function lookupEmbeddings(database: Database<IvfEmbeddingRoot>, refs: string[]): Map<string, StoredEmbedding> | undefined;
+    export declare function insertEmbeddings(database: Database<IvfEmbeddingRoot>, items: EmbeddingInput[]): undefined;
+    export declare function removeEmbeddings(database: Database<IvfEmbeddingRoot>, refs: string[]): void;
 
 }
 
 declare module "sliftutils/storage/proxydatabase/transactionSet" {
     import { Database } from "./Database";
-    export type TransactionSetStore = {
+    declare const valueTag: unique symbol;
+    export type TransactionSetStore<Value> = {
         [fileNumber: string]: Uint8Array;
+        [valueTag]?: Value;
     };
-    export declare function transactionRead<Value>(database: Database<TransactionSetStore>): Map<string, Value> | undefined;
-    export declare function replayTransactionStore<Value>(store: TransactionSetStore | undefined): Map<string, Value>;
-    export declare function transactionMutate<Value>(database: Database<TransactionSetStore>, transactions: {
+    export declare function transactionRead<Value>(database: Database<TransactionSetStore<Value>>): Map<string, Value> | undefined;
+    export declare function replayTransactionStore<Value>(store: TransactionSetStore<Value> | undefined): Map<string, Value>;
+    export declare function transactionMutate<Value>(database: Database<TransactionSetStore<Value>>, transactions: {
         key: string;
         value: Value | undefined;
-    }[], compactAfterFiles?: number): true | undefined;
+    }[], compactAfterFiles?: number): void;
+    export declare function transactionDelete<Value>(database: Database<TransactionSetStore<Value>>): void;
+    export {};
 
 }
 

@@ -19,6 +19,7 @@ import { MaybePromise } from "socket-function/src/types";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { resetAllNodeCallFactories } from "socket-function/src/nodeCache";
 import { getKeyStore } from "./persistentLocalStorage";
+import { ellipsize } from "../strings";
 
 setFlag(require, "node-forge", "allowclient", true);
 setFlag(require, "js-sha256", "allowclient", true);
@@ -192,7 +193,7 @@ export const sign = measureWrap(function sign(keyPair: { key: string | Buffer },
 export function verify(cert: string, signature: string, data: unknown) {
     let certObj = parseCert(cert);
     if (!(certObj.publicKey as forge.pki.rsa.PublicKey).verify(JSON.stringify(data), signature)) {
-        throw new Error(`Signature verification failed. Signature: ${JSON.stringify(signature)} | Data: ${JSON.stringify(data).slice(0, 1024)}`);
+        throw new Error(`Signature verification failed. Signature: ${JSON.stringify(signature)} | Data: ${ellipsize(JSON.stringify(data), 1024)}`);
     }
 }
 

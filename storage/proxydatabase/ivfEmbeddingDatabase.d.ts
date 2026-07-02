@@ -4,16 +4,22 @@ import { StoredEmbedding, EmbeddingFormat } from "../embeddingFormats";
 export type IvfConfig = {
     model: string;
     format: EmbeddingFormat;
-    cellTarget: number;
-    splitAt: number;
+    cellTargetSize: number;
 };
 export type IvfEmbeddingRoot = {
     config: IvfConfig;
-    centroids: TransactionSetStore;
-    cells: {
-        [cellId: string]: TransactionSetStore;
+    count: number;
+    flat: TransactionSetStore<StoredEmbedding>;
+    byRef: {
+        [ref: string]: Uint8Array;
     };
-    refIndex: TransactionSetStore;
+    steps: {
+        [step: string]: boolean;
+    };
+    centroids: TransactionSetStore<StoredEmbedding>;
+    cells: {
+        [cellId: string]: TransactionSetStore<StoredEmbedding>;
+    };
 };
 export type EmbeddingInput = {
     ref: string;
@@ -23,9 +29,11 @@ export type SearchHit = {
     ref: string;
     closeness: number;
 };
+export declare function rebuildStructure(database: Database<IvfEmbeddingRoot>): void;
 export declare function searchEmbeddings(database: Database<IvfEmbeddingRoot>, query: StoredEmbedding, options: {
     probeBudget: number;
     resultCount: number;
 }): SearchHit[] | undefined;
-export declare function insertEmbeddings(database: Database<IvfEmbeddingRoot>, items: EmbeddingInput[]): true | undefined;
-export declare function removeEmbeddings(database: Database<IvfEmbeddingRoot>, refs: string[]): true | undefined;
+export declare function lookupEmbeddings(database: Database<IvfEmbeddingRoot>, refs: string[]): Map<string, StoredEmbedding> | undefined;
+export declare function insertEmbeddings(database: Database<IvfEmbeddingRoot>, items: EmbeddingInput[]): undefined;
+export declare function removeEmbeddings(database: Database<IvfEmbeddingRoot>, refs: string[]): void;

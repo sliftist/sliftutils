@@ -41,6 +41,7 @@ export interface BuiltFile {
 export declare function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes?: number): BuiltFile[];
 export declare function buildFileBufferRaw(rows: RawRow[], targetBytes?: number): BuiltFile[];
 export type BaseBulkDatabaseReader = {
+    name?: string;
     rowCount: number;
     totalBytes: number;
     minTime: number;
@@ -82,4 +83,5 @@ export declare function loadBulkHeader(getRange: (start: number, end: number) =>
 export declare function loadBulkDatabase(config: {
     totalBytes: number;
     getRange: (start: number, end: number) => Promise<Buffer>;
+    name?: string;
 }): Promise<BaseBulkDatabaseReader>;
