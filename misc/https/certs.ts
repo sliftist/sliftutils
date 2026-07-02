@@ -28,7 +28,7 @@ const timeInDay = 1000 * 60 * 60 * 24;
 
 export const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
 
-export const identityStorageKey = "machineCA_11";
+export const identityStorageKey = "machineCA_12";
 export type IdentityStorageType = { domain: string; certB64: string; keyB64: string };
 // In the browser the private key is a non-extractable CryptoKey. IndexedDB structured-clones
 //  it, so it persists, but the raw key bytes can never be read by JavaScript (only used
@@ -258,6 +258,27 @@ function normalizeCertToPEM(PEMorDER: string | Buffer): string {
     return "-----BEGIN CERTIFICATE-----\n" + PEMorDER + "\n-----END CERTIFICATE-----";
 }
 
+// Base32 (RFC 4648, lowercase, unpadded), as domain names are case-insensitive,
+//  which rules out base64/hex-with-case
+const base32Alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+function encodeBase32(bytes: Buffer): string {
+    let result = "";
+    let bitCount = 0;
+    let value = 0;
+    for (let byte of bytes) {
+        value = (value << 8) | byte;
+        bitCount += 8;
+        while (bitCount >= 5) {
+            result += base32Alphabet[(value >>> (bitCount - 5)) & 31];
+            bitCount -= 5;
+        }
+    }
+    if (bitCount > 0) {
+        result += base32Alphabet[(value << (5 - bitCount)) & 31];
+    }
+    return result;
+}
+
 function getDomainPartFromPublicKey(publicKey: { publicKeyBytes: Buffer } | forge.pki.KeyPair["publicKey"] | Buffer) {
     let bytes: Buffer;
     if ("publicKeyBytes" in publicKey) {
@@ -267,7 +288,7 @@ function getDomainPartFromPublicKey(publicKey: { publicKeyBytes: Buffer } | forg
     } else {
         bytes = Buffer.from(new Uint32Array((publicKey as any).n.data).buffer);
     }
-    return "b" + Buffer.from(sha265.sha256.array(Buffer.from(bytes))).toString("base64").slice(0, 16).replaceAll("+", "-").replaceAll("/", "_");
+    return "b" + encodeBase32(Buffer.from(sha265.sha256.array(Buffer.from(bytes)))).slice(0, 20);
 }
 
 export function validateCACert(domain: string, cert: string | Buffer) {
