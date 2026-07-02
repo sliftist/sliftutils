@@ -708,10 +708,21 @@ export function verifyMachineIdForPublicKey(config: {
 export function getThreadKeyCert(domain: string) {
     return getThreadKeyCertBase(domain)();
 }
-const getThreadKeyCertBase = cache((domain: string) => lazy(() => {
-    let ca = getIdentityCA(domain);
-    return createCertFromCA({ CAKeyPair: ca });
-}));
+const getThreadKeyCertBase = cache((domain: string) => {
+    let threadCert = lazy((): MaybePromise<X509KeyPair> => {
+        let ca = getIdentityCA(domain);
+        let result = createCertFromCA({ CAKeyPair: ca });
+        if (result instanceof Promise) {
+            // Becomes synchronous once generated, matching the identityCA pattern
+            return result.then(value => {
+                threadCert.set(value);
+                return value;
+            });
+        }
+        return result;
+    });
+    return threadCert;
+});
 
 export const createTestBrowserKeyCert = lazy(async () => {
     let keyPair = generateRSAKeyPair();
