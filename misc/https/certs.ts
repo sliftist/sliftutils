@@ -644,7 +644,7 @@ export async function loadIdentityCA(domain: string) {
 export function getIdentityCA(domain: string): X509KeyPair {
     let value = identityCA(domain)();
     if (value instanceof Promise) {
-        throw new Error("Identity CA is not yet loaded. Call and wait for loadIdentityCA() in your startup before accessing the identity (or call getIdentityCAPromise())");
+        throw new Error(`Identity CA is not yet loaded. Call and wait for loadIdentityCA(${JSON.stringify(domain)}) in your startup before accessing the identity (or call getIdentityCAPromise(${JSON.stringify(domain)}))`);
     }
     return value;
 }
@@ -662,7 +662,7 @@ export function getOwnMachineId(domain: string) {
 export function getOwnThreadId(domain: string) {
     let threadKeyCert = getThreadKeyCert(domain);
     if (threadKeyCert instanceof Promise) {
-        throw new Error("Thread key cert is not yet loaded. Await getThreadKeyCert() in your startup before accessing the threadId");
+        throw new Error(`Thread key cert is not yet loaded. Await getThreadKeyCert(${JSON.stringify(domain)}) in your startup before accessing the threadId`);
     }
     return decodeNodeIdAssert(threadKeyCert.domain, domain).threadId;
 }
