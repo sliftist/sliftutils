@@ -1,12 +1,11 @@
 import { isNode } from "socket-function/src/misc";
 import fs from "fs";
 import os from "os";
-import { MaybePromise } from "socket-function/src/types";
 import { cache } from "socket-function/src/caching";
 
 export function getKeyStore<T>(appName: string, key: string): {
-    get(): MaybePromise<T | undefined>;
-    set(value: T | null): MaybePromise<void>;
+    get(): T | undefined;
+    set(value: T | null): void;
 } {
     if (isNode()) {
         let path = os.homedir() + `/keystore_${appName}_` + key + ".json";

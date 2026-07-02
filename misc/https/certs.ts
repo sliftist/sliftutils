@@ -15,7 +15,6 @@ import crypto from "crypto";
 import { trustCertificate } from "socket-function/src/certStore";
 import { measureBlock, measureFnc, measureWrap } from "socket-function/src/profiling/measure";
 import { getNodeIdDomain, getNodeIdDomainMaybeUndefined, getNodeIdLocation } from "socket-function/src/nodeCache";
-import { MaybePromise } from "socket-function/src/types";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { resetAllNodeCallFactories } from "socket-function/src/nodeCache";
 import { getKeyStore } from "./persistentLocalStorage";
@@ -423,36 +422,32 @@ export function generateTestCA(domain: string) {
     return createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
 }
 
-let identityCA = cache((domain: string) => {
-    let identityCA = lazy((async (): Promise<X509KeyPair> => {
-        let identityCACached = getIdentityStore(domain);
-        let caCached = await identityCACached.get();
-        if (!caCached) {
-            console.log(`Generating new identity CA`);
-            const keyPair = generateKeyPair();
-            let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
-            let fullDomain = `${caPublicKeyPart}.${domain}`;
+let identityCA = cache((domain: string) => lazy((): X509KeyPair => {
+    let identityCACached = getIdentityStore(domain);
+    let caCached = identityCACached.get();
+    if (!caCached) {
+        console.log(`Generating new identity CA`);
+        const keyPair = generateKeyPair();
+        let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
+        let fullDomain = `${caPublicKeyPart}.${domain}`;
 
-            let value = createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
+        let value = createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
 
-            caCached = {
-                domain: value.domain,
-                certB64: value.cert.toString("base64"),
-                keyB64: value.key.toString("base64"),
-            };
-            await identityCACached.set(caCached);
-        }
-        let result = {
-            domain: caCached.domain,
-            cert: Buffer.from(caCached.certB64, "base64"),
-            key: Buffer.from(caCached.keyB64, "base64"),
+        caCached = {
+            domain: value.domain,
+            certB64: value.cert.toString("base64"),
+            keyB64: value.key.toString("base64"),
         };
-        trustCertificate(result.cert.toString());
-        identityCA.set(result);
-        return result;
-    }) as (() => MaybePromise<X509KeyPair>));
-    return identityCA;
-});
+        identityCACached.set(caCached);
+    }
+    let result = {
+        domain: caCached.domain,
+        cert: Buffer.from(caCached.certB64, "base64"),
+        key: Buffer.from(caCached.keyB64, "base64"),
+    };
+    trustCertificate(result.cert.toString());
+    return result;
+}));
 
 // IMPORTANT! We do not embed any debug info in this domain. If we did, it would be useful,
 //  but... potentally a security vulnerability, as if the debug info (such as a prefix)
@@ -543,24 +538,23 @@ export async function setIdentityCARaw(domain: string, json: string) {
     trustCertificate(ca.cert.toString());
     identityCA(domain).set(ca);
     getThreadKeyCertBase(domain).reset();
-    await identityCACached.set(obj);
+    identityCACached.set(obj);
     resetAllNodeCallFactories();
 }
 
+// NOTE: The identity CA is available synchronously (storage is fs/localStorage, both
+//  synchronous), so this only exists for backwards compatibility with startup code
+//  that awaits it.
 export async function loadIdentityCA(domain: string) {
-    await identityCA(domain)();
+    identityCA(domain)();
 }
 export function getIdentityCA(domain: string): X509KeyPair {
-    let value = identityCA(domain)();
-    if (value instanceof Promise) {
-        throw new Error(`Identity CA is not yet loaded. Call and wait for loadIdentityCA(${JSON.stringify(domain)}) in your startup before accessing the identity (or call getIdentityCAPromise(${JSON.stringify(domain)}))`);
-    }
-    return value;
+    return identityCA(domain)();
 }
 
 // TODO: Replace this with a database, so it is easy for us to trust CAs
 //  cross machine, and even have multiple users, etc, etc.
-export function getIdentityCAPromise(domain: string): MaybePromise<X509KeyPair> {
+export function getIdentityCAPromise(domain: string): X509KeyPair {
     return identityCA(domain)();
 }
 
