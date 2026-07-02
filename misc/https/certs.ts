@@ -386,6 +386,14 @@ function validateAltNames(certParsed: forge.pki.Certificate, subject: string) {
 }
 
 
+// NOTE: We can't use crypto.subtle (non-extractable CryptoKeys) for our keys, because subtle
+//  is asynchronous, and everything here (key generation, cert creation, signing) must be
+//  available synchronously. The only real benefit of subtle is that a cross-site scripting
+//  attack can't exfiltrate the key. Which, while nice, is of minor benefit, as the cross-site
+//  script can already do quite a bit of damage anyway with access. And if that happens, the
+//  first thing the user is probably going to do is reset all their credentials, which solves
+//  the case of the key being exfiltrated anyway (by telling the server to stop trusting
+//  all identities).
 export function generateKeyPair() {
     return measureBlock(function generateKeyPair() {
         // NOTE: We use ED25519 because it can generated keys about 10X faster, WHICH, is still slow
