@@ -439,8 +439,8 @@ export function createCertFromCA(config: {
     });
 }
 
-export function getMachineId(domainName: string) {
-    return domainName.split(".").slice(-3).join(".");
+export function getMachineId(domainNameOrNodeId: string, domain: string) {
+    return decodeNodeIdAssert(domainNameOrNodeId, domain, "allowMissingThreadId").machineId;
 }
 
 export type NodeIdParts = {
@@ -449,13 +449,18 @@ export type NodeIdParts = {
     domain: string;
     port: number;
 };
-export function decodeNodeId(nodeId: string): NodeIdParts | undefined {
+export function decodeNodeId(nodeId: string, domain: string, allowMissingThreadId?: "allowMissingThreadId"): NodeIdParts | undefined {
     let locationObj = getNodeIdLocation(nodeId);
     if (!locationObj) {
         return undefined;
     }
     let parts = locationObj.address.split(".");
-    if (nodeId.startsWith("127-0-0-1.") && parts.length === 3) {
+    // NOTE: We have to only allow localhost domains on our own domain, as the underlying domain
+    //  gets stripped when we're looking at the machineId. So if we allowed localhost domains on
+    //  other domains, a server could trick us into connecting to it, and then once the connection
+    //  is established, it could talk back and we would think it has a localhost machineId, which
+    //  is implicitly trusted, which would then give it access to everything.
+    if (locationObj.address === `127-0-0-1.${domain}` && nodeId.includes(":")) {
         return {
             threadId: "",
             machineId: parts.at(-3) || "",
@@ -463,7 +468,8 @@ export function decodeNodeId(nodeId: string): NodeIdParts | undefined {
             port: locationObj.port,
         };
     }
-    if (parts.length < 4) {
+    let isValid = parts.length >= 4 || allowMissingThreadId && parts.length === 3;
+    if (!isValid) {
         return undefined;
     }
     return {
@@ -473,10 +479,10 @@ export function decodeNodeId(nodeId: string): NodeIdParts | undefined {
         port: locationObj.port,
     };
 }
-export function decodeNodeIdAssert(nodeId: string): NodeIdParts {
-    let result = decodeNodeId(nodeId);
+export function decodeNodeIdAssert(nodeId: string, domain: string, allowMissingThreadId?: "allowMissingThreadId"): NodeIdParts {
+    let result = decodeNodeId(nodeId, domain, allowMissingThreadId);
     if (!result) {
-        throw new Error(`Invalid nodeId: ${nodeId}`);
+        throw new Error(`Invalid nodeId: ${JSON.stringify(nodeId)}`);
     }
     return result;
 }
@@ -522,7 +528,10 @@ export function getIdentityCAPromise(domain: string): MaybePromise<X509KeyPair> 
 
 
 export function getOwnMachineId(domain: string) {
-    return getMachineId(getIdentityCA(domain).domain);
+    return getMachineId(getIdentityCA(domain).domain, domain);
+}
+export function getOwnThreadId(domain: string) {
+    return decodeNodeIdAssert(getThreadKeyCert(domain).domain, domain).threadId;
 }
 
 /** Part of the machineId comes from the publicKey, so we can use it to verify */
@@ -532,7 +541,8 @@ export function verifyMachineIdForPublicKey(config: {
 }): boolean {
     let { machineId, publicKey } = config;
     let domainPart = getDomainPartFromPublicKey(publicKey);
-    return machineId.split(".").at(-3) === domainPart;
+    // machineId is the bare key-hash label, but also accept legacy "hash.domain.tld" forms
+    return machineId.split(".")[0] === domainPart;
 }
 
 // NOTE: We don't have a cache per CA, as... the CA should be set first

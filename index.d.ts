@@ -108,21 +108,22 @@ declare module "sliftutils/misc/https/certs" {
     export declare function createCertFromCA(config: {
         CAKeyPair: X509KeyPair;
     }): X509KeyPair;
-    export declare function getMachineId(domainName: string): string;
+    export declare function getMachineId(domainNameOrNodeId: string, domain: string): string;
     export type NodeIdParts = {
         threadId: string;
         machineId: string;
         domain: string;
         port: number;
     };
-    export declare function decodeNodeId(nodeId: string): NodeIdParts | undefined;
-    export declare function decodeNodeIdAssert(nodeId: string): NodeIdParts;
+    export declare function decodeNodeId(nodeId: string, domain: string, allowMissingThreadId?: "allowMissingThreadId"): NodeIdParts | undefined;
+    export declare function decodeNodeIdAssert(nodeId: string, domain: string, allowMissingThreadId?: "allowMissingThreadId"): NodeIdParts;
     export declare function encodeNodeId(parts: NodeIdParts): string;
     export declare function setIdentityCARaw(domain: string, json: string): Promise<void>;
     export declare function loadIdentityCA(domain: string): Promise<void>;
     export declare function getIdentityCA(domain: string): X509KeyPair;
     export declare function getIdentityCAPromise(domain: string): MaybePromise<X509KeyPair>;
     export declare function getOwnMachineId(domain: string): string;
+    export declare function getOwnThreadId(domain: string): string;
     /** Part of the machineId comes from the publicKey, so we can use it to verify */
     export declare function verifyMachineIdForPublicKey(config: {
         machineId: string;
