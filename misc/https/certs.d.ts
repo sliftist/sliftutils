@@ -4,7 +4,7 @@
 /// <reference types="node" />
 import * as forge from "node-forge";
 export declare const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
-export declare const identityStorageKey = "machineCA_13";
+export declare const identityStorageKey = "machineCA_14";
 export type IdentityStorageType = {
     domain: string;
     certB64: string;
@@ -23,9 +23,9 @@ export declare function createX509(config: {
     keyPair: {
         publicKey: forge.Ed25519PublicKey;
         privateKey: forge.Ed25519PrivateKey;
-    } | forge.pki.KeyPair;
+    };
 }): X509KeyPair;
-export declare function privateKeyToPem(buffer: forge.pki.PrivateKey | forge.Ed25519PrivateKey): string;
+export declare function privateKeyToPem(key: forge.Ed25519PrivateKey): string;
 export declare function parseCert(PEMorDER: string | Buffer): forge.pki.Certificate;
 export declare function getPublicIdentifier(PEMorDER: string | Buffer): Buffer;
 export declare const sign: (keyPair: {
@@ -34,8 +34,10 @@ export declare const sign: (keyPair: {
 export declare function verify(cert: string, signature: string, data: unknown): void;
 export declare function validateCACert(domain: string, cert: string | Buffer): void;
 export declare function validateCertificate(domain: string, cert: Buffer | string, issuerCert: Buffer | string): void;
-export declare function generateKeyPair(): forge.pki.rsa.KeyPair;
-export declare function generateRSAKeyPair(): forge.pki.rsa.KeyPair;
+export declare function generateKeyPair(): {
+    publicKey: forge.Ed25519PublicKey;
+    privateKey: forge.Ed25519PrivateKey;
+};
 export declare function generateTestCA(domain: string): X509KeyPair;
 export declare function createCertFromCA(config: {
     CAKeyPair: X509KeyPair;
@@ -62,10 +64,5 @@ export declare function verifyMachineIdForPublicKey(config: {
     publicKey: Buffer;
 }): boolean;
 export declare function getThreadKeyCert(domain: string): X509KeyPair;
-export declare const createTestBrowserKeyCert: {
-    (): Promise<X509KeyPair>;
-    reset(): void;
-    set(newValue: Promise<X509KeyPair>): void;
-};
 export declare function getOwnNodeId(): string;
 export declare function getOwnNodeIdAllowUndefined(): string;
