@@ -2,6 +2,9 @@
 
 module.allowclient = true;
 
+// NOTE: We can't use crypto.subtle (non-extractable CryptoKeys) for our keys, because subtle is asynchronous, and everything here (key generation, cert creation, signing) must be available synchronously. The only real benefit of subtle is that a cross-site scripting attack can't exfiltrate the key. Which, while nice, is of minor benefit, as the cross-site script can already do quite a bit of damage anyway with access. And if that happens, the first thing the user is probably going to do is reset all their credentials, which solves the case of the key being exfiltrated anyway (by telling the server to stop trusting all identities).
+// NOTE: We are just not going to support HTTPS browser certs. Our code is purely for identification, and so it only supports ED25519.
+
 // https://www.rfc-editor.org/rfc/rfc5280#page-42
 
 import { setFlag } from "socket-function/require/compileFlags";
@@ -27,7 +30,7 @@ const timeInDay = 1000 * 60 * 60 * 24;
 
 export const CA_NOT_FOUND_ERROR = "18aa7318-f88f-4d2d-b41f-3daf4a433827";
 
-export const identityStorageKey = "machineCA_12";
+export const identityStorageKey = "machineCA_14";
 export type IdentityStorageType = { domain: string; certB64: string; keyB64: string };
 
 function getIdentityStore(domain: string) {
@@ -52,19 +55,16 @@ export function createX509(
         keyPair: {
             publicKey: forge.Ed25519PublicKey;
             privateKey: forge.Ed25519PrivateKey;
-        } | forge.pki.KeyPair;
+        };
     }
 ): X509KeyPair {
     return measureBlock(function createX509() {
         let { domain, issuer, lifeSpan, keyPair } = config;
 
         let certObj = forge.pki.createCertificate();
-        certObj.publicKey = keyPair.publicKey;
+        certObj.publicKey = keyPair.publicKey as unknown as forge.pki.PublicKey;
         certObj.serialNumber = "01";
-        // Give it 5 minutes before now. If we give it too much time, it can look like the cert is really
-        //  old, which will trigger various processes to try to get a fresher one (as if it lasts for
-        //  1 hour, but we set notBefore to 1 month ago, it looks 1 month old, and so almost expired,
-        //  when it isn't...)
+        // Give it 5 minutes before now. If we give it too much time, it can look like the cert is really old, which will trigger various processes to try to get a fresher one (as if it lasts for 1 hour, but we set notBefore to 1 month ago, it looks 1 month old, and so almost expired, when it isn't...)
         certObj.validity.notBefore = new Date(Date.now() - 1000 * 60 * 5);
         certObj.validity.notAfter = new Date(Date.now() + lifeSpan);
 
@@ -94,15 +94,10 @@ export function createX509(
                     { type: 2, value: domain },
                     { type: 2, value: "*." + domain },
                     { type: 2, value: localHostDomain },
-                    // NOTE: No longer allow 127.0.0.1, to make this more secure. We might enable this
-                    //  behavior behind a flag, for development.
-                    //{ type: 7, ip: "127.0.0.1" }
+                    // NOTE: No longer allow 127.0.0.1 ({ type: 7, ip: "127.0.0.1" }), to make this more secure. We might enable this behavior behind a flag, for development.
                 ]
             },
-            // NOTE: nameConstraints require our forked node-forge:
-            //      "node-forge": "https://github.com/sliftist/forge#e618181b469b07bdc70b968b0391beb8ef5fecd6",
-            //  Chrome ignores them (https://bugs.chromium.org/p/chromium/issues/detail?id=1072083),
-            //  but our own validation (validateCACert/validateCertificate) enforces them.
+            // NOTE: nameConstraints require our forked node-forge ("node-forge": "https://github.com/sliftist/forge#e618181b469b07bdc70b968b0391beb8ef5fecd6"). Chrome ignores them (https://bugs.chromium.org/p/chromium/issues/detail?id=1072083), but our own validation (validateCACert/validateCertificate) enforces them.
             {
                 name: "nameConstraints",
                 permittedSubtrees: [
@@ -116,9 +111,9 @@ export function createX509(
 
         measureBlock(function sign() {
             if (issuer === "self") {
-                certObj.sign(keyPair.privateKey as any, forge.md.sha256.create());
+                certObj.sign(keyPair.privateKey as any);
             } else {
-                certObj.sign(privateKeyFromPem(issuer.key.toString()) as any, forge.md.sha256.create());
+                certObj.sign(forge.ed25519.privateKeyFromPem(issuer.key.toString()) as any);
             }
         });
 
@@ -131,75 +126,37 @@ export function createX509(
         });
     });
 }
-export function privateKeyToPem(buffer: forge.pki.PrivateKey | forge.Ed25519PrivateKey) {
-    if ("privateKeyBytes" in buffer) {
-        return forge.ed25519.privateKeyToPem(buffer);
-    }
-    return forge.pki.privateKeyToPem(buffer);
-}
-function privateKeyFromPem(pem: string) {
-    // We want to guess the type correctly, as caught exceptions make debugging annoying
-    if (pem.length < 200) {
-        try {
-            return forge.ed25519.privateKeyFromPem(pem);
-        } catch { }
-    }
-    try {
-        return forge.pki.privateKeyFromPem(pem);
-    } catch {
-        return forge.ed25519.privateKeyFromPem(pem);
-    }
-}
-function publicKeyFromCert(cert: string) {
-    return parseCert(cert).publicKey;
+export function privateKeyToPem(key: forge.Ed25519PrivateKey) {
+    return forge.ed25519.privateKeyToPem(key);
 }
 export function parseCert(PEMorDER: string | Buffer) {
     return forge.pki.certificateFromPem(normalizeCertToPEM(PEMorDER));
 }
 
+function getED25519PublicKey(certParsed: forge.pki.Certificate): forge.Ed25519PublicKey {
+    let publicKey = certParsed.publicKey;
+    if (!("publicKeyBytes" in publicKey)) {
+        throw new Error(`Only ED25519 certificates are supported, the certificate public key is not ED25519 (subject: ${certParsed.subject.getField("CN")?.value})`);
+    }
+    return publicKey as unknown as forge.Ed25519PublicKey;
+}
+
 // Gets a unique value to represent the public key
 export function getPublicIdentifier(PEMorDER: string | Buffer): Buffer {
-    let obj = parseCert(PEMorDER);
-    let publicKey = obj.publicKey;
-    if ("publicKeyBytes" in publicKey) {
-        return Buffer.from(publicKey.publicKeyBytes as any);
-    }
-    return Buffer.from(new Uint32Array((publicKey as any).n.data).buffer);
+    return Buffer.from(getED25519PublicKey(parseCert(PEMorDER)).publicKeyBytes);
 }
 
-function isED25519(key: string | Buffer) {
-    return key.length < 256;
-}
-
-// EQUIVALENT TO: `crypto.createSign("SHA256").update(JSON.stringify(payload)).sign(keyCert.key, "binary")`
 export const sign = measureWrap(function sign(keyPair: { key: string | Buffer }, data: unknown): string {
     let dataStr = JSON.stringify(data);
-    if (isED25519(keyPair.key)) {
-        let privateKey = (forge.pki.ed25519 as any).privateKeyFromPem(keyPair.key.toString());
-        return privateKey.sign(dataStr);
-    } else {
-        let privateKey = forge.pki.privateKeyFromPem(keyPair.key.toString());
-        const md = forge.md.sha256.create();
-        md.update(dataStr);
-        return privateKey.sign(md);
-    }
+    let privateKey = forge.ed25519.privateKeyFromPem(keyPair.key.toString());
+    return privateKey.sign(dataStr);
 });
 
 export function verify(cert: string, signature: string, data: unknown) {
     let certObj = parseCert(cert);
-    let publicKey = certObj.publicKey;
+    let publicKey = getED25519PublicKey(certObj);
     let dataStr = JSON.stringify(data);
-    let verified: boolean;
-    if ("publicKeyBytes" in publicKey) {
-        // ed25519 verifies the raw message (it hashes internally)
-        verified = (publicKey as unknown as { verify(message: string, signature: string): boolean }).verify(dataStr, signature);
-    } else {
-        // RSA verifies against the digest, matching the digest sign() creates
-        const md = forge.md.sha256.create();
-        md.update(dataStr);
-        verified = (publicKey as forge.pki.rsa.PublicKey).verify(md.digest().bytes(), signature);
-    }
-    if (!verified) {
+    if (!publicKey.verify(dataStr, signature)) {
         throw new Error(`Signature verification failed. Signature: ${JSON.stringify(signature)} | Data: ${ellipsize(dataStr, 1024)}`);
     }
 }
@@ -212,8 +169,7 @@ function normalizeCertToPEM(PEMorDER: string | Buffer): string {
     return "-----BEGIN CERTIFICATE-----\n" + PEMorDER + "\n-----END CERTIFICATE-----";
 }
 
-// Base32 (RFC 4648, lowercase, unpadded), as domain names are case-insensitive,
-//  which rules out base64/hex-with-case
+// Base32 (RFC 4648, lowercase, unpadded), as domain names are case-insensitive, which rules out base64/hex-with-case
 const base32Alphabet = "abcdefghijklmnopqrstuvwxyz234567";
 function encodeBase32(bytes: Buffer): string {
     let result = "";
@@ -233,14 +189,12 @@ function encodeBase32(bytes: Buffer): string {
     return result;
 }
 
-function getDomainPartFromPublicKey(publicKey: { publicKeyBytes: Buffer } | forge.pki.KeyPair["publicKey"] | Buffer) {
+function getDomainPartFromPublicKey(publicKey: { publicKeyBytes: Buffer } | Buffer) {
     let bytes: Buffer;
     if ("publicKeyBytes" in publicKey) {
         bytes = publicKey.publicKeyBytes;
-    } else if (publicKey instanceof Buffer) {
-        bytes = publicKey;
     } else {
-        bytes = Buffer.from(new Uint32Array((publicKey as any).n.data).buffer);
+        bytes = publicKey;
     }
     return "b" + encodeBase32(Buffer.from(sha265.sha256.array(Buffer.from(bytes)))).slice(0, 20);
 }
@@ -255,9 +209,7 @@ export function validateCACert(domain: string, cert: string | Buffer) {
 
     let rootDomainParsed = [domainParts.shift(), domainParts.shift()].reverse().join(".");
     if (rootDomainParsed !== domain) {
-        // This is important, as our trust store contains more then just OUR certificates,
-        //  so if we allow any domains then real domains can impersonate anyone! It has to
-        //  be one OUR domain to be trusted!
+        // This is important, as our trust store contains more then just OUR certificates, so if we allow any domains then real domains can impersonate anyone! It has to be OUR domain to be trusted!
         throw new Error(`Certificate root domain should be ${domain}, but is ${rootDomainParsed}`);
     }
     // TODO: Maybe just skip if it isn't a hash string?
@@ -266,7 +218,7 @@ export function validateCACert(domain: string, cert: string | Buffer) {
     }
 
     let certExpectedPublicKeyPart = (domainParts.shift() || "").split("-").slice(-1)[0];
-    let certActualPublicKeyPart = getDomainPartFromPublicKey(certParsed.publicKey);
+    let certActualPublicKeyPart = getDomainPartFromPublicKey(getED25519PublicKey(certParsed));
     if (certExpectedPublicKeyPart !== certActualPublicKeyPart) {
         throw new Error(`Certificate public key in the url is ${certExpectedPublicKeyPart}, but in the cert is ${certActualPublicKeyPart}`);
     }
@@ -281,8 +233,7 @@ export function validateCACert(domain: string, cert: string | Buffer) {
         throw new Error(`Certificate must have nameConstraints.permittedSubtrees`);
     }
     let subtreeValues = subtrees.map((x: any) => x.value);
-    // Ignore localhostDomain, as it can always safely be allowed (the same machine
-    //      is always allowed).
+    // Ignore localhostDomain, as it can always safely be allowed (the same machine is always allowed).
     subtreeValues = subtreeValues.filter((x: string) => x !== localhostDomain);
     if (subtreeValues.length !== 1 || subtreeValues[0] !== subject) {
         throw new Error(`Certificate must have a single constrained domain (had ${JSON.stringify(subtreeValues)})`);
@@ -312,14 +263,14 @@ export function validateCertificate(domain: string, cert: Buffer | string, issue
     let issuerCertParsed = parseCert(issuerCert);
 
     let issuerExpectedPublicKeyPart = domainParts.shift() || "";
-    let issuerActualPublicKeyPart = getDomainPartFromPublicKey(issuerCertParsed.publicKey);
+    let issuerActualPublicKeyPart = getDomainPartFromPublicKey(getED25519PublicKey(issuerCertParsed));
     if (issuerExpectedPublicKeyPart !== issuerActualPublicKeyPart) {
         throw new Error(`Issuer public key in the url is ${issuerExpectedPublicKeyPart}, but in the cert is ${issuerActualPublicKeyPart}`);
     }
 
     // Take the last part
     let certExpectedPublicKeyPart = domainParts.shift() || "";
-    let certActualPublicKeyPart = getDomainPartFromPublicKey(certParsed.publicKey);
+    let certActualPublicKeyPart = getDomainPartFromPublicKey(getED25519PublicKey(certParsed));
     if (certExpectedPublicKeyPart !== certActualPublicKeyPart) {
         throw new Error(`Certificate public key in the url is ${certExpectedPublicKeyPart}, but in the cert is ${certActualPublicKeyPart}`);
     }
@@ -334,8 +285,7 @@ export function validateCertificate(domain: string, cert: Buffer | string, issue
         throw new Error(`CA must have nameConstraints.permittedSubtrees`);
     }
     let subtreeValues = subtrees.map((x: any) => x.value);
-    // Ignore localhostDomain, as it can always safely be allowed (the same machine
-    //      is always allowed).
+    // Ignore localhostDomain, as it can always safely be allowed (the same machine is always allowed).
     subtreeValues = subtreeValues.filter((x: string) => x !== localhostDomain);
     if (subtreeValues.length !== 1) {
         throw new Error(`CA must have a single constrained domain (had ${JSON.stringify(subtreeValues)})`);
@@ -367,16 +317,7 @@ function validateAltNames(certParsed: forge.pki.Certificate, subject: string) {
             !(
                 x === subject
                 || x.endsWith("." + subject)
-                // Commented out, because... it is so easy to publish a 127.0.0.1 A record,
-                //  and even to generate a real cert, so, we should jsut do that, and keep it secure.
-                //  If we need this for development we can put it behind a flag, so non-development
-                //  instances are still secure.
-                // // Also allow 127.0.0.1, for local testing, for now?
-                // //  - This might be insecure if these are trusted by the browser,
-                // //      as then anyone that stores any cookies in this ip can have
-                // //      the cookies stolen. But... if this is just cross-server...
-                // //      I don't see how this could cause a security vulnerability.
-                // || x === Buffer.from([127, 0, 0, 1]).toString()
+                // NOTE: We don't allow 127.0.0.1 (|| x === Buffer.from([127, 0, 0, 1]).toString()), because it is so easy to publish a 127.0.0.1 A record, and even to generate a real cert, so we should just do that, and keep it secure. If we need this for development we can put it behind a flag, so non-development instances are still secure.
             )
         )
     ) {
@@ -385,29 +326,10 @@ function validateAltNames(certParsed: forge.pki.Certificate, subject: string) {
 }
 
 
-// NOTE: We can't use crypto.subtle (non-extractable CryptoKeys) for our keys, because subtle
-//  is asynchronous, and everything here (key generation, cert creation, signing) must be
-//  available synchronously. The only real benefit of subtle is that a cross-site scripting
-//  attack can't exfiltrate the key. Which, while nice, is of minor benefit, as the cross-site
-//  script can already do quite a bit of damage anyway with access. And if that happens, the
-//  first thing the user is probably going to do is reset all their credentials, which solves
-//  the case of the key being exfiltrated anyway (by telling the server to stop trusting
-//  all identities).
 export function generateKeyPair() {
     return measureBlock(function generateKeyPair() {
-        // NOTE: We use ED25519 because it can generated keys about 10X faster, WHICH, is still slow
-        //  (~6ms on my machine). So we DEFINITELY don't want it to be 10X slower!
-        // NOTE: ED25519 doens't have great support in browsers, but we shouldn't need self signed certificates
-        //  in the browser anyway.
-        //  - https://security.stackexchange.com/a/236943/282367
-        //let keyPair = forge.ed25519.generateKeyPair();
-        let keyPair = forge.pki.rsa.generateKeyPair();
-        return keyPair;
-    });
-}
-export function generateRSAKeyPair() {
-    return measureBlock(function generateKeyPair() {
-        return forge.pki.rsa.generateKeyPair();
+        // NOTE: We use ED25519 because it can generate keys about 10X faster than RSA (which is still slow, ~6ms on my machine, so we DEFINITELY don't want it to be 10X slower!) - https://security.stackexchange.com/a/236943/282367
+        return forge.ed25519.generateKeyPair();
     });
 }
 
@@ -415,10 +337,6 @@ export function generateTestCA(domain: string) {
     const keyPair = generateKeyPair();
     let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
     let fullDomain = `${caPublicKeyPart}.${domain}`;
-    if (!isNode()) {
-        fullDomain = `${caPublicKeyPart}.${domain}`;
-    }
-
     return createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
 }
 
@@ -449,12 +367,7 @@ let identityCA = cache((domain: string) => lazy((): X509KeyPair => {
     return result;
 }));
 
-// IMPORTANT! We do not embed any debug info in this domain. If we did, it would be useful,
-//  but... potentally a security vulnerability, as if the debug info (such as a prefix)
-//  is used to identify what a certificate is for, it would be easy for an attack to
-//  forge this (as the debug info won't be secured). So it is much better to keep
-//  the certificate opaque, and then require any metadata to be actually vetted
-//  (and hopefully stored in a UI, showing IP, time, etc).
+// IMPORTANT! We do not embed any debug info in this domain. If we did, it would be useful, but... potentally a security vulnerability, as if the debug info (such as a prefix) is used to identify what a certificate is for, it would be easy for an attack to forge this (as the debug info won't be secured). So it is much better to keep the certificate opaque, and then require any metadata to be actually vetted (and hopefully stored in a UI, showing IP, time, etc).
 export function createCertFromCA(config: {
     CAKeyPair: X509KeyPair;
 }): X509KeyPair {
@@ -488,11 +401,7 @@ export function decodeNodeId(nodeId: string, domain: string, allowMissingThreadI
         return undefined;
     }
     let parts = locationObj.address.split(".");
-    // NOTE: We have to only allow localhost domains on our own domain, as the underlying domain
-    //  gets stripped when we're looking at the machineId. So if we allowed localhost domains on
-    //  other domains, a server could trick us into connecting to it, and then once the connection
-    //  is established, it could talk back and we would think it has a localhost machineId, which
-    //  is implicitly trusted, which would then give it access to everything.
+    // NOTE: We have to only allow localhost domains on our own domain, as the underlying domain gets stripped when we're looking at the machineId. So if we allowed localhost domains on other domains, a server could trick us into connecting to it, and then once the connection is established, it could talk back and we would think it has a localhost machineId, which is implicitly trusted, which would then give it access to everything.
     if (locationObj.address === `127-0-0-1.${domain}` && nodeId.includes(":")) {
         return {
             threadId: "",
@@ -542,9 +451,7 @@ export async function setIdentityCARaw(domain: string, json: string) {
     resetAllNodeCallFactories();
 }
 
-// NOTE: The identity CA is available synchronously (storage is fs/localStorage, both
-//  synchronous), so this only exists for backwards compatibility with startup code
-//  that awaits it.
+// NOTE: The identity CA is available synchronously (storage is fs/localStorage, both synchronous), so this only exists for backwards compatibility with startup code that awaits it.
 export async function loadIdentityCA(domain: string) {
     identityCA(domain)();
 }
@@ -552,8 +459,7 @@ export function getIdentityCA(domain: string): X509KeyPair {
     return identityCA(domain)();
 }
 
-// TODO: Replace this with a database, so it is easy for us to trust CAs
-//  cross machine, and even have multiple users, etc, etc.
+// TODO: Replace this with a database, so it is easy for us to trust CAs cross machine, and even have multiple users, etc, etc.
 export function getIdentityCAPromise(domain: string): X509KeyPair {
     return identityCA(domain)();
 }
@@ -578,11 +484,8 @@ export function verifyMachineIdForPublicKey(config: {
 }
 
 // NOTE: We don't have a cache per CA, as... the CA should be set first
-//  TODO: Maybe throw if they try to change the CA after they generate any certificates?
-// TODO: Regenerate certificates after enough time (as thread certs should be relatively short lived,
-//  so it is plausible for them to expire)
-//  - We will also need to provide a callback so that users of the cert can update the cert they
-//      are using as well.
+// TODO: Maybe throw if they try to change the CA after they generate any certificates?
+// TODO: Regenerate certificates after enough time (as thread certs should be relatively short lived, so it is plausible for them to expire). We will also need to provide a callback so that users of the cert can update the cert they are using as well.
 export function getThreadKeyCert(domain: string) {
     return getThreadKeyCertBase(domain)();
 }
@@ -590,11 +493,6 @@ const getThreadKeyCertBase = cache((domain: string) => lazy(() => {
     let ca = getIdentityCA(domain);
     return createCertFromCA({ CAKeyPair: ca });
 }));
-
-export const createTestBrowserKeyCert = lazy(async () => {
-    let keyPair = generateRSAKeyPair();
-    return await createX509({ domain: "test", issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
-});
 
 export function getOwnNodeId(): string {
     let nodeId = SocketFunction.mountedNodeId;
