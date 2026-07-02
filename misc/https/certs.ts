@@ -191,7 +191,9 @@ export const sign = measureWrap(function sign(keyPair: { key: string | Buffer },
 
 export function verify(cert: string, signature: string, data: unknown) {
     let certObj = parseCert(cert);
-    return (certObj.publicKey as forge.pki.rsa.PublicKey).verify(JSON.stringify(data), signature);
+    if (!(certObj.publicKey as forge.pki.rsa.PublicKey).verify(JSON.stringify(data), signature)) {
+        throw new Error(`Signature verification failed. Signature: ${JSON.stringify(signature)} | Data: ${JSON.stringify(data).slice(0, 1024)}`);
+    }
 }
 
 function normalizeCertToPEM(PEMorDER: string | Buffer): string {

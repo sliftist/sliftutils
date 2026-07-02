@@ -32,7 +32,7 @@ export declare function getPublicIdentifier(PEMorDER: string | Buffer): Buffer;
 export declare const sign: (keyPair: {
     key: string | Buffer;
 }, data: unknown) => string;
-export declare function verify(cert: string, signature: string, data: unknown): boolean;
+export declare function verify(cert: string, signature: string, data: unknown): void;
 export declare function validateCACert(domain: string, cert: string | Buffer): void;
 export declare function validateCertificate(domain: string, cert: Buffer | string, issuerCert: Buffer | string): void;
 export declare function generateKeyPair(): forge.pki.rsa.KeyPair;
