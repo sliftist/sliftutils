@@ -14,7 +14,4 @@ declare module "node-forge" {
         static publicKeyToPem(key: Ed25519PublicKey): string;
         static publicKeyFromPem(pem: string): Ed25519PublicKey;
     }
-    namespace pki {
-        function getTBSCertificate(cert: pki.Certificate): asn1.Asn1;
-    }
 }
