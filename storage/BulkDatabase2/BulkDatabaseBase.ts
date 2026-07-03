@@ -67,7 +67,7 @@ export const bulkDatabase2Timing = {
     // the whole stream file per write.
     writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
     fileSetPollIntervalMs: 30 * 60 * 1000,
-    memoryFlushHeapBytes: 1500 * 1024 * 1024,
+    memoryFlushHeapBytes: 5 * 1024 * 1024 * 1024,
     memoryFlushMinCollectionBytes: 100 * 1024 * 1024,
     memoryFlushThrottleMs: 15 * 60 * 1000,
 };
