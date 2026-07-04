@@ -627,8 +627,13 @@ export async function autocompactBulkDatabases(root: string): Promise<void> {
         const start = Date.now();
         console.log(`  [autocompact] ${at} ${name}: starting merge`);
         try {
-            await getCompactor(baseDir, name).tryMergeNow();
-            console.log(`  [autocompact] ${at} ${name}: done (${Date.now() - start}ms)`);
+            const result = await getCompactor(baseDir, name).tryMergeNow();
+            let outcome = result.merged && "merged" || "nothing to merge";
+            if (result.skipReason) {
+                outcome = `skipped: ${result.skipReason}`;
+                if (result.lockExpiresInMs !== undefined) outcome += ` (lock held by ${result.lockHolderId}, expires in ${Math.max(0, Math.round(result.lockExpiresInMs / 1000))}s)`;
+            }
+            console.log(`  [autocompact] ${at} ${name}: done (${outcome}, ${Date.now() - start}ms)`);
         } catch (e) {
             console.warn(`  [autocompact] ${at} ${name}: failed after ${Date.now() - start}ms - ${(e as Error).message}`);
         }

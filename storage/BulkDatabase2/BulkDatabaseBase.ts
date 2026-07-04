@@ -18,7 +18,7 @@ import { blue, magenta } from "socket-function/src/formatting/logColors";
 import { STREAM_EXTENSION, frameDeletes, frameRows, streamReaderFromEntries } from "./streamLog";
 import { broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, connect as syncConnect, isSyncSupported, RemoteWrite } from "./syncClient";
 import { DELETED } from "./WriteOverlay";
-import { releaseMergeFileLock, releaseMergeLock, startMergeFileLockHeartbeat, tryAcquireMergeFileLock, tryAcquireMergeLock } from "./mergeLock";
+import { MergeLockInfo, peekMergeFileLock, peekMergeLock, releaseMergeFileLock, releaseMergeLock, startMergeFileLockHeartbeat, tryAcquireMergeFileLock, tryAcquireMergeLock } from "./mergeLock";
 import { markerExclusions, processDeleteMarkers, readDeleteMarkers, writeDeleteMarker } from "./mergeMarkers";
 import {
     BulkFileInfo,
@@ -49,6 +49,9 @@ const DUP_THRESHOLD = 0.4;
 const DEDUP_TRIGGER_BYTES = 512 * 1024 * 1024;
 const DEDUP_TRIGGER_FRACTION = 0.5;
 const WRITE_FLUSH_FIRST_STEP_MS = 250;
+// Skip logs are throttled per collection: the background write path retries merges about once a second,
+// so an unthrottled log would repeat for the whole duration of another tab's merge.
+const MERGE_SKIP_LOG_INTERVAL_MS = 30 * 1000;
 
 export const bulkDatabase2Timing = {
     streamSealAgeMs: 10 * 60 * 60 * 1000,
@@ -102,6 +105,26 @@ export type StorageFactory = (path: string) => Promise<FileStorage>;
 export type BulkDatabase2Config = {
     // See BulkDatabaseReader.cfg.maxTriggerThrottleMs.
     maxTriggerThrottleMs?: number;
+};
+
+export type MergeSkipReason =
+    // This instance is already mid-merge.
+    | "mergeInFlight"
+    // Another same-origin tab holds the localStorage merge lock.
+    | "tabLockHeld"
+    // Another process holds the cross-process .merge-lock file (or won the settle race for it).
+    | "fileLockHeld"
+    // compact() only: the collection has no files on disk.
+    | "nothingToMerge";
+
+// What a compact()/tryMergeNow() call did. skipReason is set when the pass never ran; for the lock
+// reasons, lockHolderId/lockExpiresInMs report who holds the lock and how long until it goes stale
+// (so a scheduler knows when retrying could succeed).
+export type MergeAttemptResult = {
+    merged: boolean;
+    skipReason?: MergeSkipReason;
+    lockHolderId?: string;
+    lockExpiresInMs?: number;
 };
 
 let networkCompactionEnabled = false;
@@ -237,6 +260,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // tryMergeNow calls) return immediately instead of queueing. Keeps the visibility-timer firings
     // from stacking behind a long merge.
     private mergeInFlight = false;
+    private lastMergeSkipLogMs = 0;
     // Running counters of stream-tier rows + bytes on disk. Seeded from each LoadedIndex build, then
     // incremented per flush so the fold-trigger checks current data without an extra directory listing.
     private streamRowsOnDisk = 0;
@@ -614,58 +638,77 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (!await this.automaticCompactionAllowed()) return;
         if (opts.onlyIfStreamHeavy && !this.streamNeedsFold()) return;
         try {
-            await this.tryMergeNow();
+            await this.tryMergeThrottled();
         } catch (e) {
             console.warn(`${this.name}: background merge failed: ${(e as Error).message}`);
         }
     }
 
-    // Returns immediately with { lockFailed: true } if another call is already in flight (same
-    // instance), if the localStorage lock is held by another tab, or if the cross-process file lock
-    // says another process owns it. Otherwise: acquires both locks, runs testMerge, releases.
-    public tryMergeNow = throttleFunction(1000, async () => {
-        if (this.mergeInFlight) return;
-        if (!tryAcquireMergeLock(this.name, writerId)) return;
+    // Build the "we didn't merge" result and log it (throttled — see MERGE_SKIP_LOG_INTERVAL_MS). For
+    // lock reasons the log and result include the holder and time until the lock goes stale.
+    private async mergeSkip(reason: MergeSkipReason): Promise<MergeAttemptResult> {
+        let lock: MergeLockInfo | undefined;
+        if (reason === "tabLockHeld") {
+            lock = peekMergeLock(this.name);
+        } else if (reason === "fileLockHeld") {
+            lock = await peekMergeFileLock(await this.storage());
+        }
+        if (Date.now() - this.lastMergeSkipLogMs >= MERGE_SKIP_LOG_INTERVAL_MS) {
+            this.lastMergeSkipLogMs = Date.now();
+            const detail = lock && ` (held by ${lock.holderId}, expires in ${formatTime(Math.max(0, lock.expiresInMs))})` || "";
+            console.log(`${blue(this.name)} ${magenta("merge")} skipped: ${reason}${detail}`);
+        }
+        return { merged: false, skipReason: reason, lockHolderId: lock?.holderId, lockExpiresInMs: lock?.expiresInMs };
+    }
+
+    // Acquire both merge locks (same-tab mergeInFlight, cross-tab localStorage, cross-process file),
+    // run the pass, release. Skips (with the reason) instead of waiting when any of them is held.
+    private async runLockedMerge(run: () => Promise<MergeAttemptResult>): Promise<MergeAttemptResult> {
+        if (this.mergeInFlight) return await this.mergeSkip("mergeInFlight");
+        if (!tryAcquireMergeLock(this.name, writerId)) return await this.mergeSkip("tabLockHeld");
         const storage = await this.storage();
         const haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
         if (!haveFileLock) {
             releaseMergeLock(this.name, writerId);
-            return;
+            return await this.mergeSkip("fileLockHeld");
         }
         this.mergeInFlight = true;
         const stopHeartbeat = startMergeFileLockHeartbeat(storage, writerId);
         try {
-            await this.testMergeINTERNAL_DO_NOT_CALL();
+            return await run();
         } finally {
             stopHeartbeat();
             await releaseMergeFileLock(storage, writerId);
             releaseMergeLock(this.name, writerId);
             this.mergeInFlight = false;
         }
+    }
+
+    // The background path (maybeMerge) goes through this so write bursts coalesce; explicit callers use
+    // tryMergeNow directly and get the per-call result.
+    private tryMergeThrottled = throttleFunction(1000, async () => {
+        await this.tryMergeNow();
     });
 
-    public async compact(): Promise<void> {
-        if (this.mergeInFlight) return;
-        if (!tryAcquireMergeLock(this.name, writerId)) return;
-        const storage = await this.storage();
-        const haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
-        if (!haveFileLock) { releaseMergeLock(this.name, writerId); return; }
-        this.mergeInFlight = true;
-        const stopHeartbeat = startMergeFileLockHeartbeat(storage, writerId);
-        try {
+    public async tryMergeNow(): Promise<MergeAttemptResult> {
+        return await this.runLockedMerge(async () => {
+            const merged = await this.testMergeINTERNAL_DO_NOT_CALL();
+            return { merged };
+        });
+    }
+
+    public async compact(): Promise<MergeAttemptResult> {
+        return await this.runLockedMerge(async () => {
             await this.flushPending();
             syncBroadcastSeal(this.name);
             this.streamFileName = undefined;
             const { bulkFiles, streamFiles } = await this.listFiles();
+            if (bulkFiles.length + streamFiles.length < 1) return await this.mergeSkip("nothingToMerge");
             // compact() folds every file → no older data survives outside it → surviving tombstones
             // can be dropped (nothing left to suppress).
-            if (bulkFiles.length + streamFiles.length >= 1) await this.mergeFileSet(bulkFiles, streamFiles, true);
-        } finally {
-            stopHeartbeat();
-            await releaseMergeFileLock(storage, writerId);
-            releaseMergeLock(this.name, writerId);
-            this.mergeInFlight = false;
-        }
+            const merged = await this.mergeFileSet(bulkFiles, streamFiles, true);
+            return { merged };
+        });
     }
 
     public async merge(timeLo: number, timeHi: number): Promise<void> {

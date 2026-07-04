@@ -17,6 +17,16 @@ import type { FileStorage } from "../FileFolderAPI";
 
 const LOCK_TTL_MS = 30 * 1000;
 
+export type MergeLockInfo = { holderId: string; expiresInMs: number };
+
+function parseLockToken(token: string): { holderId: string; time: number } | undefined {
+    const colon = token.lastIndexOf(":");
+    if (colon < 0) return undefined;
+    const time = parseInt(token.slice(colon + 1), 10);
+    if (!Number.isFinite(time)) return undefined;
+    return { holderId: token.slice(0, colon), time };
+}
+
 function getLocalStorage(): Storage | undefined {
     try {
         return typeof localStorage !== "undefined" ? localStorage : undefined;
@@ -40,13 +50,25 @@ export function tryAcquireMergeLock(collection: string, holderId: string): boole
     const now = Date.now();
     const existing = ls.getItem(key);
     if (existing && !existing.startsWith(holderId + ":")) {
-        const t = parseInt(existing.slice(existing.lastIndexOf(":") + 1), 10);
-        if (Number.isFinite(t) && now - t < LOCK_TTL_MS) return false;
+        const parsed = parseLockToken(existing);
+        if (parsed && now - parsed.time < LOCK_TTL_MS) return false;
     }
     const token = holderId + ":" + now;
     ls.setItem(key, token);
     // Re-read to catch a racing setItem from another tab (best-effort, not atomic).
     return ls.getItem(key) === token;
+}
+
+// Non-mutating look at the tab lock: who holds it and how long until it goes stale (negative = already
+// stale). For logging why a merge was skipped.
+export function peekMergeLock(collection: string): MergeLockInfo | undefined {
+    const ls = getLocalStorage();
+    if (!ls) return undefined;
+    const existing = ls.getItem(lockKey(collection));
+    if (!existing) return undefined;
+    const parsed = parseLockToken(existing);
+    if (!parsed) return undefined;
+    return { holderId: parsed.holderId, expiresInMs: parsed.time + LOCK_TTL_MS - Date.now() };
 }
 
 export function releaseMergeLock(collection: string, holderId: string): void {
@@ -63,17 +85,19 @@ const FILE_LOCK_TTL_MS = 5 * 60 * 1000;
 const FILE_LOCK_SETTLE_MS = 15 * 1000;
 const FILE_LOCK_HEARTBEAT_MS = 2 * 60 * 1000;
 
-async function readMergeFileLock(storage: FileStorage): Promise<{ id: string; time: number } | undefined> {
+async function readMergeFileLock(storage: FileStorage): Promise<{ holderId: string; time: number } | undefined> {
     try {
         const buf = await storage.get(FILE_LOCK_KEY);
         if (!buf) return undefined;
-        const s = buf.toString("utf8");
-        const colon = s.lastIndexOf(":");
-        if (colon < 0) return undefined;
-        const time = parseInt(s.slice(colon + 1), 10);
-        if (!Number.isFinite(time)) return undefined;
-        return { id: s.slice(0, colon), time };
+        return parseLockToken(buf.toString("utf8"));
     } catch { return undefined; }
+}
+
+// Non-mutating look at the cross-process lock file (see peekMergeLock).
+export async function peekMergeFileLock(storage: FileStorage): Promise<MergeLockInfo | undefined> {
+    const existing = await readMergeFileLock(storage);
+    if (!existing) return undefined;
+    return { holderId: existing.holderId, expiresInMs: existing.time + FILE_LOCK_TTL_MS - Date.now() };
 }
 
 async function writeMergeFileLock(storage: FileStorage, holderId: string, time: number): Promise<void> {
@@ -86,11 +110,11 @@ async function writeMergeFileLock(storage: FileStorage, holderId: string, time: 
 export async function tryAcquireMergeFileLock(storage: FileStorage, holderId: string): Promise<boolean> {
     const now = Date.now();
     const existing = await readMergeFileLock(storage);
-    if (existing && existing.id !== holderId && now - existing.time < FILE_LOCK_TTL_MS) return false;
+    if (existing && existing.holderId !== holderId && now - existing.time < FILE_LOCK_TTL_MS) return false;
     await writeMergeFileLock(storage, holderId, now);
     await new Promise(r => setTimeout(r, FILE_LOCK_SETTLE_MS));
     const after = await readMergeFileLock(storage);
-    return !!after && after.id === holderId;
+    return !!after && after.holderId === holderId;
 }
 
 // Keep the lock fresh. The merge might run longer than FILE_LOCK_TTL_MS; without periodic re-stamping,
@@ -107,6 +131,6 @@ export function startMergeFileLockHeartbeat(storage: FileStorage, holderId: stri
 export async function releaseMergeFileLock(storage: FileStorage, holderId: string): Promise<void> {
     try {
         const existing = await readMergeFileLock(storage);
-        if (existing && existing.id === holderId) await storage.remove(FILE_LOCK_KEY);
+        if (existing && existing.holderId === holderId) await storage.remove(FILE_LOCK_KEY);
     } catch { /* ignore */ }
 }
