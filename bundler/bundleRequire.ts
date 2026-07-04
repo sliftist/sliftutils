@@ -182,13 +182,16 @@ export function bundleRequire(config: BundleRequireConfig) {
         requireFnc.main = newModule;
         requireFnc.extensions = "extension not implemented yet" as any;
 
-        // Resolves file extensions
+        // Resolves file extensions, and also directory-style imports (e.g. `./foo` matching `./foo/index.ts`), which node/webpack support but our bundler previously did not
         function innerResolve(path: string): string {
             let candidates = [
                 path,
                 path + ".js",
                 path + ".ts",
                 path + ".tsx",
+                path + "/index.js",
+                path + "/index.ts",
+                path + "/index.tsx",
             ];
             for (let candidate of candidates) {
                 let registered = globalThis.registeredModules?.[candidate];
