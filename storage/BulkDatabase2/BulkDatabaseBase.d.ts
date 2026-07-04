@@ -27,6 +27,13 @@ export type StorageFactory = (path: string) => Promise<FileStorage>;
 export type BulkDatabase2Config = {
     maxTriggerThrottleMs?: number;
 };
+export type MergeSkipReason = "mergeInFlight" | "tabLockHeld" | "fileLockHeld" | "nothingToMerge";
+export type MergeAttemptResult = {
+    merged: boolean;
+    skipReason?: MergeSkipReason;
+    lockHolderId?: string;
+    lockExpiresInMs?: number;
+};
 export declare class BulkDatabaseBase<T extends {
     key: string;
 }> {
@@ -50,6 +57,7 @@ export declare class BulkDatabaseBase<T extends {
     private currentStreamFileName;
     private currentStreamFileBytes;
     private mergeInFlight;
+    private lastMergeSkipLogMs;
     private streamRowsOnDisk;
     private streamBytesOnDisk;
     private fileSetPollTimer;
@@ -100,8 +108,11 @@ export declare class BulkDatabaseBase<T extends {
     private processMarkers;
     private writeBulkFile;
     private maybeMerge;
-    tryMergeNow: () => Promise<void>;
-    compact(): Promise<void>;
+    private mergeSkip;
+    private runLockedMerge;
+    private tryMergeThrottled;
+    tryMergeNow(): Promise<MergeAttemptResult>;
+    compact(): Promise<MergeAttemptResult>;
     merge(timeLo: number, timeHi: number): Promise<void>;
     private readBulkHeader;
     private fileLogicalSize;

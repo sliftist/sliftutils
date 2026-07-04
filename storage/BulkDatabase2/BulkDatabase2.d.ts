@@ -1,6 +1,6 @@
-import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing } from "./BulkDatabaseBase";
+import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing, MergeAttemptResult } from "./BulkDatabaseBase";
 export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing } from "./BulkDatabaseBase";
+export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing, MergeAttemptResult, MergeSkipReason } from "./BulkDatabaseBase";
 /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
 export type BulkColumnInfo = {
     column: string;
@@ -116,8 +116,13 @@ export interface IBulkDatabase2<T extends {
      * size/fragmentation and deciding whether to call tryMergeNow()/compact().
      */
     getFileInfo(): Promise<BulkFileInfoListing>;
-    /** Consolidate on-disk files. Optional to call; the database also does this in the background. */
-    compact(): Promise<void>;
+    /**
+     * Consolidate on-disk files. Optional to call; the database also does this in the background.
+     * Returns whether anything was merged, or (via skipReason) why the pass never ran — another merge
+     * in flight, another tab/process holding the merge lock (with who holds it and when the lock
+     * expires), or nothing on disk to compact.
+     */
+    compact(): Promise<MergeAttemptResult>;
     /**
      * Whether this collection's storage is served over the network (a remote server) rather than local
      * disk. Apps can branch on this to adapt to the higher latency. Note: over the network the database
@@ -135,10 +140,11 @@ export interface IBulkDatabase2<T extends {
     /**
      * Run one merge pass now (the same policy the database runs on a timer): consolidate recent
      * fragmentation and dedup a key range if it's worth it. Returns whether it merged anything and
-     * whether it bailed because another tab/process holds the merge lock — so a scheduler can call this
-     * (e.g. every 30 minutes) and tell "nothing to do" from "someone else is already merging".
+     * whether it bailed because another tab/process holds the merge lock (including the lock's holder
+     * and expiry) — so a scheduler can call this (e.g. every 30 minutes) and tell "nothing to do" from
+     * "someone else is already merging".
      */
-    tryMergeNow(): Promise<void>;
+    tryMergeNow(): Promise<MergeAttemptResult>;
     /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
      * most callers want compact() or tryMergeNow(). */
     merge(timeLo: number, timeHi: number): Promise<void>;
