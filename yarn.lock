@@ -2095,10 +2095,10 @@ typenode@^6.0.1:
     source-map-support "https://github.com/7rulnik/node-source-map-support"
     typescript "5.3.3"
 
-typenode@^6.3.0:
-  version "6.3.0"
-  resolved "https://registry.yarnpkg.com/typenode/-/typenode-6.3.0.tgz#f7f22dbd3116056801271fca527e72ba91e28c68"
-  integrity sha512-pqAYBmWdzw5QjOugX82uH4+mc1JGL/1dqXwKxY/vsvpNK4j8SUaSVGJrASac+wU3rPVIIBRIAWTVDPEvGwJx8Q==
+typenode@^6.6.1:
+  version "6.6.1"
+  resolved "https://registry.yarnpkg.com/typenode/-/typenode-6.6.1.tgz#a7236a618bca1e2dc8c7126ddf303349388a7a38"
+  integrity sha512-gFvy6F3dUE7WivTDrtZvgKH5aRrDORXeO2+4RtSVf3k4SKTHHUlh8wvsMi6aE9hYOgjmb9X03fKDvUDlC9T4PA==
   dependencies:
     "@types/pegjs" "^0.10.3"
     source-map-support "https://github.com/7rulnik/node-source-map-support"
