@@ -5,6 +5,9 @@ import { STREAM_EXTENSION, StreamEntry, parseStream, streamReaderFromEntries } f
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import { blue, red } from "socket-function/src/formatting/logColors";
 
+// Duplicated from BulkDatabaseBase to avoid a circular import — used only to build a fuller storage-relative path for log messages.
+const BULK_ROOT_FOLDER = "bulkDatabases2";
+
 export type BulkFileInfo = { fileName: string; level: number; timestamp: number };
 export type StreamFileInfo = { fileName: string; timestamp: number };
 export type StreamReaderCacheEntry = { readSize: number; parsedPos: number; entries: StreamEntry[] };
@@ -257,7 +260,7 @@ export async function loadFileReader(name: string, storage: FileStorage, f: Bulk
     const raw = await makeRawGetRange(storage, f.fileName);
     const fileId = nullJoin(name, f.fileName);
     const opened = await blockCache.open(fileId, raw.size, raw.rawGetRange);
-    const reader = await loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange, name: f.fileName });
+    const reader = await loadBulkDatabase({ totalBytes: opened.uncompressedSize, getRange: opened.getRange, name: `${BULK_ROOT_FOLDER}/${name}/${f.fileName}` });
     cache.set(f.fileName, reader);
     return reader;
 }
@@ -333,11 +336,11 @@ function pruneSubCaches(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[]
 // visible without flooding the log on every rebuild.
 const warnedCorruptReads = new Set<string>();
 function warnCorruptRead(db: BaseBulkDatabaseReader, column: string, e: unknown): void {
-    const fileName = db.name || "(unknown source)";
-    const dedupeKey = nullJoin(fileName, column);
+    const path = db.name || "(unknown source)";
+    const dedupeKey = nullJoin(path, column);
     if (warnedCorruptReads.has(dedupeKey)) return;
     warnedCorruptReads.add(dedupeKey);
-    console.warn(`${red("corrupt read")}: file ${fileName} column ${JSON.stringify(column)} could not be read - skipping it (its data is dropped from results): ${(e as Error).message}`);
+    console.warn(`${red("corrupt read")}: file ${path} column ${JSON.stringify(column)} could not be read - skipping it (its data is dropped from results): ${(e as Error).message}`);
 }
 
 function joinBulkDatabases(databases: BaseBulkDatabaseReader[]): ResolvedReader {
