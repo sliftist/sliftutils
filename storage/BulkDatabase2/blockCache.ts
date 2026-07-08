@@ -150,7 +150,11 @@ export class BlockCache {
                 let lastMeta = index.blocks[runEnd - 1];
                 let compEnd = index.offsets[runEnd - 1] + lastMeta.len;
                 let runCompressed = rawGetRange(compStart, compEnd);
-                // Register a per-block promise BEFORE awaiting so concurrent reads dedupe onto it.
+                // Hold this run's promises locally. Registering them in the LRU can evict earlier
+                // blocks of the same run (or of a concurrent run) before we get to await them, so
+                // reading them back out of the cache would silently drop blocks and return a short
+                // buffer. We still register in the LRU so concurrent reads dedupe onto them.
+                let runPromises: Promise<Buffer>[] = [];
                 for (let i = runStart; i < runEnd; i++) {
                     let meta = index.blocks[i];
                     let relOffset = index.offsets[i] - compStart;
@@ -159,17 +163,20 @@ export class BlockCache {
                         if (meta.c) return LZ4.decompress(stored);
                         return stored;
                     });
+                    runPromises.push(blockPromise);
                     this.touch(`${fileId}:${i}`, blockPromise);
                 }
-                for (let i = runStart; i < runEnd; i++) {
-                    let promise = this.blocks.get(`${fileId}:${i}`);
-                    if (promise) parts.push(await promise);
-                }
+                for (let promise of runPromises) parts.push(await promise);
                 block = runEnd;
             }
 
             let combined = parts.length === 1 && parts[0] || Buffer.concat(parts);
             let sliceStart = start - firstBlock * blockSize;
+            // A short combined buffer means we lost blocks; subarray would clamp and hand back
+            // truncated data that every caller treats as valid. Fail loudly instead.
+            if (combined.length < sliceStart + (end - start)) {
+                throw new Error(`Expected ${sliceStart + (end - start)} bytes of blocks for range [${start}, ${end}) of ${fileId}, was ${combined.length}`);
+            }
             return combined.subarray(sliceStart, sliceStart + (end - start));
         };
     }
