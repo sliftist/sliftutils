@@ -2606,6 +2606,8 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         private lastDeniedLog;
         getDebugName(): string;
         private authenticate;
+        private callAuthed;
+        waitingForAccess(): Promise<string | undefined>;
         private onAccessDenied;
         private ensureSetup;
         private call;

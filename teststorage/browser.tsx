@@ -4,6 +4,7 @@ import preact from "preact";
 import { observable } from "mobx";
 import { observer } from "../render-utils/observer";
 import { isNode } from "socket-function/src/misc";
+import { delay } from "socket-function/src/batching";
 import { formatNumber, formatDateTime } from "socket-function/src/formatting/format";
 import { css } from "typesafecss";
 import { InputLabel } from "../render-utils/InputLabel";
@@ -15,6 +16,7 @@ const STORAGE_ADDRESS = "storage.vidgridweb.com";
 const STORAGE_PORT = 4444;
 const ACCOUNT = "test";
 const BUCKET = "testfiles";
+const ACCESS_CHECK_INTERVAL = 1000 * 15;
 
 const archives = new ArchivesRemote({
     address: STORAGE_ADDRESS,
@@ -32,11 +34,20 @@ class TestStoragePage extends preact.Component {
         content: "",
         contentLoaded: false,
         newFileName: "",
+        accessLink: "",
         error: "",
     });
 
     componentDidMount() {
-        void this.refresh();
+        void (async () => {
+            while (true) {
+                let link = await archives.waitingForAccess();
+                this.synced.accessLink = link || "";
+                if (!link) break;
+                await delay(ACCESS_CHECK_INTERVAL);
+            }
+            await this.refresh();
+        })();
     }
 
     private async refresh() {
@@ -81,10 +92,10 @@ class TestStoragePage extends preact.Component {
         return <div className={css.vbox(12).pad2(16)}>
             <div>Storage test site. Account {ACCOUNT}, bucket {BUCKET} on {STORAGE_ADDRESS}:{STORAGE_PORT}</div>
             {synced.error && <div className={errorMessage}>{synced.error}</div>}
-            {!synced.loaded && <div>
-                Loading files... If this never finishes, this machine does not have access yet. An
-                access request has been made; the browser console logs the command to run on the
-                storage machine to grant it.
+            {!synced.loaded && !synced.accessLink && <div>Loading files...</div>}
+            {!synced.loaded && synced.accessLink && <div className={css.vbox(8)}>
+                <div>This machine does not have access to the account yet. Grant it here:</div>
+                <a href={synced.accessLink} target="_blank">{synced.accessLink}</a>
             </div>}
             {synced.loaded && <div className={css.hbox(24).alignItems("flex-start")}>
                 <div className={css.vbox(8)}>

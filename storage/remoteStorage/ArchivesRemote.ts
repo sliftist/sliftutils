@@ -74,15 +74,29 @@ export class ArchivesRemote implements IArchives {
         await authenticateStorage({ address: this.config.address, port: this.config.port, nodeId: this.nodeId });
     }
 
-    private async onAccessDenied(): Promise<void> {
-        let requested: { machineId: string; ip: string } | undefined;
+    // Runs a call, authenticating (and re-authenticating after reconnects) as needed. Unlike
+    // call(), does NOT wait for account access.
+    private async callAuthed<T>(fnc: () => Promise<T>): Promise<T> {
         try {
-            requested = await this.controller.requestAccess(this.config.account);
+            return await fnc();
         } catch (e: any) {
             if (!String(e.stack || e).includes(STORAGE_NOT_AUTHENTICATED)) throw e;
             await this.authenticate();
-            requested = await this.controller.requestAccess(this.config.account);
+            return await fnc();
         }
+    }
+
+    // Returns undefined if this machine has access to the account. Otherwise puts in an access
+    // request and returns the link to the page where access can be granted.
+    public async waitingForAccess(): Promise<string | undefined> {
+        let state = await this.callAuthed(() => this.controller.getAccessState(this.config.account));
+        if (state.hasAccess) return undefined;
+        await this.callAuthed(() => this.controller.requestAccess(this.config.account));
+        return `https://${this.config.address}:${this.config.port}/${this.config.account}`;
+    }
+
+    private async onAccessDenied(): Promise<void> {
+        let requested = await this.callAuthed(() => this.controller.requestAccess(this.config.account));
         if (Date.now() - this.lastDeniedLog > timeInMinute) {
             this.lastDeniedLog = Date.now();
             console.log(`No access to storage account ${JSON.stringify(this.config.account)} on ${this.config.address}:${this.config.port} (our machine ${requested.machineId}, ip ${requested.ip}). Waiting for access to be granted. See https://${this.config.address}:${this.config.port}/${this.config.account} - or on the storage machine run: typenode storage/remoteStorage/storageServer.ts --domain ${this.config.address} --port ${this.config.port} --listAccess ${requested.ip}`);
