@@ -69,9 +69,9 @@ class AccessPage extends preact.Component {
             {!state && !error && <div>Requesting access...</div>}
             {state && !state.hasAccess && <div className={css.vbox(8)}>
                 <div>This machine ({state.machineId}, ip {state.ip}) does NOT have access yet.</div>
-                <div>An access request has been made. To grant it, run this on the storage machine:</div>
-                <pre>{state.listAccessCommand}</pre>
-                <div>Then grant the request for this machine with --grantAccess (this page rechecks every {REFRESH_INTERVAL / 1000} seconds).</div>
+                <div>An access request has been made. To grant it, run this single command (it sshes into the storage machine):</div>
+                <pre>{state.grantAccessCommand || state.listAccessCommand}</pre>
+                <div>This page rechecks every {REFRESH_INTERVAL / 1000} seconds.</div>
             </div>}
             {state && state.hasAccess && <div className={css.vbox(8)}>
                 <div>This machine ({state.machineId}, ip {state.ip}) has access.</div>

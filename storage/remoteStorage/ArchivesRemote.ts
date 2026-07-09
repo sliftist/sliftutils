@@ -99,7 +99,7 @@ export class ArchivesRemote implements IArchives {
         let requested = await this.callAuthed(() => this.controller.requestAccess(this.config.account));
         if (Date.now() - this.lastDeniedLog > timeInMinute) {
             this.lastDeniedLog = Date.now();
-            console.log(`No access to storage account ${JSON.stringify(this.config.account)} on ${this.config.address}:${this.config.port} (our machine ${requested.machineId}, ip ${requested.ip}). Waiting for access to be granted. See https://${this.config.address}:${this.config.port}/${this.config.account} - or on the storage machine run: typenode storage/remoteStorage/storageServer.ts --domain ${this.config.address} --port ${this.config.port} --listAccess ${requested.ip}`);
+            console.log(`No access to storage account ${JSON.stringify(this.config.account)} on ${this.config.address}:${this.config.port} (our machine ${requested.machineId}, ip ${requested.ip}). Waiting for access to be granted. See https://${this.config.address}:${this.config.port}/${this.config.account} - or grant it with: ${requested.grantAccessCommand}`);
         }
         await delay(ACCESS_RETRY_DELAY);
     }

@@ -52,8 +52,10 @@ export type AccessState = {
     machineId: string;
     ip: string;
     hasAccess: boolean;
-    // The command to run on the storage machine (shown when the caller has no access)
+    // Single ssh commands, runnable from anywhere, that run the admin CLI on the storage machine
+    // (shown when the caller has no access). grantAccessCommand grants the caller's own request.
     listAccessCommand: string;
+    grantAccessCommand?: string;
     // Only provided when the caller has access
     machines?: (AccessRequest & { trusted: boolean })[];
 };
@@ -62,6 +64,10 @@ export type StorageServerState = {
     domain: string;
     port: number;
     rootDomain: string;
+    // user@externalIp of the storage machine, for generated ssh commands
+    sshTarget: string;
+    // Absolute command that runs storageServer.ts on the storage machine (admin args appended)
+    serverCommand: string;
     blobStore: BlobStore;
     trust: IStorage<TrustRecord>;
     requests: IStorage<AccessRequest[]>;
@@ -137,9 +143,17 @@ async function requireAccess(account: string): Promise<string> {
     return machineId;
 }
 
-function getListAccessCommand(ip: string): string {
+// A single command, runnable from anywhere, that sshes into the storage machine and runs the
+// admin CLI there
+function getAdminCommand(args: string): string {
     let state = getState();
-    return `typenode storage/remoteStorage/storageServer.ts --domain ${state.domain} --port ${state.port} --listAccess ${ip}`;
+    return `ssh ${state.sshTarget} '${state.serverCommand} ${args}'`;
+}
+function getListAccessCommand(ip: string): string {
+    return getAdminCommand(`--listAccess ${ip}`);
+}
+function getGrantAccessCommand(requestId: string): string {
+    return getAdminCommand(`--grantAccess ${requestId}`);
 }
 
 async function getBucketWriteConfig(account: string, bucketName: string): Promise<WriteConfig> {
@@ -183,7 +197,7 @@ class RemoteStorageControllerBase {
 
     // Records that the calling machine wants access to an account. Requests are kept per requesting
     // IP, so the storage machine's admin can list them with --listAccess <ip> and grant one.
-    async requestAccess(account: string): Promise<{ machineId: string; ip: string; requestId: string }> {
+    async requestAccess(account: string): Promise<{ machineId: string; ip: string; requestId: string; grantAccessCommand: string }> {
         assertValidName(account, "account");
         let state = getState();
         let machineId = getCallerMachineId();
@@ -204,7 +218,7 @@ class RemoteStorageControllerBase {
         }
         while (requests.length > MAX_REQUESTS_PER_IP) requests.shift();
         await state.requests.set(ip, requests);
-        return { machineId, ip, requestId: existing.requestId };
+        return { machineId, ip, requestId: existing.requestId, grantAccessCommand: getGrantAccessCommand(existing.requestId) };
     }
 
     async getAccessState(account: string): Promise<AccessState> {
@@ -214,7 +228,13 @@ class RemoteStorageControllerBase {
         let ip = getCallerIP();
         let hasAccess = isAdmin(machineId) || !!await state.trust.get(`${account}|${machineId}`);
         let result: AccessState = { machineId, ip, hasAccess, listAccessCommand: getListAccessCommand(ip) };
-        if (!hasAccess) return result;
+        if (!hasAccess) {
+            let ownRequest = (await state.requests.get(ip) || []).find(x => x.account === account && x.machineId === machineId);
+            if (ownRequest) {
+                result.grantAccessCommand = getGrantAccessCommand(ownRequest.requestId);
+            }
+            return result;
+        }
 
         let machines = new Map<string, AccessRequest & { trusted: boolean }>();
         for (let requestIp of await state.requests.getKeys()) {

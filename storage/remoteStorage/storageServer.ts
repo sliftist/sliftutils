@@ -1,6 +1,8 @@
 process.env.NODE_ENV = "production";
+import os from "os";
 import path from "path";
 import { SocketFunction } from "socket-function/SocketFunction";
+import { getExternalIP } from "socket-function/src/networking";
 import { RequireController } from "socket-function/require/RequireController";
 import { hostServer } from "../../misc/https/hostServer";
 import { getFileStorageNested2 } from "../FileFolderAPI";
@@ -30,6 +32,12 @@ process.on("uncaughtException", (error) => {
     console.error("Uncaught exception:", error);
 });
 
+// The absolute command that runs this script (with the given args) on this machine, usable from
+// any working directory (ex: over ssh)
+function getServerCommand(args: string): string {
+    return `${process.execPath} ${require.resolve("typenode/bootstrap.js")} ${__filename} ${args}`;
+}
+
 function getArg(name: string): string | undefined {
     let index = process.argv.indexOf(`--${name}`);
     if (index < 0) return undefined;
@@ -54,7 +62,7 @@ async function runAdminCommand(config: { domain: string; port: number; listAcces
         for (let request of requests) {
             console.log(`  --grantAccess ${request.requestId}  (account ${request.account}, machine ${request.machineId}, requested ${new Date(request.time).toISOString()})`);
         }
-        console.log(`Grant one with: typenode storage/remoteStorage/storageServer.ts --domain ${config.domain} --port ${config.port} --grantAccess <requestId>`);
+        console.log(`Grant one with: ${getServerCommand(`--domain ${config.domain} --port ${config.port} --grantAccess <requestId>`)}`);
         return;
     }
     if (config.grantAccess) {
@@ -90,6 +98,8 @@ async function main() {
         domain,
         port,
         rootDomain: domain.split(".").slice(-2).join("."),
+        sshTarget: `${os.userInfo().username}@${await getExternalIP()}`,
+        serverCommand: getServerCommand(`--domain ${domain} --port ${port}`),
         blobStore: new BlobStore(path.resolve(folder)),
         trust,
         requests,

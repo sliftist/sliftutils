@@ -2743,6 +2743,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         ip: string;
         hasAccess: boolean;
         listAccessCommand: string;
+        grantAccessCommand?: string;
         machines?: (AccessRequest & {
             trusted: boolean;
         })[];
@@ -2751,6 +2752,8 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         domain: string;
         port: number;
         rootDomain: string;
+        sshTarget: string;
+        serverCommand: string;
         blobStore: BlobStore;
         trust: IStorage<TrustRecord>;
         requests: IStorage<AccessRequest[]>;
@@ -2766,6 +2769,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             machineId: string;
             ip: string;
             requestId: string;
+            grantAccessCommand: string;
         }>;
         getAccessState: (account: string) => Promise<AccessState>;
         adminListRequests: (ip: string) => Promise<AccessRequest[]>;
