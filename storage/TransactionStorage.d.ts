@@ -11,12 +11,13 @@ export declare class TransactionStorage implements IStorage<Buffer> {
     private rawStorage;
     private debugName;
     private writeDelay;
+    private resyncFromDisk;
     cache: Map<string, TransactionEntry>;
     private diskFiles;
     private currentChunk;
     private entryCount;
     private static allStorage;
-    constructor(rawStorage: IStorageRaw, debugName: string, writeDelay?: number);
+    constructor(rawStorage: IStorageRaw, debugName: string, writeDelay?: number, resyncFromDisk?: boolean);
     static compressAll(): Promise<void>;
     private resyncCallbacks;
     watchResync(callback: () => void): void;

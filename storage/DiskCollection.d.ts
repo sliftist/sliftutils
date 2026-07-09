@@ -12,6 +12,7 @@ export declare class DiskCollection<T> implements IStorageSync<T> {
         writeDelay?: number | undefined;
         cbor?: boolean | undefined;
         noPrompt?: boolean | undefined;
+        resyncFromDisk?: boolean | undefined;
         freeze?: "deep" | "shallow" | undefined;
         beforeWrite?: ((update: {
             newValue: T;

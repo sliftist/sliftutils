@@ -34,6 +34,8 @@ export class DiskCollection<T> implements IStorageSync<T> {
             writeDelay?: number;
             cbor?: boolean;
             noPrompt?: boolean;
+            // Poll disk and reload when another process/tab writes to this collection. Off by default.
+            resyncFromDisk?: boolean;
             freeze?: "shallow" | "deep";
             // May mutate newValue in order to change what will be written
             beforeWrite?: (update: { newValue: T; key: string; collection: DiskCollection<T> }) => void;
@@ -52,7 +54,7 @@ export class DiskCollection<T> implements IStorageSync<T> {
             let collections = await fileStorage.folder.getStorage("collections");
             curCollection = await collections.folder.getStorage(this.collectionName);
         }
-        let baseStorage = new TransactionStorage(curCollection, this.collectionName, this.config?.writeDelay);
+        let baseStorage = new TransactionStorage(curCollection, this.collectionName, this.config?.writeDelay, this.config?.resyncFromDisk);
         this.transactionStorage = baseStorage;
         return this.config?.cbor ? new CBORStorage<T>(baseStorage) : new JSONStorage<T>(baseStorage);
     }

@@ -92,7 +92,11 @@ export class TransactionStorage implements IStorage<Buffer> {
     constructor(
         private rawStorage: IStorageRaw,
         private debugName: string,
-        private writeDelay = WRITE_DELAY
+        private writeDelay = WRITE_DELAY,
+        // When set, we poll the underlying storage and reload if another process/tab writes new
+        // chunk files. Off by default, as it costs a periodic disk scan and most collections are
+        // only written by a single process.
+        private resyncFromDisk = false
     ) {
         TransactionStorage.allStorage.push(this);
         // VERY useful for debugging.
@@ -282,7 +286,7 @@ export class TransactionStorage implements IStorage<Buffer> {
     private async loadAllTransactions(initialLoad?: boolean): Promise<string[]> {
         if (isInBuild()) return [];
 
-        if (initialLoad) {
+        if (initialLoad && this.resyncFromDisk) {
             runInfinitePoll(DISK_CHECK_INTERVAL, () => this.checkDisk());
         }
 
