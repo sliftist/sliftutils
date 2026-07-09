@@ -2105,9 +2105,9 @@ typenode@^6.6.1:
     typescript "5.3.3"
 
 typesafecss@*:
-  version "0.27.0"
-  resolved "https://registry.yarnpkg.com/typesafecss/-/typesafecss-0.27.0.tgz#b88df162f13abd7a0da8758f92ec4996170fe39a"
-  integrity sha512-YkcOw9eUv6VhBZ9d9MfVkHlCB1P6zqIw3DTp1PqEmfLZcFr72ZkSmQrnrRP/9wxbOJNhUK8/OvnpuYB2fcD5UQ==
+  version "0.31.0"
+  resolved "https://registry.yarnpkg.com/typesafecss/-/typesafecss-0.31.0.tgz#deac4a9b6bb95e0220b87f10b84648e55782d195"
+  integrity sha512-DzRibU6BBb/v+3RYRO3grn+oLKUX3JwFWqH94cPhr2rFpGW3rEspUhnolBkoNzkiWPhlnjBK0a7kevtQUqe1bw==
 
 typescript@5.3.3:
   version "5.3.3"
