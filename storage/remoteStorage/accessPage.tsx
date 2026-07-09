@@ -14,6 +14,32 @@ import { authenticateStorage } from "./ArchivesRemote";
 // storage machine to grant it, and once granted, the machines with (or requesting) access.
 
 const REFRESH_INTERVAL = 1000 * 15;
+const COPIED_RESET_DELAY = 2000;
+
+@observer
+class CopyableCommand extends preact.Component<{ command: string }> {
+    synced = observable({
+        copied: false,
+    });
+
+    render() {
+        let command = this.props.command;
+        return <div className={css.hbox(8).alignItems("flex-start")}>
+            <button onClick={async () => {
+                await navigator.clipboard.writeText(command);
+                this.synced.copied = true;
+                setTimeout(() => { this.synced.copied = false; }, COPIED_RESET_DELAY);
+            }}>
+                {this.synced.copied && "Copied!" || "Copy"}
+            </button>
+            <code className={css.fontFamily("monospace").whiteSpace("pre-wrap")
+                .hsl(0, 0, 92).pad2(8, 4).borderRadius(4)
+            }>
+                {command}
+            </code>
+        </div>;
+    }
+}
 
 @observer
 class AccessPage extends preact.Component {
@@ -70,7 +96,7 @@ class AccessPage extends preact.Component {
             {state && !state.hasAccess && <div className={css.vbox(8)}>
                 <div>This machine ({state.machineId}, ip {state.ip}) does NOT have access yet.</div>
                 <div>An access request has been made. To grant it, run this single command (it sshes into the storage machine):</div>
-                <pre>{state.grantAccessCommand || state.listAccessCommand}</pre>
+                <CopyableCommand command={state.grantAccessCommand || state.listAccessCommand} />
                 <div>This page rechecks every {REFRESH_INTERVAL / 1000} seconds.</div>
             </div>}
             {state && state.hasAccess && <div className={css.vbox(8)}>
