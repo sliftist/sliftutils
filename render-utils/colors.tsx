@@ -1,3 +1,5 @@
+module.allowclient = true;
+
 import { css } from "typesafecss";
 
 export const redButton = css.hsl(0, 75, 50).bord(1, "hsl(0, 75%, 75%)").background("hsl(0, 75%, 75%)", "hover") as string;

@@ -1,6 +1,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
-export declare class ArchivesBackblaze {
+import { IArchives } from "./IArchives";
+export declare class ArchivesBackblaze implements IArchives {
     private config;
     constructor(config: {
         bucketName: string;

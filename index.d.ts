@@ -1968,6 +1968,47 @@ declare module "sliftutils/storage/FileFolderAPI" {
 
 }
 
+declare module "sliftutils/storage/IArchives" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    export type ArchiveFileInfo = {
+        path: string;
+        createTime: number;
+        size: number;
+    };
+    export interface IArchives {
+        getDebugName(): string;
+        get(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<Buffer | undefined>;
+        set(fileName: string, data: Buffer): Promise<void>;
+        del(fileName: string): Promise<void>;
+        /** Streams a file too large to hold in memory. getNextData returns undefined when done. */
+        setLargeFile(config: {
+            path: string;
+            getNextData(): Promise<Buffer | undefined>;
+        }): Promise<void>;
+        getInfo(fileName: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        find(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<string[]>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<ArchiveFileInfo[]>;
+        /** Only works for public buckets (private buckets are API-access only). */
+        getURL(path: string): Promise<string>;
+    }
+
+}
+
 declare module "sliftutils/storage/IStorage" {
     /// <reference types="node" />
     /// <reference types="node" />
@@ -2224,7 +2265,8 @@ declare module "sliftutils/storage/TransactionStorage" {
 declare module "sliftutils/storage/backblaze" {
     /// <reference types="node" />
     /// <reference types="node" />
-    export declare class ArchivesBackblaze {
+    import { IArchives } from "./IArchives";
+    export declare class ArchivesBackblaze implements IArchives {
         private config;
         constructor(config: {
             bucketName: string;
@@ -2524,6 +2566,234 @@ declare module "sliftutils/storage/remoteFileStorage" {
         error: string;
     };
     export declare function testRemoteConnection(url: string, password: string, options?: RemoteOptions): Promise<RemoteConnectResult>;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IArchives, ArchiveFileInfo } from "../IArchives";
+    export type ArchivesRemoteConfig = {
+        address: string;
+        port: number;
+        account: string;
+        bucketName: string;
+        public?: boolean;
+        fast?: boolean;
+        writeDelay?: number;
+    };
+    export declare function buildPublicFileURL(config: {
+        address: string;
+        port: number;
+        account: string;
+        bucketName: string;
+        path: string;
+    }): string;
+    export declare function authenticateStorage(config: {
+        address: string;
+        port: number;
+        nodeId: string;
+    }): Promise<{
+        machineId: string;
+        ip: string;
+    }>;
+    export declare class ArchivesRemote implements IArchives {
+        private config;
+        constructor(config: ArchivesRemoteConfig);
+        private nodeId;
+        private controller;
+        private setupDone;
+        private lastDeniedLog;
+        getDebugName(): string;
+        private authenticate;
+        private onAccessDenied;
+        private ensureSetup;
+        private call;
+        get(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<Buffer | undefined>;
+        set(fileName: string, data: Buffer): Promise<void>;
+        del(fileName: string): Promise<void>;
+        getInfo(fileName: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<ArchiveFileInfo[]>;
+        find(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<string[]>;
+        setLargeFile(config: {
+            path: string;
+            getNextData(): Promise<Buffer | undefined>;
+        }): Promise<void>;
+        getURL(path: string): Promise<string>;
+    }
+
+}
+
+declare module "sliftutils/storage/remoteStorage/accessPage" {
+    export {};
+
+}
+
+declare module "sliftutils/storage/remoteStorage/blobStore" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { ArchiveFileInfo } from "../IArchives";
+    export declare const DEFAULT_FAST_WRITE_DELAY: number;
+    export type WriteConfig = {
+        fast?: boolean;
+        writeDelay?: number;
+    };
+    export declare class BlobStore {
+        private folder;
+        constructor(folder: string);
+        private memCache;
+        private overlay;
+        private writeQueue;
+        private openBlobs;
+        private largeUploads;
+        private nextLargeUploadId;
+        private currentBlobNumber;
+        private currentBlobOffset;
+        private currentBlobFd;
+        private index;
+        private deadBytes;
+        private blobsDir;
+        init: {
+            (): Promise<void>;
+            reset(): void;
+            set(newValue: Promise<void>): void;
+        };
+        private blobName;
+        private blobPath;
+        private getBlobHandle;
+        private closeBlobHandle;
+        private addDeadBytes;
+        private appendData;
+        private setIndexEntry;
+        set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
+        del(key: string, config?: WriteConfig): Promise<void>;
+        get(key: string, range?: {
+            start: number;
+            end: number;
+        }): Promise<Buffer | undefined>;
+        getInfo(key: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type?: "files" | "folders";
+        }): Promise<ArchiveFileInfo[]>;
+        startLargeUpload(): Promise<string>;
+        appendLargeUpload(id: string, data: Buffer): Promise<void>;
+        finishLargeUpload(id: string, key: string): Promise<void>;
+        cancelLargeUpload(id: string): Promise<void>;
+        private flushOverlay;
+        private compact;
+    }
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storageController" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { ArchiveFileInfo } from "../IArchives";
+    import type { BlobStore } from "./blobStore";
+    import type { IStorage } from "../IStorage";
+    export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
+    export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
+    export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
+    export declare const STORAGE_ACCESS_DENIED = "REMOTE_STORAGE_ACCESS_DENIED_9d81a4c0";
+    export type AuthToken = {
+        certPem: string;
+        time: number;
+        signature: string;
+    };
+    export type AccessRequest = {
+        requestId: string;
+        account: string;
+        machineId: string;
+        ip: string;
+        time: number;
+    };
+    export type TrustRecord = {
+        account: string;
+        machineId: string;
+        ip: string;
+        time: number;
+    };
+    export type BucketConfig = {
+        public?: boolean;
+        fast?: boolean;
+        writeDelay?: number;
+    };
+    export type AccessState = {
+        machineId: string;
+        ip: string;
+        hasAccess: boolean;
+        listAccessCommand: string;
+        machines?: (AccessRequest & {
+            trusted: boolean;
+        })[];
+    };
+    export type StorageServerState = {
+        domain: string;
+        port: number;
+        rootDomain: string;
+        blobStore: BlobStore;
+        trust: IStorage<TrustRecord>;
+        requests: IStorage<AccessRequest[]>;
+        buckets: IStorage<BucketConfig>;
+    };
+    export declare function setStorageServerState(state: StorageServerState): void;
+    export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
+        authenticate: (token: AuthToken) => Promise<{
+            machineId: string;
+            ip: string;
+        }>;
+        requestAccess: (account: string) => Promise<{
+            machineId: string;
+            ip: string;
+            requestId: string;
+        }>;
+        getAccessState: (account: string) => Promise<AccessState>;
+        adminListRequests: (ip: string) => Promise<AccessRequest[]>;
+        adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
+        ensureBucket: (account: string, bucketName: string, config: BucketConfig) => Promise<void>;
+        get: (account: string, bucketName: string, path: string, range?: {
+            start: number;
+            end: number;
+        }) => Promise<Buffer | undefined>;
+        set: (account: string, bucketName: string, path: string, data: Buffer) => Promise<void>;
+        del: (account: string, bucketName: string, path: string) => Promise<void>;
+        getInfo: (account: string, bucketName: string, path: string) => Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        findInfo: (account: string, bucketName: string, prefix: string, config?: {
+            shallow?: boolean;
+            type?: "files" | "folders";
+        }) => Promise<ArchiveFileInfo[]>;
+        startLargeFile: (account: string, bucketName: string, path: string) => Promise<string>;
+        uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
+        finishLargeFile: (uploadId: string) => Promise<void>;
+        cancelLargeFile: (uploadId: string) => Promise<void>;
+        getPublicFile: (account: string, bucketName: string, path: string) => Promise<Buffer>;
+    }>;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storageServer" {
+    import "./accessPage";
 
 }
 

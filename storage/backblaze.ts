@@ -9,6 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest } from "socket-function/src/https";
+import { IArchives } from "./IArchives";
 
 type BackblazeCreds = {
     applicationKeyId: string;
@@ -372,7 +373,7 @@ const getAPI = lazy(async () => {
 type B2Api = (typeof getAPI) extends () => Promise<infer T> ? T : never;
 
 
-export class ArchivesBackblaze {
+export class ArchivesBackblaze implements IArchives {
     public constructor(private config: {
         bucketName: string;
         public?: boolean;

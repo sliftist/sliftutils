@@ -1,3 +1,5 @@
+module.allowclient = true;
+
 import preact from "preact";
 import { Input } from "./Input";
 import { css } from "typesafecss";
