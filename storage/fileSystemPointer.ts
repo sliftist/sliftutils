@@ -55,6 +55,36 @@ export async function deleteFileSystemPointer(pointer: FileSystemPointer) {
     });
 }
 
+// Enumerates every stored pointer handle whose permission is already granted for `mode`, newest first
+// (pointer keys start with Date.now(), which sorts lexicographically). Callable from a Web Worker —
+// unlike getFileSystemPointer's onUserActivation flow, this only uses queryPermission, which does
+// NOT require user activation.
+export async function findGrantedPointerHandle(mode: "read" | "readwrite"): Promise<FileSystemDirectoryHandle | undefined> {
+    let database = await db();
+    if (!database) return undefined;
+    let store = database.transaction(objectStoreName, "readonly").objectStore(objectStoreName);
+    let keysReq = store.getAllKeys();
+    let valuesReq = store.getAll();
+    await new Promise((resolve, reject) => {
+        keysReq.addEventListener("success", resolve);
+        keysReq.addEventListener("error", reject);
+    });
+    await new Promise((resolve, reject) => {
+        valuesReq.addEventListener("success", resolve);
+        valuesReq.addEventListener("error", reject);
+    });
+    let keys = keysReq.result as string[];
+    let values = valuesReq.result as (FileSystemFileHandle | FileSystemDirectoryHandle)[];
+    let entries = keys.map((key, i) => ({ key, value: values[i], time: +key.split("_")[0] || 0 }))
+        .sort((a, b) => b.time - a.time);
+    for (let entry of entries) {
+        if (entry.value.kind !== "directory") continue;
+        let state = await (entry.value as any).queryPermission({ mode });
+        if (state === "granted") return entry.value;
+    }
+    return undefined;
+}
+
 export async function getFileSystemPointer(config: {
     pointer: FileSystemPointer;
 }): Promise<{
