@@ -1,10 +1,9 @@
-import { isNode } from "typesafecss";
-
 // Browser-side cross-tab write sync for BulkDatabase2, over BroadcastChannel (one channel per
-// collection, same-origin tabs). It does NOT persist anything — each tab writes to disk itself; this
-// just relays live writes to other open tabs and, when a tab starts up, asks peers for writes they've
-// made recently that may not be on disk yet. No-op in Node / where BroadcastChannel is unavailable, so
-// BulkDatabase2 can call these unconditionally. This is an optional feature, so there is no fallback.
+// collection, same-origin tabs and workers). It does NOT persist anything — each side writes to disk
+// itself; this just relays live writes to other open tabs/workers and, when one starts up, asks peers
+// for writes they've made recently that may not be on disk yet. No-op in Node / where
+// BroadcastChannel is unavailable, so BulkDatabase2 can call these unconditionally. This is an
+// optional feature, so there is no fallback.
 
 export type RemoteWrite = { key: string; time: number; deleted?: boolean; value?: unknown };
 
@@ -24,7 +23,11 @@ type Channel = {
 const channels = new Map<string, Channel>();
 
 export function isSyncSupported(): boolean {
-    return !isNode() && typeof BroadcastChannel !== "undefined";
+    // window (main-thread browser) or WorkerGlobalScope (Web/Service/Shared worker) — but not Node
+    // (typesafecss's isNode is `typeof window === "undefined"`, which misclassifies workers)
+    let isBrowserOrWorker = typeof window !== "undefined"
+        || "WorkerGlobalScope" in globalThis;
+    return isBrowserOrWorker && typeof BroadcastChannel !== "undefined";
 }
 
 function pruneRecent(channel: Channel) {
