@@ -4,6 +4,7 @@ export declare function storeFileSystemPointer(config: {
     handle: FileSystemFileHandle | FileSystemDirectoryHandle;
 }): Promise<FileSystemPointer>;
 export declare function deleteFileSystemPointer(pointer: FileSystemPointer): Promise<void>;
+export declare function findGrantedPointerHandle(mode: "read" | "readwrite"): Promise<FileSystemDirectoryHandle | undefined>;
 export declare function getFileSystemPointer(config: {
     pointer: FileSystemPointer;
 }): Promise<{

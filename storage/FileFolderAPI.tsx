@@ -1,5 +1,5 @@
 import preact from "preact";
-import { getFileSystemPointer, storeFileSystemPointer } from "./fileSystemPointer";
+import { findGrantedPointerHandle, getFileSystemPointer, storeFileSystemPointer } from "./fileSystemPointer";
 import { observable } from "mobx";
 import { observer } from "../render-utils/observer";
 import { cache, lazy } from "socket-function/src/caching";
@@ -35,6 +35,9 @@ declare global {
 //  this a user supported toggle too, so they can choose during runtime if they want it.
 // DO NOT enable this is isNode
 const USE_INDEXED_DB = false;
+
+// How often a worker rechecks the pointer IndexedDB for a granted handle when none is available yet.
+const WORKER_POLL_INTERVAL_MS = 60 * 1000;
 
 // These mirror the subset of the native FileSystemFileHandle / FileSystemDirectoryHandle API we use, so
 // the native browser handles, the Node handles, and the remote handles are all interchangeable — and
@@ -459,6 +462,20 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
     // localStorage. Must come first so a worker never reaches the branches below.
     if (storageRootOverride) {
         return storageRootOverride as unknown as DirectoryWrapper;
+    }
+    // A worker can't show the picker (no DOM / no user activation) and can't read localStorage, but
+    // it CAN open the pointer IndexedDB the main-thread picker persists to. Poll it for a handle
+    // whose permission is already granted; the owning window may also postMessage a handle in
+    // mid-poll (checked each iteration). This has to come before the isNode branch: typesafecss's
+    // isNode() returns true in workers (window is undefined), so a worker would otherwise fall into
+    // the Node branch and try to use fs/path.
+    if ("WorkerGlobalScope" in globalThis) {
+        while (true) {
+            if (storageRootOverride) return storageRootOverride as unknown as DirectoryWrapper;
+            let handle = await findGrantedPointerHandle("readwrite");
+            if (handle) return handle as unknown as DirectoryWrapper;
+            await new Promise(resolve => setTimeout(resolve, WORKER_POLL_INTERVAL_MS));
+        }
     }
     if (isNode()) {
         return new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
