@@ -91,6 +91,18 @@ export function setFileAPIKey(key: string) {
     fileAPIKey = key;
 }
 
+// A directory handle to serve as the storage root instead of resolving one via
+// the picker / stored-pointer / remote flow. Set this in a context that can't run
+// the interactive resolution — most importantly a Web Worker, which has no DOM to
+// prompt with and no localStorage pointer. The owning window resolves the handle
+// (with its permission grant) and postMessages it in; the worker calls this before
+// touching any storage. When set, getDirectoryHandle returns it directly and skips
+// every DOM / localStorage branch below.
+let storageRootOverride: FileSystemDirectoryHandle | undefined;
+export function setStorageRootOverride(handle: FileSystemDirectoryHandle | undefined): void {
+    storageRootOverride = handle;
+}
+
 // ---- remote (server) storage config ----
 // Instead of a local folder, the user can point at a remoteFileServer.js instance (URL + password).
 // When configured, getFileStorageNested2 serves everything from that server. Persisted in localStorage.
@@ -442,6 +454,12 @@ export function pickPrivateFolder(name: string): void {
 // (we actually connect) before use; if it no longer works we re-prompt, just like a local folder whose
 // permission was lost. Blocks until ready (or the user dismisses, which rejects).
 export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Promise<DirectoryWrapper> {
+    // An injected root (e.g. a Web Worker handed the handle by its owning window)
+    // short-circuits the whole interactive resolution — no picker, no DOM, no
+    // localStorage. Must come first so a worker never reaches the branches below.
+    if (storageRootOverride) {
+        return storageRootOverride as unknown as DirectoryWrapper;
+    }
     if (isNode()) {
         return new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
     }

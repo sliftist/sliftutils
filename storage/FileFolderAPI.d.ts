@@ -66,6 +66,7 @@ export type DirectoryWrapper = {
     [Symbol.asyncIterator](): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
 };
 export declare function setFileAPIKey(key: string): void;
+export declare function setStorageRootOverride(handle: FileSystemDirectoryHandle | undefined): void;
 export declare class NodeJSFileHandleWrapper implements FileWrapper {
     private filePath;
     constructor(filePath: string);
