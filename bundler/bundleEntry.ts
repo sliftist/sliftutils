@@ -32,7 +32,6 @@ async function main() {
     if (name.endsWith(".ts") || name.endsWith(".tsx")) {
         name = name.split(".").slice(0, -1).join(".");
     }
-    name += ".js";
 
     let modules = Object.values(require.cache).filter(x => x?.id !== module.id);
 
@@ -42,16 +41,21 @@ async function main() {
         entryPoints: [entryPoint],
     });
 
-    let finalPath = `${outputFolder}/${name}`;
-    let tempPath = `${finalPath}.tmp`;
-
-    try {
-        await fs.promises.writeFile(tempPath, bundled.bundle);
-        await fs.promises.rename(tempPath, finalPath);
-    } finally {
+    // Two artifacts: `name.js` without the sourcemap (the sourcemap is usually bigger than the code
+    // itself, so this is what production serves) and `name.debug.js` with the inline sourcemap
+    // appended (serve it behind something like a ?debug query param).
+    async function write(finalPath: string, contents: string) {
+        let tempPath = `${finalPath}.tmp`;
         try {
-            await fs.promises.unlink(tempPath);
-        } catch { }
+            await fs.promises.writeFile(tempPath, contents);
+            await fs.promises.rename(tempPath, finalPath);
+        } finally {
+            try {
+                await fs.promises.unlink(tempPath);
+            } catch { }
+        }
     }
+    await write(`${outputFolder}/${name}.js`, bundled.bundle);
+    await write(`${outputFolder}/${name}.debug.js`, bundled.bundle + "\n" + bundled.sourceMapComment);
 }
 main().catch(err => { console.error(err); process.exitCode = 1; }).finally(() => process.exit());
