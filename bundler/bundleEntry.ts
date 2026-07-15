@@ -12,9 +12,21 @@ async function main() {
     if (!outputFolder) {
         throw new Error("No output folder provided. Please use the --outputFolder option.");
     }
-    // We prefer production, as this is what the bundler uses internally. This ensures that in the build and when run, we will have the same environment, which will result in the same requires being called. 
+    // We prefer production, as this is what the bundler uses internally. This ensures that in the build and when run, we will have the same environment, which will result in the same requires being called.
     process.env.NODE_ENV = process.env.NODE_ENV || "production";
     require(entryPoint);
+
+    // Warm pass: this process only exists to compile the entry's whole graph
+    // (and this bundler's own modules, compiled at our startup) into typenode's
+    // on-disk cache, then exit. The caller runs a SECOND, fresh process for the
+    // real bundle — that process reads everything from the warm cache and so
+    // never has typenode lazy-load the TypeScript compiler. Without this, a
+    // cold-cache build (e.g. a fresh CI/server checkout, or an entry whose files
+    // no other entry imports) leaves `typescript` in require.cache and the
+    // bundler serializes the entire 9 MB+ compiler into the output bundle.
+    if (process.argv[4] === "--warm") {
+        return;
+    }
 
     let name = path.basename(entryPoint);
     if (name.endsWith(".ts") || name.endsWith(".tsx")) {
