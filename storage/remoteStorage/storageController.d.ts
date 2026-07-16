@@ -36,9 +36,7 @@ export type AccessState = {
     hasAccess: boolean;
     listAccessCommand: string;
     grantAccessCommand?: string;
-    machines?: (AccessRequest & {
-        trusted: boolean;
-    })[];
+    trustedMachines?: TrustRecord[];
 };
 export type StorageServerState = {
     domain: string;
@@ -64,6 +62,8 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         grantAccessCommand: string;
     }>;
     getAccessState: (account: string) => Promise<AccessState>;
+    listRequestsForIP: (account: string, ip: string) => Promise<AccessRequest[]>;
+    grantAccess: (requestId: string) => Promise<TrustRecord>;
     adminListRequests: (ip: string) => Promise<AccessRequest[]>;
     adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
     ensureBucket: (account: string, bucketName: string, config: BucketConfig) => Promise<void>;

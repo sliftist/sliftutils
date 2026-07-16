@@ -34,16 +34,16 @@ class TestStoragePage extends preact.Component {
         content: "",
         contentLoaded: false,
         newFileName: "",
-        accessLink: "",
+        access: undefined as { link: string; machineId: string; ip: string } | undefined,
         error: "",
     });
 
     componentDidMount() {
         void (async () => {
             while (true) {
-                let link = await archives.waitingForAccess();
-                this.synced.accessLink = link || "";
-                if (!link) break;
+                let access = await archives.waitingForAccess();
+                this.synced.access = access;
+                if (!access) break;
                 await delay(ACCESS_CHECK_INTERVAL);
             }
             await this.refresh();
@@ -92,10 +92,12 @@ class TestStoragePage extends preact.Component {
         return <div className={css.vbox(12).pad2(16)}>
             <div>Storage test site. Account {ACCOUNT}, bucket {BUCKET} on {STORAGE_ADDRESS}:{STORAGE_PORT}</div>
             {synced.error && <div className={errorMessage}>{synced.error}</div>}
-            {!synced.loaded && !synced.accessLink && <div>Loading files...</div>}
-            {!synced.loaded && synced.accessLink && <div className={css.vbox(8)}>
-                <div>This machine does not have access to the account yet. Grant it here:</div>
-                <a href={synced.accessLink} target="_blank">{synced.accessLink}</a>
+            {!synced.loaded && !synced.access && <div>Loading files...</div>}
+            {!synced.loaded && synced.access && <div className={css.vbox(8)}>
+                <div>This machine does not have access to the account yet.</div>
+                <div>Machine: {synced.access.machineId}</div>
+                <div>IP: {synced.access.ip}</div>
+                <a href={synced.access.link} target="_blank">{synced.access.link}</a>
             </div>}
             {synced.loaded && <div className={css.hbox(24).alignItems("flex-start")}>
                 <div className={css.vbox(8)}>

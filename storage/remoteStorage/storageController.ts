@@ -56,8 +56,10 @@ export type AccessState = {
     // (shown when the caller has no access). grantAccessCommand grants the caller's own request.
     listAccessCommand: string;
     grantAccessCommand?: string;
-    // Only provided when the caller has access
-    machines?: (AccessRequest & { trusted: boolean })[];
+    // Only the machines that ALREADY have access. Pending requests are NEVER listed here — showing
+    // them would let a trusted user accidentally approve a random request. Callers see pending
+    // requests only by explicitly typing an IP into listRequestsForIP.
+    trustedMachines?: TrustRecord[];
 };
 
 export type StorageServerState = {
@@ -236,29 +238,50 @@ class RemoteStorageControllerBase {
             return result;
         }
 
-        let machines = new Map<string, AccessRequest & { trusted: boolean }>();
-        for (let requestIp of await state.requests.getKeys()) {
-            for (let request of await state.requests.get(requestIp) || []) {
-                if (request.account !== account) continue;
-                machines.set(request.machineId, { ...request, trusted: false });
-            }
-        }
+        let trustedMachines: TrustRecord[] = [];
         for (let key of await state.trust.getKeys()) {
             if (!key.startsWith(`${account}|`)) continue;
             let record = await state.trust.get(key);
-            if (!record) continue;
-            let existing = machines.get(record.machineId);
-            machines.set(record.machineId, {
-                requestId: existing?.requestId || "",
-                account,
-                machineId: record.machineId,
-                ip: record.ip,
-                time: record.time,
-                trusted: true,
-            });
+            if (record) trustedMachines.push(record);
         }
-        result.machines = Array.from(machines.values());
+        result.trustedMachines = trustedMachines;
         return result;
+    }
+
+    // Callable by any machine that has access to `account`. Returns pending access requests for the
+    // account that come from EXACTLY `ip`. Callers must type in an IP explicitly — the server never
+    // volunteers a list of requesting IPs, so a trusted user can't accidentally approve a random
+    // request from a machine they didn't mean to trust.
+    async listRequestsForIP(account: string, ip: string): Promise<AccessRequest[]> {
+        await requireAccess(account);
+        let state = getState();
+        return (await state.requests.get(ip) || []).filter(x => x.account === account);
+    }
+
+    // Callable by any machine that has access to the request's account (or by the storage-machine
+    // admin). Grants the requested access; the caller must supply the specific requestId, which they
+    // only get by explicitly looking up requests for a specific IP.
+    async grantAccess(requestId: string): Promise<TrustRecord> {
+        // Must capture in the synchronous phase — SocketFunction.getCaller() only works before any await.
+        let callerMachineId = getCallerMachineId();
+        let state = getState();
+        for (let ip of await state.requests.getKeys()) {
+            for (let request of await state.requests.get(ip) || []) {
+                if (request.requestId !== requestId) continue;
+                if (!isAdmin(callerMachineId) && !await state.trust.get(`${request.account}|${callerMachineId}`)) {
+                    throw new Error(`${STORAGE_ACCESS_DENIED} Machine ${callerMachineId} has no access to account ${JSON.stringify(request.account)}`);
+                }
+                let record: TrustRecord = {
+                    account: request.account,
+                    machineId: request.machineId,
+                    ip: request.ip,
+                    time: Date.now(),
+                };
+                await state.trust.set(`${request.account}|${request.machineId}`, record);
+                return record;
+            }
+        }
+        throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
     // Admin (must be run from the storage machine itself, which shares the server's machineId).
@@ -381,6 +404,8 @@ export const RemoteStorageController = SocketFunction.register(
         authenticate: {},
         requestAccess: {},
         getAccessState: {},
+        listRequestsForIP: {},
+        grantAccess: {},
         adminListRequests: {},
         adminGrantAccess: {},
         ensureBucket: {},
