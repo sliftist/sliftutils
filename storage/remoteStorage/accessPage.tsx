@@ -164,16 +164,16 @@ class AccessPage extends preact.Component {
                     </table>
                 </div>
                 <div className={css.vbox(6)}>
-                    <div>Approve request:</div>
+                    <div>Approve request</div>
                     <div className={css.hbox(8).alignItems("center")}>
                         <input
-                            placeholder="IP"
+                            placeholder="ip"
                             value={synced.lookupIp}
                             onInput={e => { synced.lookupIp = (e.currentTarget as HTMLInputElement).value; }}
                             onKeyDown={e => { if (e.key === "Enter") void this.lookupIP(); }}
                         />
                         <button disabled={synced.looking || !synced.lookupIp.trim()} onClick={this.lookupIP}>
-                            {synced.looking && "Looking up..." || "Look up"}
+                            search
                         </button>
                     </div>
                     {synced.lookupError && <div>Error: {synced.lookupError}</div>}
