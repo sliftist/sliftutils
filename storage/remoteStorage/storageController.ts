@@ -126,6 +126,10 @@ function assertValidPath(path: string) {
     if (!path || path.startsWith("/") || path.endsWith("/") || path.includes("//") || path.includes("\\") || path.includes("\x00")) {
         throw new Error(`Invalid path ${JSON.stringify(path.slice(0, 200))}, paths cannot be empty, start or end with /, or contain //, backslashes, or null characters`);
     }
+    // Paths are one-to-one with files on disk, so . and .. segments would escape the store folder
+    if (path.split("/").some(part => part === "." || part === "..")) {
+        throw new Error(`Invalid path ${JSON.stringify(path.slice(0, 200))}, paths cannot contain . or .. segments`);
+    }
 }
 
 function getCallerMachineId(): string {

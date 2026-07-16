@@ -1,41 +1,19 @@
 import fs from "fs";
 import path from "path";
 import { lazy } from "socket-function/src/caching";
-import { runInSerial, runInfinitePoll } from "socket-function/src/batching";
-import { timeInMinute, sort } from "socket-function/src/misc";
-import { formatNumber } from "socket-function/src/formatting/format";
-import { TransactionStorage } from "../TransactionStorage";
-import { JSONStorage } from "../JSONStorage";
-import { getFileStorageNested2 } from "../FileFolderAPI";
+import { runInfinitePoll } from "socket-function/src/batching";
+import { timeInMinute, sort, binarySearchBasic } from "socket-function/src/misc";
 import { ArchiveFileInfo } from "../IArchives";
 
-// Disk engine for the remote storage server. Files are packed into large append-only blob files
-// (instead of one file on disk per stored file), with a transaction-log index mapping
-// key -> (blob, offset, length). This keeps us efficient with many small files and scales to
-// terabytes: reads are single pread calls, writes are appends, and deleted space is reclaimed by
-// compacting blobs that are mostly dead.
+// Disk engine for the remote storage server. Storage is one-to-one with the file system: every
+// key is exactly one file on disk (under files/), so the file system itself is the index. File
+// handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a
+// file run in serial, so they can't collide with each other or with handle closing.
 
-// Roll to a new blob file once the current one reaches this size
-const MAX_BLOB_SIZE = 4 * 1024 * 1024 * 1024;
-// Whole-file memory cache (only files up to MEMORY_CACHE_MAX_FILE are cached)
-const MEMORY_CACHE_BYTES = 256 * 1024 * 1024;
-const MEMORY_CACHE_MAX_FILE = 16 * 1024 * 1024;
 export const DEFAULT_FAST_WRITE_DELAY = timeInMinute * 5;
 const FAST_FLUSH_POLL = 1000 * 15;
-const COMPACTION_INTERVAL = timeInMinute * 10;
-// Compact a blob once this fraction of its bytes are dead (deleted/overwritten)
-const COMPACTION_DEAD_FRACTION = 0.5;
-const MAX_OPEN_BLOBS = 64;
-
-type IndexEntry = {
-    // Blob file name
-    f: string;
-    // Offset + length within the blob
-    o: number;
-    l: number;
-    // Write time
-    t: number;
-};
+const HANDLE_IDLE_TIMEOUT = 1000 * 60;
+const HANDLE_SWEEP_INTERVAL = 1000 * 15;
 
 export type WriteConfig = {
     // Resolve once the write is in memory; flush to disk after writeDelay, coalescing writes to
@@ -51,181 +29,172 @@ type OverlayEntry = {
     flushAt: number;
 };
 
-class ByteLRU {
-    private map = new Map<string, Buffer>();
-    private bytes = 0;
-    constructor(private budget: number, private maxEntry: number) { }
-    public get(key: string): Buffer | undefined {
-        let value = this.map.get(key);
-        if (value) {
-            this.map.delete(key);
-            this.map.set(key, value);
-        }
-        return value;
+type HandleEntry = {
+    filePath: string;
+    handle: fs.promises.FileHandle;
+    lastUse: number;
+};
+
+// Caches open file handles, closing them once idle for HANDLE_IDLE_TIMEOUT. Instead of one
+// setTimeout per handle, a list sorted by last use is swept periodically (entries are moved via
+// binary search on access, and lastUse values only increase, so touched entries append at the
+// end). Also serializes operations per file: each operation only starts once the previous one on
+// the same file finished, and a handle is never closed while an operation is pending on it.
+class FileHandleCache {
+    private entries = new Map<string, HandleEntry>();
+    // Sorted by lastUse ascending (least recently used first)
+    private lru: HandleEntry[] = [];
+    private pending = new Map<string, Promise<void>>();
+
+    constructor() {
+        runInfinitePoll(HANDLE_SWEEP_INTERVAL, () => this.sweep());
     }
-    public set(key: string, value: Buffer) {
-        this.delete(key);
-        if (value.length > this.maxEntry) return;
-        this.map.set(key, value);
-        this.bytes += value.length;
-        while (this.bytes > this.budget && this.map.size > 0) {
-            let oldest = this.map.keys().next().value;
-            if (oldest === undefined) break;
-            this.delete(oldest);
+
+    // Runs fnc after every previously scheduled operation on filePath has finished
+    public run<T>(filePath: string, fnc: () => Promise<T>): Promise<T> {
+        let prev = this.pending.get(filePath) || Promise.resolve();
+        let result = prev.then(fnc);
+        // The pending chain must never reject, or one failed operation would poison all later ones
+        let last = result.then(() => { }, () => { });
+        this.pending.set(filePath, last);
+        void last.then(() => {
+            // If we're still the last pending operation on this file, clear ourselves
+            if (this.pending.get(filePath) === last) {
+                this.pending.delete(filePath);
+            }
+        });
+        return result;
+    }
+
+    // Only call inside run() for the same filePath (so opens can't collide with closes)
+    public async getHandle(filePath: string, flags: number): Promise<fs.promises.FileHandle> {
+        let entry = this.entries.get(filePath);
+        if (entry) {
+            this.removeFromLRU(entry);
+            entry.lastUse = Date.now();
+            this.lru.push(entry);
+            return entry.handle;
+        }
+        let handle = await fs.promises.open(filePath, flags);
+        entry = { filePath, handle, lastUse: Date.now() };
+        this.entries.set(filePath, entry);
+        this.lru.push(entry);
+        return handle;
+    }
+
+    // Only call inside run() for the same filePath
+    public async closeNow(filePath: string): Promise<void> {
+        let entry = this.entries.get(filePath);
+        if (!entry) return;
+        this.entries.delete(filePath);
+        this.removeFromLRU(entry);
+        await entry.handle.close();
+    }
+
+    private removeFromLRU(entry: HandleEntry) {
+        let index = binarySearchBasic(this.lru, x => x.lastUse, entry.lastUse);
+        if (index < 0) return;
+        // Multiple entries can share a lastUse, so scan for the exact one
+        while (index < this.lru.length && this.lru[index].lastUse === entry.lastUse) {
+            if (this.lru[index] === entry) {
+                this.lru.splice(index, 1);
+                return;
+            }
+            index++;
         }
     }
-    public delete(key: string) {
-        let existing = this.map.get(key);
-        if (!existing) return;
-        this.bytes -= existing.length;
-        this.map.delete(key);
+
+    private async sweep(): Promise<void> {
+        let cutoff = Date.now() - HANDLE_IDLE_TIMEOUT;
+        let index = 0;
+        while (index < this.lru.length && this.lru[index].lastUse <= cutoff) {
+            let entry = this.lru[index];
+            // Can't close a handle with a pending operation; it'll be swept after it finishes
+            if (this.pending.has(entry.filePath)) {
+                index++;
+                continue;
+            }
+            this.lru.splice(index, 1);
+            this.entries.delete(entry.filePath);
+            await entry.handle.close();
+        }
     }
 }
 
 export class BlobStore {
     constructor(private folder: string) { }
 
-    private memCache = new ByteLRU(MEMORY_CACHE_BYTES, MEMORY_CACHE_MAX_FILE);
+    private filesDir = path.join(this.folder, "files");
+    private uploadsDir = path.join(this.folder, "uploads");
+    private handles = new FileHandleCache();
     private overlay = new Map<string, OverlayEntry>();
-    private writeQueue = runInSerial(async (fnc: () => Promise<void>) => fnc());
-    private openBlobs = new Map<string, Promise<fs.promises.FileHandle>>();
-    private largeUploads = new Map<string, { fd: fs.promises.FileHandle; tmpPath: string; size: number }>();
+    private largeUploads = new Map<string, { tmpPath: string }>();
     private nextLargeUploadId = 1;
 
-    private currentBlobNumber = 0;
-    private currentBlobOffset = 0;
-    private currentBlobFd: fs.promises.FileHandle | undefined;
-
-    private index!: JSONStorage<IndexEntry>;
-    // Dead (deleted/overwritten) byte count per blob file, for compaction
-    private deadBytes!: JSONStorage<number>;
-
-    private blobsDir = path.join(this.folder, "blobs");
-
     public init = lazy(async () => {
-        fs.mkdirSync(this.blobsDir, { recursive: true });
-        let root = await getFileStorageNested2(path.resolve(this.folder));
-        let indexRaw = await root.folder.getStorage("index");
-        this.index = new JSONStorage<IndexEntry>(new TransactionStorage(indexRaw, "blobStoreIndex"));
-        let metaRaw = await root.folder.getStorage("meta");
-        this.deadBytes = new JSONStorage<number>(new TransactionStorage(metaRaw, "blobStoreDeadBytes"));
-
-        for (let file of fs.readdirSync(this.blobsDir)) {
-            let match = /^blob_(\d+)\.bin$/.exec(file);
-            if (!match) continue;
-            this.currentBlobNumber = Math.max(this.currentBlobNumber, +match[1]);
+        await fs.promises.mkdir(this.filesDir, { recursive: true });
+        await fs.promises.mkdir(this.uploadsDir, { recursive: true });
+        // Uploads don't survive restarts (the uploader streams into them), so old ones are garbage
+        for (let file of await fs.promises.readdir(this.uploadsDir)) {
+            await fs.promises.unlink(path.join(this.uploadsDir, file));
         }
-        if (this.currentBlobNumber > 0) {
-            this.currentBlobOffset = fs.statSync(path.join(this.blobsDir, this.blobName(this.currentBlobNumber))).size;
-        }
-
         runInfinitePoll(FAST_FLUSH_POLL, () => this.flushOverlay());
-        runInfinitePoll(COMPACTION_INTERVAL, () => this.compact());
     });
 
-    private blobName(n: number) {
-        return `blob_${String(n).padStart(6, "0")}.bin`;
-    }
-    private blobPath(name: string) {
-        return path.join(this.blobsDir, name);
-    }
-
-    private async getBlobHandle(name: string): Promise<fs.promises.FileHandle> {
-        let cached = this.openBlobs.get(name);
-        if (cached) {
-            // Re-insert for LRU ordering
-            this.openBlobs.delete(name);
-            this.openBlobs.set(name, cached);
-            return cached;
+    private filePath(key: string): string {
+        let result = path.join(this.filesDir, key);
+        if (!result.startsWith(this.filesDir + path.sep)) {
+            throw new Error(`Invalid key ${JSON.stringify(key.slice(0, 200))}, it escapes the store folder`);
         }
-        let handle = fs.promises.open(this.blobPath(name), "r");
-        this.openBlobs.set(name, handle);
-        while (this.openBlobs.size > MAX_OPEN_BLOBS) {
-            let oldest = this.openBlobs.keys().next().value;
-            if (oldest === undefined) break;
-            let oldHandle = this.openBlobs.get(oldest);
-            this.openBlobs.delete(oldest);
-            void oldHandle?.then(h => h.close()).catch(() => { });
-        }
-        return handle;
-    }
-    private async closeBlobHandle(name: string) {
-        let handle = this.openBlobs.get(name);
-        if (!handle) return;
-        this.openBlobs.delete(name);
-        await handle.then(h => h.close()).catch(() => { });
-    }
-
-    private async addDeadBytes(entry: IndexEntry) {
-        // Large files get a dedicated blob file, so on delete we can unlink it immediately
-        if (entry.f.startsWith("large_")) {
-            await this.closeBlobHandle(entry.f);
-            await fs.promises.unlink(this.blobPath(entry.f)).catch(() => { });
-            return;
-        }
-        let dead = await this.deadBytes.get(entry.f) || 0;
-        await this.deadBytes.set(entry.f, dead + entry.l);
-    }
-
-    // Appends data to the current blob file, returning where it landed
-    private async appendData(data: Buffer): Promise<{ f: string; o: number; l: number }> {
-        let result: { f: string; o: number; l: number } | undefined;
-        await this.writeQueue(async () => {
-            if (!this.currentBlobFd || this.currentBlobOffset >= MAX_BLOB_SIZE) {
-                if (this.currentBlobFd) {
-                    await this.currentBlobFd.close();
-                    this.currentBlobFd = undefined;
-                }
-                this.currentBlobNumber++;
-                this.currentBlobOffset = 0;
-            }
-            if (!this.currentBlobFd) {
-                this.currentBlobFd = await fs.promises.open(this.blobPath(this.blobName(this.currentBlobNumber)), "a");
-                this.currentBlobOffset = (await this.currentBlobFd.stat()).size;
-            }
-            let offset = this.currentBlobOffset;
-            await this.currentBlobFd.write(data, 0, data.length);
-            this.currentBlobOffset += data.length;
-            result = { f: this.blobName(this.currentBlobNumber), o: offset, l: data.length };
-        });
-        if (!result) throw new Error(`Append did not run, this should be impossible`);
         return result;
-    }
-
-    private async setIndexEntry(key: string, entry: IndexEntry) {
-        let prev = await this.index.get(key);
-        await this.index.set(key, entry);
-        if (prev) {
-            await this.addDeadBytes(prev);
-        }
     }
 
     public async set(key: string, data: Buffer, config?: WriteConfig): Promise<void> {
         await this.init();
-        this.memCache.set(key, data);
         if (config?.fast) {
             let writeDelay = config.writeDelay || DEFAULT_FAST_WRITE_DELAY;
             this.overlay.set(key, { data, t: Date.now(), flushAt: Date.now() + writeDelay });
             return;
         }
         this.overlay.delete(key);
-        let location = await this.appendData(data);
-        await this.setIndexEntry(key, { ...location, t: Date.now() });
+        await this.writeToDisk(key, data);
+    }
+
+    private async writeToDisk(key: string, data: Buffer, writeTime?: number): Promise<void> {
+        let filePath = this.filePath(key);
+        await this.handles.run(filePath, async () => {
+            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+            let handle = await this.handles.getHandle(filePath, fs.constants.O_RDWR | fs.constants.O_CREAT);
+            await handle.truncate(0);
+            await handle.write(data, 0, data.length, 0);
+            // Delayed (fast) writes keep the time the write actually happened
+            if (writeTime) {
+                await handle.utimes(new Date(writeTime), new Date(writeTime));
+            }
+        });
     }
 
     public async del(key: string, config?: WriteConfig): Promise<void> {
         await this.init();
-        this.memCache.delete(key);
         if (config?.fast) {
             let writeDelay = config.writeDelay || DEFAULT_FAST_WRITE_DELAY;
             this.overlay.set(key, { data: undefined, t: Date.now(), flushAt: Date.now() + writeDelay });
             return;
         }
         this.overlay.delete(key);
-        let prev = await this.index.get(key);
-        if (!prev) return;
-        await this.index.remove(key);
-        await this.addDeadBytes(prev);
+        await this.deleteFromDisk(key);
+    }
+
+    private async deleteFromDisk(key: string): Promise<void> {
+        let filePath = this.filePath(key);
+        await this.handles.run(filePath, async () => {
+            await this.handles.closeNow(filePath);
+            try {
+                await fs.promises.unlink(filePath);
+            } catch (e: any) {
+                if (e.code !== "ENOENT") throw e;
+            }
+        });
     }
 
     public async get(key: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
@@ -233,29 +202,30 @@ export class BlobStore {
         let overlayEntry = this.overlay.get(key);
         if (overlayEntry) {
             if (!overlayEntry.data) return undefined;
-            if (!range) return overlayEntry.data;
-            return overlayEntry.data.subarray(Math.min(range.start, overlayEntry.data.length), Math.min(range.end, overlayEntry.data.length));
+            let data = overlayEntry.data;
+            if (!range) return data;
+            return data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
         }
-        let cached = this.memCache.get(key);
-        if (cached) {
-            if (!range) return cached;
-            return cached.subarray(Math.min(range.start, cached.length), Math.min(range.end, cached.length));
-        }
-        let entry = await this.index.get(key);
-        if (!entry) return undefined;
-        let start = range && Math.min(range.start, entry.l) || 0;
-        let end = range && Math.min(range.end, entry.l) || entry.l;
-        if (end <= start) return Buffer.alloc(0);
-        let handle = await this.getBlobHandle(entry.f);
-        let buffer = Buffer.alloc(end - start);
-        let { bytesRead } = await handle.read(buffer, 0, buffer.length, entry.o + start);
-        if (bytesRead !== buffer.length) {
-            throw new Error(`Expected ${buffer.length} bytes at ${entry.f}:${entry.o + start} for ${key}, read ${bytesRead}`);
-        }
-        if (!range && buffer.length <= MEMORY_CACHE_MAX_FILE) {
-            this.memCache.set(key, buffer);
-        }
-        return buffer;
+        let filePath = this.filePath(key);
+        return await this.handles.run(filePath, async () => {
+            let handle: fs.promises.FileHandle;
+            try {
+                handle = await this.handles.getHandle(filePath, fs.constants.O_RDWR);
+            } catch (e: any) {
+                if (e.code === "ENOENT") return undefined;
+                throw e;
+            }
+            let size = (await handle.stat()).size;
+            let start = range && Math.min(range.start, size) || 0;
+            let end = range && Math.min(range.end, size) || size;
+            if (end <= start) return Buffer.alloc(0);
+            let buffer = Buffer.alloc(end - start);
+            let { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+            if (bytesRead !== buffer.length) {
+                throw new Error(`Expected ${buffer.length} bytes at ${filePath}:${start}, read ${bytesRead}`);
+            }
+            return buffer;
+        });
     }
 
     public async getInfo(key: string): Promise<{ writeTime: number; size: number } | undefined> {
@@ -265,24 +235,29 @@ export class BlobStore {
             if (!overlayEntry.data) return undefined;
             return { writeTime: overlayEntry.t, size: overlayEntry.data.length };
         }
-        let entry = await this.index.get(key);
-        if (!entry) return undefined;
-        return { writeTime: entry.t, size: entry.l };
+        let filePath = this.filePath(key);
+        return await this.handles.run(filePath, async () => {
+            try {
+                let stats = await fs.promises.stat(filePath);
+                if (!stats.isFile()) return undefined;
+                return { writeTime: stats.mtimeMs, size: stats.size };
+            } catch (e: any) {
+                if (e.code === "ENOENT") return undefined;
+                throw e;
+            }
+        });
     }
 
     public async findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         await this.init();
         let infos = new Map<string, ArchiveFileInfo>();
-        for (let key of await this.index.getKeys()) {
-            if (!key.startsWith(prefix)) continue;
-            if (this.overlay.has(key)) continue;
-            let entry = await this.index.get(key);
-            if (!entry) continue;
-            infos.set(key, { path: key, createTime: entry.t, size: entry.l });
-        }
+        await this.collectFiles("", prefix, infos);
         for (let [key, overlayEntry] of this.overlay) {
             if (!key.startsWith(prefix)) continue;
-            if (!overlayEntry.data) continue;
+            if (!overlayEntry.data) {
+                infos.delete(key);
+                continue;
+            }
             infos.set(key, { path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
         }
         let files = Array.from(infos.values());
@@ -308,39 +283,87 @@ export class BlobStore {
         return files;
     }
 
-    // Large files stream into their own dedicated blob file, so concurrent small writes don't
-    // interleave into the middle of them.
+    // relDir is "" or ends with "/". Only descends into directories that can still match the prefix.
+    private async collectFiles(relDir: string, prefix: string, infos: Map<string, ArchiveFileInfo>): Promise<void> {
+        let entries: fs.Dirent[];
+        try {
+            entries = await fs.promises.readdir(path.join(this.filesDir, relDir), { withFileTypes: true });
+        } catch (e: any) {
+            if (e.code === "ENOENT") return;
+            throw e;
+        }
+        for (let entry of entries) {
+            let relPath = relDir + entry.name;
+            if (entry.isDirectory()) {
+                let dirPath = relPath + "/";
+                if (dirPath.startsWith(prefix) || prefix.startsWith(dirPath)) {
+                    await this.collectFiles(dirPath, prefix, infos);
+                }
+                continue;
+            }
+            if (!entry.isFile()) continue;
+            if (!relPath.startsWith(prefix)) continue;
+            try {
+                let stats = await fs.promises.stat(path.join(this.filesDir, relPath));
+                infos.set(relPath, { path: relPath, createTime: stats.mtimeMs, size: stats.size });
+            } catch (e: any) {
+                // Deleted while we were walking
+                if (e.code !== "ENOENT") throw e;
+            }
+        }
+    }
+
+    // Large files stream into their own file under uploads/, then move into place on finish. No
+    // handle is opened until the first append actually happens.
     public async startLargeUpload(): Promise<string> {
         await this.init();
         let id = `${Date.now()}_${this.nextLargeUploadId++}`;
-        let tmpPath = path.join(this.blobsDir, `upload_${id}.tmp`);
-        let fd = await fs.promises.open(tmpPath, "w");
-        this.largeUploads.set(id, { fd, tmpPath, size: 0 });
+        this.largeUploads.set(id, { tmpPath: path.join(this.uploadsDir, `upload_${id}.tmp`) });
         return id;
     }
     public async appendLargeUpload(id: string, data: Buffer): Promise<void> {
         let upload = this.largeUploads.get(id);
         if (!upload) throw new Error(`Unknown large upload ${id}`);
-        await upload.fd.write(data, 0, data.length);
-        upload.size += data.length;
+        const tmpPath = upload.tmpPath;
+        await this.handles.run(tmpPath, async () => {
+            let handle = await this.handles.getHandle(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND);
+            await handle.write(data, 0, data.length);
+        });
     }
     public async finishLargeUpload(id: string, key: string): Promise<void> {
         let upload = this.largeUploads.get(id);
         if (!upload) throw new Error(`Unknown large upload ${id}`);
+        const tmpPath = upload.tmpPath;
         this.largeUploads.delete(id);
-        await upload.fd.close();
-        let blobName = `large_${id}.bin`;
-        await fs.promises.rename(upload.tmpPath, this.blobPath(blobName));
-        this.memCache.delete(key);
         this.overlay.delete(key);
-        await this.setIndexEntry(key, { f: blobName, o: 0, l: upload.size, t: Date.now() });
+        let filePath = this.filePath(key);
+        await this.handles.run(tmpPath, () => this.handles.closeNow(tmpPath));
+        await this.handles.run(filePath, async () => {
+            // Close any cached handle to the file we're replacing, so later reads reopen the new file
+            await this.handles.closeNow(filePath);
+            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+            try {
+                await fs.promises.rename(tmpPath, filePath);
+            } catch (e: any) {
+                if (e.code !== "ENOENT") throw e;
+                // Nothing was ever appended, so the upload file was never created
+                await fs.promises.writeFile(filePath, Buffer.alloc(0));
+            }
+        });
     }
     public async cancelLargeUpload(id: string): Promise<void> {
         let upload = this.largeUploads.get(id);
         if (!upload) return;
+        const tmpPath = upload.tmpPath;
         this.largeUploads.delete(id);
-        await upload.fd.close();
-        await fs.promises.unlink(upload.tmpPath).catch(() => { });
+        await this.handles.run(tmpPath, async () => {
+            await this.handles.closeNow(tmpPath);
+            try {
+                await fs.promises.unlink(tmpPath);
+            } catch (e: any) {
+                if (e.code !== "ENOENT") throw e;
+            }
+        });
     }
 
     private async flushOverlay(): Promise<void> {
@@ -348,56 +371,14 @@ export class BlobStore {
         for (let [key, entry] of this.overlay) {
             if (entry.flushAt > now) continue;
             if (entry.data) {
-                let location = await this.appendData(entry.data);
-                await this.setIndexEntry(key, { ...location, t: entry.t });
+                await this.writeToDisk(key, entry.data, entry.t);
             } else {
-                let prev = await this.index.get(key);
-                if (prev) {
-                    await this.index.remove(key);
-                    await this.addDeadBytes(prev);
-                }
+                await this.deleteFromDisk(key);
             }
             // Only remove if it wasn't overwritten while we were flushing
             if (this.overlay.get(key) === entry) {
                 this.overlay.delete(key);
             }
-        }
-    }
-
-    private async compact(): Promise<void> {
-        let currentBlob = this.blobName(this.currentBlobNumber);
-        for (let blobName of await this.deadBytes.getKeys()) {
-            if (blobName === currentBlob) continue;
-            let dead = await this.deadBytes.get(blobName) || 0;
-            let blobPath = this.blobPath(blobName);
-            let size = 0;
-            try {
-                size = fs.statSync(blobPath).size;
-            } catch {
-                await this.deadBytes.remove(blobName);
-                continue;
-            }
-            if (dead < size * COMPACTION_DEAD_FRACTION) continue;
-
-            console.log(`Compacting blob ${blobName} (${formatNumber(dead)}B dead of ${formatNumber(size)}B)`);
-            for (let key of await this.index.getKeys()) {
-                let entry = await this.index.get(key);
-                if (!entry || entry.f !== blobName) continue;
-                let data = await this.get(key);
-                if (!data) continue;
-                let location = await this.appendData(data);
-                // Only move it if it wasn't rewritten while we were reading
-                let latest = await this.index.get(key);
-                if (latest && latest.f === entry.f && latest.o === entry.o) {
-                    await this.index.set(key, { ...location, t: latest.t });
-                } else {
-                    // Our copy is stale, so its bytes are immediately dead
-                    await this.deadBytes.set(location.f, (await this.deadBytes.get(location.f) || 0) + location.l);
-                }
-            }
-            await this.closeBlobHandle(blobName);
-            await fs.promises.unlink(blobPath).catch(() => { });
-            await this.deadBytes.remove(blobName);
         }
     }
 }

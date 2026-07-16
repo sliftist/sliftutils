@@ -9,32 +9,22 @@ export type WriteConfig = {
 export declare class BlobStore {
     private folder;
     constructor(folder: string);
-    private memCache;
+    private filesDir;
+    private uploadsDir;
+    private handles;
     private overlay;
-    private writeQueue;
-    private openBlobs;
     private largeUploads;
     private nextLargeUploadId;
-    private currentBlobNumber;
-    private currentBlobOffset;
-    private currentBlobFd;
-    private index;
-    private deadBytes;
-    private blobsDir;
     init: {
         (): Promise<void>;
         reset(): void;
         set(newValue: Promise<void>): void;
     };
-    private blobName;
-    private blobPath;
-    private getBlobHandle;
-    private closeBlobHandle;
-    private addDeadBytes;
-    private appendData;
-    private setIndexEntry;
+    private filePath;
     set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
+    private writeToDisk;
     del(key: string, config?: WriteConfig): Promise<void>;
+    private deleteFromDisk;
     get(key: string, range?: {
         start: number;
         end: number;
@@ -47,10 +37,10 @@ export declare class BlobStore {
         shallow?: boolean;
         type?: "files" | "folders";
     }): Promise<ArchiveFileInfo[]>;
+    private collectFiles;
     startLargeUpload(): Promise<string>;
     appendLargeUpload(id: string, data: Buffer): Promise<void>;
     finishLargeUpload(id: string, key: string): Promise<void>;
     cancelLargeUpload(id: string): Promise<void>;
     private flushOverlay;
-    private compact;
 }
