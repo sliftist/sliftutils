@@ -30,8 +30,7 @@ export type HostStorageServerConfig = {
     domain: string;
     port: number;
     folder: string;
-    // Cloudflare API token: either the token string ({ key }) or a path to a file containing it
-    // ({ path }). Required — pass { path: "./cloudflare.json" } explicitly for the on-disk file.
+    // Set hostServer.ts:HostServerConfig:cloudflareApiToken
     cloudflareApiToken: { key: string } | { path: string };
     // When free space on the folder's drive drops below this many bytes, the server console.errors
     // every 15 minutes. Below 10% of it, the server also rejects write operations (creating files,
