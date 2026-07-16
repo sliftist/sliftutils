@@ -2,9 +2,12 @@ export type HostServerConfig = {
     /** Full domain to host on (e.g. "testsite.example.com"). The HTTPS cert is created for this domain and *.domain, so using a subdomain never touches the root domain (beyond its _acme-challenge TXT record). */
     domain: string;
     port: number;
-    /** Cloudflare API token (or a path to a file containing one). If neither is given, ./cloudflare.json is used. */
-    cloudflareApiToken?: string;
-    cloudflareApiTokenPath?: string;
+    /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Omit to fall back to ./cloudflare.json. */
+    cloudflareApiToken?: {
+        key: string;
+    } | {
+        path: string;
+    };
     /** Creates an unproxied A record pointing domain at this machine (publicIp, or our detected external IP) */
     setDNSRecord?: boolean;
     publicIp?: string;

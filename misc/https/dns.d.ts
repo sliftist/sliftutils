@@ -11,8 +11,12 @@ export declare function deleteRecord(type: string, key: string, value: string): 
 export declare function setRecord(type: string, key: string, value: string, proxied?: "proxied"): Promise<void>;
 /** Keeps existing records */
 export declare function addRecord(type: string, key: string, value: string, proxied?: "proxied"): Promise<void>;
-/** Provide Cloudflare credentials directly (an API token, or a path to a file containing one), instead of relying on ./cloudflare.json */
+/** Provide Cloudflare credentials directly instead of relying on ./cloudflare.json. Exactly one of
+ *  key (the API token itself) or path (a file to read it from) — TypeScript rejects both/neither. */
 export declare function setCloudflareCredentials(config: {
-    key?: string;
-    path?: string;
+    value: {
+        key: string;
+    } | {
+        path: string;
+    };
 }): void;

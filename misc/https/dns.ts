@@ -115,15 +115,10 @@ export async function addRecord(type: string, key: string, value: string, proxie
 
 
 let credsOverride: { key: string } | undefined;
-/** Provide Cloudflare credentials directly (an API token, or a path to a file containing one), instead of relying on ./cloudflare.json */
-export function setCloudflareCredentials(config: { key?: string; path?: string }) {
-    let key = config.key;
-    if (!key && config.path) {
-        key = fs.readFileSync(config.path, "utf8").trim();
-    }
-    if (!key) {
-        throw new Error(`Must provide either key or path in setCloudflareCredentials, received ${JSON.stringify(Object.keys(config))}`);
-    }
+/** Provide Cloudflare credentials directly instead of relying on ./cloudflare.json. Exactly one of
+ *  key (the API token itself) or path (a file to read it from) — TypeScript rejects both/neither. */
+export function setCloudflareCredentials(config: { value: { key: string } | { path: string } }) {
+    let key = "key" in config.value ? config.value.key : fs.readFileSync(config.value.path, "utf8").trim();
     credsOverride = { key };
 }
 

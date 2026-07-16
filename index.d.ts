@@ -150,10 +150,14 @@ declare module "sliftutils/misc/https/dns" {
     export declare function setRecord(type: string, key: string, value: string, proxied?: "proxied"): Promise<void>;
     /** Keeps existing records */
     export declare function addRecord(type: string, key: string, value: string, proxied?: "proxied"): Promise<void>;
-    /** Provide Cloudflare credentials directly (an API token, or a path to a file containing one), instead of relying on ./cloudflare.json */
+    /** Provide Cloudflare credentials directly instead of relying on ./cloudflare.json. Exactly one of
+     *  key (the API token itself) or path (a file to read it from) — TypeScript rejects both/neither. */
     export declare function setCloudflareCredentials(config: {
-        key?: string;
-        path?: string;
+        value: {
+            key: string;
+        } | {
+            path: string;
+        };
     }): void;
 
 }
@@ -163,9 +167,12 @@ declare module "sliftutils/misc/https/hostServer" {
         /** Full domain to host on (e.g. "testsite.example.com"). The HTTPS cert is created for this domain and *.domain, so using a subdomain never touches the root domain (beyond its _acme-challenge TXT record). */
         domain: string;
         port: number;
-        /** Cloudflare API token (or a path to a file containing one). If neither is given, ./cloudflare.json is used. */
-        cloudflareApiToken?: string;
-        cloudflareApiTokenPath?: string;
+        /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Omit to fall back to ./cloudflare.json. */
+        cloudflareApiToken?: {
+            key: string;
+        } | {
+            path: string;
+        };
         /** Creates an unproxied A record pointing domain at this machine (publicIp, or our detected external IP) */
         setDNSRecord?: boolean;
         publicIp?: string;
@@ -2815,8 +2822,11 @@ declare module "sliftutils/storage/remoteStorage/storageServer" {
         domain: string;
         port: number;
         folder: string;
-        cloudflareApiToken?: string;
-        cloudflareApiTokenPath?: string;
+        cloudflareApiToken?: {
+            key: string;
+        } | {
+            path: string;
+        };
         lowSpaceThresholdBytes?: number;
     };
     export declare function hostStorageServer(config: HostStorageServerConfig): Promise<void>;

@@ -30,7 +30,7 @@ async function main() {
     await hostServer({
         domain: DOMAIN,
         port: PORT,
-        cloudflareApiTokenPath: os.homedir() + "/vidgridweb.com.key",
+        cloudflareApiToken: { path: os.homedir() + "/vidgridweb.com.key" },
         setDNSRecord: true,
     });
 }
