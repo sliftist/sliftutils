@@ -35,7 +35,11 @@ export declare class ArchivesRemote implements IArchives {
     getDebugName(): string;
     private authenticate;
     private callAuthed;
-    waitingForAccess(): Promise<string | undefined>;
+    waitingForAccess(): Promise<{
+        link: string;
+        machineId: string;
+        ip: string;
+    } | undefined>;
     private onAccessDenied;
     private ensureSetup;
     private call;

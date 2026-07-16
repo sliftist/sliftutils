@@ -87,12 +87,17 @@ export class ArchivesRemote implements IArchives {
     }
 
     // Returns undefined if this machine has access to the account. Otherwise puts in an access
-    // request and returns the link to the page where access can be granted.
-    public async waitingForAccess(): Promise<string | undefined> {
+    // request and returns our machineId + ip (so the caller can display them alongside the link,
+    // for the approver to match the incoming request) and the link to the grant page.
+    public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
         let state = await this.callAuthed(() => this.controller.getAccessState(this.config.account));
         if (state.hasAccess) return undefined;
-        await this.callAuthed(() => this.controller.requestAccess(this.config.account));
-        return `https://${this.config.address}:${this.config.port}/${this.config.account}`;
+        let requested = await this.callAuthed(() => this.controller.requestAccess(this.config.account));
+        return {
+            link: `https://${this.config.address}:${this.config.port}/${this.config.account}`,
+            machineId: requested.machineId,
+            ip: requested.ip,
+        };
     }
 
     private async onAccessDenied(): Promise<void> {
