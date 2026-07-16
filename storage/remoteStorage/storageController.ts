@@ -262,11 +262,15 @@ class RemoteStorageControllerBase {
     // admin). Grants the requested access; the caller must supply the specific requestId, which they
     // only get by explicitly looking up requests for a specific IP.
     async grantAccess(requestId: string): Promise<TrustRecord> {
+        // Must capture in the synchronous phase — SocketFunction.getCaller() only works before any await.
+        let callerMachineId = getCallerMachineId();
         let state = getState();
         for (let ip of await state.requests.getKeys()) {
             for (let request of await state.requests.get(ip) || []) {
                 if (request.requestId !== requestId) continue;
-                await requireAccess(request.account);
+                if (!isAdmin(callerMachineId) && !await state.trust.get(`${request.account}|${callerMachineId}`)) {
+                    throw new Error(`${STORAGE_ACCESS_DENIED} Machine ${callerMachineId} has no access to account ${JSON.stringify(request.account)}`);
+                }
                 let record: TrustRecord = {
                     account: request.account,
                     machineId: request.machineId,
