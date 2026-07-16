@@ -2,8 +2,8 @@ export type HostServerConfig = {
     /** Full domain to host on (e.g. "testsite.example.com"). The HTTPS cert is created for this domain and *.domain, so using a subdomain never touches the root domain (beyond its _acme-challenge TXT record). */
     domain: string;
     port: number;
-    /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Omit to fall back to ./cloudflare.json. */
-    cloudflareApiToken?: {
+    /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Required — pass { path: "./cloudflare.json" } explicitly for the on-disk file. */
+    cloudflareApiToken: {
         key: string;
     } | {
         path: string;

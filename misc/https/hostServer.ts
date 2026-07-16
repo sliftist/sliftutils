@@ -21,8 +21,8 @@ export type HostServerConfig = {
     /** Full domain to host on (e.g. "testsite.example.com"). The HTTPS cert is created for this domain and *.domain, so using a subdomain never touches the root domain (beyond its _acme-challenge TXT record). */
     domain: string;
     port: number;
-    /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Omit to fall back to ./cloudflare.json. */
-    cloudflareApiToken?: { key: string } | { path: string };
+    /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Required — pass { path: "./cloudflare.json" } explicitly for the on-disk file. */
+    cloudflareApiToken: { key: string } | { path: string };
     /** Creates an unproxied A record pointing domain at this machine (publicIp, or our detected external IP) */
     setDNSRecord?: boolean;
     publicIp?: string;
@@ -32,9 +32,7 @@ export type HostServerConfig = {
 /** Hosts a SocketFunction server on a real domain, with an automatically created and renewed Let's Encrypt HTTPS certificate (cached in the home folder, shared between processes on the machine). Expose your controllers (and any RequireController setup) before calling this. Returns the mounted nodeId. */
 export async function hostServer(config: HostServerConfig): Promise<string> {
     let { domain, port } = config;
-    if (config.cloudflareApiToken) {
-        setCloudflareCredentials({ value: config.cloudflareApiToken });
-    }
+    setCloudflareCredentials({ value: config.cloudflareApiToken });
     // The identity CA always lives on the root domain (nodeIds are threadHash.machineHash.root.tld)
     let rootDomain = domain.split(".").slice(-2).join(".");
     await loadIdentityCA(rootDomain);

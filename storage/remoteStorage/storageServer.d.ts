@@ -3,7 +3,7 @@ export type HostStorageServerConfig = {
     domain: string;
     port: number;
     folder: string;
-    cloudflareApiToken?: {
+    cloudflareApiToken: {
         key: string;
     } | {
         path: string;
