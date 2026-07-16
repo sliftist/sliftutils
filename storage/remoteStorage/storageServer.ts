@@ -1,4 +1,3 @@
-process.env.NODE_ENV = "production";
 import os from "os";
 import path from "path";
 import { SocketFunction } from "socket-function/SocketFunction";
@@ -17,77 +16,37 @@ import { authenticateStorage } from "./ArchivesRemote";
 // Import browser code, so it is allowed to be required by the client
 import "./accessPage";
 
-// The remote storage server. Run modes:
-//   Host the server:
+// The remote storage server. Callers import hostStorageServer() and run it inside their own process
+// (no separate entry point / bin script needed). The file is ALSO runnable directly as a testing /
+// admin entry:
+//   Host (test):
 //     typenode storage/remoteStorage/storageServer.ts --domain storage.example.com --port 4444
 //       --folder /storage/data --cloudflareApiTokenPath ~/example.com.key
-//   Admin commands (run on the storage machine itself, against the running server):
-//     --listAccess <ip>            lists pending access requests from that IP (with requestIds)
-//     --grantAccess <requestId>    trusts the machine from that request for the requested account
+//   Grant an access request (must be run on the storage machine itself):
+//     typenode storage/remoteStorage/storageServer.ts --domain storage.example.com --port 4444
+//       --grantAccess <requestId>
+// Listing access requests is not exposed on the CLI — that flow happens in the browser on the
+// access page (a trusted user types in an IP to look up and approve pending requests).
 
-process.on("unhandledRejection", (error) => {
-    console.error("Unhandled promise rejection:", error);
-});
-process.on("uncaughtException", (error) => {
-    console.error("Uncaught exception:", error);
-});
-
-// The absolute command that runs this script (with the given args) on this machine, usable from
-// any working directory (ex: over ssh)
+// The absolute command that runs this script (with the given args) on this machine, usable from any
+// working directory (ex: over ssh). Same regardless of who imported us, since __filename points at
+// this file.
 function getServerCommand(args: string): string {
     return `${process.execPath} ${require.resolve("typenode/bootstrap.js")} ${__filename} ${args}`;
 }
 
-function getArg(name: string): string | undefined {
-    let index = process.argv.indexOf(`--${name}`);
-    if (index < 0) return undefined;
-    let value = process.argv[index + 1];
-    if (!value || value.startsWith("--")) {
-        throw new Error(`Missing value for --${name}`);
-    }
-    return value;
-}
+export type HostStorageServerConfig = {
+    domain: string;
+    port: number;
+    folder: string;
+    cloudflareApiToken?: string;
+    cloudflareApiTokenPath?: string;
+};
 
-async function runAdminCommand(config: { domain: string; port: number; listAccess?: string; grantAccess?: string }) {
-    let nodeId = SocketFunction.connect({ address: config.domain, port: config.port });
-    let controller = RemoteStorageController.nodes[nodeId];
-    await authenticateStorage({ address: config.domain, port: config.port, nodeId });
-    if (config.listAccess) {
-        let requests = await controller.adminListRequests(config.listAccess);
-        if (!requests.length) {
-            console.log(`No access requests from ${config.listAccess}`);
-            return;
-        }
-        console.log(`Access requests from ${config.listAccess}:`);
-        for (let request of requests) {
-            console.log(`  --grantAccess ${request.requestId}  (account ${request.account}, machine ${request.machineId}, requested ${new Date(request.time).toISOString()})`);
-        }
-        console.log(`Grant one with: ${getServerCommand(`--domain ${config.domain} --port ${config.port} --grantAccess <requestId>`)}`);
-        return;
-    }
-    if (config.grantAccess) {
-        let record = await controller.adminGrantAccess(config.grantAccess);
-        console.log(`Granted machine ${record.machineId} access to account ${JSON.stringify(record.account)}`);
-    }
-}
-
-async function main() {
-    let domain = getArg("domain");
-    if (!domain) throw new Error(`--domain is required (ex: --domain storage.example.com)`);
-    let port = +(getArg("port") || 443);
-
-    let listAccess = getArg("listAccess");
-    let grantAccess = getArg("grantAccess");
-    if (listAccess || grantAccess) {
-        await runAdminCommand({ domain, port, listAccess, grantAccess });
-        process.exit(0);
-    }
-
-    let folder = getArg("folder");
-    if (!folder) throw new Error(`--folder is required (where the storage server keeps its data)`);
-    let cloudflareApiTokenPath = getArg("cloudflareApiTokenPath");
-    if (!cloudflareApiTokenPath) throw new Error(`--cloudflareApiTokenPath is required (path to a Cloudflare API token file, for HTTPS certs)`);
-
+// Starts hosting the remote storage server in the caller's process. Exposes RemoteStorageController
+// + serves the access page. Blocks until the server is listening.
+export async function hostStorageServer(config: HostStorageServerConfig): Promise<void> {
+    let { domain, port, folder } = config;
     let root = await getFileStorageNested2(path.resolve(folder));
     let system = await root.folder.getStorage("system");
     let trust = new JSONStorage<TrustRecord>(new TransactionStorage(await system.folder.getStorage("trust"), "storageTrust"));
@@ -120,13 +79,64 @@ async function main() {
     await hostServer({
         domain,
         port,
-        cloudflareApiTokenPath,
+        cloudflareApiToken: config.cloudflareApiToken,
+        cloudflareApiTokenPath: config.cloudflareApiTokenPath,
         setDNSRecord: true,
     });
+}
+
+// Admin: grants an access request by requestId. Must be run on the storage machine itself (the CLI
+// entry below authenticates with this machine's certs.ts identity, which is what the server trusts
+// as admin).
+export async function grantAccessRequest(config: { domain: string; port: number; requestId: string }): Promise<TrustRecord> {
+    let nodeId = SocketFunction.connect({ address: config.domain, port: config.port });
+    await authenticateStorage({ address: config.domain, port: config.port, nodeId });
+    return await RemoteStorageController.nodes[nodeId].adminGrantAccess(config.requestId);
+}
+
+function getArg(name: string): string | undefined {
+    let index = process.argv.indexOf(`--${name}`);
+    if (index < 0) return undefined;
+    let value = process.argv[index + 1];
+    if (!value || value.startsWith("--")) {
+        throw new Error(`Missing value for --${name}`);
+    }
+    return value;
+}
+
+async function cliMain() {
+    let domain = getArg("domain");
+    if (!domain) throw new Error(`--domain is required (ex: --domain storage.example.com)`);
+    let port = +(getArg("port") || 443);
+
+    let grantAccessArg = getArg("grantAccess");
+    if (grantAccessArg) {
+        let record = await grantAccessRequest({ domain, port, requestId: grantAccessArg });
+        console.log(`Granted machine ${record.machineId} access to account ${JSON.stringify(record.account)}`);
+        process.exit(0);
+    }
+
+    let folder = getArg("folder");
+    if (!folder) throw new Error(`--folder is required (where the storage server keeps its data)`);
+    let cloudflareApiTokenPath = getArg("cloudflareApiTokenPath");
+    if (!cloudflareApiTokenPath) throw new Error(`--cloudflareApiTokenPath is required (path to a Cloudflare API token file, for HTTPS certs)`);
+
+    await hostStorageServer({ domain, port, folder, cloudflareApiTokenPath });
     console.log(`Storage server running at https://${domain}:${port}`);
 }
 
-main().catch(e => {
-    console.error(e);
-    process.exit(1);
-});
+// Only run the CLI when this file is invoked directly (typenode storageServer.ts ...), not when a
+// consumer imports us as a library.
+if (require.main === module) {
+    process.env.NODE_ENV = "production";
+    process.on("unhandledRejection", (error) => {
+        console.error("Unhandled promise rejection:", error);
+    });
+    process.on("uncaughtException", (error) => {
+        console.error("Uncaught exception:", error);
+    });
+    cliMain().catch(e => {
+        console.error(e);
+        process.exit(1);
+    });
+}
