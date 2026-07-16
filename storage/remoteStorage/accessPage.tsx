@@ -138,7 +138,7 @@ class AccessPage extends preact.Component {
             {!state && !error && <div>Requesting access...</div>}
             {state && !state.hasAccess && <div className={css.vbox(8)}>
                 <div>This machine ({state.machineId}, ip {state.ip}) does NOT have access yet.</div>
-                <div>An access request has been made. To grant it, either have another machine that already has access approve it from this page (by looking up your IP), or run this single command (it sshes into the storage machine):</div>
+                <div>An access request has been made. To grant it, run this command:</div>
                 <CopyableCommand command={state.grantAccessCommand || state.listAccessCommand} />
                 <div>This page rechecks every {REFRESH_INTERVAL / 1000} seconds.</div>
             </div>}
@@ -164,17 +164,16 @@ class AccessPage extends preact.Component {
                     </table>
                 </div>
                 <div className={css.vbox(6)}>
-                    <div>Approve someone else's access request:</div>
-                    <div>Ask them for their IP (shown on their own access page). Then type it here to see and approve their pending requests for this account. Requests are never shown unsolicited.</div>
+                    <div>Approve request:</div>
                     <div className={css.hbox(8).alignItems("center")}>
                         <input
-                            placeholder="requester's IP"
+                            placeholder="IP"
                             value={synced.lookupIp}
                             onInput={e => { synced.lookupIp = (e.currentTarget as HTMLInputElement).value; }}
                             onKeyDown={e => { if (e.key === "Enter") void this.lookupIP(); }}
                         />
                         <button disabled={synced.looking || !synced.lookupIp.trim()} onClick={this.lookupIP}>
-                            {synced.looking && "Looking up..." || "Look up requests"}
+                            {synced.looking && "Looking up..." || "Look up"}
                         </button>
                     </div>
                     {synced.lookupError && <div>Error: {synced.lookupError}</div>}
