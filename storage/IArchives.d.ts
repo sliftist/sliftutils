@@ -20,6 +20,7 @@ export interface IArchives {
         path: string;
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
+    /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. */
     getInfo(fileName: string): Promise<{
         writeTime: number;
         size: number;
