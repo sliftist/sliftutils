@@ -26,6 +26,7 @@ export type TrustRecord = {
     time: number;
 };
 export type BucketConfig = {
+    folder: string;
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
@@ -43,7 +44,7 @@ export type StorageServerState = {
     rootDomain: string;
     sshTarget: string;
     serverCommand: string;
-    blobStore: BlobStore;
+    getBlobStore(bucket: BucketConfig): BlobStore;
     trust: IStorage<TrustRecord>;
     requests: IStorage<AccessRequest[]>;
     buckets: IStorage<BucketConfig>;
@@ -66,7 +67,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     grantAccess: (requestId: string) => Promise<TrustRecord>;
     adminListRequests: (ip: string) => Promise<AccessRequest[]>;
     adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
-    ensureBucket: (account: string, bucketName: string, config: BucketConfig) => Promise<void>;
+    ensureBucket: (account: string, bucketName: string, config: Omit<BucketConfig, "folder">) => Promise<void>;
     get: (account: string, bucketName: string, path: string, range?: {
         start: number;
         end: number;

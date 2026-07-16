@@ -2770,6 +2770,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         time: number;
     };
     export type BucketConfig = {
+        folder: string;
         public?: boolean;
         fast?: boolean;
         writeDelay?: number;
@@ -2787,7 +2788,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         rootDomain: string;
         sshTarget: string;
         serverCommand: string;
-        blobStore: BlobStore;
+        getBlobStore(bucket: BucketConfig): BlobStore;
         trust: IStorage<TrustRecord>;
         requests: IStorage<AccessRequest[]>;
         buckets: IStorage<BucketConfig>;
@@ -2810,7 +2811,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         grantAccess: (requestId: string) => Promise<TrustRecord>;
         adminListRequests: (ip: string) => Promise<AccessRequest[]>;
         adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
-        ensureBucket: (account: string, bucketName: string, config: BucketConfig) => Promise<void>;
+        ensureBucket: (account: string, bucketName: string, config: Omit<BucketConfig, "folder">) => Promise<void>;
         get: (account: string, bucketName: string, path: string, range?: {
             start: number;
             end: number;

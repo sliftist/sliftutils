@@ -44,6 +44,10 @@ export type TrustRecord = {
     time: number;
 };
 export type BucketConfig = {
+    // This bucket's blob store folder, relative to the server's storage folder. Derived from the
+    // account/bucket by ensureBucket for new buckets, and never changed after (so a bucket's data
+    // never silently moves). Server-assigned — clients cannot pick folders.
+    folder: string;
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
@@ -70,7 +74,9 @@ export type StorageServerState = {
     sshTarget: string;
     // Absolute command that runs storageServer.ts on the storage machine (admin args appended)
     serverCommand: string;
-    blobStore: BlobStore;
+    // Each bucket has its own blob store (in its own folder, see BucketConfig.folder). The server
+    // caches stores per folder, creating them on first use.
+    getBlobStore(bucket: BucketConfig): BlobStore;
     trust: IStorage<TrustRecord>;
     requests: IStorage<AccessRequest[]>;
     buckets: IStorage<BucketConfig>;
@@ -163,16 +169,15 @@ function getGrantAccessCommand(requestId: string): string {
     return `ssh ${state.sshTarget} '${state.serverCommand} --requestId ${requestId}'`;
 }
 
-async function getBucketWriteConfig(account: string, bucketName: string): Promise<WriteConfig> {
-    let state = getState();
-    let config = await state.buckets.get(`${account}/${bucketName}`);
-    return { fast: config?.fast, writeDelay: config?.writeDelay };
-}
-function fileKey(account: string, bucketName: string, path: string): string {
+async function getBucketStore(account: string, bucketName: string): Promise<{ store: BlobStore; writeConfig: WriteConfig }> {
     assertValidName(account, "account");
     assertValidName(bucketName, "bucket name");
-    assertValidPath(path);
-    return `${account}/${bucketName}/${path}`;
+    let state = getState();
+    let config = await state.buckets.get(`${account}/${bucketName}`);
+    if (!config) {
+        throw new Error(`Bucket ${account}/${bucketName} does not exist. Call ensureBucket first.`);
+    }
+    return { store: state.getBlobStore(config), writeConfig: { fast: config.fast, writeDelay: config.writeDelay } };
 }
 
 class RemoteStorageControllerBase {
@@ -316,50 +321,58 @@ class RemoteStorageControllerBase {
         throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
-    async ensureBucket(account: string, bucketName: string, config: BucketConfig): Promise<void> {
+    async ensureBucket(account: string, bucketName: string, config: Omit<BucketConfig, "folder">): Promise<void> {
         await requireAccess(account);
         assertValidName(bucketName, "bucket name");
         let state = getState();
         let key = `${account}/${bucketName}`;
         let existing = await state.buckets.get(key);
-        if (existing && JSON.stringify(existing) === JSON.stringify(config)) return;
+        // The spread comes first so a caller-supplied folder can never override the server-assigned
+        // one (folders are server-assigned, see BucketConfig.folder)
+        let full: BucketConfig = { ...config, folder: existing?.folder || `buckets/${account}/${bucketName}` };
+        if (existing && JSON.stringify(existing) === JSON.stringify(full)) return;
         assertWritesAllowed();
-        await state.buckets.set(key, config);
+        await state.buckets.set(key, full);
     }
 
     async get(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
         await requireAccess(account);
-        return await getState().blobStore.get(fileKey(account, bucketName, path), range);
+        assertValidPath(path);
+        let { store } = await getBucketStore(account, bucketName);
+        return await store.get(path, range);
     }
     async set(account: string, bucketName: string, path: string, data: Buffer): Promise<void> {
         assertWritesAllowed();
         await requireAccess(account);
-        let writeConfig = await getBucketWriteConfig(account, bucketName);
-        await getState().blobStore.set(fileKey(account, bucketName, path), Buffer.from(data), writeConfig);
+        assertValidPath(path);
+        let { store, writeConfig } = await getBucketStore(account, bucketName);
+        await store.set(path, Buffer.from(data), writeConfig);
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
         await requireAccess(account);
-        let writeConfig = await getBucketWriteConfig(account, bucketName);
-        await getState().blobStore.del(fileKey(account, bucketName, path), writeConfig);
+        assertValidPath(path);
+        let { store, writeConfig } = await getBucketStore(account, bucketName);
+        await store.del(path, writeConfig);
     }
     async getInfo(account: string, bucketName: string, path: string): Promise<{ writeTime: number; size: number } | undefined> {
         await requireAccess(account);
-        return await getState().blobStore.getInfo(fileKey(account, bucketName, path));
+        assertValidPath(path);
+        let { store } = await getBucketStore(account, bucketName);
+        return await store.getInfo(path);
     }
     async findInfo(account: string, bucketName: string, prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         await requireAccess(account);
-        assertValidName(bucketName, "bucket name");
-        let bucketRoot = `${account}/${bucketName}/`;
-        let infos = await getState().blobStore.findInfo(bucketRoot + prefix, config);
-        return infos.map(info => ({ ...info, path: info.path.slice(bucketRoot.length) }));
+        let { store } = await getBucketStore(account, bucketName);
+        return await store.findInfo(prefix, config);
     }
 
     async startLargeFile(account: string, bucketName: string, path: string): Promise<string> {
         assertWritesAllowed();
         await requireAccess(account);
         // Validates now, so the upload doesn't fail at the end
-        fileKey(account, bucketName, path);
-        let id = await getState().blobStore.startLargeUpload();
+        assertValidPath(path);
+        let { store } = await getBucketStore(account, bucketName);
+        let id = await store.startLargeUpload();
         largeUploadInfo.set(id, { account, bucketName, path });
         return id;
     }
@@ -368,7 +381,8 @@ class RemoteStorageControllerBase {
         let info = largeUploadInfo.get(uploadId);
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
         await requireAccess(info.account);
-        await getState().blobStore.appendLargeUpload(uploadId, Buffer.from(data));
+        let { store } = await getBucketStore(info.account, info.bucketName);
+        await store.appendLargeUpload(uploadId, Buffer.from(data));
     }
     async finishLargeFile(uploadId: string): Promise<void> {
         assertWritesAllowed();
@@ -376,25 +390,30 @@ class RemoteStorageControllerBase {
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
         await requireAccess(info.account);
         largeUploadInfo.delete(uploadId);
-        await getState().blobStore.finishLargeUpload(uploadId, fileKey(info.account, info.bucketName, info.path));
+        let { store } = await getBucketStore(info.account, info.bucketName);
+        await store.finishLargeUpload(uploadId, info.path);
     }
     async cancelLargeFile(uploadId: string): Promise<void> {
         let info = largeUploadInfo.get(uploadId);
         if (!info) return;
         await requireAccess(info.account);
         largeUploadInfo.delete(uploadId);
-        await getState().blobStore.cancelLargeUpload(uploadId);
+        let { store } = await getBucketStore(info.account, info.bucketName);
+        await store.cancelLargeUpload(uploadId);
     }
 
     // Serves files from public buckets over plain HTTP GET (see IArchives getURL). No
     // authentication, which is what public means (private buckets are API-access only).
     async getPublicFile(account: string, bucketName: string, path: string): Promise<Buffer> {
+        assertValidName(account, "account");
+        assertValidName(bucketName, "bucket name");
         let state = getState();
         let bucket = await state.buckets.get(`${account}/${bucketName}`);
         if (!bucket?.public) {
             throw new Error(`Bucket ${account}/${bucketName} is not public`);
         }
-        let data = await state.blobStore.get(fileKey(account, bucketName, path));
+        assertValidPath(path);
+        let data = await state.getBlobStore(bucket).get(path);
         if (!data) {
             throw new Error(`File not found: ${path} in ${account}/${bucketName}`);
         }

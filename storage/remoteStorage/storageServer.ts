@@ -84,19 +84,28 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     let { url, folder } = config;
     let { address: domain, port } = parseStorageUrl(url);
     let lowSpaceThreshold = config.lowSpaceThresholdBytes ?? DEFAULT_LOW_SPACE_THRESHOLD_BYTES;
-    let root = await getFileStorageNested2(path.resolve(folder));
+    let rootFolder = path.resolve(folder);
+    let root = await getFileStorageNested2(rootFolder);
     let system = await root.folder.getStorage("system");
     let trust = new JSONStorage<TrustRecord>(new TransactionStorage(await system.folder.getStorage("trust"), "storageTrust"));
     let requests = new JSONStorage<AccessRequest[]>(new TransactionStorage(await system.folder.getStorage("requests"), "storageRequests"));
     let buckets = new JSONStorage<BucketConfig>(new TransactionStorage(await system.folder.getStorage("buckets"), "storageBuckets"));
 
+    let blobStores = new Map<string, BlobStore>();
     setStorageServerState({
         domain,
         port,
         rootDomain: domain.split(".").slice(-2).join("."),
         sshTarget: `${os.userInfo().username}@${await getExternalIP()}`,
         serverCommand: `node ${getGrantAccessCliPath()} --url ${url}`,
-        blobStore: new BlobStore(path.resolve(folder)),
+        getBlobStore(bucket: BucketConfig) {
+            let store = blobStores.get(bucket.folder);
+            if (!store) {
+                store = new BlobStore(path.join(rootFolder, bucket.folder));
+                blobStores.set(bucket.folder, store);
+            }
+            return store;
+        },
         trust,
         requests,
         buckets,
