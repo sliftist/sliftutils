@@ -52,9 +52,9 @@ export type AccessState = {
     machineId: string;
     ip: string;
     hasAccess: boolean;
-    // Single ssh commands, runnable from anywhere, that run the admin CLI on the storage machine
-    // (shown when the caller has no access). grantAccessCommand grants the caller's own request.
-    listAccessCommand: string;
+    // A single ssh command, runnable from anywhere, that runs the grantAccess CLI on the storage
+    // machine to grant the caller's own pending request. Only set when the caller has a pending
+    // request (so an already-trusted caller has no need for it).
     grantAccessCommand?: string;
     // Only the machines that ALREADY have access. Pending requests are NEVER listed here — showing
     // them would let a trusted user accidentally approve a random request. Callers see pending
@@ -79,6 +79,17 @@ export type StorageServerState = {
 let serverState: StorageServerState | undefined;
 export function setStorageServerState(state: StorageServerState) {
     serverState = state;
+}
+
+// When set, all write-path operations (creating files, appending large uploads, creating buckets)
+// throw this message. Reads, findInfo, and deletes still work — so clients can free space. Managed
+// by hostStorageServer's disk-space monitor.
+let writesRejectedReason: string | undefined;
+export function setWritesRejectedReason(reason: string | undefined) {
+    writesRejectedReason = reason;
+}
+function assertWritesAllowed() {
+    if (writesRejectedReason) throw new Error(writesRejectedReason);
 }
 function getState(): StorageServerState {
     let state = serverState;
@@ -146,16 +157,10 @@ async function requireAccess(account: string): Promise<string> {
 }
 
 // A single command, runnable from anywhere, that sshes into the storage machine and runs the
-// admin CLI there
-function getAdminCommand(args: string): string {
-    let state = getState();
-    return `ssh ${state.sshTarget} '${state.serverCommand} ${args}'`;
-}
-function getListAccessCommand(ip: string): string {
-    return getAdminCommand(`--listAccess ${ip}`);
-}
+// grantAccess CLI there
 function getGrantAccessCommand(requestId: string): string {
-    return getAdminCommand(`--grantAccess ${requestId}`);
+    let state = getState();
+    return `ssh ${state.sshTarget} '${state.serverCommand} --requestId ${requestId}'`;
 }
 
 async function getBucketWriteConfig(account: string, bucketName: string): Promise<WriteConfig> {
@@ -229,7 +234,7 @@ class RemoteStorageControllerBase {
         let machineId = getCallerMachineId();
         let ip = getCallerIP();
         let hasAccess = isAdmin(machineId) || !!await state.trust.get(`${account}|${machineId}`);
-        let result: AccessState = { machineId, ip, hasAccess, listAccessCommand: getListAccessCommand(ip) };
+        let result: AccessState = { machineId, ip, hasAccess };
         if (!hasAccess) {
             let ownRequest = (await state.requests.get(ip) || []).find(x => x.account === account && x.machineId === machineId);
             if (ownRequest) {
@@ -308,7 +313,7 @@ class RemoteStorageControllerBase {
                 return record;
             }
         }
-        throw new Error(`No access request found with id ${JSON.stringify(requestId)}. Run --listAccess <ip> to see request ids.`);
+        throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
     async ensureBucket(account: string, bucketName: string, config: BucketConfig): Promise<void> {
@@ -318,6 +323,7 @@ class RemoteStorageControllerBase {
         let key = `${account}/${bucketName}`;
         let existing = await state.buckets.get(key);
         if (existing && JSON.stringify(existing) === JSON.stringify(config)) return;
+        assertWritesAllowed();
         await state.buckets.set(key, config);
     }
 
@@ -326,6 +332,7 @@ class RemoteStorageControllerBase {
         return await getState().blobStore.get(fileKey(account, bucketName, path), range);
     }
     async set(account: string, bucketName: string, path: string, data: Buffer): Promise<void> {
+        assertWritesAllowed();
         await requireAccess(account);
         let writeConfig = await getBucketWriteConfig(account, bucketName);
         await getState().blobStore.set(fileKey(account, bucketName, path), Buffer.from(data), writeConfig);
@@ -348,6 +355,7 @@ class RemoteStorageControllerBase {
     }
 
     async startLargeFile(account: string, bucketName: string, path: string): Promise<string> {
+        assertWritesAllowed();
         await requireAccess(account);
         // Validates now, so the upload doesn't fail at the end
         fileKey(account, bucketName, path);
@@ -356,12 +364,14 @@ class RemoteStorageControllerBase {
         return id;
     }
     async uploadPart(uploadId: string, data: Buffer): Promise<void> {
+        assertWritesAllowed();
         let info = largeUploadInfo.get(uploadId);
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
         await requireAccess(info.account);
         await getState().blobStore.appendLargeUpload(uploadId, Buffer.from(data));
     }
     async finishLargeFile(uploadId: string): Promise<void> {
+        assertWritesAllowed();
         let info = largeUploadInfo.get(uploadId);
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
         await requireAccess(info.account);

@@ -1,5 +1,6 @@
 import os from "os";
 import path from "path";
+import fsp from "fs/promises";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { getExternalIP } from "socket-function/src/networking";
 import { RequireController } from "socket-function/require/RequireController";
@@ -9,31 +10,21 @@ import { TransactionStorage } from "../TransactionStorage";
 import { JSONStorage } from "../JSONStorage";
 import { BlobStore } from "./blobStore";
 import {
-    RemoteStorageController, setStorageServerState,
+    RemoteStorageController, setStorageServerState, setWritesRejectedReason,
     AccessRequest, TrustRecord, BucketConfig,
 } from "./storageController";
-import { authenticateStorage } from "./ArchivesRemote";
 // Import browser code, so it is allowed to be required by the client
 import "./accessPage";
 
-// The remote storage server. Callers import hostStorageServer() and run it inside their own process
-// (no separate entry point / bin script needed). The file is ALSO runnable directly as a testing /
-// admin entry:
-//   Host (test):
-//     typenode storage/remoteStorage/storageServer.ts --domain storage.example.com --port 4444
-//       --folder /storage/data --cloudflareApiTokenPath ~/example.com.key
-//   Grant an access request (must be run on the storage machine itself):
-//     typenode storage/remoteStorage/storageServer.ts --domain storage.example.com --port 4444
-//       --grantAccess <requestId>
-// Listing access requests is not exposed on the CLI — that flow happens in the browser on the
-// access page (a trusted user types in an IP to look up and approve pending requests).
+const DEFAULT_LOW_SPACE_THRESHOLD_BYTES = 25 * 1024 ** 3;
+const DISK_SPACE_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+// Below this fraction of the warn threshold, we start rejecting writes so the server itself doesn't
+// tip the machine into instability. Reads/deletes still work so users can free space.
+const HARD_REJECT_FRACTION = 0.1;
 
-// The absolute command that runs this script (with the given args) on this machine, usable from any
-// working directory (ex: over ssh). Same regardless of who imported us, since __filename points at
-// this file.
-function getServerCommand(args: string): string {
-    return `${process.execPath} ${require.resolve("typenode/bootstrap.js")} ${__filename} ${args}`;
-}
+// The remote storage server, as a library function: consumers call hostStorageServer() from their
+// own process to start hosting. The only CLI we ship is grantAccess.js (next to this file), which
+// is what the access page's shown SSH command points at.
 
 export type HostStorageServerConfig = {
     domain: string;
@@ -41,12 +32,54 @@ export type HostStorageServerConfig = {
     folder: string;
     cloudflareApiToken?: string;
     cloudflareApiTokenPath?: string;
+    // When free space on the folder's drive drops below this many bytes, the server console.errors
+    // every 15 minutes. Below 10% of it, the server also rejects write operations (creating files,
+    // large uploads, new buckets) — reads, findInfo, and deletes still work so the user can free
+    // space. Default 25 GiB.
+    lowSpaceThresholdBytes?: number;
 };
 
-// Starts hosting the remote storage server in the caller's process. Exposes RemoteStorageController
-// + serves the access page. Blocks until the server is listening.
+function formatBytes(bytes: number): string {
+    return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+}
+
+async function checkDiskSpace(config: { folder: string; threshold: number }): Promise<void> {
+    let { folder, threshold } = config;
+    let stats = await fsp.statfs(folder);
+    let free = Number(stats.bavail) * Number(stats.bsize);
+    let hardLimit = threshold * HARD_REJECT_FRACTION;
+    if (free >= threshold) {
+        setWritesRejectedReason(undefined);
+        return;
+    }
+    let under = threshold - free;
+    let rejecting = free < hardLimit;
+    console.error(
+        `Storage folder ${folder} is low on disk: ${formatBytes(free)} free`
+        + ` (warn threshold ${formatBytes(threshold)}, ${formatBytes(under)} under;`
+        + ` hard-reject threshold ${formatBytes(hardLimit)}${rejecting ? ", REACHED — write ops now rejected" : ""}).`
+    );
+    if (rejecting) {
+        setWritesRejectedReason(
+            `Storage server is out of disk space: only ${formatBytes(free)} free on ${folder}`
+            + ` (hard-reject threshold ${formatBytes(hardLimit)}, warn threshold ${formatBytes(threshold)}).`
+            + ` Write operations (create/append/new bucket) are rejected; reads, findInfo, and deletes still work — please free space.`
+        );
+    } else {
+        setWritesRejectedReason(undefined);
+    }
+}
+
+// Full path to the grantAccess CLI bootstrap that lives next to this file. The SSH command shown on
+// the access page invokes it via `node <path> ...` (found through __dirname so consumers don't have
+// to know where our source lives).
+function getGrantAccessCliPath(): string {
+    return path.join(__dirname, "grantAccess.js");
+}
+
 export async function hostStorageServer(config: HostStorageServerConfig): Promise<void> {
     let { domain, port, folder } = config;
+    let lowSpaceThreshold = config.lowSpaceThresholdBytes ?? DEFAULT_LOW_SPACE_THRESHOLD_BYTES;
     let root = await getFileStorageNested2(path.resolve(folder));
     let system = await root.folder.getStorage("system");
     let trust = new JSONStorage<TrustRecord>(new TransactionStorage(await system.folder.getStorage("trust"), "storageTrust"));
@@ -58,7 +91,7 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
         port,
         rootDomain: domain.split(".").slice(-2).join("."),
         sshTarget: `${os.userInfo().username}@${await getExternalIP()}`,
-        serverCommand: getServerCommand(`--domain ${domain} --port ${port}`),
+        serverCommand: `node ${getGrantAccessCliPath()} --domain ${domain} --port ${port}`,
         blobStore: new BlobStore(path.resolve(folder)),
         trust,
         requests,
@@ -69,12 +102,21 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     SocketFunction.expose(RequireController);
     SocketFunction.expose(RemoteStorageController);
     // No static roots, so the access page HTML is served at every path (the path is the account
-    // name, see accessPage.tsx)
+    // name, see accessPage.tsx).
     // A full URL, so the page resolves modules from the origin root even when served at
-    // /accountName (a relative require would resolve inside the account path)
+    // /accountName (a relative require would resolve inside the account path).
     SocketFunction.setDefaultHTTPCall(RequireController, "requireHTML", {
         requireCalls: [`https://${domain}:${port}/./storage/remoteStorage/accessPage.tsx`],
     });
+
+    // Initial check so a server starting under-limit immediately rejects writes; then keep checking
+    // every 15 minutes so recovery (freed disk space) is picked up automatically.
+    await checkDiskSpace({ folder, threshold: lowSpaceThreshold });
+    let interval = setInterval(() => {
+        void checkDiskSpace({ folder, threshold: lowSpaceThreshold })
+            .catch(e => console.error(`Disk space check failed for ${folder}:`, e));
+    }, DISK_SPACE_CHECK_INTERVAL_MS);
+    (interval as { unref?: () => void }).unref?.();
 
     await hostServer({
         domain,
@@ -82,61 +124,5 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
         cloudflareApiToken: config.cloudflareApiToken,
         cloudflareApiTokenPath: config.cloudflareApiTokenPath,
         setDNSRecord: true,
-    });
-}
-
-// Admin: grants an access request by requestId. Must be run on the storage machine itself (the CLI
-// entry below authenticates with this machine's certs.ts identity, which is what the server trusts
-// as admin).
-export async function grantAccessRequest(config: { domain: string; port: number; requestId: string }): Promise<TrustRecord> {
-    let nodeId = SocketFunction.connect({ address: config.domain, port: config.port });
-    await authenticateStorage({ address: config.domain, port: config.port, nodeId });
-    return await RemoteStorageController.nodes[nodeId].adminGrantAccess(config.requestId);
-}
-
-function getArg(name: string): string | undefined {
-    let index = process.argv.indexOf(`--${name}`);
-    if (index < 0) return undefined;
-    let value = process.argv[index + 1];
-    if (!value || value.startsWith("--")) {
-        throw new Error(`Missing value for --${name}`);
-    }
-    return value;
-}
-
-async function cliMain() {
-    let domain = getArg("domain");
-    if (!domain) throw new Error(`--domain is required (ex: --domain storage.example.com)`);
-    let port = +(getArg("port") || 443);
-
-    let grantAccessArg = getArg("grantAccess");
-    if (grantAccessArg) {
-        let record = await grantAccessRequest({ domain, port, requestId: grantAccessArg });
-        console.log(`Granted machine ${record.machineId} access to account ${JSON.stringify(record.account)}`);
-        process.exit(0);
-    }
-
-    let folder = getArg("folder");
-    if (!folder) throw new Error(`--folder is required (where the storage server keeps its data)`);
-    let cloudflareApiTokenPath = getArg("cloudflareApiTokenPath");
-    if (!cloudflareApiTokenPath) throw new Error(`--cloudflareApiTokenPath is required (path to a Cloudflare API token file, for HTTPS certs)`);
-
-    await hostStorageServer({ domain, port, folder, cloudflareApiTokenPath });
-    console.log(`Storage server running at https://${domain}:${port}`);
-}
-
-// Only run the CLI when this file is invoked directly (typenode storageServer.ts ...), not when a
-// consumer imports us as a library.
-if (require.main === module) {
-    process.env.NODE_ENV = "production";
-    process.on("unhandledRejection", (error) => {
-        console.error("Unhandled promise rejection:", error);
-    });
-    process.on("uncaughtException", (error) => {
-        console.error("Uncaught exception:", error);
-    });
-    cliMain().catch(e => {
-        console.error(e);
-        process.exit(1);
     });
 }

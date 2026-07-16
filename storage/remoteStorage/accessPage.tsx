@@ -139,7 +139,7 @@ class AccessPage extends preact.Component {
             {state && !state.hasAccess && <div className={css.vbox(8)}>
                 <div>This machine ({state.machineId}, ip {state.ip}) does NOT have access yet.</div>
                 <div>An access request has been made. To grant it, run this command:</div>
-                <CopyableCommand command={state.grantAccessCommand || state.listAccessCommand} />
+                {state.grantAccessCommand && <CopyableCommand command={state.grantAccessCommand} />}
                 <div>This page rechecks every {REFRESH_INTERVAL / 1000} seconds.</div>
             </div>}
             {state && state.hasAccess && <div className={css.vbox(16)}>

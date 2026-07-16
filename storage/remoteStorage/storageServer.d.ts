@@ -1,4 +1,3 @@
-import { TrustRecord } from "./storageController";
 import "./accessPage";
 export type HostStorageServerConfig = {
     domain: string;
@@ -6,10 +5,6 @@ export type HostStorageServerConfig = {
     folder: string;
     cloudflareApiToken?: string;
     cloudflareApiTokenPath?: string;
+    lowSpaceThresholdBytes?: number;
 };
 export declare function hostStorageServer(config: HostStorageServerConfig): Promise<void>;
-export declare function grantAccessRequest(config: {
-    domain: string;
-    port: number;
-    requestId: string;
-}): Promise<TrustRecord>;

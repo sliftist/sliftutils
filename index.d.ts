@@ -2711,6 +2711,11 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
 
 }
 
+declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
+    export {};
+
+}
+
 declare module "sliftutils/storage/remoteStorage/storageController" {
     /// <reference types="node" />
     /// <reference types="node" />
@@ -2748,7 +2753,6 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         machineId: string;
         ip: string;
         hasAccess: boolean;
-        listAccessCommand: string;
         grantAccessCommand?: string;
         trustedMachines?: TrustRecord[];
     };
@@ -2764,6 +2768,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         buckets: IStorage<BucketConfig>;
     };
     export declare function setStorageServerState(state: StorageServerState): void;
+    export declare function setWritesRejectedReason(reason: string | undefined): void;
     export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
         authenticate: (token: AuthToken) => Promise<{
             machineId: string;
@@ -2805,7 +2810,6 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
 }
 
 declare module "sliftutils/storage/remoteStorage/storageServer" {
-    import { TrustRecord } from "./storageController";
     import "./accessPage";
     export type HostStorageServerConfig = {
         domain: string;
@@ -2813,13 +2817,9 @@ declare module "sliftutils/storage/remoteStorage/storageServer" {
         folder: string;
         cloudflareApiToken?: string;
         cloudflareApiTokenPath?: string;
+        lowSpaceThresholdBytes?: number;
     };
     export declare function hostStorageServer(config: HostStorageServerConfig): Promise<void>;
-    export declare function grantAccessRequest(config: {
-        domain: string;
-        port: number;
-        requestId: string;
-    }): Promise<TrustRecord>;
 
 }
 

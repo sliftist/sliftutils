@@ -34,7 +34,6 @@ export type AccessState = {
     machineId: string;
     ip: string;
     hasAccess: boolean;
-    listAccessCommand: string;
     grantAccessCommand?: string;
     trustedMachines?: TrustRecord[];
 };
@@ -50,6 +49,7 @@ export type StorageServerState = {
     buckets: IStorage<BucketConfig>;
 };
 export declare function setStorageServerState(state: StorageServerState): void;
+export declare function setWritesRejectedReason(reason: string | undefined): void;
 export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
     authenticate: (token: AuthToken) => Promise<{
         machineId: string;
