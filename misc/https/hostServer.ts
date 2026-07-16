@@ -21,6 +21,8 @@ export type HostServerConfig = {
     /** Full domain to host on (e.g. "testsite.example.com"). The HTTPS cert is created for this domain and *.domain, so using a subdomain never touches the root domain (beyond its _acme-challenge TXT record). */
     domain: string;
     port: number;
+
+    // TODO: Eventually we should support running without Cloudflare API tokens. It's annoying though as the user will have to create a self-signed certificate and then they'll have to go through and trust it everywhere, and a lot of the stuff is transparent, and so it'll have to be non-transparent, getting the user to go to the page that owns the domain and trust it from there. It's much better just make a Cloudflare account. You can buy a domain for $15 a year, and then you can use it for GitHub pages to host your own site and do all kinds of things just like any other real site.
     /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Required — pass { path: "./cloudflare.json" } explicitly for the on-disk file. */
     cloudflareApiToken: { key: string } | { path: string };
     /** Creates an unproxied A record pointing domain at this machine (publicIp, or our detected external IP) */
