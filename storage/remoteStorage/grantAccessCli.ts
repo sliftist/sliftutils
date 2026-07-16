@@ -1,20 +1,11 @@
 import { SocketFunction } from "socket-function/SocketFunction";
 import { RemoteStorageController } from "./storageController";
 import { authenticateStorage, parseStorageUrl } from "./ArchivesRemote";
+import { getArg } from "./cliArgs";
 
 // The grantAccess CLI. Invoked via the sibling grantAccess.js bootstrap (which loads typenode and
 // then requires this file). Grants a specific access request by its requestId; must be run on the
 // storage machine itself (its certs.ts identity is what the server trusts as admin).
-
-function getArg(name: string): string | undefined {
-    let index = process.argv.indexOf(`--${name}`);
-    if (index < 0) return undefined;
-    let value = process.argv[index + 1];
-    if (!value || value.startsWith("--")) {
-        throw new Error(`Missing value for --${name}`);
-    }
-    return value;
-}
 
 async function main() {
     let url = getArg("url");

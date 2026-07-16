@@ -7,10 +7,10 @@ import { hostServer } from "../misc/https/hostServer";
 // Import browser code, so it is allowed to be required by the client
 import "./browser";
 
-// Static test site for the remote storage system (storage/remoteStorage). The browser talks to
+// Static example site for the remote storage system (storage/remoteStorage). The browser talks to
 // the storage server directly, so this server only serves the page.
 
-const DOMAIN = "stest.vidgridweb.com";
+const DOMAIN = "sexample.vidgridweb.com";
 const PORT = 4445;
 
 process.on("unhandledRejection", (error) => {
@@ -24,7 +24,7 @@ async function main() {
     RequireController.allowAllNodeModules();
     SocketFunction.expose(RequireController);
     SocketFunction.setDefaultHTTPCall(RequireController, "requireHTML", {
-        requireCalls: ["./teststorage/browser.tsx"],
+        requireCalls: ["./examplestorage/browser.tsx"],
     });
     RequireController.addStaticRoot(path.resolve("."));
 
@@ -34,7 +34,7 @@ async function main() {
         cloudflareApiToken: { path: os.homedir() + "/vidgridweb.com.key" },
         setDNSRecord: true,
     });
-    console.log(`Storage test site running at https://${DOMAIN}:${PORT}`);
+    console.log(`Storage example site running at https://${DOMAIN}:${PORT}`);
 }
 
 main().catch(e => {

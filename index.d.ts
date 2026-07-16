@@ -2726,6 +2726,11 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
 
 }
 
+declare module "sliftutils/storage/remoteStorage/cliArgs" {
+    export declare function getArg(name: string): string | undefined;
+
+}
+
 declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
     export {};
 
@@ -2838,6 +2843,11 @@ declare module "sliftutils/storage/remoteStorage/storageServer" {
         lowSpaceThresholdBytes?: number;
     };
     export declare function hostStorageServer(config: HostStorageServerConfig): Promise<void>;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storageServerCli" {
+    export {};
 
 }
 

@@ -33,6 +33,7 @@
     "bin": {
         "filehoster": "./bin/filehoster.js",
         "autohost": "./bin/autohost.js",
+        "storageserver": "./bin/storageserver.js",
         "build-nodejs": "./builders/nodeJSBuildRun.js",
         "buildnodejs": "./builders/nodeJSBuildRun.js",
         "build-extension": "./builders/extensionBuildRun.js",

@@ -13,15 +13,15 @@ import { createArchivesRemoteFactory } from "../storage/remoteStorage/ArchivesRe
 import { ArchiveFileInfo } from "../storage/IArchives";
 
 const STORAGE_URL = "https://storage.vidgridweb.com:4444/storagerouting.json";
-const ACCOUNT = "test";
-const BUCKET = "testfiles";
+const ACCOUNT = "example";
+const BUCKET = "examplefiles";
 const ACCESS_CHECK_INTERVAL = 1000 * 15;
 
 const archives = createArchivesRemoteFactory({ url: STORAGE_URL, account: ACCOUNT })
     .getBucket({ bucketName: BUCKET });
 
 @observer
-class TestStoragePage extends preact.Component {
+class ExampleStoragePage extends preact.Component {
     synced = observable({
         files: [] as ArchiveFileInfo[],
         loaded: false,
@@ -85,7 +85,7 @@ class TestStoragePage extends preact.Component {
     render() {
         let synced = this.synced;
         return <div className={css.vbox(12).pad2(16)}>
-            <div>Storage test site. Account {ACCOUNT}, bucket {BUCKET} on {STORAGE_URL}</div>
+            <div>Storage example site. Account {ACCOUNT}, bucket {BUCKET} on {STORAGE_URL}</div>
             {synced.error && <div className={errorMessage}>{synced.error}</div>}
             {!synced.loaded && !synced.access && <div>Loading files...</div>}
             {!synced.loaded && synced.access && <div className={css.vbox(8)}>
@@ -139,7 +139,7 @@ class TestStoragePage extends preact.Component {
 
 async function main() {
     if (isNode()) return;
-    preact.render(<TestStoragePage />, document.body);
+    preact.render(<ExampleStoragePage />, document.body);
 }
 
 main().catch(console.error);

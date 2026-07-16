@@ -24,8 +24,8 @@ const DISK_SPACE_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 const HARD_REJECT_FRACTION = 0.1;
 
 // The remote storage server, as a library function: consumers call hostStorageServer() from their
-// own process to start hosting. The only CLI we ship is grantAccess.js (next to this file), which
-// is what the access page's shown SSH command points at.
+// own process to start hosting (or use the storageserver bin, see storageServerCli.ts). The
+// grantAccess.js bootstrap (next to this file) is what the access page's shown SSH command points at.
 
 export type HostStorageServerConfig = {
     // Full URL of this storage server, e.g. "https://storage.example.com:4444/storagerouting.json".
