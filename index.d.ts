@@ -2746,9 +2746,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         hasAccess: boolean;
         listAccessCommand: string;
         grantAccessCommand?: string;
-        machines?: (AccessRequest & {
-            trusted: boolean;
-        })[];
+        trustedMachines?: TrustRecord[];
     };
     export type StorageServerState = {
         domain: string;
@@ -2774,6 +2772,8 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             grantAccessCommand: string;
         }>;
         getAccessState: (account: string) => Promise<AccessState>;
+        listRequestsForIP: (account: string, ip: string) => Promise<AccessRequest[]>;
+        grantAccess: (requestId: string) => Promise<TrustRecord>;
         adminListRequests: (ip: string) => Promise<AccessRequest[]>;
         adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
         ensureBucket: (account: string, bucketName: string, config: BucketConfig) => Promise<void>;
