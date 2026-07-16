@@ -18,10 +18,10 @@ import {
 const ACCESS_RETRY_DELAY = 1000 * 30;
 const LARGE_FILE_PART_SIZE = 8 * 1024 * 1024;
 
-export type ArchivesRemoteConfig = {
-    address: string;
-    port: number;
-    account: string;
+// The storage server is addressed by a single URL (e.g. https://storage.example.com:4444/storagerouting.json)
+// that is shared server-side and client-side. Address and port are extracted from it; the path is
+// reserved for the routing config (handled separately).
+export type ArchivesRemoteBucketConfig = {
     bucketName: string;
     // Public buckets are served over plain HTTPS GETs (getURL). Private buckets are API-access only.
     public?: boolean;
@@ -31,10 +31,23 @@ export type ArchivesRemoteConfig = {
     fast?: boolean;
     writeDelay?: number;
 };
+export type ArchivesRemoteConfig = ArchivesRemoteBucketConfig & {
+    url: string;
+    account: string;
+};
 
-export function buildPublicFileURL(config: { address: string; port: number; account: string; bucketName: string; path: string }): string {
+export function parseStorageUrl(url: string): { address: string; port: number } {
+    let u = new URL(url);
+    if (u.protocol !== "https:") {
+        throw new Error(`Storage URL must use https, got ${JSON.stringify(u.protocol)} in ${JSON.stringify(url)}`);
+    }
+    return { address: u.hostname, port: +u.port || 443 };
+}
+
+export function buildPublicFileURL(config: { url: string; account: string; bucketName: string; path: string }): string {
+    let { address, port } = parseStorageUrl(config.url);
     let args = encodeURIComponent(JSON.stringify([config.account, config.bucketName, config.path]));
-    return `https://${config.address}:${config.port}/?classGuid=${REMOTE_STORAGE_CLASS_GUID}&functionName=getPublicFile&args=${args}`;
+    return `https://${address}:${port}/?classGuid=${REMOTE_STORAGE_CLASS_GUID}&functionName=getPublicFile&args=${args}`;
 }
 
 // Authenticates a connection to a storage server with this machine's certs.ts identity
@@ -54,6 +67,18 @@ export async function authenticateStorage(config: { address: string; port: numbe
     return await RemoteStorageController.nodes[config.nodeId].authenticate({ certPem: ca.cert.toString(), time, signature });
 }
 
+// Groups url + account so callers only pass bucket-specific config per bucket, rather than
+// repeating the connection details for every bucket they need.
+export class ArchivesRemoteFactory {
+    constructor(private config: { url: string; account: string }) { }
+    public getBucket(bucket: ArchivesRemoteBucketConfig): ArchivesRemote {
+        return new ArchivesRemote({ url: this.config.url, account: this.config.account, ...bucket });
+    }
+}
+export function createArchivesRemoteFactory(config: { url: string; account: string }): ArchivesRemoteFactory {
+    return new ArchivesRemoteFactory(config);
+}
+
 export class ArchivesRemote implements IArchives {
     constructor(private config: ArchivesRemoteConfig) {
         // hostServer nodeIds are machine-specific, so connections by domain must target "any
@@ -61,17 +86,18 @@ export class ArchivesRemote implements IArchives {
         SocketFunction.ENABLE_CLIENT_MODE = true;
     }
 
-    private nodeId = SocketFunction.connect({ address: this.config.address, port: this.config.port });
+    private parsed = parseStorageUrl(this.config.url);
+    private nodeId = SocketFunction.connect({ address: this.parsed.address, port: this.parsed.port });
     private controller = RemoteStorageController.nodes[this.nodeId];
     private setupDone = false;
     private lastDeniedLog = 0;
 
     public getDebugName() {
-        return `remoteStorage/${this.config.address}:${this.config.port}/${this.config.account}/${this.config.bucketName}`;
+        return `remoteStorage/${this.parsed.address}:${this.parsed.port}/${this.config.account}/${this.config.bucketName}`;
     }
 
     private async authenticate(): Promise<void> {
-        await authenticateStorage({ address: this.config.address, port: this.config.port, nodeId: this.nodeId });
+        await authenticateStorage({ address: this.parsed.address, port: this.parsed.port, nodeId: this.nodeId });
     }
 
     // Runs a call, authenticating (and re-authenticating after reconnects) as needed. Unlike
@@ -94,7 +120,7 @@ export class ArchivesRemote implements IArchives {
         if (state.hasAccess) return undefined;
         let requested = await this.callAuthed(() => this.controller.requestAccess(this.config.account));
         return {
-            link: `https://${this.config.address}:${this.config.port}/${this.config.account}`,
+            link: `https://${this.parsed.address}:${this.parsed.port}/${this.config.account}`,
             machineId: requested.machineId,
             ip: requested.ip,
         };
@@ -104,7 +130,7 @@ export class ArchivesRemote implements IArchives {
         let requested = await this.callAuthed(() => this.controller.requestAccess(this.config.account));
         if (Date.now() - this.lastDeniedLog > timeInMinute) {
             this.lastDeniedLog = Date.now();
-            console.log(`No access to storage account ${JSON.stringify(this.config.account)} on ${this.config.address}:${this.config.port} (our machine ${requested.machineId}, ip ${requested.ip}). Waiting for access to be granted. See https://${this.config.address}:${this.config.port}/${this.config.account} - or grant it with: ${requested.grantAccessCommand}`);
+            console.log(`No access to storage account ${JSON.stringify(this.config.account)} on ${this.parsed.address}:${this.parsed.port} (our machine ${requested.machineId}, ip ${requested.ip}). Waiting for access to be granted. See https://${this.parsed.address}:${this.parsed.port}/${this.config.account} - or grant it with: ${requested.grantAccessCommand}`);
         }
         await delay(ACCESS_RETRY_DELAY);
     }
@@ -190,8 +216,7 @@ export class ArchivesRemote implements IArchives {
             throw new Error(`getURL only works on public buckets (private buckets are API-access only). Bucket: ${this.getDebugName()}`);
         }
         return buildPublicFileURL({
-            address: this.config.address,
-            port: this.config.port,
+            url: this.config.url,
             account: this.config.account,
             bucketName: this.config.bucketName,
             path,

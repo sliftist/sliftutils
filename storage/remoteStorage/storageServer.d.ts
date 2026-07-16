@@ -1,7 +1,6 @@
 import "./accessPage";
 export type HostStorageServerConfig = {
-    domain: string;
-    port: number;
+    url: string;
     folder: string;
     cloudflareApiToken: {
         key: string;

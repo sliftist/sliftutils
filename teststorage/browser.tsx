@@ -9,21 +9,16 @@ import { formatNumber, formatDateTime } from "socket-function/src/formatting/for
 import { css } from "typesafecss";
 import { InputLabel } from "../render-utils/InputLabel";
 import { redButton, greenButton, errorMessage } from "../render-utils/colors";
-import { ArchivesRemote } from "../storage/remoteStorage/ArchivesRemote";
+import { createArchivesRemoteFactory } from "../storage/remoteStorage/ArchivesRemote";
 import { ArchiveFileInfo } from "../storage/IArchives";
 
-const STORAGE_ADDRESS = "storage.vidgridweb.com";
-const STORAGE_PORT = 4444;
+const STORAGE_URL = "https://storage.vidgridweb.com:4444/storagerouting.json";
 const ACCOUNT = "test";
 const BUCKET = "testfiles";
 const ACCESS_CHECK_INTERVAL = 1000 * 15;
 
-const archives = new ArchivesRemote({
-    address: STORAGE_ADDRESS,
-    port: STORAGE_PORT,
-    account: ACCOUNT,
-    bucketName: BUCKET,
-});
+const archives = createArchivesRemoteFactory({ url: STORAGE_URL, account: ACCOUNT })
+    .getBucket({ bucketName: BUCKET });
 
 @observer
 class TestStoragePage extends preact.Component {
@@ -90,7 +85,7 @@ class TestStoragePage extends preact.Component {
     render() {
         let synced = this.synced;
         return <div className={css.vbox(12).pad2(16)}>
-            <div>Storage test site. Account {ACCOUNT}, bucket {BUCKET} on {STORAGE_ADDRESS}:{STORAGE_PORT}</div>
+            <div>Storage test site. Account {ACCOUNT}, bucket {BUCKET} on {STORAGE_URL}</div>
             {synced.error && <div className={errorMessage}>{synced.error}</div>}
             {!synced.loaded && !synced.access && <div>Loading files...</div>}
             {!synced.loaded && synced.access && <div className={css.vbox(8)}>

@@ -1,18 +1,22 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { IArchives, ArchiveFileInfo } from "../IArchives";
-export type ArchivesRemoteConfig = {
-    address: string;
-    port: number;
-    account: string;
+export type ArchivesRemoteBucketConfig = {
     bucketName: string;
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
 };
-export declare function buildPublicFileURL(config: {
+export type ArchivesRemoteConfig = ArchivesRemoteBucketConfig & {
+    url: string;
+    account: string;
+};
+export declare function parseStorageUrl(url: string): {
     address: string;
     port: number;
+};
+export declare function buildPublicFileURL(config: {
+    url: string;
     account: string;
     bucketName: string;
     path: string;
@@ -25,9 +29,22 @@ export declare function authenticateStorage(config: {
     machineId: string;
     ip: string;
 }>;
+export declare class ArchivesRemoteFactory {
+    private config;
+    constructor(config: {
+        url: string;
+        account: string;
+    });
+    getBucket(bucket: ArchivesRemoteBucketConfig): ArchivesRemote;
+}
+export declare function createArchivesRemoteFactory(config: {
+    url: string;
+    account: string;
+}): ArchivesRemoteFactory;
 export declare class ArchivesRemote implements IArchives {
     private config;
     constructor(config: ArchivesRemoteConfig);
+    private parsed;
     private nodeId;
     private controller;
     private setupDone;

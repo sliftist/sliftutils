@@ -13,6 +13,7 @@ import {
     RemoteStorageController, setStorageServerState, setWritesRejectedReason,
     AccessRequest, TrustRecord, BucketConfig,
 } from "./storageController";
+import { parseStorageUrl } from "./ArchivesRemote";
 // Import browser code, so it is allowed to be required by the client
 import "./accessPage";
 
@@ -27,8 +28,10 @@ const HARD_REJECT_FRACTION = 0.1;
 // is what the access page's shown SSH command points at.
 
 export type HostStorageServerConfig = {
-    domain: string;
-    port: number;
+    // Full URL of this storage server, e.g. "https://storage.example.com:4444/storagerouting.json".
+    // The domain and port are extracted from it; the path is reserved for the routing config
+    // (handled elsewhere). The exact same URL is what clients pass to createArchivesRemoteFactory.
+    url: string;
     folder: string;
     // Set hostServer.ts:HostServerConfig:cloudflareApiToken
     cloudflareApiToken: { key: string } | { path: string };
@@ -78,7 +81,8 @@ function getGrantAccessCliPath(): string {
 }
 
 export async function hostStorageServer(config: HostStorageServerConfig): Promise<void> {
-    let { domain, port, folder } = config;
+    let { url, folder } = config;
+    let { address: domain, port } = parseStorageUrl(url);
     let lowSpaceThreshold = config.lowSpaceThresholdBytes ?? DEFAULT_LOW_SPACE_THRESHOLD_BYTES;
     let root = await getFileStorageNested2(path.resolve(folder));
     let system = await root.folder.getStorage("system");
@@ -91,7 +95,7 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
         port,
         rootDomain: domain.split(".").slice(-2).join("."),
         sshTarget: `${os.userInfo().username}@${await getExternalIP()}`,
-        serverCommand: `node ${getGrantAccessCliPath()} --domain ${domain} --port ${port}`,
+        serverCommand: `node ${getGrantAccessCliPath()} --url ${url}`,
         blobStore: new BlobStore(path.resolve(folder)),
         trust,
         requests,
