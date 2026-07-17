@@ -55,6 +55,7 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
 
     let nodeId = await SocketFunction.mount({
         public: true,
+        autoForwardPort: true,
         port,
         ...getThreadKeyCert(rootDomain),
         SNICerts: {

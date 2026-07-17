@@ -22,7 +22,7 @@ const HARD_REJECT_FRACTION = 0.1;
 // grantAccess.js bootstrap (next to this file) is what the access page's shown SSH command points at.
 
 export type HostStorageServerConfig = {
-    // Full URL of this storage server, e.g. "https://storage.example.com:4444/storagerouting.json".
+    // Full URL of this storage server, e.g. "https://storage.example.com:4444".
     // The domain and port are extracted from it; the path is reserved for the routing config
     // (handled elsewhere). The exact same URL is what clients pass to createArchivesRemoteFactory.
     url: string;

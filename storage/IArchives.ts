@@ -22,7 +22,9 @@ export type RemoteConfig = RemoteConfigBase[];
         https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
         - These map to { url }, with the type inferred from the url
 
-    NOTE: If only a URL is provided. 
+    NOTE: If we do not have right access to these, then it becomes a read-only IArchives, where we solely read using the url form (which might throw due to not having access as well). UNLESS Our configuration explicitly has public: false, in which case, we don't even hit the URL and we throw on access.
+
+    NOTE: If we're in the browser, we should allow downloading the files via the URL form (if it's a public bucket), however, we won't allow writing, because their servers do not allow secure browser writes.
 */
 export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
 
