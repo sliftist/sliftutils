@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 export type ArchivesRemoteBucketConfig = {
     bucketName: string;
     public?: boolean;
@@ -66,7 +66,18 @@ export declare class ArchivesRemote implements IArchives {
             end: number;
         };
     }): Promise<Buffer | undefined>;
-    set(fileName: string, data: Buffer): Promise<void>;
+    get2(fileName: string, config?: {
+        range?: {
+            start: number;
+            end: number;
+        };
+    }): Promise<{
+        data: Buffer;
+        writeTime: number;
+    } | undefined>;
+    set(fileName: string, data: Buffer, config?: {
+        lastModified?: number;
+    }): Promise<void>;
     del(fileName: string): Promise<void>;
     getInfo(fileName: string): Promise<{
         writeTime: number;
@@ -80,6 +91,9 @@ export declare class ArchivesRemote implements IArchives {
         shallow?: boolean;
         type: "files" | "folders";
     }): Promise<string[]>;
+    getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
+    getConfig(): Promise<ArchivesConfig>;
+    getSyncStatus(): Promise<ArchivesSyncStatus>;
     setLargeFile(config: {
         path: string;
         getNextData(): Promise<Buffer | undefined>;

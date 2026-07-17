@@ -9,7 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest } from "socket-function/src/https";
-import { IArchives } from "./IArchives";
+import { IArchives, ArchivesConfig, assertValidLastModified } from "./IArchives";
 
 type BackblazeCreds = {
     applicationKeyId: string;
@@ -594,7 +594,23 @@ export class ArchivesBackblaze implements IArchives {
             downloading = false;
         }
     }
-    public async set(fileName: string, data: Buffer): Promise<void> {
+    public async get2(fileName: string, config?: { range?: { start: number; end: number; } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+        // B2 downloads don't return the upload time, so this takes a second API call
+        let [data, info] = await Promise.all([this.get(fileName, config), this.getInfo(fileName)]);
+        if (!data || !info) return undefined;
+        return { data, writeTime: info.writeTime };
+    }
+    public async getConfig(): Promise<ArchivesConfig> {
+        return {};
+    }
+    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+        if (config?.lastModified) {
+            assertValidLastModified(config.lastModified);
+            let existing = await this.getInfo(fileName);
+            // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own
+            // upload time, so the exact lastModified is not preserved on the stored file.
+            if (existing && config.lastModified < existing.writeTime) return;
+        }
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
         let f = fileName;
         await this.apiRetryLogic(async (api) => {

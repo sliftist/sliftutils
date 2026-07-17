@@ -803,6 +803,75 @@ declare module "sliftutils/render-utils/observer" {
 
 }
 
+declare module "sliftutils/storage/ArchivesDisk" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IArchives, ArchiveFileInfo, ArchivesConfig } from "./IArchives";
+    export declare class ArchivesDisk implements IArchives {
+        private folder;
+        constructor(folder: string);
+        private filesDir;
+        private uploadsDir;
+        private handles;
+        private largeUploads;
+        private nextLargeUploadId;
+        init: {
+            (): Promise<void>;
+            reset(): void;
+            set(newValue: Promise<void>): void;
+        };
+        getDebugName(): string;
+        getConfig(): Promise<ArchivesConfig>;
+        private filePath;
+        set(key: string, data: Buffer, config?: {
+            lastModified?: number;
+        }): Promise<void>;
+        del(key: string): Promise<void>;
+        get(key: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<Buffer | undefined>;
+        get2(key: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        getInfo(key: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        find(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<string[]>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type?: "files" | "folders";
+        }): Promise<ArchiveFileInfo[]>;
+        private collectFiles;
+        setLargeFile(config: {
+            path: string;
+            getNextData(): Promise<Buffer | undefined>;
+        }): Promise<void>;
+        startLargeUpload(): Promise<string>;
+        appendLargeUpload(id: string, data: Buffer): Promise<void>;
+        finishLargeUpload(id: string, key: string): Promise<void>;
+        cancelLargeUpload(id: string): Promise<void>;
+        getURL(path: string): Promise<string>;
+    }
+    export declare function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: {
+        shallow?: boolean;
+        type?: "files" | "folders";
+    }): ArchiveFileInfo[];
+
+}
+
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
     import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing, MergeAttemptResult } from "./BulkDatabaseBase";
     export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
@@ -1979,10 +2048,38 @@ declare module "sliftutils/storage/FileFolderAPI" {
 declare module "sliftutils/storage/IArchives" {
     /// <reference types="node" />
     /// <reference types="node" />
+    export declare const MAX_LAST_MODIFIED_FUTURE: number;
+    export declare function assertValidLastModified(lastModified: number): void;
     export type ArchiveFileInfo = {
         path: string;
         createTime: number;
         size: number;
+    };
+    export type ArchivesConfig = {
+        supportsChangesAfter?: boolean;
+    };
+    export type SyncOptions = {
+        copyFiles?: boolean;
+        writeBack?: boolean;
+        cacheReads?: boolean;
+        validWindow: [number, number];
+        required?: boolean;
+    };
+    export type ArchivesSource = {
+        source: IArchives;
+        options: SyncOptions;
+    };
+    export type ArchivesSyncSourceStatus = {
+        debugName: string;
+        options: SyncOptions;
+        supportsChangesAfter: boolean;
+        initialScanComplete: boolean;
+        scannedCount: number;
+    };
+    export type ArchivesSyncStatus = {
+        allScansComplete: boolean;
+        indexSize: number;
+        sources: ArchivesSyncSourceStatus[];
     };
     export interface IArchives {
         getDebugName(): string;
@@ -1992,7 +2089,24 @@ declare module "sliftutils/storage/IArchives" {
                 end: number;
             };
         }): Promise<Buffer | undefined>;
-        set(fileName: string, data: Buffer): Promise<void>;
+        /** Like get, but also returns the last-write time of the file. get just calls get2. */
+        get2(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        /**
+         * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
+         * the file's current last-write time the write no-ops (so delayed / synchronized writes can
+         * never clobber newer data). Times more than 15 minutes in the future are rejected.
+         */
+        set(fileName: string, data: Buffer, config?: {
+            lastModified?: number;
+        }): Promise<void>;
         del(fileName: string): Promise<void>;
         /** Streams a file too large to hold in memory. getNextData returns undefined when done. */
         setLargeFile(config: {
@@ -2014,6 +2128,15 @@ declare module "sliftutils/storage/IArchives" {
         }): Promise<ArchiveFileInfo[]>;
         /** Only works for public buckets (private buckets are API-access only). */
         getURL(path: string): Promise<string>;
+        /** The bucket's configuration, which tells whether the optional functions are supported. */
+        getConfig(): Promise<ArchivesConfig>;
+        /**
+         * All files changed after the given time. Only exists when getConfig().supportsChangesAfter;
+         * backed by an index, so it is fast (unlike a full findInfo scan). Deletions are not reported.
+         */
+        getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
+        /** Synchronization introspection, for backends that synchronize from sources (see BlobStore). */
+        getSyncStatus?(): Promise<ArchivesSyncStatus>;
     }
 
 }
@@ -2274,7 +2397,7 @@ declare module "sliftutils/storage/TransactionStorage" {
 declare module "sliftutils/storage/backblaze" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives } from "./IArchives";
+    import { IArchives, ArchivesConfig } from "./IArchives";
     export declare class ArchivesBackblaze implements IArchives {
         private config;
         constructor(config: {
@@ -2299,7 +2422,19 @@ declare module "sliftutils/storage/backblaze" {
             };
             retryCount?: number;
         }): Promise<Buffer | undefined>;
-        set(fileName: string, data: Buffer): Promise<void>;
+        get2(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        getConfig(): Promise<ArchivesConfig>;
+        set(fileName: string, data: Buffer, config?: {
+            lastModified?: number;
+        }): Promise<void>;
         del(fileName: string): Promise<void>;
         setLargeFile(config: {
             path: string;
@@ -2582,7 +2717,7 @@ declare module "sliftutils/storage/remoteFileStorage" {
 declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
     export type ArchivesRemoteBucketConfig = {
         bucketName: string;
         public?: boolean;
@@ -2648,7 +2783,18 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
                 end: number;
             };
         }): Promise<Buffer | undefined>;
-        set(fileName: string, data: Buffer): Promise<void>;
+        get2(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        set(fileName: string, data: Buffer, config?: {
+            lastModified?: number;
+        }): Promise<void>;
         del(fileName: string): Promise<void>;
         getInfo(fileName: string): Promise<{
             writeTime: number;
@@ -2662,6 +2808,9 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
             shallow?: boolean;
             type: "files" | "folders";
         }): Promise<string[]>;
+        getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
+        getConfig(): Promise<ArchivesConfig>;
+        getSyncStatus(): Promise<ArchivesSyncStatus>;
         setLargeFile(config: {
             path: string;
             getNextData(): Promise<Buffer | undefined>;
@@ -2679,35 +2828,55 @@ declare module "sliftutils/storage/remoteStorage/accessPage" {
 declare module "sliftutils/storage/remoteStorage/blobStore" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { ArchiveFileInfo } from "../IArchives";
+    import { ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus } from "../IArchives";
     export declare const DEFAULT_FAST_WRITE_DELAY: number;
     export type WriteConfig = {
         fast?: boolean;
         writeDelay?: number;
+        lastModified?: number;
     };
     export declare class BlobStore {
         private folder;
-        constructor(folder: string);
-        private filesDir;
-        private uploadsDir;
-        private handles;
+        private sources;
+        constructor(folder: string, sources: ArchivesSource[]);
+        private index;
+        private mem;
+        private dirty;
         private overlay;
-        private largeUploads;
-        private nextLargeUploadId;
+        private sourceStates;
         init: {
             (): Promise<void>;
             reset(): void;
             set(newValue: Promise<void>): void;
         };
-        private filePath;
-        set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
-        private writeToDisk;
-        del(key: string, config?: WriteConfig): Promise<void>;
-        private deleteFromDisk;
+        private loadIndex;
+        private setIndexEntry;
+        private deleteIndexEntry;
+        private flushIndex;
+        private runSourceSync;
+        private scanSource;
+        private applyScanned;
+        private pollChanges;
+        private copySourceFiles;
+        private waitForRequiredScans;
+        private checkMissingKey;
+        private getIndexEntry;
         get(key: string, range?: {
             start: number;
             end: number;
         }): Promise<Buffer | undefined>;
+        get2(key: string, range?: {
+            start: number;
+            end: number;
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        private cacheRead;
+        set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
+        private writeToSources;
+        del(key: string, config?: WriteConfig): Promise<void>;
+        private deleteFromSources;
         getInfo(key: string): Promise<{
             writeTime: number;
             size: number;
@@ -2716,7 +2885,9 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             shallow?: boolean;
             type?: "files" | "folders";
         }): Promise<ArchiveFileInfo[]>;
-        private collectFiles;
+        getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
+        getSyncStatus(): Promise<ArchivesSyncStatus>;
+        private getDiskSource;
         startLargeUpload(): Promise<string>;
         appendLargeUpload(id: string, data: Buffer): Promise<void>;
         finishLargeUpload(id: string, key: string): Promise<void>;
@@ -2739,7 +2910,7 @@ declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
 declare module "sliftutils/storage/remoteStorage/storageController" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { ArchiveFileInfo } from "../IArchives";
+    import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
     import type { BlobStore } from "./blobStore";
     import type { IStorage } from "../IStorage";
     export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
@@ -2811,7 +2982,14 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             start: number;
             end: number;
         }) => Promise<Buffer | undefined>;
-        set: (account: string, bucketName: string, path: string, data: Buffer) => Promise<void>;
+        get2: (account: string, bucketName: string, path: string, range?: {
+            start: number;
+            end: number;
+        }) => Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number) => Promise<void>;
         del: (account: string, bucketName: string, path: string) => Promise<void>;
         getInfo: (account: string, bucketName: string, path: string) => Promise<{
             writeTime: number;
@@ -2821,6 +2999,8 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             shallow?: boolean;
             type?: "files" | "folders";
         }) => Promise<ArchiveFileInfo[]>;
+        getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
+        getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
         startLargeFile: (account: string, bucketName: string, path: string) => Promise<string>;
         uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
         finishLargeFile: (uploadId: string) => Promise<void>;

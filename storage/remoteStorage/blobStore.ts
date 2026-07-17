@@ -1,25 +1,44 @@
-import fs from "fs";
 import path from "path";
 import { lazy } from "socket-function/src/caching";
-import { runInfinitePoll } from "socket-function/src/batching";
-import { timeInMinute, sort, binarySearchBasic } from "socket-function/src/misc";
-import { ArchiveFileInfo } from "../IArchives";
+import { runInfinitePoll, delay } from "socket-function/src/batching";
+import { timeInMinute, sort, promiseObj } from "socket-function/src/misc";
+import {
+    IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, assertValidLastModified,
+} from "../IArchives";
+import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
+import { BulkDatabaseBase, noopReactiveDeps } from "../BulkDatabase2/BulkDatabaseBase";
+import { wrapHandle, NodeJSDirectoryHandleWrapper, DirectoryWrapper } from "../FileFolderAPI";
 
-// Disk engine for the remote storage server. Storage is one-to-one with the file system: every
-// key is exactly one file on disk (under files/), so the file system itself is the index. File
-// handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a
-// file run in serial, so they can't collide with each other or with handle closing.
+// The storage engine of the remote storage server. Data lives in synchronization sources (at
+// minimum an ArchivesDisk, the local disk); BlobStore keeps an index of every file (path, last
+// modified time, size, and which source currently holds the data) in a BulkDatabase2, and
+// synchronizes the index from all sources (see ArchivesSource / SyncOptions in IArchives.ts).
+// Every startup fully rescans each source's metadata, so the index self-heals; the file with the
+// highest write time wins across all sources, so multiple sources need no stacking order.
 
 export const DEFAULT_FAST_WRITE_DELAY = timeInMinute * 5;
 const FAST_FLUSH_POLL = 1000 * 15;
-const HANDLE_IDLE_TIMEOUT = 1000 * 60;
-const HANDLE_SWEEP_INTERVAL = 1000 * 15;
+// Index changes are buffered in memory and written to the BulkDatabase2 in batches
+const INDEX_FLUSH_INTERVAL = 1000 * 30;
+// Sources that support getChangesAfter are polled this often
+const CHANGES_POLL_INTERVAL = 1000 * 60;
+// Sources that don't support getChangesAfter get a full metadata rescan this often
+const FULL_RESCAN_INTERVAL = 1000 * 60 * 60;
+// On a request for a file the index doesn't know, changes-after sources are re-polled, at most
+// this often
+const MISS_CHECK_INTERVAL = 1000 * 5;
+// Change polls re-request this much overlap, so clock skew between us and a source can't drop changes
+const CHANGES_POLL_OVERLAP = timeInMinute;
+const SCAN_RETRY_DELAY = 1000 * 30;
 
 export type WriteConfig = {
-    // Resolve once the write is in memory; flush to disk after writeDelay, coalescing writes to
-    // the same key (only the latest is written). Data is lost if the process crashes first.
+    // Resolve once the write is in memory; flush to the sources after writeDelay, coalescing
+    // writes to the same key (only the latest is written). Data is lost if the process crashes first.
     fast?: boolean;
     writeDelay?: number;
+    // Stamps the write with this last-write time instead of now. Older than the current file's
+    // time no-ops; more than 15 minutes in the future throws. See IArchives.set.
+    lastModified?: number;
 };
 
 type OverlayEntry = {
@@ -29,149 +48,339 @@ type OverlayEntry = {
     flushAt: number;
 };
 
-type HandleEntry = {
-    filePath: string;
-    handle: fs.promises.FileHandle;
-    lastUse: number;
+// One row of the BulkDatabase2 index (key is the file path)
+type BlobIndexEntry = {
+    key: string;
+    writeTime: number;
+    size: number;
+    // Which synchronization source currently holds the data (an index into the sources array)
+    source: number;
+};
+type IndexEntry = {
+    writeTime: number;
+    size: number;
+    source: number;
+    // When WE last changed this entry (not the file's write time) — what getChangesAfter filters
+    // on, so late-arriving files with old write times are still reported as changes
+    changedAt: number;
 };
 
-// Caches open file handles, closing them once idle for HANDLE_IDLE_TIMEOUT. Instead of one
-// setTimeout per handle, a list sorted by last use is swept periodically (entries are moved via
-// binary search on access, and lastUse values only increase, so touched entries append at the
-// end). Also serializes operations per file: each operation only starts once the previous one on
-// the same file finished, and a handle is never closed while an operation is pending on it.
-class FileHandleCache {
-    private entries = new Map<string, HandleEntry>();
-    // Sorted by lastUse ascending (least recently used first)
-    private lru: HandleEntry[] = [];
-    private pending = new Map<string, Promise<void>>();
-
-    constructor() {
-        runInfinitePoll(HANDLE_SWEEP_INTERVAL, () => this.sweep());
-    }
-
-    // Runs fnc after every previously scheduled operation on filePath has finished
-    public run<T>(filePath: string, fnc: () => Promise<T>): Promise<T> {
-        let prev = this.pending.get(filePath) || Promise.resolve();
-        let result = prev.then(fnc);
-        // The pending chain must never reject, or one failed operation would poison all later ones
-        let last = result.then(() => { }, () => { });
-        this.pending.set(filePath, last);
-        void last.then(() => {
-            // If we're still the last pending operation on this file, clear ourselves
-            if (this.pending.get(filePath) === last) {
-                this.pending.delete(filePath);
-            }
-        });
-        return result;
-    }
-
-    // Only call inside run() for the same filePath (so opens can't collide with closes)
-    public async getHandle(filePath: string, flags: number): Promise<fs.promises.FileHandle> {
-        let entry = this.entries.get(filePath);
-        if (entry) {
-            this.removeFromLRU(entry);
-            entry.lastUse = Date.now();
-            this.lru.push(entry);
-            return entry.handle;
-        }
-        let handle = await fs.promises.open(filePath, flags);
-        entry = { filePath, handle, lastUse: Date.now() };
-        this.entries.set(filePath, entry);
-        this.lru.push(entry);
-        return handle;
-    }
-
-    // Only call inside run() for the same filePath
-    public async closeNow(filePath: string): Promise<void> {
-        let entry = this.entries.get(filePath);
-        if (!entry) return;
-        this.entries.delete(filePath);
-        this.removeFromLRU(entry);
-        await entry.handle.close();
-    }
-
-    private removeFromLRU(entry: HandleEntry) {
-        let index = binarySearchBasic(this.lru, x => x.lastUse, entry.lastUse);
-        if (index < 0) return;
-        // Multiple entries can share a lastUse, so scan for the exact one
-        while (index < this.lru.length && this.lru[index].lastUse === entry.lastUse) {
-            if (this.lru[index] === entry) {
-                this.lru.splice(index, 1);
-                return;
-            }
-            index++;
-        }
-    }
-
-    private async sweep(): Promise<void> {
-        let cutoff = Date.now() - HANDLE_IDLE_TIMEOUT;
-        let index = 0;
-        while (index < this.lru.length && this.lru[index].lastUse <= cutoff) {
-            let entry = this.lru[index];
-            // Can't close a handle with a pending operation; it'll be swept after it finishes
-            if (this.pending.has(entry.filePath)) {
-                index++;
-                continue;
-            }
-            this.lru.splice(index, 1);
-            this.entries.delete(entry.filePath);
-            await entry.handle.close();
-        }
-    }
-}
+type SourceState = {
+    supportsChangesAfter: boolean;
+    initialScan: ReturnType<typeof promiseObj>;
+    scanComplete: boolean;
+    // Files seen in this source's scans / change polls so far
+    scannedCount: number;
+    // Watermark for getChangesAfter polls
+    changesAfterTime: number;
+    lastMissCheck: number;
+};
 
 export class BlobStore {
-    constructor(private folder: string) { }
+    constructor(private folder: string, private sources: ArchivesSource[]) { }
 
-    private filesDir = path.join(this.folder, "files");
-    private uploadsDir = path.join(this.folder, "uploads");
-    private handles = new FileHandleCache();
+    // The index's BulkDatabase2 files live under <folder>/index
+    private index = new BulkDatabaseBase<BlobIndexEntry>("blobIndex", noopReactiveDeps, async (p: string) => {
+        let base: DirectoryWrapper = new NodeJSDirectoryHandleWrapper(path.join(this.folder, "index"));
+        for (let part of p.split("/")) {
+            if (part) base = await base.getDirectoryHandle(part, { create: true });
+        }
+        return wrapHandle(base);
+    });
+    // The in-memory copy of the index. All reads are served from it; changes are buffered in
+    // dirty and flushed to the BulkDatabase2 in batches (undefined = delete).
+    private mem = new Map<string, IndexEntry>();
+    private dirty = new Map<string, IndexEntry | undefined>();
     private overlay = new Map<string, OverlayEntry>();
-    private largeUploads = new Map<string, { tmpPath: string }>();
-    private nextLargeUploadId = 1;
+    private sourceStates = this.sources.map((): SourceState => ({
+        supportsChangesAfter: false,
+        initialScan: promiseObj(),
+        scanComplete: false,
+        scannedCount: 0,
+        changesAfterTime: 0,
+        lastMissCheck: 0,
+    }));
 
     public init = lazy(async () => {
-        await fs.promises.mkdir(this.filesDir, { recursive: true });
-        await fs.promises.mkdir(this.uploadsDir, { recursive: true });
-        // Uploads don't survive restarts (the uploader streams into them), so old ones are garbage
-        for (let file of await fs.promises.readdir(this.uploadsDir)) {
-            await fs.promises.unlink(path.join(this.uploadsDir, file));
+        await this.loadIndex();
+        for (let i = 0; i < this.sources.length; i++) {
+            void this.runSourceSync(i);
         }
         runInfinitePoll(FAST_FLUSH_POLL, () => this.flushOverlay());
+        runInfinitePoll(INDEX_FLUSH_INTERVAL, () => this.flushIndex());
     });
 
-    private filePath(key: string): string {
-        let result = path.join(this.filesDir, key);
-        if (!result.startsWith(this.filesDir + path.sep)) {
-            throw new Error(`Invalid key ${JSON.stringify(key.slice(0, 200))}, it escapes the store folder`);
+    private async loadIndex(): Promise<void> {
+        let [writeTimes, sizes, sources] = await Promise.all([
+            this.index.getColumn("writeTime"),
+            this.index.getColumn("size"),
+            this.index.getColumn("source"),
+        ]);
+        let sizeMap = new Map(sizes.map(x => [x.key, x.value]));
+        let sourceMap = new Map(sources.map(x => [x.key, x.value]));
+        for (let entry of writeTimes) {
+            let size = sizeMap.get(entry.key);
+            let source = sourceMap.get(entry.key);
+            // Explicit checks, as 0 is a valid size and a valid source number
+            if (size === undefined || source === undefined) continue;
+            this.mem.set(entry.key, { writeTime: entry.value, size, source, changedAt: entry.time });
+        }
+    }
+
+    private setIndexEntry(key: string, entry: { writeTime: number; size: number; source: number }): void {
+        let full: IndexEntry = { ...entry, changedAt: Date.now() };
+        this.mem.set(key, full);
+        this.dirty.set(key, full);
+    }
+    private deleteIndexEntry(key: string): void {
+        if (!this.mem.has(key)) return;
+        this.mem.delete(key);
+        this.dirty.set(key, undefined);
+    }
+
+    private async flushIndex(): Promise<void> {
+        if (!this.dirty.size) return;
+        let dirty = this.dirty;
+        this.dirty = new Map();
+        let writes: BlobIndexEntry[] = [];
+        let deletes: string[] = [];
+        for (let [key, entry] of dirty) {
+            if (entry) {
+                writes.push({ key, writeTime: entry.writeTime, size: entry.size, source: entry.source });
+            } else {
+                deletes.push(key);
+            }
+        }
+        if (writes.length) await this.index.writeBatch(writes);
+        if (deletes.length) await this.index.deleteBatch(deletes);
+    }
+
+    // ── synchronization ──
+
+    private async runSourceSync(sourceIndex: number): Promise<void> {
+        let { source, options } = this.sources[sourceIndex];
+        let state = this.sourceStates[sourceIndex];
+        while (true) {
+            try {
+                let config = await source.getConfig();
+                state.supportsChangesAfter = !!(config.supportsChangesAfter && source.getChangesAfter);
+                await this.scanSource(sourceIndex);
+                break;
+            } catch (e) {
+                console.error(`Initial scan of sync source ${source.getDebugName()} failed, retrying:`, e);
+                await delay(SCAN_RETRY_DELAY);
+            }
+        }
+        state.scanComplete = true;
+        state.initialScan.resolve(undefined);
+        if (options.copyFiles) {
+            try {
+                await this.copySourceFiles(sourceIndex);
+            } catch (e) {
+                console.error(`Copying files from sync source ${source.getDebugName()} failed:`, e);
+            }
+        }
+        if (state.supportsChangesAfter) {
+            runInfinitePoll(CHANGES_POLL_INTERVAL, async () => {
+                await this.pollChanges(sourceIndex);
+                if (options.copyFiles) await this.copySourceFiles(sourceIndex);
+            });
+        } else {
+            runInfinitePoll(FULL_RESCAN_INTERVAL, async () => {
+                await this.scanSource(sourceIndex);
+                if (options.copyFiles) await this.copySourceFiles(sourceIndex);
+            });
+        }
+    }
+
+    // Full metadata scan (size, writeTime, path) of one source, applied to the index
+    private async scanSource(sourceIndex: number): Promise<void> {
+        let { source } = this.sources[sourceIndex];
+        let state = this.sourceStates[sourceIndex];
+        let scanStart = Date.now();
+        let files = await source.findInfo("");
+        let seen = new Set<string>();
+        for (let file of files) {
+            seen.add(file.path);
+            this.applyScanned(sourceIndex, file);
+        }
+        state.scannedCount = files.length;
+        // Index entries this source was the holder of, but that vanished from it (e.g. deleted
+        // while we were offline), come out of the index. Entries changed after the scan started
+        // are kept — the scan listing may simply predate them.
+        for (let [key, entry] of this.mem) {
+            if (entry.source !== sourceIndex) continue;
+            if (seen.has(key)) continue;
+            if (entry.changedAt >= scanStart) continue;
+            this.deleteIndexEntry(key);
+        }
+        state.changesAfterTime = Math.max(state.changesAfterTime, scanStart - CHANGES_POLL_OVERLAP);
+    }
+
+    private applyScanned(sourceIndex: number, file: ArchiveFileInfo): void {
+        let [windowStart, windowEnd] = this.sources[sourceIndex].options.validWindow;
+        if (file.createTime < windowStart || file.createTime > windowEnd) return;
+        let existing = this.mem.get(file.path);
+        // The highest write time wins across all sources (ties keep the existing entry)
+        if (existing && file.createTime <= existing.writeTime) return;
+        this.setIndexEntry(file.path, { writeTime: file.createTime, size: file.size, source: sourceIndex });
+    }
+
+    private async pollChanges(sourceIndex: number): Promise<void> {
+        let { source } = this.sources[sourceIndex];
+        if (!source.getChangesAfter) return;
+        let state = this.sourceStates[sourceIndex];
+        let pollStart = Date.now();
+        let changes = await source.getChangesAfter(state.changesAfterTime);
+        for (let file of changes) {
+            this.applyScanned(sourceIndex, file);
+        }
+        state.scannedCount += changes.length;
+        state.changesAfterTime = pollStart - CHANGES_POLL_OVERLAP;
+    }
+
+    // Downloads the files a copyFiles source currently holds into the cacheReads sources (the
+    // local cache), preserving their modified times — so a newer local write always wins
+    private async copySourceFiles(sourceIndex: number): Promise<void> {
+        let { source } = this.sources[sourceIndex];
+        let targets: number[] = [];
+        for (let i = 0; i < this.sources.length; i++) {
+            if (i !== sourceIndex && this.sources[i].options.cacheReads) targets.push(i);
+        }
+        if (!targets.length) return;
+        for (let [key, entry] of this.mem) {
+            if (entry.source !== sourceIndex) continue;
+            let result = await source.get2(key);
+            if (!result) continue;
+            for (let target of targets) {
+                await this.sources[target].source.set(key, result.data, { lastModified: result.writeTime });
+            }
+            // Only move the entry's source if it wasn't changed while we copied
+            if (this.mem.get(key) === entry) {
+                this.setIndexEntry(key, { writeTime: result.writeTime, size: result.data.length, source: targets[0] });
+            }
+        }
+    }
+
+    // findInfo and getChangesAfter list from the index, so they must wait for the required
+    // sources' initial scans (which might lag minutes) before the listing is trustworthy
+    private async waitForRequiredScans(): Promise<void> {
+        for (let i = 0; i < this.sources.length; i++) {
+            if (!this.sources[i].options.required) continue;
+            await this.sourceStates[i].initialScan.promise;
+        }
+    }
+
+    // A requested file isn't in the index: required sources that haven't finished their initial
+    // scan are checked directly, and changes-after sources are re-polled (at most every 5 seconds)
+    private async checkMissingKey(key: string): Promise<void> {
+        for (let i = 0; i < this.sources.length; i++) {
+            let { source, options } = this.sources[i];
+            let state = this.sourceStates[i];
+            if (options.required && !state.scanComplete) {
+                let info = await source.getInfo(key);
+                if (info) {
+                    this.applyScanned(i, { path: key, createTime: info.writeTime, size: info.size });
+                }
+                continue;
+            }
+            if (state.supportsChangesAfter && Date.now() - state.lastMissCheck > MISS_CHECK_INTERVAL) {
+                state.lastMissCheck = Date.now();
+                await this.pollChanges(i);
+            }
+        }
+    }
+
+    private async getIndexEntry(key: string): Promise<IndexEntry | undefined> {
+        let entry = this.mem.get(key);
+        if (entry && this.sources[entry.source]) return entry;
+        if (entry) {
+            // The source list changed and this entry's source no longer exists; treat as missing
+            this.deleteIndexEntry(key);
+        }
+        await this.checkMissingKey(key);
+        return this.mem.get(key);
+    }
+
+    // ── data operations ──
+
+    public async get(key: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
+        let result = await this.get2(key, range);
+        return result && result.data || undefined;
+    }
+
+    public async get2(key: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+        await this.init();
+        let overlayEntry = this.overlay.get(key);
+        if (overlayEntry) {
+            if (!overlayEntry.data) return undefined;
+            let data = overlayEntry.data;
+            if (range) {
+                data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
+            }
+            return { data, writeTime: overlayEntry.t };
+        }
+        let entry = await this.getIndexEntry(key);
+        if (!entry) return undefined;
+        let { source, options } = this.sources[entry.source];
+        let result = await source.get2(key, { range });
+        if (!result) {
+            // The source no longer has it, so our index entry was stale
+            this.deleteIndexEntry(key);
+            return undefined;
+        }
+        // Ranged reads can't populate a cache (they're partial)
+        if (!options.cacheReads && !range) {
+            await this.cacheRead(key, result);
         }
         return result;
+    }
+
+    // The read didn't come from a cacheReads source, so write it into all of them (using them as
+    // caches), and the first one becomes the entry's new source
+    private async cacheRead(key: string, result: { data: Buffer; writeTime: number }): Promise<void> {
+        let first: number | undefined;
+        for (let i = 0; i < this.sources.length; i++) {
+            if (!this.sources[i].options.cacheReads) continue;
+            await this.sources[i].source.set(key, result.data, { lastModified: result.writeTime });
+            if (first === undefined) first = i;
+        }
+        if (first === undefined) return;
+        this.setIndexEntry(key, { writeTime: result.writeTime, size: result.data.length, source: first });
     }
 
     public async set(key: string, data: Buffer, config?: WriteConfig): Promise<void> {
         await this.init();
+        let lastModified = config?.lastModified;
+        if (lastModified) {
+            assertValidLastModified(lastModified);
+            let overlayEntry = this.overlay.get(key);
+            let entry = this.mem.get(key);
+            let currentTime = overlayEntry && overlayEntry.t || entry && entry.writeTime || 0;
+            // An older write never overwrites a newer one (see IArchives.set)
+            if (lastModified < currentTime) return;
+        }
+        let writeTime = lastModified || Date.now();
         if (config?.fast) {
             let writeDelay = config.writeDelay || DEFAULT_FAST_WRITE_DELAY;
-            this.overlay.set(key, { data, t: Date.now(), flushAt: Date.now() + writeDelay });
+            this.overlay.set(key, { data, t: writeTime, flushAt: Date.now() + writeDelay });
             return;
         }
         this.overlay.delete(key);
-        await this.writeToDisk(key, data);
+        await this.writeToSources(key, data, writeTime);
     }
 
-    private async writeToDisk(key: string, data: Buffer, writeTime?: number): Promise<void> {
-        let filePath = this.filePath(key);
-        await this.handles.run(filePath, async () => {
-            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-            let handle = await this.handles.getHandle(filePath, fs.constants.O_RDWR | fs.constants.O_CREAT);
-            await handle.truncate(0);
-            await handle.write(data, 0, data.length, 0);
-            // Delayed (fast) writes keep the time the write actually happened
-            if (writeTime) {
-                await handle.utimes(new Date(writeTime), new Date(writeTime));
-            }
-        });
+    private async writeToSources(key: string, data: Buffer, writeTime: number): Promise<void> {
+        let first: number | undefined;
+        for (let i = 0; i < this.sources.length; i++) {
+            if (!this.sources[i].options.writeBack) continue;
+            await this.sources[i].source.set(key, data, { lastModified: writeTime });
+            if (first === undefined) first = i;
+        }
+        if (first === undefined) {
+            throw new Error(`No writeBack sources configured, so writes cannot be stored (store ${this.folder})`);
+        }
+        this.setIndexEntry(key, { writeTime, size: data.length, source: first });
     }
 
     public async del(key: string, config?: WriteConfig): Promise<void> {
@@ -182,50 +391,15 @@ export class BlobStore {
             return;
         }
         this.overlay.delete(key);
-        await this.deleteFromDisk(key);
+        await this.deleteFromSources(key);
     }
 
-    private async deleteFromDisk(key: string): Promise<void> {
-        let filePath = this.filePath(key);
-        await this.handles.run(filePath, async () => {
-            await this.handles.closeNow(filePath);
-            try {
-                await fs.promises.unlink(filePath);
-            } catch (e: any) {
-                if (e.code !== "ENOENT") throw e;
-            }
-        });
-    }
-
-    public async get(key: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
-        await this.init();
-        let overlayEntry = this.overlay.get(key);
-        if (overlayEntry) {
-            if (!overlayEntry.data) return undefined;
-            let data = overlayEntry.data;
-            if (!range) return data;
-            return data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
+    private async deleteFromSources(key: string): Promise<void> {
+        for (let i = 0; i < this.sources.length; i++) {
+            if (!this.sources[i].options.writeBack) continue;
+            await this.sources[i].source.del(key);
         }
-        let filePath = this.filePath(key);
-        return await this.handles.run(filePath, async () => {
-            let handle: fs.promises.FileHandle;
-            try {
-                handle = await this.handles.getHandle(filePath, fs.constants.O_RDWR);
-            } catch (e: any) {
-                if (e.code === "ENOENT") return undefined;
-                throw e;
-            }
-            let size = (await handle.stat()).size;
-            let start = range && Math.min(range.start, size) || 0;
-            let end = range && Math.min(range.end, size) || size;
-            if (end <= start) return Buffer.alloc(0);
-            let buffer = Buffer.alloc(end - start);
-            let { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-            if (bytesRead !== buffer.length) {
-                throw new Error(`Expected ${buffer.length} bytes at ${filePath}:${start}, read ${bytesRead}`);
-            }
-            return buffer;
-        });
+        this.deleteIndexEntry(key);
     }
 
     public async getInfo(key: string): Promise<{ writeTime: number; size: number } | undefined> {
@@ -235,23 +409,19 @@ export class BlobStore {
             if (!overlayEntry.data) return undefined;
             return { writeTime: overlayEntry.t, size: overlayEntry.data.length };
         }
-        let filePath = this.filePath(key);
-        return await this.handles.run(filePath, async () => {
-            try {
-                let stats = await fs.promises.stat(filePath);
-                if (!stats.isFile()) return undefined;
-                return { writeTime: stats.mtimeMs, size: stats.size };
-            } catch (e: any) {
-                if (e.code === "ENOENT") return undefined;
-                throw e;
-            }
-        });
+        let entry = await this.getIndexEntry(key);
+        if (!entry) return undefined;
+        return { writeTime: entry.writeTime, size: entry.size };
     }
 
     public async findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         await this.init();
+        await this.waitForRequiredScans();
         let infos = new Map<string, ArchiveFileInfo>();
-        await this.collectFiles("", prefix, infos);
+        for (let [key, entry] of this.mem) {
+            if (!key.startsWith(prefix)) continue;
+            infos.set(key, { path: key, createTime: entry.writeTime, size: entry.size });
+        }
         for (let [key, overlayEntry] of this.overlay) {
             if (!key.startsWith(prefix)) continue;
             if (!overlayEntry.data) {
@@ -260,110 +430,75 @@ export class BlobStore {
             }
             infos.set(key, { path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
         }
-        let files = Array.from(infos.values());
-        if (config?.type === "folders") {
-            let folders = new Map<string, ArchiveFileInfo>();
-            for (let file of files) {
-                let rest = file.path.slice(prefix.length);
-                let restParts = rest.split("/");
-                if (restParts.length < 2) continue;
-                let folder: string;
-                if (config.shallow) {
-                    folder = prefix + restParts[0];
-                } else {
-                    folder = file.path.split("/").slice(0, -1).join("/");
-                }
-                folders.set(folder, { path: folder, createTime: file.createTime, size: file.size });
-            }
-            files = Array.from(folders.values());
-        } else if (config?.shallow) {
-            files = files.filter(file => !file.path.slice(prefix.length).includes("/"));
+        let files = applyFindInfoShape(Array.from(infos.values()), prefix, config);
+        sort(files, x => x.path);
+        return files;
+    }
+
+    // All files changed after the given time — fast, straight from the in-memory index. Filters on
+    // when WE learned of the change (changedAt), so files synchronized late (with old write times)
+    // are still reported. Deletions are not reported.
+    public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
+        await this.init();
+        await this.waitForRequiredScans();
+        let files: ArchiveFileInfo[] = [];
+        for (let [key, entry] of this.mem) {
+            if (entry.changedAt <= time) continue;
+            if (this.overlay.has(key)) continue;
+            files.push({ path: key, createTime: entry.writeTime, size: entry.size });
+        }
+        for (let [key, overlayEntry] of this.overlay) {
+            if (!overlayEntry.data) continue;
+            if (overlayEntry.t <= time) continue;
+            files.push({ path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
         }
         sort(files, x => x.path);
         return files;
     }
 
-    // relDir is "" or ends with "/". Only descends into directories that can still match the prefix.
-    private async collectFiles(relDir: string, prefix: string, infos: Map<string, ArchiveFileInfo>): Promise<void> {
-        let entries: fs.Dirent[];
-        try {
-            entries = await fs.promises.readdir(path.join(this.filesDir, relDir), { withFileTypes: true });
-        } catch (e: any) {
-            if (e.code === "ENOENT") return;
-            throw e;
-        }
-        for (let entry of entries) {
-            let relPath = relDir + entry.name;
-            if (entry.isDirectory()) {
-                let dirPath = relPath + "/";
-                if (dirPath.startsWith(prefix) || prefix.startsWith(dirPath)) {
-                    await this.collectFiles(dirPath, prefix, infos);
-                }
-                continue;
-            }
-            if (!entry.isFile()) continue;
-            if (!relPath.startsWith(prefix)) continue;
-            try {
-                let stats = await fs.promises.stat(path.join(this.filesDir, relPath));
-                infos.set(relPath, { path: relPath, createTime: stats.mtimeMs, size: stats.size });
-            } catch (e: any) {
-                // Deleted while we were walking
-                if (e.code !== "ENOENT") throw e;
-            }
-        }
+    public async getSyncStatus(): Promise<ArchivesSyncStatus> {
+        await this.init();
+        return {
+            allScansComplete: this.sourceStates.every(x => x.scanComplete),
+            indexSize: this.mem.size,
+            sources: this.sources.map((x, i) => ({
+                debugName: x.source.getDebugName(),
+                options: x.options,
+                supportsChangesAfter: this.sourceStates[i].supportsChangesAfter,
+                initialScanComplete: this.sourceStates[i].scanComplete,
+                scannedCount: this.sourceStates[i].scannedCount,
+            })),
+        };
     }
 
-    // Large files stream into their own file under uploads/, then move into place on finish. No
-    // handle is opened until the first append actually happens.
+    // ── large uploads ──
+    // Large uploads stream onto the local disk source directly (they may not fit in memory)
+
+    private getDiskSource(): { disk: ArchivesDisk; sourceIndex: number } {
+        for (let i = 0; i < this.sources.length; i++) {
+            let source = this.sources[i].source;
+            if (source instanceof ArchivesDisk) return { disk: source, sourceIndex: i };
+        }
+        throw new Error(`Large uploads require an ArchivesDisk source, and this store has none (store ${this.folder})`);
+    }
     public async startLargeUpload(): Promise<string> {
         await this.init();
-        let id = `${Date.now()}_${this.nextLargeUploadId++}`;
-        this.largeUploads.set(id, { tmpPath: path.join(this.uploadsDir, `upload_${id}.tmp`) });
-        return id;
+        return await this.getDiskSource().disk.startLargeUpload();
     }
     public async appendLargeUpload(id: string, data: Buffer): Promise<void> {
-        let upload = this.largeUploads.get(id);
-        if (!upload) throw new Error(`Unknown large upload ${id}`);
-        const tmpPath = upload.tmpPath;
-        await this.handles.run(tmpPath, async () => {
-            let handle = await this.handles.getHandle(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND);
-            await handle.write(data, 0, data.length);
-        });
+        await this.getDiskSource().disk.appendLargeUpload(id, data);
     }
     public async finishLargeUpload(id: string, key: string): Promise<void> {
-        let upload = this.largeUploads.get(id);
-        if (!upload) throw new Error(`Unknown large upload ${id}`);
-        const tmpPath = upload.tmpPath;
-        this.largeUploads.delete(id);
+        let { disk, sourceIndex } = this.getDiskSource();
+        await disk.finishLargeUpload(id, key);
         this.overlay.delete(key);
-        let filePath = this.filePath(key);
-        await this.handles.run(tmpPath, () => this.handles.closeNow(tmpPath));
-        await this.handles.run(filePath, async () => {
-            // Close any cached handle to the file we're replacing, so later reads reopen the new file
-            await this.handles.closeNow(filePath);
-            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-            try {
-                await fs.promises.rename(tmpPath, filePath);
-            } catch (e: any) {
-                if (e.code !== "ENOENT") throw e;
-                // Nothing was ever appended, so the upload file was never created
-                await fs.promises.writeFile(filePath, Buffer.alloc(0));
-            }
-        });
+        let info = await disk.getInfo(key);
+        if (info) {
+            this.setIndexEntry(key, { writeTime: info.writeTime, size: info.size, source: sourceIndex });
+        }
     }
     public async cancelLargeUpload(id: string): Promise<void> {
-        let upload = this.largeUploads.get(id);
-        if (!upload) return;
-        const tmpPath = upload.tmpPath;
-        this.largeUploads.delete(id);
-        await this.handles.run(tmpPath, async () => {
-            await this.handles.closeNow(tmpPath);
-            try {
-                await fs.promises.unlink(tmpPath);
-            } catch (e: any) {
-                if (e.code !== "ENOENT") throw e;
-            }
-        });
+        await this.getDiskSource().disk.cancelLargeUpload(id);
     }
 
     private async flushOverlay(): Promise<void> {
@@ -371,9 +506,9 @@ export class BlobStore {
         for (let [key, entry] of this.overlay) {
             if (entry.flushAt > now) continue;
             if (entry.data) {
-                await this.writeToDisk(key, entry.data, entry.t);
+                await this.writeToSources(key, entry.data, entry.t);
             } else {
-                await this.deleteFromDisk(key);
+                await this.deleteFromSources(key);
             }
             // Only remove if it wasn't overwritten while we were flushing
             if (this.overlay.get(key) === entry) {

@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { ArchiveFileInfo } from "../IArchives";
+import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
 import type { BlobStore } from "./blobStore";
 import type { IStorage } from "../IStorage";
 export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
@@ -72,7 +72,14 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         start: number;
         end: number;
     }) => Promise<Buffer | undefined>;
-    set: (account: string, bucketName: string, path: string, data: Buffer) => Promise<void>;
+    get2: (account: string, bucketName: string, path: string, range?: {
+        start: number;
+        end: number;
+    }) => Promise<{
+        data: Buffer;
+        writeTime: number;
+    } | undefined>;
+    set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number) => Promise<void>;
     del: (account: string, bucketName: string, path: string) => Promise<void>;
     getInfo: (account: string, bucketName: string, path: string) => Promise<{
         writeTime: number;
@@ -82,6 +89,8 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         shallow?: boolean;
         type?: "files" | "folders";
     }) => Promise<ArchiveFileInfo[]>;
+    getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
+    getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
     startLargeFile: (account: string, bucketName: string, path: string) => Promise<string>;
     uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
     finishLargeFile: (uploadId: string) => Promise<void>;

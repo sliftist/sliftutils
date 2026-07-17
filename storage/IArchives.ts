@@ -3,16 +3,72 @@ module.allowclient = true;
 // The important operations of an archive bucket (extracted from ArchivesBackblaze), so other
 // backends (e.g. our own remote storage server) can be used interchangeably.
 
+// A write may not be stamped more than this far in the future, or clock skew between machines
+// would let a bad timestamp block writes for a long time.
+export const MAX_LAST_MODIFIED_FUTURE = 15 * 60 * 1000;
+export function assertValidLastModified(lastModified: number): void {
+    let max = Date.now() + MAX_LAST_MODIFIED_FUTURE;
+    if (lastModified > max) {
+        throw new Error(`lastModified is too far in the future: ${lastModified} > ${max} (now + 15 minutes)`);
+    }
+}
+
 // createTime is a misnomer kept for compatibility — it is really the LAST-WRITE time, same as
 // getInfo's writeTime. Neither Backblaze nor our remote storage tracks a distinct creation date:
 // each write stamps a fresh timestamp on the current version, so both fields are just "when the
 // bytes served by get() were most recently written".
 export type ArchiveFileInfo = { path: string; createTime: number; size: number };
 
+export type ArchivesConfig = {
+    // Whether getChangesAfter is implemented (fast change polling, instead of full rescans)
+    supportsChangesAfter?: boolean;
+};
+
+// How a synchronization source behaves (see BlobStore, which synchronizes an index + local cache
+// from a list of { source, options }).
+export type SyncOptions = {
+    // After the source's metadata is copied into the index, also copy the file contents over (into
+    // the cacheReads sources), preserving their modified times.
+    copyFiles?: boolean;
+    // On write, write back to this source.
+    writeBack?: boolean;
+    // If a read wasn't served by this source, write the data back to it (using it as a cache), and
+    // update the index so it becomes the new source. Set for the local disk source.
+    cacheReads?: boolean;
+    // Ignore values with write times outside [start, end].
+    validWindow: [number, number];
+    // If a file isn't in the index and this source hasn't finished its initial scan, check the
+    // source directly before declaring the file nonexistent. Set for the disk source.
+    required?: boolean;
+};
+export type ArchivesSource = { source: IArchives; options: SyncOptions };
+
+export type ArchivesSyncSourceStatus = {
+    debugName: string;
+    options: SyncOptions;
+    supportsChangesAfter: boolean;
+    initialScanComplete: boolean;
+    // Files seen in this source's scans / change polls so far
+    scannedCount: number;
+};
+export type ArchivesSyncStatus = {
+    allScansComplete: boolean;
+    // Number of files in the index
+    indexSize: number;
+    sources: ArchivesSyncSourceStatus[];
+};
+
 export interface IArchives {
     getDebugName(): string;
     get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined>;
-    set(fileName: string, data: Buffer): Promise<void>;
+    /** Like get, but also returns the last-write time of the file. get just calls get2. */
+    get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined>;
+    /**
+     * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
+     * the file's current last-write time the write no-ops (so delayed / synchronized writes can
+     * never clobber newer data). Times more than 15 minutes in the future are rejected.
+     */
+    set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void>;
     del(fileName: string): Promise<void>;
     /** Streams a file too large to hold in memory. getNextData returns undefined when done. */
     setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void>;
@@ -22,4 +78,13 @@ export interface IArchives {
     findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]>;
     /** Only works for public buckets (private buckets are API-access only). */
     getURL(path: string): Promise<string>;
+    /** The bucket's configuration, which tells whether the optional functions are supported. */
+    getConfig(): Promise<ArchivesConfig>;
+    /**
+     * All files changed after the given time. Only exists when getConfig().supportsChangesAfter;
+     * backed by an index, so it is fast (unlike a full findInfo scan). Deletions are not reported.
+     */
+    getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
+    /** Synchronization introspection, for backends that synchronize from sources (see BlobStore). */
+    getSyncStatus?(): Promise<ArchivesSyncStatus>;
 }

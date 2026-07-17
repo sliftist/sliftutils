@@ -5,7 +5,7 @@ import { getNodeIdIP } from "socket-function/src/nodeCache";
 import { setHTTPResultHeaders } from "socket-function/src/callHTTPHandler";
 import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
-import { ArchiveFileInfo } from "../IArchives";
+import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
 import type { BlobStore, WriteConfig } from "./blobStore";
 import type { IStorage } from "../IStorage";
 
@@ -345,12 +345,18 @@ class RemoteStorageControllerBase {
         let { store } = await getBucketStore(account, bucketName);
         return await store.get(path, range);
     }
-    async set(account: string, bucketName: string, path: string, data: Buffer): Promise<void> {
+    async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+        await requireAccess(account);
+        assertValidPath(path);
+        let { store } = await getBucketStore(account, bucketName);
+        return await store.get2(path, range);
+    }
+    async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number): Promise<void> {
         assertWritesAllowed();
         await requireAccess(account);
         assertValidPath(path);
         let { store, writeConfig } = await getBucketStore(account, bucketName);
-        await store.set(path, Buffer.from(data), writeConfig);
+        await store.set(path, Buffer.from(data), { ...writeConfig, lastModified });
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
         await requireAccess(account);
@@ -368,6 +374,17 @@ class RemoteStorageControllerBase {
         await requireAccess(account);
         let { store } = await getBucketStore(account, bucketName);
         return await store.findInfo(prefix, config);
+    }
+    // Fast (served from the store's BulkDatabase2 index, not a scan) — see IArchives.getChangesAfter
+    async getChangesAfter(account: string, bucketName: string, time: number): Promise<ArchiveFileInfo[]> {
+        await requireAccess(account);
+        let { store } = await getBucketStore(account, bucketName);
+        return await store.getChangesAfter(time);
+    }
+    async getSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus> {
+        await requireAccess(account);
+        let { store } = await getBucketStore(account, bucketName);
+        return await store.getSyncStatus();
     }
 
     async startLargeFile(account: string, bucketName: string, path: string): Promise<string> {
@@ -443,10 +460,13 @@ export const RemoteStorageController = SocketFunction.register(
         adminGrantAccess: {},
         ensureBucket: {},
         get: {},
+        get2: {},
         set: {},
         del: {},
         getInfo: {},
         findInfo: {},
+        getChangesAfter: {},
+        getSyncStatus: {},
         startLargeFile: {},
         uploadPart: {},
         finishLargeFile: {},

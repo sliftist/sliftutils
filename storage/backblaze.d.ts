@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives } from "./IArchives";
+import { IArchives, ArchivesConfig } from "./IArchives";
 export declare class ArchivesBackblaze implements IArchives {
     private config;
     constructor(config: {
@@ -25,7 +25,19 @@ export declare class ArchivesBackblaze implements IArchives {
         };
         retryCount?: number;
     }): Promise<Buffer | undefined>;
-    set(fileName: string, data: Buffer): Promise<void>;
+    get2(fileName: string, config?: {
+        range?: {
+            start: number;
+            end: number;
+        };
+    }): Promise<{
+        data: Buffer;
+        writeTime: number;
+    } | undefined>;
+    getConfig(): Promise<ArchivesConfig>;
+    set(fileName: string, data: Buffer, config?: {
+        lastModified?: number;
+    }): Promise<void>;
     del(fileName: string): Promise<void>;
     setLargeFile(config: {
         path: string;

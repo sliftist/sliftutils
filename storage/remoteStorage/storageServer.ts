@@ -9,6 +9,7 @@ import { getFileStorageNested2 } from "../FileFolderAPI";
 import { TransactionStorage } from "../TransactionStorage";
 import { JSONStorage } from "../JSONStorage";
 import { BlobStore } from "./blobStore";
+import { ArchivesDisk } from "../ArchivesDisk";
 import {
     RemoteStorageController, setStorageServerState, setWritesRejectedReason,
     AccessRequest, TrustRecord, BucketConfig,
@@ -101,7 +102,13 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
         getBlobStore(bucket: BucketConfig) {
             let store = blobStores.get(bucket.folder);
             if (!store) {
-                store = new BlobStore(path.join(rootFolder, bucket.folder));
+                let bucketFolder = path.join(rootFolder, bucket.folder);
+                // Synchronization sources are global (BlobStore doesn't namespace them), so the
+                // disk source is rooted at the full absolute folder, including the bucket's name
+                store = new BlobStore(bucketFolder, [{
+                    source: new ArchivesDisk(bucketFolder),
+                    options: { writeBack: true, cacheReads: true, required: true, validWindow: [0, Number.MAX_SAFE_INTEGER] },
+                }]);
                 blobStores.set(bucket.folder, store);
             }
             return store;
