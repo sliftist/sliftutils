@@ -13,6 +13,70 @@ export function assertValidLastModified(lastModified: number): void {
     }
 }
 
+
+export type RemoteConfig = RemoteConfigBase[];
+
+/**
+    string arguments will be a url, looking like:
+        https://storage2.vidgridweb.com:4445/file/querysubtest-com-public-immutable/storage/storagerouting.json
+        https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
+        - These map to { url }, with the type inferred from the url
+
+    NOTE: If only a URL is provided. 
+*/
+export type RemoteConfigBase = string | ({
+    type: "remote";
+
+    // Ex: https://storage2.vidgridweb.com:4445/file/querysubtest-com-public-immutable/storage/storagerouting.json
+    // NOTE: The bucket name is obtained from the URL. 
+    url: string;
+
+    // NOTE: Authentication is handled by cert.ts, via having your machine trusted to access this account. 
+    accountName?: string;
+
+    public?: boolean;
+    // Fast mode: the server acknowledges writes once they are in memory, flushing to disk after
+    // writeDelay (default 5 minutes) and coalescing writes to the same file. A server crash loses
+    // writes that haven't flushed yet.
+    fast?: boolean;
+    writeDelay?: number;
+    // The bucket is served straight from the server's disk, with no index — so no fast writes and
+    // no getChangesAfter/getSyncStatus.
+    rawDisk?: boolean;
+    // Writes to paths that already exist are disallowed (deletes still work).
+    immutable?: boolean;
+} | {
+    type: "backblaze";
+    // Ex: https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
+    // NOTE: The bucket name is obtained from the URL.
+    url: string;
+    // Public buckets are served over plain HTTPS GETs (getURL). Private buckets are API-access only.
+    bucketName: string;
+    public?: boolean;
+    // NOTE: This isn't enforced on the backblaze level, so this is just a client-side guarantee. This can change how we cache files.
+    //  - Backblaze does support immutability. However, apparently, once we enable it on a bucket, we can't disable it, which is really bad, as it means if our code could ever enable it and we accidentally enable it on an important bucket, we essentially just bricked that bucket. So we should never write any code that ever tries to use backblaze to make things immutable. 
+    immutable?: boolean;
+
+    // NOTE: We will access the api key from getSecret, see backblaze.ts for the specific keys.
+}) & {
+    // NOTE: Version is used when updating the configuration. The newer version is always taken. A missing version counts as version -1.
+    version?: number;
+    /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
+    syncOptions?: SyncOptions;
+};
+
+
+export const DEFAULT_BASE_SYNC_OPTIONS: SyncOptions = {
+    cacheReads: true,
+    required: true,
+    validWindow: [0, Number.MAX_SAFE_INTEGER],
+};
+export const DEFAULT_SYNC_OPTIONS: SyncOptions = {
+    validWindow: [0, Number.MAX_SAFE_INTEGER],
+};
+
+
+
 // createTime is a misnomer kept for compatibility — it is really the LAST-WRITE time, same as
 // getInfo's writeTime. Neither Backblaze nor our remote storage tracks a distinct creation date:
 // each write stamps a fresh timestamp on the current version, so both fields are just "when the

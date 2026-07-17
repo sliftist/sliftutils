@@ -1,60 +1,156 @@
 
-Searching
-    1) We want to create something that's database agnostic
-        - So I think we need like multiple phases for reading. And for applying it? We need to be able to know all of our reads ahead of time, which we should be able to roughly know. Or at least we'll have multiple stages. That should be fine. I guess we could do it so it actually understands our database. Like it reads, and then if it's not there, it returns. That might be fine too. 
 
-interface Database<Root> {
-    readData: <T>(fnc: (root: Root) => T) => T | undefined;
-    writeData: <T>(fnc: (root: Root) => T, newValue: T) => void;
-}
-I guess this works. We need multiple stages, so it's gonna have to read in the index, In parallel, and then once it has the full index, then it can do the next step in parallel, etc. 
-
-
-remaining
-    1) The code book creation. We kind of do want to recreate it sometimes. Maybe we can have something that does a full expensive recreation at certain early on points?
-    2) The searching there's a few different stages. Like, we want to search more IVF cells, but then even within the cells, we kind of want to download more of the final embeddings.  because the codes aren't gonna to be perfect. So we have to do both at the same time?
-
-parts
-    p8g8 format (q8), so we can store 2048 dimensions is a bit over 2KB
-    IVF cell size 32? PQ index reduces by 32X, and if IVF cells reduce by 32X... then 500K 2KB values (1GB) would still just be... 1MB IVF index, so... that's good.
-    0) In IVF, sample 32, then keep sampling more, up to 128 cells
-    1) Pq 64 index (byte values each, break into 64 groups, always... should work well, For face vectors, they're already really optimized. They have so few dimensions, and so we don't compress it by that much. But for text vectors, they're less compressed, so we compress it more. So it should work in all cases)
-    2) Retraining index on a subset
-        - Or... just don't. Freeze after a certain point, and... it might be fine? HMM... Although no, we could allow retraining. It should be cheap enough. 
-    3) Split into transaction logs, so we can read the PQ index efficiently, but still update it
-        UGH... I mean basically you would just be replicating some of what we actually store on disk, but in our database, which is stupid, but I think we'll probably do it anyway. Basically, just a transaction log. We have to read everything every time, but it should help the speed a little bit...
-            - And I think it's fair because it's us saying, hey, we're going to read all this data every time, which the database can't know, so it can't optimize for that, but we can know, and then we can optimize for it
-    4) IVF the pq index to vastly decrease the initial access time
-    5.0) automatically split cells when they get big enough (2X their initial size)
-    5) occasionally regenerate the entire IVF.
-    5.1) Have something to store a subset of the data codes?
-    5.1) Have something that stores some of the data randomly so we can easily access a subset. We won't represent deletions in it. That's fine. This will allow us to rebalance the IVF fairly efficiently. 
-        - And maybe even slowly move stuff over to the new IVF as we access stuff, we see if it's in the new IVF, and if not, we move it?
-        - 10% of the data? And... maybe just the pq index values?
-        - Should make retraining the IVF ten times faster and shouldn't affect the recall by too much, especially if we have more cells
-        - AND, Maybe we can actually sample less the more data we have. Ramping up to 10%. 
-unknown
-    exactly how we're going to update the IVF. 
-    IVF pq index, so we can read part of it
-        mini transaction logs in each cell?
-
-    BUT... how do we update IVF
-
-
-
-
-1) Converting once is faster, so we should investigate if we can have a pool of memory. If we can reuse it, then the allocations are free. 
-
-1) Fix embedding formats. It's really, really stupid. decodeToLength was just absolutely retarded. 
+IMPORTANT! modified time PLUS size is what's important. Store both!
 
 
 
 
 
 
-0) Make sure the AI stops trying to stop when a read didn't work because it doesn't fucking matter. I don't think there's a single place that's doing it where it actually matters. 
-    - I mean, I guess there are a few places. Like when we're rebalancing, that's one place.
-    - I guess some of the returns are valid, but I guess we have to check all of them. 
+- We need to update our HTTP handling so this is supported:
+    https://storage2.vidgridweb.com:4445/file/querysubtest-com-public-immutable/storage/storagerouting.json
+    - To do this, we're going to need to make a wrapper for require controller and make that the default call. I believe we will have access to the underlying HTTP call information so we can get the original URL, and full the pieces (the bucket name and path) out of it.
 
-1) Make sure the AI gets rid of all those four each's. I mean, what the fuck? 
-1)  Ensure the AI efficiently switches from the hard-coded stuff to the regular stuff and correctly regenerates the codebook. 
+
+
+UGH... Sweet, we want the routing to exist per source, but it does need to be stored in a bucket. Fuck. 
+
+
+OH! The functions for the construction need to be actually asynchronous. lambdas, or at least support that, because the credentials for backblaze might be secrets. 
+
+I think we just need to tell it to have one consolidated factory
+    - I mean, I guess it will be two stages so we can make a factory function, so the configuration is simpler
+    - With different types depending on the type of the configuration
+
+
+
+0) Consolidated sources So we have one single factory, and all the different types of sources are in a folder nicely organized
+
+    https://storage2.vidgridweb.com:4445/storagerouting.json
+    https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
+    local:transaction:trust
+    local:direct:${bucketName}
+
+    AH! But the configuration is really a list of objects with URLs, although there's a few different forms. 
+        (FullConfig|string)[] | string
+        Where string just becomes [string] immediately
+
+    The first option has defaults of:
+        { cacheReads: true, required: true }
+    The rest have no defaults (So we're just a reader for it. So we write back to it, but we don't copy all the files).
+
+    Types of sources
+        Remote archives
+        local singletons
+        Remote backblaze API
+        Remote backblaze URL only (read only)
+
+
+-2.1) Rename some of the stuff like blob store so everything makes more sense for what it actually does. 
+
+1) Verify the code and make updates
+2) VERIFY that our scanning code is efficient and not download something that we already have. 
+
+
+
+-1) Update it so that the bucket configuration has a version number in it. That way, old code doesn't force an old bucket configuration. We'll check and we'll see, oh, well, we do want to ensure that it has this bucket configuration, but the versions outdated. So instead, we'll read the bucket configuration from the remote, instead of updating it.
+
+
+0) CLI configuration of bucket configuration source (and special option so WE are the source). This sets the default bucket configuration. So if a user tries to set something with an older version, this will take over. And when the user sets something with a newer version, we will write to this source.
+    - Global configuration per bucket stored in our root source, hosted on a URL, Used as our source of truth about where our sources come from, with API functions to update this. We can also have this store our bucket configuration with the version as well. So, our code with the newer version will still clobber this, or if this is newer than our code, it will clobber it. It just depends on which one we update.
+    - CONFIGURED via the remote factory (still per bucket I guess)
+AH!, Update it so you can set any bucket settings except the bucket name in the factory or in the bucket. So you can add defaults if you want. For example, the bucket configuration source. 
+
+1) Support configuring synchronization sources in bucket config (although we will probably usually set it in the remote factory).
+    - The sources will all be global. They won't be namespaced. 
+    - The sources will all be full URLs
+
+2) use the global configuration in readers in case the main synchronization source is down.
+    - I believe we can just always use it. Even if it's out of date, it's probably better than nothing. 
+    - BUT, never write to anything but the main source!
+
+2) MAKE SURE! That we just have something that goes from an array of URLs that has the config.json (perhaps with object configuration as well, Although we should allow it to just be a list of URLs, using default sync options), And from this it can make a reader.
+    - We'll both use this client side and server side. Although server side, we will do a few extra things. Like, we'll see, oh, that URL is ourself, So we don't need to talk over HTTP. We can just use the singleton in memory, etc. 
+
+3) Test on our test site, Running two processes and having one chain to the other. And then play around a bit writing and then taking down one and making sure we can still read from the other, etc., etc. 
+
+
+
+
+1) Allow specifying storage sources to store our credentials
+    - Check if it's in public mode and if it is throw, we can't allow our credentials to be public
+    - DEFAULT to use ourself
+
+
+2) Support backblaze urls, using our credential store to access them
+    - If they don't exist, we'll request their credentials, which will require going onto the site to specify the backlash credentials, which will then be stored in our credential source, which defaults to ourself. 
+
+3) Verify we can use Backblaze as a synchronization source now and fall back to it for reading. 
+
+
+
+
+
+2) Make our interface to set up the storage configuration be typed. So any client can just take the underlying storage, instantiate it, and access and manipulate this storage configuration for all of the buckets in a type-safe manner. 
+    - As in, we won't expose an API for it. They should just access the storage directly. 
+    - Even if it's backed by Backblaze, if the storage configuration sets up chaining, Then they'll build a write to backblaze through us and read from backblaze through us.
+
+2) Use our machine configuration to setup A basic three-chain thing where we have two chains for redundancy and then the back end is backblaze. 
+    - Probably without copying the files. But we could use write back
+
+2.1) Add a page on our site to configure the global bucket configuration, easily chaining, etc
+    LINKED to via the service that hosts the storageServer
+    - We might even have some UI that shows all of the storage services together, allowing you to easily configure how they chain, etc. 
+    - We should also have it poll for the status of like scanning file stats, etc. 
+
+
+
+
+
+
+
+3) Support sharding in synchronization sources as well, adding new field
+    routeRange: [number, number];
+3.1) We will almost always set up copy files on our different shards, but of course, these will only be considered depending on the valid window. 
+3.2) Of course, having our site configuration support sharding as well. So you don't need to fiddle with the shards. You kind of just say there are a certain number of shards. And if you want to change the shards, it will automatically set them up in the future, applying a default switch time of a day that you can also configure yourself, etc. 
+
+
+
+
+5) Shard retry writes - Basically, they give us part of a path, and part of it we can fill in ourselves. We try to keep track of which shards are down and if a shard is down, we will keep changing that random value until we find something that doesn't match that shard Until we hit a certain percentage of shards being down, probably greater than 99%. And then we return the path that we ended up using. 
+    - This solves the problem of not being able to write to the backup sources. As it'll mean you'll be able to read if a shard is down, and you'll also be able to write if a shard is down. So it'll be like everything's fine. 
+    - We only need to use this for certain important things like uploading images. pretty much all of the AI stuff, we can probably use it. 
+    HMMM!!! This causes problems if we want it to be an image or a video. So we should probably have it so by default we try to put nothing there, So it'll be the exact path the user requested. That way, if they try to do the same right multiple times, it'll clobber itself.
+        - Although realistically, I don't think it'll really matter.  because we're not generating the same content most of the time. 
+6) geographical sharding as well. Which tries to change the hash so it's the server that we're closest to
+    - This can massively reduce the write latency, Which is important because we don't want to have to send the data around all the time, we just want to send around the URLs. Well then this requires waiting for the remote to confirm that we can read back. which will be purely limited really on latency if it's close to us. 
+
+7) readerDiskLimit. Only when our first sync source has copyFiles is false and cacheReads is true (and required true). Once we copy over a certain amount, we start deleting the least recently used from our local cache. This allows us to cache large sources without getting overwhelmed. 
+
+
+
+
+
+ArchivesRemote
+    bucketName
+    public
+    fast
+    writeDelay
+
+ArchivesFactory
+    host: https://storage.vidgridweb.com:4444/storagerouting.json
+    redundantHosts:
+        - https://storage2.vidgridweb.com:4445/storagerouting.json
+        - https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
+
+HostStorageServerConfig
+    host: https://storage.vidgridweb.com:4444/storagerouting.json
+    redundantHosts:
+        - https://storage.vidgridweb.com:4444/storagerouting.json
+        - https://storage2.vidgridweb.com:4445/storagerouting.json
+        - https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
+    folder: os.homedir() + "/storage"
+    cloudflareApiToken: ...
+
+
+https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/image/img_00BloAFyIevA_1024x1536.jpg
