@@ -14,7 +14,11 @@ export function assertValidLastModified(lastModified: number): void {
 }
 
 
-export type RemoteConfig = RemoteConfigBase[];
+export type RemoteConfig = {
+    // NOTE: Version is used when updating the configuration. The newer version is always taken. A missing version counts as version -1.
+    version?: number;
+    sources: RemoteConfigBase[];
+};
 
 /**
     string arguments will be a url, looking like:
@@ -29,8 +33,6 @@ export type RemoteConfig = RemoteConfigBase[];
 export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
 
 export type CommonConfig = {
-    // NOTE: Version is used when updating the configuration. The newer version is always taken. A missing version counts as version -1.
-    version?: number;
     /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
     syncOptions?: SyncOptions;
 };
