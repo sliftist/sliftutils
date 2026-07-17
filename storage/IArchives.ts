@@ -24,7 +24,16 @@ export type RemoteConfig = RemoteConfigBase[];
 
     NOTE: If only a URL is provided. 
 */
-export type RemoteConfigBase = string | ({
+export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
+
+export type CommonConfig = {
+    // NOTE: Version is used when updating the configuration. The newer version is always taken. A missing version counts as version -1.
+    version?: number;
+    /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
+    syncOptions?: SyncOptions;
+};
+
+export type HostedConfig = CommonConfig & {
     type: "remote";
 
     // Ex: https://storage2.vidgridweb.com:4445/file/querysubtest-com-public-immutable/storage/storagerouting.json
@@ -45,7 +54,9 @@ export type RemoteConfigBase = string | ({
     rawDisk?: boolean;
     // Writes to paths that already exist are disallowed (deletes still work).
     immutable?: boolean;
-} | {
+};
+
+export type BackblazeConfig = CommonConfig & {
     type: "backblaze";
     // Ex: https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
     // NOTE: The bucket name is obtained from the URL.
@@ -58,11 +69,6 @@ export type RemoteConfigBase = string | ({
     immutable?: boolean;
 
     // NOTE: We will access the api key from getSecret, see backblaze.ts for the specific keys.
-}) & {
-    // NOTE: Version is used when updating the configuration. The newer version is always taken. A missing version counts as version -1.
-    version?: number;
-    /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
-    syncOptions?: SyncOptions;
 };
 
 

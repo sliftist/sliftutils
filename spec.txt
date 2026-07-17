@@ -4,7 +4,7 @@ IMPORTANT! modified time PLUS size is what's important. Store both!
 
 
 
-
+I added "RemoteConfig", which uses "RemoteConfigBase" in IArchives.ts.  What we want to do is we want to have it so that this is our new base config type. 
 
 
 - We need to update our HTTP handling so this is supported:
