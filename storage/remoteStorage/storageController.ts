@@ -2,13 +2,16 @@ module.allowclient = true;
 
 import { SocketFunction } from "socket-function/SocketFunction";
 import { getNodeIdIP } from "socket-function/src/nodeCache";
-import { setHTTPResultHeaders } from "socket-function/src/callHTTPHandler";
+import { setHTTPResultHeaders, getCurrentHTTPRequest } from "socket-function/src/callHTTPHandler";
+import { performLocalCall } from "socket-function/src/callManager";
+import { RequireController } from "socket-function/require/RequireController";
 import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
-import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
-import type { IBucketStore, WriteConfig } from "./blobStore";
+import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { ROUTING_FILE } from "./remoteConfig";
 import {
-    getStorageServerConfig, getWritesRejectedReason, getTrust, getRequests, getBuckets, getBlobStore,
+    getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
+    deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
 } from "./storageServerState";
 
 // The remote storage server's API. Authentication uses certs.ts machine identities: a client
@@ -16,6 +19,10 @@ import {
 // can't be replayed elsewhere), and the server then trusts that connection as that machineId.
 // Access to an account is granted to specific machineIds, via a command line command run on the
 // storage machine (see storageServer.ts).
+//
+// There is no bucket-creation API: a bucket exists iff its routing config (ROUTING_FILE) exists,
+// and writing that file creates or reconfigures the bucket (see storageServerState.ts). Reads of
+// nonexistent buckets return undefined / empty, same as reads of nonexistent files.
 
 export const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
@@ -45,20 +52,6 @@ export type TrustRecord = {
     ip: string;
     time: number;
 };
-export type BucketConfig = {
-    // This bucket's blob store folder, relative to the server's storage folder. Derived from the
-    // account/bucket by ensureBucket for new buckets, and never changed after (so a bucket's data
-    // never silently moves). Server-assigned — clients cannot pick folders.
-    folder: string;
-    public?: boolean;
-    fast?: boolean;
-    writeDelay?: number;
-    // The bucket is served straight from the disk (a raw ArchivesDisk), with no index — so no
-    // fast writes and no getChangesAfter/getSyncStatus.
-    rawDisk?: boolean;
-    // Writes to paths that already exist are disallowed (deletes still work).
-    immutable?: boolean;
-};
 export type AccessState = {
     machineId: string;
     ip: string;
@@ -72,11 +65,6 @@ export type AccessState = {
     // requests only by explicitly typing an IP into listRequestsForIP.
     trustedMachines?: TrustRecord[];
 };
-
-function assertWritesAllowed() {
-    let reason = getWritesRejectedReason();
-    if (reason) throw new Error(reason);
-}
 
 // callerNodeId -> authenticated machineId. Connections are long-lived websockets, so a session
 // lasts until the connection drops (clients re-authenticate on reconnect).
@@ -148,22 +136,10 @@ function getGrantAccessCommand(requestId: string): string {
     return `ssh ${sshTarget} '${serverCommand} --requestId ${requestId}'`;
 }
 
-async function getBucketStore(account: string, bucketName: string): Promise<{ store: IBucketStore; bucket: BucketConfig; writeConfig: WriteConfig }> {
+async function getBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined> {
     assertValidName(account, "account");
     assertValidName(bucketName, "bucket name");
-    let buckets = await getBuckets();
-    let bucket = await buckets.get(`${account}/${bucketName}`);
-    if (!bucket) {
-        throw new Error(`Bucket ${account}/${bucketName} does not exist. Call ensureBucket first.`);
-    }
-    return { store: getBlobStore(bucket), bucket, writeConfig: { fast: bucket.fast, writeDelay: bucket.writeDelay } };
-}
-
-async function assertMutable(config: { bucket: BucketConfig; store: IBucketStore; account: string; bucketName: string; path: string }): Promise<void> {
-    if (!config.bucket.immutable) return;
-    if (await config.store.getInfo(config.path)) {
-        throw new Error(`Bucket ${config.account}/${config.bucketName} is immutable and ${JSON.stringify(config.path)} already exists, so it cannot be written to`);
-    }
+    return await getLoadedBucket(account, bucketName);
 }
 
 class RemoteStorageControllerBase {
@@ -310,73 +286,68 @@ class RemoteStorageControllerBase {
         throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
-    async ensureBucket(account: string, bucketName: string, config: Omit<BucketConfig, "folder">): Promise<void> {
-        await requireAccess(account);
-        assertValidName(bucketName, "bucket name");
-        let buckets = await getBuckets();
-        let key = `${account}/${bucketName}`;
-        let existing = await buckets.get(key);
-        // The spread comes first so a caller-supplied folder can never override the server-assigned
-        // one (folders are server-assigned, see BucketConfig.folder)
-        let full: BucketConfig = { ...config, folder: existing?.folder || `buckets/${account}/${bucketName}` };
-        if (existing && JSON.stringify(existing) === JSON.stringify(full)) return;
-        assertWritesAllowed();
-        await buckets.set(key, full);
-    }
-
     async get(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
-        await requireAccess(account);
-        assertValidPath(path);
-        let { store } = await getBucketStore(account, bucketName);
-        return await store.get(path, { range });
+        let result = await this.get2(account, bucketName, path, range);
+        return result && result.data || undefined;
     }
     async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number } | undefined> {
         await requireAccess(account);
         assertValidPath(path);
-        let { store } = await getBucketStore(account, bucketName);
-        return await store.get2(path, { range });
+        let bucket = await getBucket(account, bucketName);
+        if (!bucket) return undefined;
+        return await bucket.store.get2(path, { range });
     }
     async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number): Promise<void> {
-        assertWritesAllowed();
         await requireAccess(account);
+        assertValidName(bucketName, "bucket name");
         assertValidPath(path);
-        let { store, bucket, writeConfig } = await getBucketStore(account, bucketName);
-        await assertMutable({ bucket, store, account, bucketName, path });
-        await store.set(path, Buffer.from(data), { ...writeConfig, lastModified });
+        // Handles bucket creation (writes of ROUTING_FILE), reconfiguration, fast mode, and
+        // immutability — see storageServerState.ts
+        await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified });
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
         await requireAccess(account);
+        assertValidName(bucketName, "bucket name");
         assertValidPath(path);
-        let { store, writeConfig } = await getBucketStore(account, bucketName);
-        await store.del(path, writeConfig);
+        await deleteBucketFile(account, bucketName, path);
     }
     async getInfo(account: string, bucketName: string, path: string): Promise<{ writeTime: number; size: number } | undefined> {
         await requireAccess(account);
         assertValidPath(path);
-        let { store } = await getBucketStore(account, bucketName);
-        return await store.getInfo(path);
+        let bucket = await getBucket(account, bucketName);
+        if (!bucket) return undefined;
+        return await bucket.store.getInfo(path);
     }
     async findInfo(account: string, bucketName: string, prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         await requireAccess(account);
-        let { store } = await getBucketStore(account, bucketName);
-        return await store.findInfo(prefix, config);
+        let bucket = await getBucket(account, bucketName);
+        if (!bucket) return [];
+        return await bucket.store.findInfo(prefix, config);
     }
     // Fast (served from the store's BulkDatabase2 index, not a scan) — see IArchives.getChangesAfter
     async getChangesAfter(account: string, bucketName: string, time: number): Promise<ArchiveFileInfo[]> {
         await requireAccess(account);
-        let { store } = await getBucketStore(account, bucketName);
-        if (!store.getChangesAfter) {
+        let bucket = await getBucket(account, bucketName);
+        if (!bucket) return [];
+        if (!bucket.store.getChangesAfter) {
             throw new Error(`Bucket ${account}/${bucketName} does not support getChangesAfter (rawDisk buckets have no index)`);
         }
-        return await store.getChangesAfter(time);
+        return await bucket.store.getChangesAfter(time);
+    }
+    async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
+        await requireAccess(account);
+        let bucket = await getBucket(account, bucketName);
+        // Missing buckets say true, matching what they become once created (the default store type)
+        return { supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter };
     }
     async getSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus> {
         await requireAccess(account);
-        let { store } = await getBucketStore(account, bucketName);
-        if (!store.getSyncStatus) {
+        let bucket = await getBucket(account, bucketName);
+        if (!bucket) return { allScansComplete: true, indexSize: 0, sources: [] };
+        if (!bucket.store.getSyncStatus) {
             throw new Error(`Bucket ${account}/${bucketName} does not support getSyncStatus (rawDisk buckets have no synchronization)`);
         }
-        return await store.getSyncStatus();
+        return await bucket.store.getSyncStatus();
     }
 
     async startLargeFile(account: string, bucketName: string, path: string): Promise<string> {
@@ -384,9 +355,12 @@ class RemoteStorageControllerBase {
         await requireAccess(account);
         // Validates now, so the upload doesn't fail at the end
         assertValidPath(path);
-        let { store, bucket } = await getBucketStore(account, bucketName);
-        await assertMutable({ bucket, store, account, bucketName, path });
-        let id = await store.startLargeUpload();
+        let bucket = await getBucket(account, bucketName);
+        if (!bucket) {
+            throw new Error(`Bucket ${account}/${bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
+        }
+        await assertMutable(bucket, path);
+        let id = await bucket.store.startLargeUpload();
         largeUploadInfo.set(id, { account, bucketName, path });
         return id;
     }
@@ -395,8 +369,9 @@ class RemoteStorageControllerBase {
         let info = largeUploadInfo.get(uploadId);
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
         await requireAccess(info.account);
-        let { store } = await getBucketStore(info.account, info.bucketName);
-        await store.appendLargeUpload(uploadId, Buffer.from(data));
+        let bucket = await getBucket(info.account, info.bucketName);
+        if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
+        await bucket.store.appendLargeUpload(uploadId, Buffer.from(data));
     }
     async finishLargeFile(uploadId: string): Promise<void> {
         assertWritesAllowed();
@@ -404,36 +379,59 @@ class RemoteStorageControllerBase {
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
         await requireAccess(info.account);
         largeUploadInfo.delete(uploadId);
-        let { store } = await getBucketStore(info.account, info.bucketName);
-        await store.finishLargeUpload(uploadId, info.path);
+        let bucket = await getBucket(info.account, info.bucketName);
+        if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
+        await bucket.store.finishLargeUpload(uploadId, info.path);
     }
     async cancelLargeFile(uploadId: string): Promise<void> {
         let info = largeUploadInfo.get(uploadId);
         if (!info) return;
         await requireAccess(info.account);
         largeUploadInfo.delete(uploadId);
-        let { store } = await getBucketStore(info.account, info.bucketName);
-        await store.cancelLargeUpload(uploadId);
+        let bucket = await getBucket(info.account, info.bucketName);
+        if (!bucket) return;
+        await bucket.store.cancelLargeUpload(uploadId);
     }
 
-    // Serves files from public buckets over plain HTTP GET (see IArchives getURL). No
-    // authentication, which is what public means (private buckets are API-access only).
-    async getPublicFile(account: string, bucketName: string, path: string): Promise<Buffer> {
+    // The server's single default HTTP route. /file/<account>/<bucketName>/<path> serves files from
+    // public buckets over plain GETs (see IArchives.getURL); every other path serves the access
+    // page (via RequireController.requireHTML — the path is the account name, see accessPage.tsx).
+    async httpEntry(config?: { requireCalls?: string[]; cacheTime?: number }): Promise<Buffer> {
+        // Both are keyed by the current call and must be captured synchronously, before any await
+        let caller = SocketFunction.getCaller();
+        let request = getCurrentHTTPRequest();
+        let pathname = new URL(request?.url || "/", "https://localhost").pathname;
+        if (!pathname.startsWith("/file/")) {
+            return await performLocalCall({
+                caller,
+                call: { nodeId: caller.nodeId, classGuid: RequireController._classGuid, functionName: "requireHTML", args: [config] },
+            }) as Buffer;
+        }
+        let parts = pathname.split("/").filter(x => x).map(decodeURIComponent);
+        let account = parts[1];
+        let bucketName = parts[2];
+        let filePath = parts.slice(3).join("/");
+        if (!account || !bucketName || !filePath) {
+            return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
+        }
         assertValidName(account, "account");
         assertValidName(bucketName, "bucket name");
-        let buckets = await getBuckets();
-        let bucket = await buckets.get(`${account}/${bucketName}`);
-        if (!bucket?.public) {
-            throw new Error(`Bucket ${account}/${bucketName} is not public`);
+        assertValidPath(filePath);
+        let bucket = await getLoadedBucket(account, bucketName);
+        if (!bucket) {
+            return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
         }
-        assertValidPath(path);
-        let data = await getBlobStore(bucket).get(path);
-        if (!data) {
-            throw new Error(`File not found: ${path} in ${account}/${bucketName}`);
+        if (!bucket.self?.public) {
+            throw new Error(`Bucket ${account}/${bucketName} is not public, so its files cannot be read over plain URLs`);
         }
-        let ext = path.split(".").pop() || "";
-        return setHTTPResultHeaders(data, {
+        let result = await bucket.store.get2(filePath);
+        if (!result) {
+            return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
+        }
+        let ext = filePath.split(".").pop() || "";
+        return setHTTPResultHeaders(result.data, {
             "Content-Type": CONTENT_TYPES[ext.toLowerCase()] || "application/octet-stream",
+            "Last-Modified": new Date(result.writeTime).toUTCString(),
         });
     }
 }
@@ -451,7 +449,6 @@ export const RemoteStorageController = SocketFunction.register(
         grantAccess: {},
         adminListRequests: {},
         adminGrantAccess: {},
-        ensureBucket: {},
         get: {},
         get2: {},
         set: {},
@@ -459,11 +456,12 @@ export const RemoteStorageController = SocketFunction.register(
         getInfo: {},
         findInfo: {},
         getChangesAfter: {},
+        getArchivesConfig: {},
         getSyncStatus: {},
         startLargeFile: {},
         uploadPart: {},
         finishLargeFile: {},
         cancelLargeFile: {},
-        getPublicFile: {},
+        httpEntry: {},
     })
 );

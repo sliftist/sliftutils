@@ -43,7 +43,11 @@ export type IBucketStore = {
 export declare class BlobStore implements IBucketStore {
     private folder;
     private sources;
-    constructor(folder: string, sources: ArchivesSource[]);
+    private config?;
+    constructor(folder: string, sources: ArchivesSource[], config?: {
+        onIndexChanged?: ((key: string) => void) | undefined;
+    } | undefined);
+    private stopped;
     private index;
     private mem;
     private dirty;
@@ -54,6 +58,7 @@ export declare class BlobStore implements IBucketStore {
         reset(): void;
         set(newValue: Promise<void>): void;
     };
+    dispose(): Promise<void>;
     private loadIndex;
     private setIndexEntry;
     private deleteIndexEntry;

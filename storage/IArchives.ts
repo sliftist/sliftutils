@@ -22,9 +22,10 @@ export type RemoteConfig = {
 
 /**
     string arguments will be a url, looking like:
-        https://storage2.vidgridweb.com:4445/file/querysubtest-com-public-immutable/storage/storagerouting.json
+        https://storage2.vidgridweb.com:4445/file/exampleaccount/examplebucket/storage/storagerouting.json
         https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
         - These map to { url }, with the type inferred from the url
+        - Hosted urls are /file/<account>/<bucketName>/..., backblaze urls are /file/<bucketName>/...
 
     NOTE: If we do not have right access to these, then it becomes a read-only IArchives, where we solely read using the url form (which might throw due to not having access as well). UNLESS Our configuration explicitly has public: false, in which case, we don't even hit the URL and we throw on access.
 
@@ -40,8 +41,8 @@ export type CommonConfig = {
 export type HostedConfig = CommonConfig & {
     type: "remote";
 
-    // Ex: https://storage2.vidgridweb.com:4445/file/querysubtest-com-public-immutable/storage/storagerouting.json
-    // NOTE: The bucket name is obtained from the URL. 
+    // Ex: https://storage2.vidgridweb.com:4445/file/exampleaccount/examplebucket/storage/storagerouting.json
+    // NOTE: The account and bucket name are obtained from the URL.
     url: string;
 
     // NOTE: Authentication is handled by cert.ts, via having your machine trusted to access this account. 

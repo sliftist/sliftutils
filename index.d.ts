@@ -2050,6 +2050,45 @@ declare module "sliftutils/storage/IArchives" {
     /// <reference types="node" />
     export declare const MAX_LAST_MODIFIED_FUTURE: number;
     export declare function assertValidLastModified(lastModified: number): void;
+    export type RemoteConfig = {
+        version?: number;
+        sources: RemoteConfigBase[];
+    };
+    /**
+        string arguments will be a url, looking like:
+            https://storage2.vidgridweb.com:4445/file/exampleaccount/examplebucket/storage/storagerouting.json
+            https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
+            - These map to { url }, with the type inferred from the url
+            - Hosted urls are /file/<account>/<bucketName>/..., backblaze urls are /file/<bucketName>/...
+
+        NOTE: If we do not have right access to these, then it becomes a read-only IArchives, where we solely read using the url form (which might throw due to not having access as well). UNLESS Our configuration explicitly has public: false, in which case, we don't even hit the URL and we throw on access.
+
+        NOTE: If we're in the browser, we should allow downloading the files via the URL form (if it's a public bucket), however, we won't allow writing, because their servers do not allow secure browser writes.
+    */
+    export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
+    export type CommonConfig = {
+        /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
+        syncOptions?: SyncOptions;
+    };
+    export type HostedConfig = CommonConfig & {
+        type: "remote";
+        url: string;
+        accountName?: string;
+        public?: boolean;
+        fast?: boolean;
+        writeDelay?: number;
+        rawDisk?: boolean;
+        immutable?: boolean;
+    };
+    export type BackblazeConfig = CommonConfig & {
+        type: "backblaze";
+        url: string;
+        bucketName: string;
+        public?: boolean;
+        immutable?: boolean;
+    };
+    export declare const DEFAULT_BASE_SYNC_OPTIONS: SyncOptions;
+    export declare const DEFAULT_SYNC_OPTIONS: SyncOptions;
     export type ArchiveFileInfo = {
         path: string;
         createTime: number;
@@ -2718,28 +2757,15 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
-    export type ArchivesRemoteBucketConfig = {
-        bucketName: string;
-        public?: boolean;
-        fast?: boolean;
-        writeDelay?: number;
-        rawDisk?: boolean;
-        immutable?: boolean;
-    };
-    export type ArchivesRemoteConfig = ArchivesRemoteBucketConfig & {
+    export type ArchivesRemoteConfig = {
         url: string;
-        account: string;
+        accountName?: string;
+        waitForAccess?: boolean;
     };
     export declare function parseStorageUrl(url: string): {
         address: string;
         port: number;
     };
-    export declare function buildPublicFileURL(config: {
-        url: string;
-        account: string;
-        bucketName: string;
-        path: string;
-    }): string;
     export declare function authenticateStorage(config: {
         address: string;
         port: number;
@@ -2748,25 +2774,14 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         machineId: string;
         ip: string;
     }>;
-    export declare class ArchivesRemoteFactory {
-        private config;
-        constructor(config: {
-            url: string;
-            account: string;
-        });
-        getBucket(bucket: ArchivesRemoteBucketConfig): ArchivesRemote;
-    }
-    export declare function createArchivesRemoteFactory(config: {
-        url: string;
-        account: string;
-    }): ArchivesRemoteFactory;
     export declare class ArchivesRemote implements IArchives {
         private config;
         constructor(config: ArchivesRemoteConfig);
         private parsed;
+        private account;
+        private bucketName;
         private nodeId;
         private controller;
-        private setupDone;
         private lastDeniedLog;
         getDebugName(): string;
         private authenticate;
@@ -2777,7 +2792,6 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
             ip: string;
         } | undefined>;
         private onAccessDenied;
-        private ensureSetup;
         private call;
         get(fileName: string, config?: {
             range?: {
@@ -2818,6 +2832,56 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
             getNextData(): Promise<Buffer | undefined>;
         }): Promise<void>;
         getURL(path: string): Promise<string>;
+    }
+
+}
+
+declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IArchives, ArchiveFileInfo, ArchivesConfig } from "../IArchives";
+    export declare class ArchivesUrl implements IArchives {
+        private base;
+        constructor(base: string);
+        getDebugName(): string;
+        private readOnlyError;
+        get(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<Buffer | undefined>;
+        get2(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        getInfo(fileName: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        set(fileName: string, data: Buffer, config?: {
+            lastModified?: number;
+        }): Promise<void>;
+        del(fileName: string): Promise<void>;
+        setLargeFile(config: {
+            path: string;
+            getNextData(): Promise<Buffer | undefined>;
+        }): Promise<void>;
+        find(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<string[]>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<ArchiveFileInfo[]>;
+        getURL(path: string): Promise<string>;
+        getConfig(): Promise<ArchivesConfig>;
     }
 
 }
@@ -2873,7 +2937,11 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
     export declare class BlobStore implements IBucketStore {
         private folder;
         private sources;
-        constructor(folder: string, sources: ArchivesSource[]);
+        private config?;
+        constructor(folder: string, sources: ArchivesSource[], config?: {
+            onIndexChanged?: ((key: string) => void) | undefined;
+        } | undefined);
+        private stopped;
         private index;
         private mem;
         private dirty;
@@ -2884,6 +2952,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             reset(): void;
             set(newValue: Promise<void>): void;
         };
+        dispose(): Promise<void>;
         private loadIndex;
         private setIndexEntry;
         private deleteIndexEntry;
@@ -2941,15 +3010,108 @@ declare module "sliftutils/storage/remoteStorage/cliArgs" {
 
 }
 
+declare module "sliftutils/storage/remoteStorage/createArchives" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+    export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
+    export declare class ArchivesChain implements IArchives {
+        private normalized;
+        private adopted;
+        private sourcesPromise;
+        constructor(config: RemoteConfig | RemoteConfigBase);
+        getDebugName(): string;
+        private getSourceConfigs;
+        private getSources;
+        private init;
+        private ensureRouting;
+        private readFromSource;
+        private read;
+        private getAccessHelp;
+        private write;
+        waitingForAccess(): Promise<{
+            link: string;
+            machineId: string;
+            ip: string;
+        } | undefined>;
+        get(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<Buffer | undefined>;
+        get2(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        getInfo(fileName: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        find(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<string[]>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type: "files" | "folders";
+        }): Promise<ArchiveFileInfo[]>;
+        getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
+        getSyncStatus(): Promise<ArchivesSyncStatus>;
+        getConfig(): Promise<ArchivesConfig>;
+        set(fileName: string, data: Buffer, config?: {
+            lastModified?: number;
+        }): Promise<void>;
+        del(fileName: string): Promise<void>;
+        setLargeFile(config: {
+            path: string;
+            getNextData(): Promise<Buffer | undefined>;
+        }): Promise<void>;
+        getURL(path: string): Promise<string>;
+    }
+    export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;
+
+}
+
 declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
     export {};
+
+}
+
+declare module "sliftutils/storage/remoteStorage/remoteConfig" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig } from "../IArchives";
+    export declare const ROUTING_FILE = "storage/storagerouting.json";
+    export declare function getConfigVersion(config: RemoteConfig): number;
+    /** Strips the routing-file suffix, leaving the bucket's public base URL (file paths append to it). */
+    export declare function getBucketBaseUrl(url: string): string;
+    export declare function buildFileUrl(baseUrl: string, filePath: string): string;
+    export declare function parseHostedUrl(url: string): {
+        address: string;
+        port: number;
+        account: string;
+        bucketName: string;
+    };
+    export declare function parseBackblazeUrl(url: string): {
+        bucketName: string;
+    };
+    export declare function normalizeSource(source: RemoteConfigBase): HostedConfig | BackblazeConfig;
+    export declare function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig;
+    export declare function parseRoutingData(data: Buffer): RemoteConfig;
+    export declare function serializeRemoteConfig(config: RemoteConfig): Buffer;
 
 }
 
 declare module "sliftutils/storage/remoteStorage/storageController" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
+    import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
     export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
     export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
     export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
@@ -2971,14 +3133,6 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         machineId: string;
         ip: string;
         time: number;
-    };
-    export type BucketConfig = {
-        folder: string;
-        public?: boolean;
-        fast?: boolean;
-        writeDelay?: number;
-        rawDisk?: boolean;
-        immutable?: boolean;
     };
     export type AccessState = {
         machineId: string;
@@ -3003,7 +3157,6 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         grantAccess: (requestId: string) => Promise<TrustRecord>;
         adminListRequests: (ip: string) => Promise<AccessRequest[]>;
         adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
-        ensureBucket: (account: string, bucketName: string, config: Omit<BucketConfig, "folder">) => Promise<void>;
         get: (account: string, bucketName: string, path: string, range?: {
             start: number;
             end: number;
@@ -3026,12 +3179,16 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             type?: "files" | "folders";
         }) => Promise<ArchiveFileInfo[]>;
         getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
+        getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
         getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
         startLargeFile: (account: string, bucketName: string, path: string) => Promise<string>;
         uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
         finishLargeFile: (uploadId: string) => Promise<void>;
         cancelLargeFile: (uploadId: string) => Promise<void>;
-        getPublicFile: (account: string, bucketName: string, path: string) => Promise<Buffer>;
+        httpEntry: (config?: {
+            requireCalls?: string[];
+            cacheTime?: number;
+        }) => Promise<Buffer>;
     }>;
 
 }
@@ -3041,7 +3198,7 @@ declare module "sliftutils/storage/remoteStorage/storageServer" {
     export type HostStorageServerConfig = {
         url: string;
         folder: string;
-        cloudflareApiToken: {
+        cloudflareApiToken?: {
             key: string;
         } | {
             path: string;
@@ -3058,9 +3215,12 @@ declare module "sliftutils/storage/remoteStorage/storageServerCli" {
 }
 
 declare module "sliftutils/storage/remoteStorage/storageServerState" {
+    /// <reference types="node" />
+    /// <reference types="node" />
     import { IBucketStore } from "./blobStore";
+    import { RemoteConfig, HostedConfig, IArchives } from "../IArchives";
     import type { IStorage } from "../IStorage";
-    import type { AccessRequest, TrustRecord, BucketConfig } from "./storageController";
+    import type { AccessRequest, TrustRecord } from "./storageController";
     export type StorageServerConfig = {
         domain: string;
         port: number;
@@ -3071,12 +3231,27 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     };
     export declare function setStorageServerConfig(value: StorageServerConfig): void;
     export declare function getStorageServerConfig(): StorageServerConfig;
+    export declare function getStorageServerConfigOptional(): StorageServerConfig | undefined;
     export declare function setWritesRejectedReason(reason: string | undefined): void;
     export declare function getWritesRejectedReason(): string | undefined;
+    export declare function assertWritesAllowed(): void;
     export declare function getTrust(): Promise<IStorage<TrustRecord>>;
     export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
-    export declare function getBuckets(): Promise<IStorage<BucketConfig>>;
-    export declare function getBlobStore(bucket: BucketConfig): IBucketStore;
+    export type LoadedBucket = {
+        account: string;
+        bucketName: string;
+        routing: RemoteConfig;
+        routingJSON: string;
+        self: HostedConfig | undefined;
+        store: IBucketStore;
+    };
+    export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
+    export declare function assertMutable(bucket: LoadedBucket, filePath: string): Promise<void>;
+    export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
+        lastModified?: number;
+    }): Promise<void>;
+    export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
+    export declare function getLocalArchives(account: string, bucketName: string): IArchives;
 
 }
 

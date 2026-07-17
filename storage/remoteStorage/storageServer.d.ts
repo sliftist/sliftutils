@@ -2,7 +2,7 @@ import "./accessPage";
 export type HostStorageServerConfig = {
     url: string;
     folder: string;
-    cloudflareApiToken: {
+    cloudflareApiToken?: {
         key: string;
     } | {
         path: string;

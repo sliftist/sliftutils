@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
+import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
 export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
@@ -22,14 +22,6 @@ export type TrustRecord = {
     machineId: string;
     ip: string;
     time: number;
-};
-export type BucketConfig = {
-    folder: string;
-    public?: boolean;
-    fast?: boolean;
-    writeDelay?: number;
-    rawDisk?: boolean;
-    immutable?: boolean;
 };
 export type AccessState = {
     machineId: string;
@@ -54,7 +46,6 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     grantAccess: (requestId: string) => Promise<TrustRecord>;
     adminListRequests: (ip: string) => Promise<AccessRequest[]>;
     adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
-    ensureBucket: (account: string, bucketName: string, config: Omit<BucketConfig, "folder">) => Promise<void>;
     get: (account: string, bucketName: string, path: string, range?: {
         start: number;
         end: number;
@@ -77,10 +68,14 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         type?: "files" | "folders";
     }) => Promise<ArchiveFileInfo[]>;
     getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
+    getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
     getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
     startLargeFile: (account: string, bucketName: string, path: string) => Promise<string>;
     uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
     finishLargeFile: (uploadId: string) => Promise<void>;
     cancelLargeFile: (uploadId: string) => Promise<void>;
-    getPublicFile: (account: string, bucketName: string, path: string) => Promise<Buffer>;
+    httpEntry: (config?: {
+        requireCalls?: string[];
+        cacheTime?: number;
+    }) => Promise<Buffer>;
 }>;

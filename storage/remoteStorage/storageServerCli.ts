@@ -13,11 +13,11 @@ process.on("uncaughtException", (error) => {
 
 async function main() {
     let url = getArg("url");
-    if (!url) throw new Error(`--url is required (ex: --url https://storage.example.com:4444/storagerouting.json)`);
+    if (!url) throw new Error(`--url is required (ex: --url https://storage.example.com:4444)`);
     let folder = getArg("folder");
     if (!folder) throw new Error(`--folder is required (the folder all data is stored in)`);
+    // Optional: hostStorageServer falls back to ~/cloudflare.json
     let cloudflareApiToken = getArg("cloudflareApiToken");
-    if (!cloudflareApiToken) throw new Error(`--cloudflareApiToken is required (a path to a file containing the token)`);
     let lowSpaceThresholdBytes: number | undefined;
     let lowSpaceThreshold = getArg("lowSpaceThreshold");
     if (lowSpaceThreshold) {
@@ -30,7 +30,7 @@ async function main() {
     await hostStorageServer({
         url,
         folder,
-        cloudflareApiToken: { path: cloudflareApiToken },
+        cloudflareApiToken: cloudflareApiToken && { path: cloudflareApiToken } || undefined,
         lowSpaceThresholdBytes,
     });
 }

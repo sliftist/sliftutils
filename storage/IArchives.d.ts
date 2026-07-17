@@ -2,6 +2,45 @@
 /// <reference types="node" />
 export declare const MAX_LAST_MODIFIED_FUTURE: number;
 export declare function assertValidLastModified(lastModified: number): void;
+export type RemoteConfig = {
+    version?: number;
+    sources: RemoteConfigBase[];
+};
+/**
+    string arguments will be a url, looking like:
+        https://storage2.vidgridweb.com:4445/file/exampleaccount/examplebucket/storage/storagerouting.json
+        https://f002.backblazeb2.com/file/querysubtest-com-public-immutable/storage/storagerouting.json
+        - These map to { url }, with the type inferred from the url
+        - Hosted urls are /file/<account>/<bucketName>/..., backblaze urls are /file/<bucketName>/...
+
+    NOTE: If we do not have right access to these, then it becomes a read-only IArchives, where we solely read using the url form (which might throw due to not having access as well). UNLESS Our configuration explicitly has public: false, in which case, we don't even hit the URL and we throw on access.
+
+    NOTE: If we're in the browser, we should allow downloading the files via the URL form (if it's a public bucket), however, we won't allow writing, because their servers do not allow secure browser writes.
+*/
+export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
+export type CommonConfig = {
+    /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
+    syncOptions?: SyncOptions;
+};
+export type HostedConfig = CommonConfig & {
+    type: "remote";
+    url: string;
+    accountName?: string;
+    public?: boolean;
+    fast?: boolean;
+    writeDelay?: number;
+    rawDisk?: boolean;
+    immutable?: boolean;
+};
+export type BackblazeConfig = CommonConfig & {
+    type: "backblaze";
+    url: string;
+    bucketName: string;
+    public?: boolean;
+    immutable?: boolean;
+};
+export declare const DEFAULT_BASE_SYNC_OPTIONS: SyncOptions;
+export declare const DEFAULT_SYNC_OPTIONS: SyncOptions;
 export type ArchiveFileInfo = {
     path: string;
     createTime: number;

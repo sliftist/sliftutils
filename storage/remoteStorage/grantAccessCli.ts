@@ -9,7 +9,7 @@ import { getArg } from "./cliArgs";
 
 async function main() {
     let url = getArg("url");
-    if (!url) throw new Error(`--url is required (ex: --url https://storage.example.com:4444/storagerouting.json)`);
+    if (!url) throw new Error(`--url is required (ex: --url https://storage.example.com:4444)`);
     let requestId = getArg("requestId");
     if (!requestId) throw new Error(`--requestId is required (the request id shown on the access page)`);
 

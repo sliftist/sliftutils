@@ -9,16 +9,15 @@ import { formatNumber, formatDateTime } from "socket-function/src/formatting/for
 import { css } from "typesafecss";
 import { InputLabel } from "../render-utils/InputLabel";
 import { redButton, greenButton, errorMessage } from "../render-utils/colors";
-import { createArchivesRemoteFactory } from "../storage/remoteStorage/ArchivesRemote";
+import { createArchives } from "../storage/remoteStorage/createArchives";
 import { ArchiveFileInfo } from "../storage/IArchives";
 
-const STORAGE_URL = "https://storage.vidgridweb.com:4444/storagerouting.json";
-const ACCOUNT = "example";
-const BUCKET = "examplefiles";
+// The bucket's routing URL: server, account ("example"), and bucket ("examplefiles") in one.
+// Nothing else is needed - the first call creates the bucket if it doesn't exist yet.
+const STORAGE_URL = "https://storage.vidgridweb.com:4444/file/example/examplefiles/storage/storagerouting.json";
 const ACCESS_CHECK_INTERVAL = 1000 * 15;
 
-const archives = createArchivesRemoteFactory({ url: STORAGE_URL, account: ACCOUNT })
-    .getBucket({ bucketName: BUCKET });
+const archives = createArchives(STORAGE_URL);
 
 @observer
 class ExampleStoragePage extends preact.Component {
@@ -85,7 +84,7 @@ class ExampleStoragePage extends preact.Component {
     render() {
         let synced = this.synced;
         return <div className={css.vbox(12).pad2(16)}>
-            <div>Storage example site. Account {ACCOUNT}, bucket {BUCKET} on {STORAGE_URL}</div>
+            <div>Storage example site. Bucket {STORAGE_URL}</div>
             {synced.error && <div className={errorMessage}>{synced.error}</div>}
             {!synced.loaded && !synced.access && <div>Loading files...</div>}
             {!synced.loaded && synced.access && <div className={css.vbox(8)}>

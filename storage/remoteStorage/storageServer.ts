@@ -5,6 +5,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { getExternalIP } from "socket-function/src/networking";
 import { RequireController } from "socket-function/require/RequireController";
 import { hostServer } from "../../misc/https/hostServer";
+import { getSecret } from "../../misc/getSecret";
 import { RemoteStorageController } from "./storageController";
 import { setStorageServerConfig, setWritesRejectedReason } from "./storageServerState";
 import { parseStorageUrl } from "./ArchivesRemote";
@@ -22,13 +23,14 @@ const HARD_REJECT_FRACTION = 0.1;
 // grantAccess.js bootstrap (next to this file) is what the access page's shown SSH command points at.
 
 export type HostStorageServerConfig = {
-    // Full URL of this storage server, e.g. "https://storage.example.com:4444".
-    // The domain and port are extracted from it; the path is reserved for the routing config
-    // (handled elsewhere). The exact same URL is what clients pass to createArchivesRemoteFactory.
+    // Full URL of this storage server, e.g. "https://storage.example.com:4444". The domain and
+    // port are extracted from it (bucket routing URLs clients use look like
+    // https://storage.example.com:4444/file/<account>/<bucketName>/storage/storagerouting.json).
     url: string;
     folder: string;
-    // Set hostServer.ts:HostServerConfig:cloudflareApiToken
-    cloudflareApiToken: { key: string } | { path: string };
+    // Set hostServer.ts:HostServerConfig:cloudflareApiToken. Defaults to getSecret("cloudflare.json")
+    // (~/cloudflare.json, { key: string }).
+    cloudflareApiToken?: { key: string } | { path: string };
     // When free space on the folder's drive drops below this many bytes, the server console.errors
     // every 15 minutes. Below 10% of it, the server also rejects write operations (creating files,
     // large uploads, new buckets) — reads, findInfo, and deletes still work so the user can free
@@ -90,11 +92,12 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     RequireController.allowAllNodeModules();
     SocketFunction.expose(RequireController);
     SocketFunction.expose(RemoteStorageController);
-    // No static roots, so the access page HTML is served at every path (the path is the account
-    // name, see accessPage.tsx).
+    // Every HTTP path goes through httpEntry: /file/<account>/<bucketName>/... serves public
+    // bucket files, everything else serves the access page (the path is the account name, see
+    // accessPage.tsx).
     // A full URL, so the page resolves modules from the origin root even when served at
     // /accountName (a relative require would resolve inside the account path).
-    SocketFunction.setDefaultHTTPCall(RequireController, "requireHTML", {
+    SocketFunction.setDefaultHTTPCall(RemoteStorageController, "httpEntry", {
         requireCalls: [`https://${domain}:${port}/./storage/remoteStorage/accessPage.tsx`],
     });
 
@@ -110,7 +113,7 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     await hostServer({
         domain,
         port,
-        cloudflareApiToken: config.cloudflareApiToken,
+        cloudflareApiToken: config.cloudflareApiToken || { key: await getSecret("cloudflare.json.key") },
         setDNSRecord: true,
     });
 }

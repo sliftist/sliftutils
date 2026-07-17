@@ -94,7 +94,17 @@ type SourceState = {
 };
 
 export class BlobStore implements IBucketStore {
-    constructor(private folder: string, private sources: ArchivesSource[]) { }
+    constructor(
+        private folder: string,
+        private sources: ArchivesSource[],
+        private config?: {
+            // Called whenever a key's index entry changes (our own writes AND files pulled in via
+            // synchronization) — how the storage server notices routing config updates.
+            onIndexChanged?: (key: string) => void;
+        }
+    ) { }
+
+    private stopped = { stop: false };
 
     // The index's BulkDatabase2 files live under <folder>/index
     private index = new BulkDatabaseBase<BlobIndexEntry>("blobIndex", noopReactiveDeps, async (p: string) => {
@@ -123,9 +133,17 @@ export class BlobStore implements IBucketStore {
         for (let i = 0; i < this.sources.length; i++) {
             void this.runSourceSync(i);
         }
-        runInfinitePoll(FAST_FLUSH_POLL, () => this.flushOverlay());
-        runInfinitePoll(INDEX_FLUSH_INTERVAL, () => this.flushIndex());
+        runInfinitePoll(FAST_FLUSH_POLL, () => this.flushOverlay(), this.stopped);
+        runInfinitePoll(INDEX_FLUSH_INTERVAL, () => this.flushIndex(), this.stopped);
     });
+
+    // Stops all synchronization scans/polls and flushes pending writes. Used when a bucket's
+    // routing config changes and the store is rebuilt with new sources.
+    public async dispose(): Promise<void> {
+        this.stopped.stop = true;
+        await this.flushOverlay(true);
+        await this.flushIndex();
+    }
 
     private async loadIndex(): Promise<void> {
         let [writeTimes, sizes, sources] = await Promise.all([
@@ -148,6 +166,7 @@ export class BlobStore implements IBucketStore {
         let full: IndexEntry = { ...entry, changedAt: Date.now() };
         this.mem.set(key, full);
         this.dirty.set(key, full);
+        this.config?.onIndexChanged?.(key);
     }
     private deleteIndexEntry(key: string): void {
         if (!this.mem.has(key)) return;
@@ -177,7 +196,7 @@ export class BlobStore implements IBucketStore {
     private async runSourceSync(sourceIndex: number): Promise<void> {
         let { source, options } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
-        while (true) {
+        while (!this.stopped.stop) {
             try {
                 let config = await source.getConfig();
                 state.supportsChangesAfter = !!(config.supportsChangesAfter && source.getChangesAfter);
@@ -190,6 +209,7 @@ export class BlobStore implements IBucketStore {
         }
         state.scanComplete = true;
         state.initialScan.resolve(undefined);
+        if (this.stopped.stop) return;
         if (options.copyFiles) {
             try {
                 await this.copySourceFiles(sourceIndex);
@@ -201,12 +221,12 @@ export class BlobStore implements IBucketStore {
             runInfinitePoll(CHANGES_POLL_INTERVAL, async () => {
                 await this.pollChanges(sourceIndex);
                 if (options.copyFiles) await this.copySourceFiles(sourceIndex);
-            });
+            }, this.stopped);
         } else {
             runInfinitePoll(FULL_RESCAN_INTERVAL, async () => {
                 await this.scanSource(sourceIndex);
                 if (options.copyFiles) await this.copySourceFiles(sourceIndex);
-            });
+            }, this.stopped);
         }
     }
 
@@ -519,10 +539,10 @@ export class BlobStore implements IBucketStore {
         await this.getDiskSource().disk.cancelLargeUpload(id);
     }
 
-    private async flushOverlay(): Promise<void> {
+    private async flushOverlay(force?: boolean): Promise<void> {
         let now = Date.now();
         for (let [key, entry] of this.overlay) {
-            if (entry.flushAt > now) continue;
+            if (!force && entry.flushAt > now) continue;
             if (entry.data) {
                 await this.writeToSources(key, entry.data, entry.t);
             } else {

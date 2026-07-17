@@ -1,28 +1,15 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
-export type ArchivesRemoteBucketConfig = {
-    bucketName: string;
-    public?: boolean;
-    fast?: boolean;
-    writeDelay?: number;
-    rawDisk?: boolean;
-    immutable?: boolean;
-};
-export type ArchivesRemoteConfig = ArchivesRemoteBucketConfig & {
+export type ArchivesRemoteConfig = {
     url: string;
-    account: string;
+    accountName?: string;
+    waitForAccess?: boolean;
 };
 export declare function parseStorageUrl(url: string): {
     address: string;
     port: number;
 };
-export declare function buildPublicFileURL(config: {
-    url: string;
-    account: string;
-    bucketName: string;
-    path: string;
-}): string;
 export declare function authenticateStorage(config: {
     address: string;
     port: number;
@@ -31,25 +18,14 @@ export declare function authenticateStorage(config: {
     machineId: string;
     ip: string;
 }>;
-export declare class ArchivesRemoteFactory {
-    private config;
-    constructor(config: {
-        url: string;
-        account: string;
-    });
-    getBucket(bucket: ArchivesRemoteBucketConfig): ArchivesRemote;
-}
-export declare function createArchivesRemoteFactory(config: {
-    url: string;
-    account: string;
-}): ArchivesRemoteFactory;
 export declare class ArchivesRemote implements IArchives {
     private config;
     constructor(config: ArchivesRemoteConfig);
     private parsed;
+    private account;
+    private bucketName;
     private nodeId;
     private controller;
-    private setupDone;
     private lastDeniedLog;
     getDebugName(): string;
     private authenticate;
@@ -60,7 +36,6 @@ export declare class ArchivesRemote implements IArchives {
         ip: string;
     } | undefined>;
     private onAccessDenied;
-    private ensureSetup;
     private call;
     get(fileName: string, config?: {
         range?: {
