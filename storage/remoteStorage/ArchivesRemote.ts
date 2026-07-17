@@ -3,10 +3,11 @@ module.allowclient = true;
 import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
+import { getCallObj } from "socket-function/src/nodeProxy";
 import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
 import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 import {
-    RemoteStorageController, REMOTE_STORAGE_CLASS_GUID, STORAGE_AUTH_PURPOSE,
+    RemoteStorageController, STORAGE_AUTH_PURPOSE,
     STORAGE_NOT_AUTHENTICATED, STORAGE_ACCESS_DENIED,
 } from "./storageController";
 
@@ -30,6 +31,11 @@ export type ArchivesRemoteBucketConfig = {
     // writes that haven't flushed yet.
     fast?: boolean;
     writeDelay?: number;
+    // The bucket is served straight from the server's disk, with no index — so no fast writes and
+    // no getChangesAfter/getSyncStatus.
+    rawDisk?: boolean;
+    // Writes to paths that already exist are disallowed (deletes still work).
+    immutable?: boolean;
 };
 export type ArchivesRemoteConfig = ArchivesRemoteBucketConfig & {
     url: string;
@@ -46,8 +52,10 @@ export function parseStorageUrl(url: string): { address: string; port: number } 
 
 export function buildPublicFileURL(config: { url: string; account: string; bucketName: string; path: string }): string {
     let { address, port } = parseStorageUrl(config.url);
-    let args = encodeURIComponent(JSON.stringify([config.account, config.bucketName, config.path]));
-    return `https://${address}:${port}/?classGuid=${REMOTE_STORAGE_CLASS_GUID}&functionName=getPublicFile&args=${args}`;
+    SocketFunction.ENABLE_CLIENT_MODE = true;
+    let nodeId = SocketFunction.connect({ address, port });
+    let call = RemoteStorageController.nodes[nodeId].getPublicFile[getCallObj](config.account, config.bucketName, config.path);
+    return SocketFunction.getHTTPCallLink(call);
 }
 
 // Authenticates a connection to a storage server with this machine's certs.ts identity
@@ -141,6 +149,8 @@ export class ArchivesRemote implements IArchives {
             public: this.config.public,
             fast: this.config.fast,
             writeDelay: this.config.writeDelay,
+            rawDisk: this.config.rawDisk,
+            immutable: this.config.immutable,
         });
         this.setupDone = true;
     }
@@ -196,7 +206,7 @@ export class ArchivesRemote implements IArchives {
         return await this.call(() => this.controller.getChangesAfter(this.config.account, this.config.bucketName, time));
     }
     public async getConfig(): Promise<ArchivesConfig> {
-        return { supportsChangesAfter: true };
+        return { supportsChangesAfter: !this.config.rawDisk };
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
         return await this.call(() => this.controller.getSyncStatus(this.config.account, this.config.bucketName));

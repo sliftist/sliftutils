@@ -2060,7 +2060,7 @@ declare module "sliftutils/storage/IArchives" {
     };
     export type SyncOptions = {
         copyFiles?: boolean;
-        writeBack?: boolean;
+        noWriteBack?: boolean;
         cacheReads?: boolean;
         validWindow: [number, number];
         required?: boolean;
@@ -2723,6 +2723,8 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         public?: boolean;
         fast?: boolean;
         writeDelay?: number;
+        rawDisk?: boolean;
+        immutable?: boolean;
     };
     export type ArchivesRemoteConfig = ArchivesRemoteBucketConfig & {
         url: string;
@@ -2835,7 +2837,40 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         writeDelay?: number;
         lastModified?: number;
     };
-    export declare class BlobStore {
+    export type IBucketStore = {
+        get(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<Buffer | undefined>;
+        get2(fileName: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+        } | undefined>;
+        set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
+        del(fileName: string, config?: WriteConfig): Promise<void>;
+        getInfo(fileName: string): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        findInfo(prefix: string, config?: {
+            shallow?: boolean;
+            type?: "files" | "folders";
+        }): Promise<ArchiveFileInfo[]>;
+        getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
+        getSyncStatus?(): Promise<ArchivesSyncStatus>;
+        startLargeUpload(): Promise<string>;
+        appendLargeUpload(id: string, data: Buffer): Promise<void>;
+        finishLargeUpload(id: string, key: string): Promise<void>;
+        cancelLargeUpload(id: string): Promise<void>;
+    };
+    export declare class BlobStore implements IBucketStore {
         private folder;
         private sources;
         constructor(folder: string, sources: ArchivesSource[]);
@@ -2861,13 +2896,17 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private waitForRequiredScans;
         private checkMissingKey;
         private getIndexEntry;
-        get(key: string, range?: {
-            start: number;
-            end: number;
+        get(key: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
         }): Promise<Buffer | undefined>;
-        get2(key: string, range?: {
-            start: number;
-            end: number;
+        get2(key: string, config?: {
+            range?: {
+                start: number;
+                end: number;
+            };
         }): Promise<{
             data: Buffer;
             writeTime: number;
@@ -2911,8 +2950,6 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
-    import type { BlobStore } from "./blobStore";
-    import type { IStorage } from "../IStorage";
     export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
     export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
     export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
@@ -2940,6 +2977,8 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         public?: boolean;
         fast?: boolean;
         writeDelay?: number;
+        rawDisk?: boolean;
+        immutable?: boolean;
     };
     export type AccessState = {
         machineId: string;
@@ -2948,19 +2987,6 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         grantAccessCommand?: string;
         trustedMachines?: TrustRecord[];
     };
-    export type StorageServerState = {
-        domain: string;
-        port: number;
-        rootDomain: string;
-        sshTarget: string;
-        serverCommand: string;
-        getBlobStore(bucket: BucketConfig): BlobStore;
-        trust: IStorage<TrustRecord>;
-        requests: IStorage<AccessRequest[]>;
-        buckets: IStorage<BucketConfig>;
-    };
-    export declare function setStorageServerState(state: StorageServerState): void;
-    export declare function setWritesRejectedReason(reason: string | undefined): void;
     export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
         authenticate: (token: AuthToken) => Promise<{
             machineId: string;
@@ -3028,6 +3054,29 @@ declare module "sliftutils/storage/remoteStorage/storageServer" {
 
 declare module "sliftutils/storage/remoteStorage/storageServerCli" {
     export {};
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storageServerState" {
+    import { IBucketStore } from "./blobStore";
+    import type { IStorage } from "../IStorage";
+    import type { AccessRequest, TrustRecord, BucketConfig } from "./storageController";
+    export type StorageServerConfig = {
+        domain: string;
+        port: number;
+        rootDomain: string;
+        sshTarget: string;
+        serverCommand: string;
+        folder: string;
+    };
+    export declare function setStorageServerConfig(value: StorageServerConfig): void;
+    export declare function getStorageServerConfig(): StorageServerConfig;
+    export declare function setWritesRejectedReason(reason: string | undefined): void;
+    export declare function getWritesRejectedReason(): string | undefined;
+    export declare function getTrust(): Promise<IStorage<TrustRecord>>;
+    export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
+    export declare function getBuckets(): Promise<IStorage<BucketConfig>>;
+    export declare function getBlobStore(bucket: BucketConfig): IBucketStore;
 
 }
 

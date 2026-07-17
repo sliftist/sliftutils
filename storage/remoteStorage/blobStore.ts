@@ -41,6 +41,23 @@ export type WriteConfig = {
     lastModified?: number;
 };
 
+// What the storage server needs from a bucket's store. BlobStore implements it fully; ArchivesDisk
+// also satisfies it (used directly for rawDisk buckets), minus the optional index-backed methods.
+export type IBucketStore = {
+    get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined>;
+    get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined>;
+    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
+    del(fileName: string, config?: WriteConfig): Promise<void>;
+    getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined>;
+    findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]>;
+    getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
+    getSyncStatus?(): Promise<ArchivesSyncStatus>;
+    startLargeUpload(): Promise<string>;
+    appendLargeUpload(id: string, data: Buffer): Promise<void>;
+    finishLargeUpload(id: string, key: string): Promise<void>;
+    cancelLargeUpload(id: string): Promise<void>;
+};
+
 type OverlayEntry = {
     // undefined data means a pending delete
     data: Buffer | undefined;
@@ -76,7 +93,7 @@ type SourceState = {
     lastMissCheck: number;
 };
 
-export class BlobStore {
+export class BlobStore implements IBucketStore {
     constructor(private folder: string, private sources: ArchivesSource[]) { }
 
     // The index's BulkDatabase2 files live under <folder>/index
@@ -304,13 +321,14 @@ export class BlobStore {
 
     // ── data operations ──
 
-    public async get(key: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
-        let result = await this.get2(key, range);
+    public async get(key: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined> {
+        let result = await this.get2(key, config);
         return result && result.data || undefined;
     }
 
-    public async get2(key: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+    public async get2(key: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
         await this.init();
+        let range = config?.range;
         let overlayEntry = this.overlay.get(key);
         if (overlayEntry) {
             if (!overlayEntry.data) return undefined;
@@ -373,12 +391,12 @@ export class BlobStore {
     private async writeToSources(key: string, data: Buffer, writeTime: number): Promise<void> {
         let first: number | undefined;
         for (let i = 0; i < this.sources.length; i++) {
-            if (!this.sources[i].options.writeBack) continue;
+            if (this.sources[i].options.noWriteBack) continue;
             await this.sources[i].source.set(key, data, { lastModified: writeTime });
             if (first === undefined) first = i;
         }
         if (first === undefined) {
-            throw new Error(`No writeBack sources configured, so writes cannot be stored (store ${this.folder})`);
+            throw new Error(`Every source is noWriteBack, so writes cannot be stored (store ${this.folder})`);
         }
         this.setIndexEntry(key, { writeTime, size: data.length, source: first });
     }
@@ -396,7 +414,7 @@ export class BlobStore {
 
     private async deleteFromSources(key: string): Promise<void> {
         for (let i = 0; i < this.sources.length; i++) {
-            if (!this.sources[i].options.writeBack) continue;
+            if (this.sources[i].options.noWriteBack) continue;
             await this.sources[i].source.del(key);
         }
         this.deleteIndexEntry(key);

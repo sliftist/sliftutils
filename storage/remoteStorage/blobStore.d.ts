@@ -7,7 +7,40 @@ export type WriteConfig = {
     writeDelay?: number;
     lastModified?: number;
 };
-export declare class BlobStore {
+export type IBucketStore = {
+    get(fileName: string, config?: {
+        range?: {
+            start: number;
+            end: number;
+        };
+    }): Promise<Buffer | undefined>;
+    get2(fileName: string, config?: {
+        range?: {
+            start: number;
+            end: number;
+        };
+    }): Promise<{
+        data: Buffer;
+        writeTime: number;
+    } | undefined>;
+    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
+    del(fileName: string, config?: WriteConfig): Promise<void>;
+    getInfo(fileName: string): Promise<{
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    findInfo(prefix: string, config?: {
+        shallow?: boolean;
+        type?: "files" | "folders";
+    }): Promise<ArchiveFileInfo[]>;
+    getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
+    getSyncStatus?(): Promise<ArchivesSyncStatus>;
+    startLargeUpload(): Promise<string>;
+    appendLargeUpload(id: string, data: Buffer): Promise<void>;
+    finishLargeUpload(id: string, key: string): Promise<void>;
+    cancelLargeUpload(id: string): Promise<void>;
+};
+export declare class BlobStore implements IBucketStore {
     private folder;
     private sources;
     constructor(folder: string, sources: ArchivesSource[]);
@@ -33,13 +66,17 @@ export declare class BlobStore {
     private waitForRequiredScans;
     private checkMissingKey;
     private getIndexEntry;
-    get(key: string, range?: {
-        start: number;
-        end: number;
+    get(key: string, config?: {
+        range?: {
+            start: number;
+            end: number;
+        };
     }): Promise<Buffer | undefined>;
-    get2(key: string, range?: {
-        start: number;
-        end: number;
+    get2(key: string, config?: {
+        range?: {
+            start: number;
+            end: number;
+        };
     }): Promise<{
         data: Buffer;
         writeTime: number;

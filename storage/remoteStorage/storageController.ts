@@ -6,8 +6,8 @@ import { setHTTPResultHeaders } from "socket-function/src/callHTTPHandler";
 import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
 import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
-import type { BlobStore, WriteConfig } from "./blobStore";
-import type { IStorage } from "../IStorage";
+import type { IBucketStore, WriteConfig } from "./blobStore";
+import type * as StorageServerState from "./storageServerState";
 
 // The remote storage server's API. Authentication uses certs.ts machine identities: a client
 // proves it owns its machine key by signing a timestamped token (bound to this server, so tokens
@@ -51,6 +51,11 @@ export type BucketConfig = {
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
+    // The bucket is served straight from the disk (a raw ArchivesDisk), with no index — so no
+    // fast writes and no getChangesAfter/getSyncStatus.
+    rawDisk?: boolean;
+    // Writes to paths that already exist are disallowed (deletes still work).
+    immutable?: boolean;
 };
 export type AccessState = {
     machineId: string;
@@ -66,41 +71,16 @@ export type AccessState = {
     trustedMachines?: TrustRecord[];
 };
 
-export type StorageServerState = {
-    domain: string;
-    port: number;
-    rootDomain: string;
-    // user@externalIp of the storage machine, for generated ssh commands
-    sshTarget: string;
-    // Absolute command that runs storageServer.ts on the storage machine (admin args appended)
-    serverCommand: string;
-    // Each bucket has its own blob store (in its own folder, see BucketConfig.folder). The server
-    // caches stores per folder, creating them on first use.
-    getBlobStore(bucket: BucketConfig): BlobStore;
-    trust: IStorage<TrustRecord>;
-    requests: IStorage<AccessRequest[]>;
-    buckets: IStorage<BucketConfig>;
-};
-
-let serverState: StorageServerState | undefined;
-export function setStorageServerState(state: StorageServerState) {
-    serverState = state;
+// The server-side global state (config, system storages, blob stores — see storageServerState.ts),
+// required lazily so this module stays loadable in the browser (the state module pulls in
+// fs-backed storage). Throws if the storage server was never initialized.
+function serverState(): typeof StorageServerState {
+    return require("./storageServerState");
 }
 
-// When set, all write-path operations (creating files, appending large uploads, creating buckets)
-// throw this message. Reads, findInfo, and deletes still work — so clients can free space. Managed
-// by hostStorageServer's disk-space monitor.
-let writesRejectedReason: string | undefined;
-export function setWritesRejectedReason(reason: string | undefined) {
-    writesRejectedReason = reason;
-}
 function assertWritesAllowed() {
-    if (writesRejectedReason) throw new Error(writesRejectedReason);
-}
-function getState(): StorageServerState {
-    let state = serverState;
-    if (!state) throw new Error(`Storage server is not initialized (this API only works on the storage server)`);
-    return state;
+    let reason = serverState().getWritesRejectedReason();
+    if (reason) throw new Error(reason);
 }
 
 // callerNodeId -> authenticated machineId. Connections are long-lived websockets, so a session
@@ -144,8 +124,7 @@ function getCallerIP(): string {
     return getNodeIdIP(SocketFunction.getCaller().nodeId);
 }
 function isAdmin(machineId: string): boolean {
-    let state = getState();
-    return machineId === getOwnMachineId(state.rootDomain);
+    return machineId === getOwnMachineId(serverState().getStorageServerConfig().rootDomain);
 }
 function requireAdmin(): string {
     let machineId = getCallerMachineId();
@@ -156,12 +135,13 @@ function requireAdmin(): string {
 }
 async function requireAccess(account: string): Promise<string> {
     assertValidName(account, "account");
-    let state = getState();
     let machineId = getCallerMachineId();
     if (isAdmin(machineId)) return machineId;
-    let trusted = await state.trust.get(`${account}|${machineId}`);
+    let trust = await serverState().getTrust();
+    let trusted = await trust.get(`${account}|${machineId}`);
     if (!trusted) {
-        throw new Error(`${STORAGE_ACCESS_DENIED} Machine ${machineId} has no access to account ${JSON.stringify(account)}. Visit https://${state.domain}:${state.port}/${account} for access instructions.`);
+        let { domain, port } = serverState().getStorageServerConfig();
+        throw new Error(`${STORAGE_ACCESS_DENIED} Machine ${machineId} has no access to account ${JSON.stringify(account)}. Visit https://${domain}:${port}/${account} for access instructions.`);
     }
     return machineId;
 }
@@ -169,26 +149,33 @@ async function requireAccess(account: string): Promise<string> {
 // A single command, runnable from anywhere, that sshes into the storage machine and runs the
 // grantAccess CLI there
 function getGrantAccessCommand(requestId: string): string {
-    let state = getState();
-    return `ssh ${state.sshTarget} '${state.serverCommand} --requestId ${requestId}'`;
+    let { sshTarget, serverCommand } = serverState().getStorageServerConfig();
+    return `ssh ${sshTarget} '${serverCommand} --requestId ${requestId}'`;
 }
 
-async function getBucketStore(account: string, bucketName: string): Promise<{ store: BlobStore; writeConfig: WriteConfig }> {
+async function getBucketStore(account: string, bucketName: string): Promise<{ store: IBucketStore; bucket: BucketConfig; writeConfig: WriteConfig }> {
     assertValidName(account, "account");
     assertValidName(bucketName, "bucket name");
-    let state = getState();
-    let config = await state.buckets.get(`${account}/${bucketName}`);
-    if (!config) {
+    let buckets = await serverState().getBuckets();
+    let bucket = await buckets.get(`${account}/${bucketName}`);
+    if (!bucket) {
         throw new Error(`Bucket ${account}/${bucketName} does not exist. Call ensureBucket first.`);
     }
-    return { store: state.getBlobStore(config), writeConfig: { fast: config.fast, writeDelay: config.writeDelay } };
+    return { store: serverState().getBlobStore(bucket), bucket, writeConfig: { fast: bucket.fast, writeDelay: bucket.writeDelay } };
+}
+
+async function assertMutable(config: { bucket: BucketConfig; store: IBucketStore; account: string; bucketName: string; path: string }): Promise<void> {
+    if (!config.bucket.immutable) return;
+    if (await config.store.getInfo(config.path)) {
+        throw new Error(`Bucket ${config.account}/${config.bucketName} is immutable and ${JSON.stringify(config.path)} already exists, so it cannot be written to`);
+    }
 }
 
 class RemoteStorageControllerBase {
     // Proves the caller owns the machine key for the machineId in its certificate. The signature
     // must be fresh and bound to this server, so it cannot be replayed to (or from) other servers.
     async authenticate(token: AuthToken): Promise<{ machineId: string; ip: string }> {
-        let state = getState();
+        let { domain, port } = serverState().getStorageServerConfig();
         let caller = SocketFunction.getCaller();
         if (Math.abs(Date.now() - token.time) > AUTH_TIME_WINDOW) {
             throw new Error(`Auth token time is too far from the server time (token ${token.time}, server ${Date.now()}, allowed drift ${AUTH_TIME_WINDOW}ms)`);
@@ -196,7 +183,7 @@ class RemoteStorageControllerBase {
         verify(token.certPem, token.signature, {
             purpose: STORAGE_AUTH_PURPOSE,
             time: token.time,
-            server: `${state.domain}:${state.port}`,
+            server: `${domain}:${port}`,
         });
         let machineId = getCommonName(token.certPem).split(".")[0];
         if (!verifyMachineIdForPublicKey({ machineId, publicKey: getPublicIdentifier(token.certPem) })) {
@@ -215,10 +202,10 @@ class RemoteStorageControllerBase {
     // IP, so the storage machine's admin can list them with --listAccess <ip> and grant one.
     async requestAccess(account: string): Promise<{ machineId: string; ip: string; requestId: string; grantAccessCommand: string }> {
         assertValidName(account, "account");
-        let state = getState();
         let machineId = getCallerMachineId();
         let ip = getCallerIP();
-        let requests = await state.requests.get(ip) || [];
+        let requestsStorage = await serverState().getRequests();
+        let requests = await requestsStorage.get(ip) || [];
         let existing = requests.find(x => x.account === account && x.machineId === machineId);
         if (existing) {
             existing.time = Date.now();
@@ -233,19 +220,20 @@ class RemoteStorageControllerBase {
             requests.push(existing);
         }
         while (requests.length > MAX_REQUESTS_PER_IP) requests.shift();
-        await state.requests.set(ip, requests);
+        await requestsStorage.set(ip, requests);
         return { machineId, ip, requestId: existing.requestId, grantAccessCommand: getGrantAccessCommand(existing.requestId) };
     }
 
     async getAccessState(account: string): Promise<AccessState> {
         assertValidName(account, "account");
-        let state = getState();
         let machineId = getCallerMachineId();
         let ip = getCallerIP();
-        let hasAccess = isAdmin(machineId) || !!await state.trust.get(`${account}|${machineId}`);
+        let trust = await serverState().getTrust();
+        let hasAccess = isAdmin(machineId) || !!await trust.get(`${account}|${machineId}`);
         let result: AccessState = { machineId, ip, hasAccess };
         if (!hasAccess) {
-            let ownRequest = (await state.requests.get(ip) || []).find(x => x.account === account && x.machineId === machineId);
+            let requests = await serverState().getRequests();
+            let ownRequest = (await requests.get(ip) || []).find(x => x.account === account && x.machineId === machineId);
             if (ownRequest) {
                 result.grantAccessCommand = getGrantAccessCommand(ownRequest.requestId);
             }
@@ -253,9 +241,9 @@ class RemoteStorageControllerBase {
         }
 
         let trustedMachines: TrustRecord[] = [];
-        for (let key of await state.trust.getKeys()) {
+        for (let key of await trust.getKeys()) {
             if (!key.startsWith(`${account}|`)) continue;
-            let record = await state.trust.get(key);
+            let record = await trust.get(key);
             if (record) trustedMachines.push(record);
         }
         result.trustedMachines = trustedMachines;
@@ -268,8 +256,8 @@ class RemoteStorageControllerBase {
     // request from a machine they didn't mean to trust.
     async listRequestsForIP(account: string, ip: string): Promise<AccessRequest[]> {
         await requireAccess(account);
-        let state = getState();
-        return (await state.requests.get(ip) || []).filter(x => x.account === account);
+        let requests = await serverState().getRequests();
+        return (await requests.get(ip) || []).filter(x => x.account === account);
     }
 
     // Callable by any machine that has access to the request's account (or by the storage-machine
@@ -278,11 +266,12 @@ class RemoteStorageControllerBase {
     async grantAccess(requestId: string): Promise<TrustRecord> {
         // Must capture in the synchronous phase — SocketFunction.getCaller() only works before any await.
         let callerMachineId = getCallerMachineId();
-        let state = getState();
-        for (let ip of await state.requests.getKeys()) {
-            for (let request of await state.requests.get(ip) || []) {
+        let trust = await serverState().getTrust();
+        let requests = await serverState().getRequests();
+        for (let ip of await requests.getKeys()) {
+            for (let request of await requests.get(ip) || []) {
                 if (request.requestId !== requestId) continue;
-                if (!isAdmin(callerMachineId) && !await state.trust.get(`${request.account}|${callerMachineId}`)) {
+                if (!isAdmin(callerMachineId) && !await trust.get(`${request.account}|${callerMachineId}`)) {
                     throw new Error(`${STORAGE_ACCESS_DENIED} Machine ${callerMachineId} has no access to account ${JSON.stringify(request.account)}`);
                 }
                 let record: TrustRecord = {
@@ -291,7 +280,7 @@ class RemoteStorageControllerBase {
                     ip: request.ip,
                     time: Date.now(),
                 };
-                await state.trust.set(`${request.account}|${request.machineId}`, record);
+                await trust.set(`${request.account}|${request.machineId}`, record);
                 return record;
             }
         }
@@ -303,14 +292,15 @@ class RemoteStorageControllerBase {
     // IP you didn't explicitly type in.
     async adminListRequests(ip: string): Promise<AccessRequest[]> {
         requireAdmin();
-        let state = getState();
-        return await state.requests.get(ip) || [];
+        let requests = await serverState().getRequests();
+        return await requests.get(ip) || [];
     }
     async adminGrantAccess(requestId: string): Promise<TrustRecord> {
         requireAdmin();
-        let state = getState();
-        for (let ip of await state.requests.getKeys()) {
-            for (let request of await state.requests.get(ip) || []) {
+        let trust = await serverState().getTrust();
+        let requests = await serverState().getRequests();
+        for (let ip of await requests.getKeys()) {
+            for (let request of await requests.get(ip) || []) {
                 if (request.requestId !== requestId) continue;
                 let record: TrustRecord = {
                     account: request.account,
@@ -318,7 +308,7 @@ class RemoteStorageControllerBase {
                     ip: request.ip,
                     time: Date.now(),
                 };
-                await state.trust.set(`${request.account}|${request.machineId}`, record);
+                await trust.set(`${request.account}|${request.machineId}`, record);
                 return record;
             }
         }
@@ -328,34 +318,35 @@ class RemoteStorageControllerBase {
     async ensureBucket(account: string, bucketName: string, config: Omit<BucketConfig, "folder">): Promise<void> {
         await requireAccess(account);
         assertValidName(bucketName, "bucket name");
-        let state = getState();
+        let buckets = await serverState().getBuckets();
         let key = `${account}/${bucketName}`;
-        let existing = await state.buckets.get(key);
+        let existing = await buckets.get(key);
         // The spread comes first so a caller-supplied folder can never override the server-assigned
         // one (folders are server-assigned, see BucketConfig.folder)
         let full: BucketConfig = { ...config, folder: existing?.folder || `buckets/${account}/${bucketName}` };
         if (existing && JSON.stringify(existing) === JSON.stringify(full)) return;
         assertWritesAllowed();
-        await state.buckets.set(key, full);
+        await buckets.set(key, full);
     }
 
     async get(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
         await requireAccess(account);
         assertValidPath(path);
         let { store } = await getBucketStore(account, bucketName);
-        return await store.get(path, range);
+        return await store.get(path, { range });
     }
     async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number } | undefined> {
         await requireAccess(account);
         assertValidPath(path);
         let { store } = await getBucketStore(account, bucketName);
-        return await store.get2(path, range);
+        return await store.get2(path, { range });
     }
     async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number): Promise<void> {
         assertWritesAllowed();
         await requireAccess(account);
         assertValidPath(path);
-        let { store, writeConfig } = await getBucketStore(account, bucketName);
+        let { store, bucket, writeConfig } = await getBucketStore(account, bucketName);
+        await assertMutable({ bucket, store, account, bucketName, path });
         await store.set(path, Buffer.from(data), { ...writeConfig, lastModified });
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
@@ -379,11 +370,17 @@ class RemoteStorageControllerBase {
     async getChangesAfter(account: string, bucketName: string, time: number): Promise<ArchiveFileInfo[]> {
         await requireAccess(account);
         let { store } = await getBucketStore(account, bucketName);
+        if (!store.getChangesAfter) {
+            throw new Error(`Bucket ${account}/${bucketName} does not support getChangesAfter (rawDisk buckets have no index)`);
+        }
         return await store.getChangesAfter(time);
     }
     async getSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus> {
         await requireAccess(account);
         let { store } = await getBucketStore(account, bucketName);
+        if (!store.getSyncStatus) {
+            throw new Error(`Bucket ${account}/${bucketName} does not support getSyncStatus (rawDisk buckets have no synchronization)`);
+        }
         return await store.getSyncStatus();
     }
 
@@ -392,7 +389,8 @@ class RemoteStorageControllerBase {
         await requireAccess(account);
         // Validates now, so the upload doesn't fail at the end
         assertValidPath(path);
-        let { store } = await getBucketStore(account, bucketName);
+        let { store, bucket } = await getBucketStore(account, bucketName);
+        await assertMutable({ bucket, store, account, bucketName, path });
         let id = await store.startLargeUpload();
         largeUploadInfo.set(id, { account, bucketName, path });
         return id;
@@ -428,13 +426,13 @@ class RemoteStorageControllerBase {
     async getPublicFile(account: string, bucketName: string, path: string): Promise<Buffer> {
         assertValidName(account, "account");
         assertValidName(bucketName, "bucket name");
-        let state = getState();
-        let bucket = await state.buckets.get(`${account}/${bucketName}`);
+        let buckets = await serverState().getBuckets();
+        let bucket = await buckets.get(`${account}/${bucketName}`);
         if (!bucket?.public) {
             throw new Error(`Bucket ${account}/${bucketName} is not public`);
         }
         assertValidPath(path);
-        let data = await state.getBlobStore(bucket).get(path);
+        let data = await serverState().getBlobStore(bucket).get(path);
         if (!data) {
             throw new Error(`File not found: ${path} in ${account}/${bucketName}`);
         }

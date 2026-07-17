@@ -30,8 +30,8 @@ export type SyncOptions = {
     // After the source's metadata is copied into the index, also copy the file contents over (into
     // the cacheReads sources), preserving their modified times.
     copyFiles?: boolean;
-    // On write, write back to this source.
-    writeBack?: boolean;
+    // Writes are NOT written to this source (by default every source receives writes).
+    noWriteBack?: boolean;
     // If a read wasn't served by this source, write the data back to it (using it as a cache), and
     // update the index so it becomes the new source. Set for the local disk source.
     cacheReads?: boolean;

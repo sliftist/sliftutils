@@ -1,8 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { ArchiveFileInfo, ArchivesSyncStatus } from "../IArchives";
-import type { BlobStore } from "./blobStore";
-import type { IStorage } from "../IStorage";
 export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
 export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
@@ -30,6 +28,8 @@ export type BucketConfig = {
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
+    rawDisk?: boolean;
+    immutable?: boolean;
 };
 export type AccessState = {
     machineId: string;
@@ -38,19 +38,6 @@ export type AccessState = {
     grantAccessCommand?: string;
     trustedMachines?: TrustRecord[];
 };
-export type StorageServerState = {
-    domain: string;
-    port: number;
-    rootDomain: string;
-    sshTarget: string;
-    serverCommand: string;
-    getBlobStore(bucket: BucketConfig): BlobStore;
-    trust: IStorage<TrustRecord>;
-    requests: IStorage<AccessRequest[]>;
-    buckets: IStorage<BucketConfig>;
-};
-export declare function setStorageServerState(state: StorageServerState): void;
-export declare function setWritesRejectedReason(reason: string | undefined): void;
 export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
     authenticate: (token: AuthToken) => Promise<{
         machineId: string;

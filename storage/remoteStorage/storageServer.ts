@@ -5,15 +5,8 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { getExternalIP } from "socket-function/src/networking";
 import { RequireController } from "socket-function/require/RequireController";
 import { hostServer } from "../../misc/https/hostServer";
-import { getFileStorageNested2 } from "../FileFolderAPI";
-import { TransactionStorage } from "../TransactionStorage";
-import { JSONStorage } from "../JSONStorage";
-import { BlobStore } from "./blobStore";
-import { ArchivesDisk } from "../ArchivesDisk";
-import {
-    RemoteStorageController, setStorageServerState, setWritesRejectedReason,
-    AccessRequest, TrustRecord, BucketConfig,
-} from "./storageController";
+import { RemoteStorageController } from "./storageController";
+import { setStorageServerConfig, setWritesRejectedReason } from "./storageServerState";
 import { parseStorageUrl } from "./ArchivesRemote";
 // Import browser code, so it is allowed to be required by the client
 import "./accessPage";
@@ -85,37 +78,13 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     let { url, folder } = config;
     let { address: domain, port } = parseStorageUrl(url);
     let lowSpaceThreshold = config.lowSpaceThresholdBytes ?? DEFAULT_LOW_SPACE_THRESHOLD_BYTES;
-    let rootFolder = path.resolve(folder);
-    let root = await getFileStorageNested2(rootFolder);
-    let system = await root.folder.getStorage("system");
-    let trust = new JSONStorage<TrustRecord>(new TransactionStorage(await system.folder.getStorage("trust"), "storageTrust"));
-    let requests = new JSONStorage<AccessRequest[]>(new TransactionStorage(await system.folder.getStorage("requests"), "storageRequests"));
-    let buckets = new JSONStorage<BucketConfig>(new TransactionStorage(await system.folder.getStorage("buckets"), "storageBuckets"));
-
-    let blobStores = new Map<string, BlobStore>();
-    setStorageServerState({
+    setStorageServerConfig({
         domain,
         port,
         rootDomain: domain.split(".").slice(-2).join("."),
         sshTarget: `${os.userInfo().username}@${await getExternalIP()}`,
         serverCommand: `node ${getGrantAccessCliPath()} --url ${url}`,
-        getBlobStore(bucket: BucketConfig) {
-            let store = blobStores.get(bucket.folder);
-            if (!store) {
-                let bucketFolder = path.join(rootFolder, bucket.folder);
-                // Synchronization sources are global (BlobStore doesn't namespace them), so the
-                // disk source is rooted at the full absolute folder, including the bucket's name
-                store = new BlobStore(bucketFolder, [{
-                    source: new ArchivesDisk(bucketFolder),
-                    options: { writeBack: true, cacheReads: true, required: true, validWindow: [0, Number.MAX_SAFE_INTEGER] },
-                }]);
-                blobStores.set(bucket.folder, store);
-            }
-            return store;
-        },
-        trust,
-        requests,
-        buckets,
+        folder: path.resolve(folder),
     });
 
     RequireController.allowAllNodeModules();

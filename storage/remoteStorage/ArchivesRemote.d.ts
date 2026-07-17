@@ -6,6 +6,8 @@ export type ArchivesRemoteBucketConfig = {
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
+    rawDisk?: boolean;
+    immutable?: boolean;
 };
 export type ArchivesRemoteConfig = ArchivesRemoteBucketConfig & {
     url: string;

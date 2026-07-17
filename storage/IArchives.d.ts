@@ -12,7 +12,7 @@ export type ArchivesConfig = {
 };
 export type SyncOptions = {
     copyFiles?: boolean;
-    writeBack?: boolean;
+    noWriteBack?: boolean;
     cacheReads?: boolean;
     validWindow: [number, number];
     required?: boolean;
