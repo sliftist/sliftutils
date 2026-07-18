@@ -1,13 +1,15 @@
 module.allowclient = true;
 
-import { isNode } from "socket-function/src/misc";
+import { isNode, sort } from "socket-function/src/misc";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig,
-    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus,
+    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW,
+    STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD,
 } from "../IArchives";
 import {
     ROUTING_FILE, getConfigVersion, parseHostedUrl, parseBackblazeUrl,
     normalizeRemoteConfig, normalizeSource, parseRoutingData, serializeRemoteConfig,
+    getRoute, routeContains, parseVariableRoute,
 } from "./remoteConfig";
 import { ArchivesRemote } from "./ArchivesRemote";
 import { ArchivesBackblaze } from "../backblaze";
@@ -47,6 +49,18 @@ type ChainState = {
     config: RemoteConfig;
     sources: SourceWrapper[];
 };
+
+function configWindowCurrent(config: HostedConfig | BackblazeConfig): boolean {
+    let now = Date.now();
+    let [start, end] = config.validWindow;
+    return start - WRITE_PAST_WINDOW_GRACE <= now && now <= end + WRITE_PAST_WINDOW_GRACE;
+}
+
+// Client writes target only the CURRENTLY valid source: a future-window source receives its data
+// through server-side downstream propagation/backfill, never directly from clients
+function configAcceptsWrites(config: HostedConfig | BackblazeConfig): boolean {
+    return configWindowCurrent(config);
+}
 
 export class ArchivesChain implements IArchives {
     private configured: RemoteConfig;
@@ -214,7 +228,10 @@ export class ArchivesChain implements IArchives {
     private async buildSources(config: RemoteConfig): Promise<SourceWrapper[]> {
         let sources: SourceWrapper[] = [];
         for (let sourceConfig of config.sources.map(normalizeSource)) {
-            sources.push(await SourceWrapper.create(sourceConfig));
+            let source = await SourceWrapper.create(sourceConfig);
+            // Latency (for variable-shard target preference) is tracked from initialization on
+            source.startPinging();
+            sources.push(source);
         }
         return sources;
     }
@@ -264,23 +281,24 @@ export class ArchivesChain implements IArchives {
         this.statePromise = Promise.resolve({ config: latest, sources });
     }
 
-    // Runs a request against the first available source, moving to the next one ONLY when the
-    // source's WebSocket is down (checked directly - never by inspecting the error, which is
-    // arbitrary data). An error from a connected source is an application error and throws as-is,
-    // e.g. a permission error on write. A down source gets its background reconnect kicked.
-    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean }, run: (archives: IArchives) => Promise<T>): Promise<T> {
+    // Runs a request against the first available source (that covers the key's route, when one is
+    // given), moving to the next one ONLY when the source's WebSocket is down (checked directly -
+    // never by inspecting the error, which is arbitrary data). An error from a connected source is
+    // an application error and throws as-is. A down source gets its background reconnect kicked.
+    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number }, run: (archives: IArchives) => Promise<T>): Promise<T> {
+        if (config.write) {
+            return await this.runWrite(state, config.route, run);
+        }
         let errors: string[] = [];
         for (let source of state.sources) {
-            if (config.write && source.config.syncOptions?.noWriteBack) continue;
+            if (config.route !== undefined && !routeContains(source.config.route, config.route)) continue;
+            if (!configWindowCurrent(source.config)) continue;
             if (!source.isConnected()) {
                 source.noteFailure();
                 errors.push(`${source.config.url} is not connected`);
                 continue;
             }
             try {
-                if (config.write) {
-                    return await source.write(run);
-                }
                 if (config.apiOnly) {
                     let api = source.api;
                     if (!api) {
@@ -296,10 +314,47 @@ export class ArchivesChain implements IArchives {
                 errors.push(String((e as Error).stack ?? e));
             }
         }
-        throw new Error(`All sources failed for ${this.getDebugName()}: ${errors.join(" | ") || "no sources available"}`);
+        throw new Error(`All sources failed for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""}: ${errors.join(" | ") || "no sources available"}`);
     }
 
-    private async request<T>(config: { apiOnly?: boolean; write?: boolean }, run: (archives: IArchives) => Promise<T>): Promise<T> {
+    // Writes are consistent: they go to the first currently-valid source covering the key's route
+    // and NEVER fail over to another node - a client wrongly deciding nodes are down must not
+    // scatter its writes across the chain. (Reads fail over freely above: sources are synchronized
+    // copies, so reading from any of them is safe.) The one retry is for a window boundary passing
+    // (or a route disagreement) mid-write, which re-resolves the target rather than falling back.
+    private async runWrite<T>(state: ChainState, route: number | undefined, run: (archives: IArchives) => Promise<T>): Promise<T> {
+        let retriedWrongWindow = false;
+        let retriedWrongRoute = false;
+        while (true) {
+            let target = state.sources.find(x => configAcceptsWrites(x.config) && (route === undefined || routeContains(x.config.route, route)));
+            if (!target) {
+                throw new Error(`No source accepts writes for ${this.getDebugName()}${route !== undefined && ` (route ${route})` || ""} (every source is outside its valid window or outside the key's route)`);
+            }
+            if (!target.isConnected()) {
+                target.noteFailure();
+                throw new Error(`Cannot write: the write target ${target.config.url} is not connected (writes never fail over to other sources)`);
+            }
+            try {
+                return await target.write(run);
+            } catch (e) {
+                let message = String((e as Error).stack ?? e);
+                if (message.includes(STORAGE_WRONG_VALID_WINDOW) && !retriedWrongWindow) {
+                    retriedWrongWindow = true;
+                    continue;
+                }
+                if (message.includes(STORAGE_WRONG_ROUTE) && !retriedWrongRoute) {
+                    retriedWrongRoute = true;
+                    continue;
+                }
+                if (!target.isConnected()) {
+                    target.noteFailure();
+                }
+                throw e;
+            }
+        }
+    }
+
+    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number }, run: (archives: IArchives) => Promise<T>): Promise<T> {
         let state = await this.getState();
         return await this.run(state, config, run);
     }
@@ -323,32 +378,104 @@ export class ArchivesChain implements IArchives {
         return result && result.data || undefined;
     }
     public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        return await this.request({}, archives => archives.get2(fileName, config));
+        return await this.request({ route: getRoute(fileName) }, archives => archives.get2(fileName, config));
     }
     public async getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined> {
-        return await this.request({}, archives => archives.getInfo(fileName));
+        return await this.request({ route: getRoute(fileName) }, archives => archives.getInfo(fileName));
     }
+
+    // A minimal set of connected, currently-valid API sources whose routes cover [0, 1) - listing
+    // operations must merge every shard. Greedy sweep: repeatedly take the source that extends
+    // coverage the furthest. In practice this is one source (unsharded), or one per shard.
+    private selectCoveringSources(state: ChainState): SourceWrapper[] {
+        let candidates = state.sources.filter(x => configWindowCurrent(x.config) && x.api && x.isConnected());
+        let chosen: SourceWrapper[] = [];
+        let covered = 0;
+        while (covered < 1) {
+            let best: SourceWrapper | undefined;
+            let bestEnd = covered;
+            for (let source of candidates) {
+                let [start, end] = source.config.route || FULL_ROUTE;
+                if (start > covered) continue;
+                if (end > bestEnd) {
+                    bestEnd = end;
+                    best = source;
+                }
+            }
+            if (!best) {
+                throw new Error(`Cannot cover the full route space for ${this.getDebugName()}: the available sources only cover up to ${covered} (some shards are down or URL-only)`);
+            }
+            chosen.push(best);
+            covered = bestEnd;
+        }
+        return chosen;
+    }
+
+    private async runOnApi<T>(source: SourceWrapper, run: (archives: IArchives) => Promise<T>): Promise<T> {
+        let api = source.api;
+        if (!api) {
+            throw new Error(`${source.config.url} has URL-only access, which cannot serve this operation`);
+        }
+        return await run(api);
+    }
+
     public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
-        return await this.request({ apiOnly: true }, archives => archives.find(prefix, config));
+        return (await this.findInfo(prefix, config)).map(x => x.path);
     }
     public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        return await this.request({ apiOnly: true }, archives => archives.findInfo(prefix, config));
+        let state = await this.getState();
+        let covering = this.selectCoveringSources(state);
+        let results = await Promise.all(covering.map(source => this.runOnApi(source, archives => archives.findInfo(prefix, config))));
+        // Overlapping shards can both report a path; the newest wins
+        let byPath = new Map<string, ArchiveFileInfo>();
+        for (let list of results) {
+            for (let file of list) {
+                let existing = byPath.get(file.path);
+                if (!existing || file.createTime > existing.createTime) {
+                    byPath.set(file.path, file);
+                }
+            }
+        }
+        let merged = [...byPath.values()];
+        sort(merged, x => x.path);
+        return merged;
     }
     public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
-        return await this.request({ apiOnly: true }, async archives => {
+        let state = await this.getState();
+        let covering = this.selectCoveringSources(state);
+        let results = await Promise.all(covering.map(source => this.runOnApi(source, async archives => {
             if (!archives.getChangesAfter) {
                 throw new Error(`${archives.getDebugName()} does not support getChangesAfter`);
             }
             return await archives.getChangesAfter(time);
-        });
+        })));
+        let byPath = new Map<string, ArchiveFileInfo>();
+        for (let list of results) {
+            for (let file of list) {
+                let existing = byPath.get(file.path);
+                if (!existing || file.createTime > existing.createTime) {
+                    byPath.set(file.path, file);
+                }
+            }
+        }
+        let merged = [...byPath.values()];
+        sort(merged, x => x.path);
+        return merged;
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
-        return await this.request({ apiOnly: true }, async archives => {
+        let state = await this.getState();
+        let covering = this.selectCoveringSources(state);
+        let statuses = await Promise.all(covering.map(source => this.runOnApi(source, async archives => {
             if (!archives.getSyncStatus) {
                 throw new Error(`${archives.getDebugName()} does not support getSyncStatus`);
             }
             return await archives.getSyncStatus();
-        });
+        })));
+        return {
+            allScansComplete: statuses.every(x => x.allScansComplete),
+            indexSize: statuses.reduce((sum, x) => sum + x.indexSize, 0),
+            sources: statuses.flatMap(x => x.sources),
+        };
     }
     public async getConfig(): Promise<ArchivesConfig> {
         let state = await this.getState();
@@ -361,40 +488,101 @@ export class ArchivesChain implements IArchives {
     public async hasWriteAccess(): Promise<boolean> {
         let state = await this.getState();
         for (let source of state.sources) {
-            if (source.config.syncOptions?.noWriteBack) continue;
+            if (!configAcceptsWrites(source.config)) continue;
             if (!await source.hasWriteAccess()) return false;
         }
         return true;
     }
 
+    private assertNotBareVariableShard(fileName: string): void {
+        if (fileName.includes(VARIABLE_SHARD) && parseVariableRoute(fileName) === undefined) {
+            throw new Error(`Keys containing VARIABLE_SHARD must be written with setVariableShard, which materializes the shard value and returns the full key. Key: ${JSON.stringify(fileName)}`);
+        }
+    }
+
     public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
-        await this.request({ write: true }, archives => archives.set(fileName, data, config));
+        this.assertNotBareVariableShard(fileName);
+        await this.request({ write: true, route: getRoute(fileName) }, archives => archives.set(fileName, data, config));
     }
     public async del(fileName: string): Promise<void> {
-        await this.request({ write: true }, archives => archives.del(fileName));
+        await this.request({ write: true, route: getRoute(fileName) }, archives => archives.del(fileName));
     }
-    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+
+    /** Writes a key containing the VARIABLE_SHARD sentinel: picks the lowest-latency up write
+     *  shard, materializes the key with a random value inside that shard's route, writes it, and
+     *  returns the FULL key actually written (the caller needs it to ever read the value back).
+     *  Unlike normal writes this CAN move to another shard when the preferred one is down (error +
+     *  socket down, same rule as reads) - each shard receives a different key, so write
+     *  consistency is preserved. */
+    public async setVariableShard(key: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
+        if (!key.includes(VARIABLE_SHARD)) {
+            throw new Error(`Expected the key to contain the VARIABLE_SHARD sentinel, was ${JSON.stringify(key)}`);
+        }
+        if (parseVariableRoute(key) !== undefined) {
+            throw new Error(`The key already has a materialized shard value; write it with set instead. Key: ${JSON.stringify(key)}`);
+        }
         let state = await this.getState();
+        // Per-shard write consistency still holds: within a route, only the FIRST source may take
+        // writes - latency only picks WHICH shard the key materializes into
+        let targetsByRoute = new Map<string, SourceWrapper>();
         for (let source of state.sources) {
-            if (source.config.syncOptions?.noWriteBack) continue;
-            if (!source.isConnected()) {
-                source.noteFailure();
+            if (!configAcceptsWrites(source.config)) continue;
+            let routeKey = JSON.stringify(source.config.route || FULL_ROUTE);
+            if (!targetsByRoute.has(routeKey)) {
+                targetsByRoute.set(routeKey, source);
+            }
+        }
+        let targets = [...targetsByRoute.values()];
+        sort(targets, x => x.getLatency());
+        let errors: string[] = [];
+        for (let target of targets) {
+            if (!target.isConnected()) {
+                target.noteFailure();
+                errors.push(`${target.config.url} is not connected`);
                 continue;
             }
-            // The data stream cannot be rewound, so there is no failover once the upload starts
-            return await source.write(archives => archives.setLargeFile(config));
+            let [start, end] = target.config.route || FULL_ROUTE;
+            let fullKey = key.replace(VARIABLE_SHARD, VARIABLE_SHARD + "_" + (start + Math.random() * (end - start)));
+            try {
+                await target.write(archives => archives.set(fullKey, data, config));
+                return fullKey;
+            } catch (e) {
+                // An error alone doesn't justify moving on (it would be an application error); the
+                // socket must also be down
+                if (target.isConnected()) throw e;
+                target.noteFailure();
+                errors.push(String((e as Error).stack ?? e));
+            }
         }
-        throw new Error(`No available source for setLargeFile on ${this.getDebugName()}`);
+        throw new Error(`Every variable-shard write target failed for ${this.getDebugName()}: ${errors.join(" | ") || "no sources accept writes"}`);
+    }
+
+    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+        this.assertNotBareVariableShard(config.path);
+        let state = await this.getState();
+        // Same consistency rule as runWrite: the first currently-valid source for the route, or nothing
+        let route = getRoute(config.path);
+        let target = state.sources.find(x => configAcceptsWrites(x.config) && routeContains(x.config.route, route));
+        if (!target) {
+            throw new Error(`No source accepts writes for setLargeFile on ${this.getDebugName()} (route ${route})`);
+        }
+        if (!target.isConnected()) {
+            target.noteFailure();
+            throw new Error(`Cannot write: the write target ${target.config.url} is not connected (writes never fail over to other sources)`);
+        }
+        await target.write(archives => archives.setLargeFile(config));
     }
 
     public async getURL(path: string): Promise<string> {
         let state = await this.getState();
+        let route = getRoute(path);
         for (let source of state.sources) {
             if (source.config.public === false) continue;
+            if (!routeContains(source.config.route, route)) continue;
             if (source.url) return await source.url.getURL(path);
             if (source.api) return await source.api.getURL(path);
         }
-        throw new Error(`No public source to build a URL from for ${this.getDebugName()} (every source has public: false)`);
+        throw new Error(`No public source covering route ${route} to build a URL from for ${this.getDebugName()}`);
     }
 
     public dispose(): void {

@@ -43,7 +43,8 @@ export class ArchivesUrl implements IArchives {
         if (total && Number.isFinite(total)) {
             size = total;
         }
-        // Servers that don't support ranges (ours doesn't) return the full file with a 200
+        // Servers that don't support ranges return the full file with a 200 (ours serves real
+        // 206s, but backblaze friendly URLs and proxies may not)
         if (range && response.status === 200) {
             data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
         }

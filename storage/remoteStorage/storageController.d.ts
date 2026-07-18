@@ -31,6 +31,7 @@ export type AccessState = {
     trustedMachines?: TrustRecord[];
 };
 export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
+    ping: () => Promise<void>;
     authenticate: (token: AuthToken) => Promise<{
         machineId: string;
         ip: string;
@@ -56,6 +57,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     }) => Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number) => Promise<void>;
     del: (account: string, bucketName: string, path: string) => Promise<void>;
@@ -69,6 +71,15 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     }) => Promise<ArchiveFileInfo[]>;
     getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
     getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
+    getIndexInfo: (account: string, bucketName: string) => Promise<{
+        fileCount: number;
+        byteCount: number;
+        sources: {
+            debugName: string;
+            fileCount: number;
+            byteCount: number;
+        }[];
+    } | undefined>;
     getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
     startLargeFile: (account: string, bucketName: string, path: string) => Promise<string>;
     uploadPart: (uploadId: string, data: Buffer) => Promise<void>;

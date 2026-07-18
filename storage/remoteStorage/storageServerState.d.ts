@@ -30,11 +30,12 @@ export type LoadedBucket = {
     bucketName: string;
     routing: RemoteConfig;
     routingJSON: string;
+    selfEntries: HostedConfig[];
     self: HostedConfig | undefined;
     store: IBucketStore;
 };
 export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
-export declare function assertMutable(bucket: LoadedBucket, filePath: string): Promise<void>;
+export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
 export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
     lastModified?: number;
 }): Promise<void>;

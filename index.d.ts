@@ -136,53 +136,19 @@ declare module "sliftutils/misc/https/certs" {
 
 }
 
-declare module "sliftutils/misc/https/dns" {
-    /** Parses our freshness tag back out of a record comment; 0 (i.e. always stale) when it's absent or unparseable. */
-    export declare function freshnessTime(comment?: string): number;
-    export declare const hasDNSWritePermissions: (() => Promise<boolean>) & {
-        reset: () => void;
-    };
-    export declare const getZoneId: (rootDomain: string) => Promise<string>;
-    export declare function getRecordsRaw(type: string, key: string): Promise<{
-        id: string;
-        type: string;
-        name: string;
-        content: string;
-        proxied: boolean;
-        modified_on: string;
-        comment?: string;
-    }[]>;
-    /** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database transaction. */
-    export declare function batchRecords(zoneId: string, batch: {
-        deletes?: { id: string }[];
-        patches?: { id: string; comment?: string }[];
-        posts?: { type: string; name: string; content: string; ttl: number; proxied: boolean; comment?: string }[];
-    }): Promise<void>;
-    export declare function getRecords(type: string, key: string): Promise<string[]>;
-    export declare function deleteRecord(type: string, key: string, value: string): Promise<void>;
-    /** Removes all existing records (unless the record is already present and fresh) */
-    export declare function setRecord(type: string, key: string, value: string, proxied?: "proxied", staleAfter?: number): Promise<void>;
-    /** Keeps existing records */
-    export declare function addRecord(type: string, key: string, value: string, proxied?: "proxied", staleAfter?: number): Promise<void>;
-
-}
-
 declare module "sliftutils/misc/https/cloudflareHelpers" {
+    /// <reference types="node" />
+    /// <reference types="node" />
     export type CloudflareCreds = {
         key: string;
         /** Set for legacy global API keys, which auth via X-Auth-Email/X-Auth-Key. Absent for API tokens, which auth via Authorization: Bearer. */
         email?: string;
     };
-    /** Provide Cloudflare credentials directly instead of relying on ./cloudflare.json. Exactly one of
-     *  key (the API token itself) or path (a file to read it from) — TypeScript rejects both/neither. */
-    export declare function setCloudflareCredentials(config: {
-        value: {
-            key: string;
-        } | {
-            path: string;
-        };
-    }): void;
-    export declare function getCloudflareCreds(): Promise<CloudflareCreds>;
+    export declare const getCloudflareCreds: {
+        (): Promise<CloudflareCreds>;
+        reset(): void;
+        set(newValue: Promise<CloudflareCreds>): void;
+    };
     export declare function cloudflareGETCall<T>(path: string, params?: {
         [key: string]: string;
     }): Promise<T>;
@@ -193,17 +159,66 @@ declare module "sliftutils/misc/https/cloudflareHelpers" {
 
 }
 
+declare module "sliftutils/misc/https/dns" {
+    /** Parses our tag back out; 0 (i.e. always stale) when it's absent or unparseable. */
+    export declare function freshnessTime(comment?: string): number;
+    export declare const hasDNSWritePermissions: {
+        (): Promise<boolean>;
+        reset(): void;
+        set(newValue: Promise<boolean>): void;
+    };
+    export declare const getZoneId: {
+        (key: string): Promise<string>;
+        clear(key: string): void;
+        clearAll(): void;
+        forceSet(key: string, value: Promise<string>): void;
+        getAllKeys(): string[];
+        get(key: string): Promise<string> | undefined;
+    };
+    export declare function getRecordsRaw(type: string, key: string): Promise<{
+        id: string;
+        type: string;
+        name: string;
+        content: string;
+        proxied: boolean;
+        modified_on: string;
+        comment?: string | undefined;
+    }[]>;
+    /** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database
+     *   transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs
+     *   aren't usable in our setup, and because it lets "remove others + assert target" happen
+     *   without a window where the name resolves to nothing. */
+    export declare function batchRecords(zoneId: string, batch: {
+        deletes?: {
+            id: string;
+        }[];
+        patches?: {
+            id: string;
+            comment?: string;
+        }[];
+        posts?: {
+            type: string;
+            name: string;
+            content: string;
+            ttl: number;
+            proxied: boolean;
+            comment?: string;
+        }[];
+    }): Promise<void>;
+    export declare function getRecords(type: string, key: string): Promise<string[]>;
+    export declare function deleteRecord(type: string, key: string, value: string): Promise<void>;
+    /** Removes all existing records (unless the record is already present and fresh) */
+    export declare function setRecord(type: string, key: string, value: string, proxied?: "proxied", staleAfter?: number): Promise<void>;
+    /** Keeps existing records */
+    export declare function addRecord(type: string, key: string, value: string, proxied?: "proxied", staleAfter?: number): Promise<void>;
+
+}
+
 declare module "sliftutils/misc/https/hostServer" {
     export type HostServerConfig = {
         /** Full domain to host on (e.g. "testsite.example.com"). The HTTPS cert is created for this domain and *.domain, so using a subdomain never touches the root domain (beyond its _acme-challenge TXT record). */
         domain: string;
         port: number;
-        /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Required — pass { path: "./cloudflare.json" } explicitly for the on-disk file. */
-        cloudflareApiToken: {
-            key: string;
-        } | {
-            path: string;
-        };
         /** Creates an unproxied A record pointing domain at this machine (publicIp, or our detected external IP) */
         setDNSRecord?: boolean;
         publicIp?: string;
@@ -853,6 +868,7 @@ declare module "sliftutils/storage/ArchivesDisk" {
         };
         getDebugName(): string;
         getConfig(): Promise<ArchivesConfig>;
+        hasWriteAccess(): Promise<boolean>;
         private filePath;
         set(key: string, data: Buffer, config?: {
             lastModified?: number;
@@ -872,6 +888,7 @@ declare module "sliftutils/storage/ArchivesDisk" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         getInfo(key: string): Promise<{
             writeTime: number;
@@ -2080,6 +2097,7 @@ declare module "sliftutils/storage/IArchives" {
     /// <reference types="node" />
     /// <reference types="node" />
     export declare const MAX_LAST_MODIFIED_FUTURE: number;
+    export declare const IMMUTABLE_CACHE_TIME: number;
     export declare function assertValidLastModified(lastModified: number): void;
     export type RemoteConfig = {
         version?: number;
@@ -2098,8 +2116,14 @@ declare module "sliftutils/storage/IArchives" {
     */
     export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
     export type CommonConfig = {
-        /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
-        syncOptions?: SyncOptions;
+        /** By default a server hosting this bucket eagerly copies this source's full contents onto its own disk (on top of the lazy read-through caching). Set this to be a front end for a very large database without copying the full database - reads still down-cache individual files on demand. */
+        noFullSync?: boolean;
+        /** Bytes of read-cache this server's disk may hold; least-recently-used files are deleted from disk to stay under it (only ever when another source verifiably holds the file - the only copy is never deleted). Requires noFullSync (a full copy can't be bounded). */
+        readerDiskLimit?: number;
+        /** The write times ([startMs, endMs]) this source is valid for (see ArchivesSource.validWindow for the synchronization semantics). Required on object configs: configuration changes must be SCHEDULED (a new source becomes valid at a future time while the old one's window ends), not flipped instantly. Plain URL-string sources default to FULL_VALID_WINDOW - once you're writing object configs, you're doing something complicated enough to think about when things change. */
+        validWindow: [number, number];
+        /** Sharding: the fraction of the key space this source handles, as [start, end) over [0, 1) (keys are routed by getRoute in remoteConfig.ts). Defaults to FULL_ROUTE (unsharded). At every point in time the sources' routes must fully cover [0, 1), or some keys could never be read. */
+        route?: [number, number];
     };
     export type HostedConfig = CommonConfig & {
         type: "remote";
@@ -2114,34 +2138,56 @@ declare module "sliftutils/storage/IArchives" {
     export type BackblazeConfig = CommonConfig & {
         type: "backblaze";
         url: string;
-        bucketName: string;
         public?: boolean;
         immutable?: boolean;
     };
-    export declare const DEFAULT_BASE_SYNC_OPTIONS: SyncOptions;
-    export declare const DEFAULT_SYNC_OPTIONS: SyncOptions;
+    export declare const FULL_VALID_WINDOW: [number, number];
     export type ArchiveFileInfo = {
         path: string;
         createTime: number;
         size: number;
     };
+    export type SyncActivity = {
+        type: "metadataScan" | "fullSync";
+        sourceDebugName: string;
+        startTime: number;
+        doneFiles?: number;
+        totalFiles?: number;
+        doneBytes?: number;
+        totalBytes?: number;
+    };
     export type ArchivesConfig = {
         supportsChangesAfter?: boolean;
-    };
-    export type SyncOptions = {
-        copyFiles?: boolean;
-        noWriteBack?: boolean;
-        cacheReads?: boolean;
-        validWindow: [number, number];
-        required?: boolean;
+        remoteConfig?: RemoteConfig;
+        index?: {
+            fileCount: number;
+            byteCount: number;
+        };
+        indexSources?: {
+            debugName: string;
+            fileCount: number;
+            byteCount: number;
+        }[];
+        readerDiskLimit?: number;
+        syncing?: SyncActivity[];
     };
     export type ArchivesSource = {
         source: IArchives;
-        options: SyncOptions;
+        validWindow: [number, number];
+        route?: [number, number];
+        noFullSync?: boolean;
     };
+    export declare const WRITE_PAST_WINDOW_GRACE: number;
+    export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
+    export declare const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17";
+    export declare const FULL_ROUTE: [number, number];
+    export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
+    export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
     export type ArchivesSyncSourceStatus = {
         debugName: string;
-        options: SyncOptions;
+        validWindow: [number, number];
+        route?: [number, number];
+        noFullSync?: boolean;
         supportsChangesAfter: boolean;
         initialScanComplete: boolean;
         scannedCount: number;
@@ -2153,13 +2199,15 @@ declare module "sliftutils/storage/IArchives" {
     };
     export interface IArchives {
         getDebugName(): string;
+        /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc).
+         *  Checked without writing anything. */
+        hasWriteAccess(): Promise<boolean>;
         get(fileName: string, config?: {
             range?: {
                 start: number;
                 end: number;
             };
         }): Promise<Buffer | undefined>;
-        /** Like get, but also returns the last-write time of the file. get just calls get2. */
         get2(fileName: string, config?: {
             range?: {
                 start: number;
@@ -2168,6 +2216,7 @@ declare module "sliftutils/storage/IArchives" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         /**
          * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
@@ -2475,6 +2524,7 @@ declare module "sliftutils/storage/backblaze" {
             public?: boolean;
             immutable?: boolean;
             cacheTime?: number;
+            allowedOrigins?: string[];
         });
         private bucketName;
         private bucketId;
@@ -2483,6 +2533,7 @@ declare module "sliftutils/storage/backblaze" {
         private log;
         getDebugName(): string;
         private getBucketAPI;
+        private currentReset;
         private last503Reset;
         private apiRetryLogic;
         get(fileName: string, config?: {
@@ -2500,8 +2551,10 @@ declare module "sliftutils/storage/backblaze" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         getConfig(): Promise<ArchivesConfig>;
+        hasWriteAccess(): Promise<boolean>;
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
         }): Promise<void>;
@@ -2527,6 +2580,17 @@ declare module "sliftutils/storage/backblaze" {
             size: number;
         }[]>;
         assertPathValid(path: string): Promise<void>;
+        move(config: {
+            path: string;
+            target: IArchives;
+            targetPath: string;
+            copyInstead?: boolean;
+        }): Promise<void>;
+        copy(config: {
+            path: string;
+            target: IArchives;
+            targetPath: string;
+        }): Promise<void>;
         getURL(path: string): Promise<string>;
         getDownloadAuthorization(config: {
             fileNamePrefix?: string;
@@ -2815,6 +2879,8 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         private controller;
         private lastDeniedLog;
         getDebugName(): string;
+        isConnected(): boolean;
+        ping(): Promise<void>;
         private authenticate;
         private callAuthed;
         waitingForAccess(): Promise<{
@@ -2822,7 +2888,8 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
             machineId: string;
             ip: string;
         } | undefined>;
-        private onAccessDenied;
+        hasWriteAccess(): Promise<boolean>;
+        private registerAccessRequest;
         private call;
         get(fileName: string, config?: {
             range?: {
@@ -2838,6 +2905,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
@@ -2890,6 +2958,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         getInfo(fileName: string): Promise<{
             writeTime: number;
@@ -2913,6 +2982,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
         }): Promise<ArchiveFileInfo[]>;
         getURL(path: string): Promise<string>;
         getConfig(): Promise<ArchivesConfig>;
+        hasWriteAccess(): Promise<boolean>;
     }
 
 }
@@ -2925,7 +2995,7 @@ declare module "sliftutils/storage/remoteStorage/accessPage" {
 declare module "sliftutils/storage/remoteStorage/blobStore" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus } from "../IArchives";
+    import { ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, SyncActivity } from "../IArchives";
     export declare const DEFAULT_FAST_WRITE_DELAY: number;
     export type WriteConfig = {
         fast?: boolean;
@@ -2947,6 +3017,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
         del(fileName: string, config?: WriteConfig): Promise<void>;
@@ -2960,6 +3031,28 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         }): Promise<ArchiveFileInfo[]>;
         getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
         getSyncStatus?(): Promise<ArchivesSyncStatus>;
+        getSyncProgress?(): {
+            index: {
+                fileCount: number;
+                byteCount: number;
+            };
+            sources: {
+                debugName: string;
+                fileCount: number;
+                byteCount: number;
+            }[];
+            readerDiskLimit?: number;
+            syncing: SyncActivity[];
+        };
+        computeIndexTotals?(): Promise<{
+            fileCount: number;
+            byteCount: number;
+            sources: {
+                debugName: string;
+                fileCount: number;
+                byteCount: number;
+            }[];
+        }>;
         startLargeUpload(): Promise<string>;
         appendLargeUpload(id: string, data: Buffer): Promise<void>;
         finishLargeUpload(id: string, key: string): Promise<void>;
@@ -2971,10 +3064,16 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private config?;
         constructor(folder: string, sources: ArchivesSource[], config?: {
             onIndexChanged?: ((key: string) => void) | undefined;
+            readerDiskLimit?: number | undefined;
         } | undefined);
         private stopped;
         private index;
         private mem;
+        private indexFileCount;
+        private indexByteCount;
+        private sourceFileCounts;
+        private sourceByteCounts;
+        private syncActivities;
         private dirty;
         private overlay;
         private sourceStates;
@@ -2985,11 +3084,38 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         };
         dispose(): Promise<void>;
         private loadIndex;
+        private countEntry;
         private setIndexEntry;
         private deleteIndexEntry;
+        /** The cheap always-current totals plus any in-progress background synchronization. */
+        getSyncProgress(): {
+            index: {
+                fileCount: number;
+                byteCount: number;
+            };
+            sources: {
+                debugName: string;
+                fileCount: number;
+                byteCount: number;
+            }[];
+            readerDiskLimit?: number;
+            syncing: SyncActivity[];
+        };
+        /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to
+         *  any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
+        computeIndexTotals(): Promise<{
+            fileCount: number;
+            byteCount: number;
+            sources: {
+                debugName: string;
+                fileCount: number;
+                byteCount: number;
+            }[];
+        }>;
         private flushIndex;
         private runSourceSync;
         private scanSource;
+        private reconcileSource;
         private applyScanned;
         private pollChanges;
         private copySourceFiles;
@@ -3010,12 +3136,13 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         private cacheRead;
         set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
-        private writeToSources;
         del(key: string, config?: WriteConfig): Promise<void>;
-        private deleteFromSources;
+        private getWritableSources;
+        private writeToSources;
         getInfo(key: string): Promise<{
             writeTime: number;
             size: number;
@@ -3032,6 +3159,9 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         finishLargeUpload(id: string, key: string): Promise<void>;
         cancelLargeUpload(id: string): Promise<void>;
         private flushOverlay;
+        private evicting;
+        private enforceDiskLimit;
+        private cleanupTombstones;
     }
 
 }
@@ -3047,19 +3177,23 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
     import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
     export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
     export declare class ArchivesChain implements IArchives {
-        private normalized;
-        private adopted;
-        private sourcesPromise;
+        private configured;
+        private activeConfig;
+        private statePromise;
+        private initRetryDelay;
+        private initRetryTimer;
+        private pollTimer;
+        private disposed;
         constructor(config: RemoteConfig | RemoteConfigBase);
         getDebugName(): string;
-        private getSourceConfigs;
-        private getSources;
+        private getState;
         private init;
-        private ensureRouting;
-        private readFromSource;
-        private read;
-        private getAccessHelp;
-        private write;
+        private buildSources;
+        private startConfigPoll;
+        private checkForNewConfig;
+        private run;
+        private runWrite;
+        private request;
         waitingForAccess(): Promise<{
             link: string;
             machineId: string;
@@ -3079,11 +3213,14 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         }): Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         getInfo(fileName: string): Promise<{
             writeTime: number;
             size: number;
         } | undefined>;
+        private selectCoveringSources;
+        private runOnApi;
         find(prefix: string, config?: {
             shallow?: boolean;
             type: "files" | "folders";
@@ -3095,15 +3232,29 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
         getSyncStatus(): Promise<ArchivesSyncStatus>;
         getConfig(): Promise<ArchivesConfig>;
+        /** True only when EVERY write-receiving source would accept our writes (partial write access
+         *  desynchronizes sources, so it counts as no access). */
+        hasWriteAccess(): Promise<boolean>;
+        private assertNotBareVariableShard;
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
         }): Promise<void>;
         del(fileName: string): Promise<void>;
+        /** Writes a key containing the VARIABLE_SHARD sentinel: picks the lowest-latency up write
+         *  shard, materializes the key with a random value inside that shard's route, writes it, and
+         *  returns the FULL key actually written (the caller needs it to ever read the value back).
+         *  Unlike normal writes this CAN move to another shard when the preferred one is down (error +
+         *  socket down, same rule as reads) - each shard receives a different key, so write
+         *  consistency is preserved. */
+        setVariableShard(key: string, data: Buffer, config?: {
+            lastModified?: number;
+        }): Promise<string>;
         setLargeFile(config: {
             path: string;
             getNextData(): Promise<Buffer | undefined>;
         }): Promise<void>;
         getURL(path: string): Promise<string>;
+        dispose(): void;
     }
     export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;
 
@@ -3119,6 +3270,14 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
     /// <reference types="node" />
     import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig } from "../IArchives";
     export declare const ROUTING_FILE = "storage/storagerouting.json";
+    /** The variable-shard route override embedded in the key ("<sentinel>_<value>", see VARIABLE_SHARD), or undefined when the key has no sentinel or the sentinel has no value yet. */
+    export declare function parseVariableRoute(key: string): number | undefined;
+    /** Where a key routes in [0, 1). A materialized variable-shard suffix completely overrides the hash. */
+    export declare function getRoute(key: string): number;
+    export declare function routeContains(route: [number, number] | undefined, value: number): boolean;
+    export declare function routesOverlap(a: [number, number] | undefined, b: [number, number] | undefined): boolean;
+    /** The overlap of two route ranges, or undefined when they don't overlap. */
+    export declare function routeIntersection(a: [number, number] | undefined, b: [number, number] | undefined): [number, number] | undefined;
     export declare function getConfigVersion(config: RemoteConfig): number;
     /** Strips the routing-file suffix, leaving the bucket's public base URL (file paths append to it). */
     export declare function getBucketBaseUrl(url: string): string;
@@ -3136,6 +3295,51 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
     export declare function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig;
     export declare function parseRoutingData(data: Buffer): RemoteConfig;
     export declare function serializeRemoteConfig(config: RemoteConfig): Buffer;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
+    import { IArchives, HostedConfig, BackblazeConfig } from "../IArchives";
+    import { ArchivesUrl } from "./ArchivesUrl";
+    export declare const RETRY_START_DELAY: number;
+    export declare const RETRY_MAX_DELAY: number;
+    export declare const RETRY_GROWTH = 1.5;
+    export declare class SourceWrapper {
+        config: HostedConfig | BackblazeConfig;
+        private background;
+        api?: IArchives;
+        url?: ArchivesUrl;
+        writeBlocked?: string;
+        private remote?;
+        private disposed;
+        private reconnectRunning;
+        private accessCache?;
+        private constructor();
+        static create(config: HostedConfig | BackblazeConfig, options?: {
+            background?: boolean;
+        }): Promise<SourceWrapper>;
+        getDebugName(): string;
+        isConnected(): boolean;
+        /** Call after a request failed while isConnected() was false: starts (if not already running)
+         *  the background reconnect loop. Never blocks - the failed request still throws. */
+        noteFailure(): void;
+        private reconnectLoop;
+        private checkAccess;
+        read<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;
+        hasWriteAccess(): Promise<boolean>;
+        private pings;
+        private pingTimer;
+        /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
+         *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
+        startPinging(): void;
+        /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our
+         *  own in-process server, which is the best possible target (0). */
+        getLatency(): number;
+        /** Writes always go through the API, so a permission error throws to the caller on every write
+         *  (and access granted in the meantime is picked up automatically). */
+        write<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;
+        dispose(): void;
+    }
 
 }
 
@@ -3173,6 +3377,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         trustedMachines?: TrustRecord[];
     };
     export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
+        ping: () => Promise<void>;
         authenticate: (token: AuthToken) => Promise<{
             machineId: string;
             ip: string;
@@ -3198,6 +3403,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         }) => Promise<{
             data: Buffer;
             writeTime: number;
+            size: number;
         } | undefined>;
         set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number) => Promise<void>;
         del: (account: string, bucketName: string, path: string) => Promise<void>;
@@ -3211,6 +3417,15 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         }) => Promise<ArchiveFileInfo[]>;
         getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
         getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
+        getIndexInfo: (account: string, bucketName: string) => Promise<{
+            fileCount: number;
+            byteCount: number;
+            sources: {
+                debugName: string;
+                fileCount: number;
+                byteCount: number;
+            }[];
+        } | undefined>;
         getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
         startLargeFile: (account: string, bucketName: string, path: string) => Promise<string>;
         uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
@@ -3229,11 +3444,6 @@ declare module "sliftutils/storage/remoteStorage/storageServer" {
     export type HostStorageServerConfig = {
         url: string;
         folder: string;
-        cloudflareApiToken?: {
-            key: string;
-        } | {
-            path: string;
-        };
         lowSpaceThresholdBytes?: number;
     };
     export declare function hostStorageServer(config: HostStorageServerConfig): Promise<void>;
@@ -3278,11 +3488,12 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         bucketName: string;
         routing: RemoteConfig;
         routingJSON: string;
+        selfEntries: HostedConfig[];
         self: HostedConfig | undefined;
         store: IBucketStore;
     };
     export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
-    export declare function assertMutable(bucket: LoadedBucket, filePath: string): Promise<void>;
+    export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
     export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<void>;

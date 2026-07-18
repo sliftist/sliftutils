@@ -18,6 +18,14 @@ Each bucket stores its complete routing config (the full redundancy list) inside
 
 Each bucket's store keeps a BulkDatabase2 index of every file (path, write time, size, holding source), served from memory — existence checks and listings are extremely fast, never touching a source. The trick that keeps the index accurate: our own disk is not special-cased, it is simply the first synchronization source. The same scan/reconcile code that synchronizes remote sources also synchronizes the disk with the index, so the index self-heals from the same machinery instead of needing separate consistency logic.
 
+## Metadata first, data second
+
+Synchronization starts with metadata: every source's full listing (path, write time, size) is scanned into the index up front. This is fast and small, so a server very quickly knows exactly what exists everywhere — and can act as a consistent authority on the bucket (serving correct reads, listings, and existence checks by fetching bytes from whichever source holds them) long before it has downloaded the actual data. The data then follows: eagerly by default (the full sync), or — when there is simply too much data to copy — in noFullSync mode, where the disk is only a lazy read cache. Either way consistency is unchanged: the index is complete, writes still go to all the servers, and only where the bytes rest differs.
+
+## Client writes are consistent; client reads are redundant
+
+Clients always write to the same node — the first source whose valid window is current — and if that node is down, the write FAILS rather than going to another node. A client having a network hiccup and wrongly deciding nodes are down must never scatter its writes across the chain; that would desynchronize the sources based on one client's flaky view of the network. Reads, by contrast, fail over freely across every redundant source: sources are synchronized copies, so reading from any of them is safe. Maximum read uptime, strictly consistent writes. (Write redundancy still exists — it just lives server-side: the receiving node fans writes out downstream and reconciliation heals anything missed, all ordered by the once-stamped write time.)
+
 ## Trust instead of API keys
 
 Machines authenticate with their certs.ts identity (proving ownership of their machine key with a signed, server-bound token), and access is granted per account to specific machineIds. No API keys are minted, copied into configs, or passed around — granting a machine access is one command on the storage machine, and revoking it is removing the trust record. The only API keys left in the system are the ones third parties force on us: backblaze and cloudflare, both resolved through getSecret.

@@ -3,19 +3,23 @@
 import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
 export declare class ArchivesChain implements IArchives {
-    private normalized;
-    private adopted;
-    private sourcesPromise;
+    private configured;
+    private activeConfig;
+    private statePromise;
+    private initRetryDelay;
+    private initRetryTimer;
+    private pollTimer;
+    private disposed;
     constructor(config: RemoteConfig | RemoteConfigBase);
     getDebugName(): string;
-    private getSourceConfigs;
-    private getSources;
+    private getState;
     private init;
-    private ensureRouting;
-    private readFromSource;
-    private read;
-    private getAccessHelp;
-    private write;
+    private buildSources;
+    private startConfigPoll;
+    private checkForNewConfig;
+    private run;
+    private runWrite;
+    private request;
     waitingForAccess(): Promise<{
         link: string;
         machineId: string;
@@ -35,11 +39,14 @@ export declare class ArchivesChain implements IArchives {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     getInfo(fileName: string): Promise<{
         writeTime: number;
         size: number;
     } | undefined>;
+    private selectCoveringSources;
+    private runOnApi;
     find(prefix: string, config?: {
         shallow?: boolean;
         type: "files" | "folders";
@@ -51,14 +58,28 @@ export declare class ArchivesChain implements IArchives {
     getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
     getSyncStatus(): Promise<ArchivesSyncStatus>;
     getConfig(): Promise<ArchivesConfig>;
+    /** True only when EVERY write-receiving source would accept our writes (partial write access
+     *  desynchronizes sources, so it counts as no access). */
+    hasWriteAccess(): Promise<boolean>;
+    private assertNotBareVariableShard;
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<void>;
     del(fileName: string): Promise<void>;
+    /** Writes a key containing the VARIABLE_SHARD sentinel: picks the lowest-latency up write
+     *  shard, materializes the key with a random value inside that shard's route, writes it, and
+     *  returns the FULL key actually written (the caller needs it to ever read the value back).
+     *  Unlike normal writes this CAN move to another shard when the preferred one is down (error +
+     *  socket down, same rule as reads) - each shard receives a different key, so write
+     *  consistency is preserved. */
+    setVariableShard(key: string, data: Buffer, config?: {
+        lastModified?: number;
+    }): Promise<string>;
     setLargeFile(config: {
         path: string;
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
     getURL(path: string): Promise<string>;
+    dispose(): void;
 }
 export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;

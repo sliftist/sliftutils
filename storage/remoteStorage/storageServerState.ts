@@ -6,9 +6,10 @@ import { ArchivesDisk } from "../ArchivesDisk";
 import { BlobStore, IBucketStore } from "./blobStore";
 import {
     RemoteConfig, HostedConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
-    ArchivesSyncStatus, DEFAULT_BASE_SYNC_OPTIONS, DEFAULT_SYNC_OPTIONS,
+    ArchivesSyncStatus, FULL_VALID_WINDOW,
+    WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
-import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion } from "./remoteConfig";
+import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
 import { createApiArchives } from "./createArchives";
 import type { IStorage } from "../IStorage";
 import type { AccessRequest, TrustRecord } from "./storageController";
@@ -133,59 +134,132 @@ export type LoadedBucket = {
     routing: RemoteConfig;
     // JSON of routing, for change detection
     routingJSON: string;
-    // Our own entry in routing.sources (this bucket on this server), holding the bucket options
-    // (public/fast/rawDisk/immutable/...). undefined when the config doesn't mention us.
+    // ALL of our own entries in routing.sources (this bucket on this server). More than one when
+    // the bucket's options change over time - one entry per valid window (e.g. immutable dropped,
+    // or fast enabled, starting at a scheduled instant).
+    selfEntries: HostedConfig[];
+    // The entry valid when the store was built - the structural options (rawDisk, which entries
+    // are downstream). Per-write options (fast/immutable) are instead evaluated at each write's
+    // time, see getWriteConfig/assertMutable. undefined when the config doesn't mention us.
     self: HostedConfig | undefined;
     store: IBucketStore;
 };
 
 const buckets = new Map<string, Promise<LoadedBucket | undefined>>();
 
+// setTimeout cannot represent longer delays; more distant window boundaries re-check after this
+const MAX_REBUILD_TIMER_DELAY = 2 ** 31 - 1;
+// Rebuild slightly after the boundary, so the newly-valid entry is unambiguously active
+const REBUILD_BOUNDARY_BUFFER = 1000;
+
 function getBucketFolder(account: string, bucketName: string): string {
     return path.join(getStorageServerConfig().folder, "buckets2", account, bucketName);
 }
 
-function findSelfIndex(routing: RemoteConfig, account: string, bucketName: string): number {
+function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[] {
     let { domain, port } = getStorageServerConfig();
+    let indexes: number[] = [];
     for (let i = 0; i < routing.sources.length; i++) {
         let source = routing.sources[i];
         if (typeof source === "string" || source.type !== "remote") continue;
         let parsed = parseHostedUrl(source.url);
         if (parsed.address === domain && parsed.port === port && parsed.account === account && parsed.bucketName === bucketName) {
-            return i;
+            indexes.push(i);
         }
     }
-    return -1;
+    return indexes;
+}
+
+// The entry whose valid window contains the time (among the entries covering the key's route,
+// when one is given - a server can hold different shards with different options). Half-open
+// ([start, end)), so clean breaks resolve unambiguously. Falls back to the nearest window when
+// none contains the time - gaps shouldn't exist, but a write must still resolve to SOME
+// configuration.
+function selectEntryAt(entries: HostedConfig[], time: number, route?: number): HostedConfig | undefined {
+    if (route !== undefined) {
+        let covering = entries.filter(x => routeContains(x.route, route));
+        if (covering.length) {
+            entries = covering;
+        }
+    }
+    let containing = entries.find(x => x.validWindow[0] <= time && time < x.validWindow[1]);
+    if (containing) return containing;
+    let best: HostedConfig | undefined;
+    let bestDistance = Infinity;
+    for (let entry of entries) {
+        let distance = Math.min(Math.abs(time - entry.validWindow[0]), Math.abs(time - entry.validWindow[1]));
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = entry;
+        }
+    }
+    return best;
+}
+
+// Bucket options can change over time (multiple self entries with different valid windows), and
+// the structural ones (rawDisk, the downstream list) are baked into the store - so the store is
+// rebuilt shortly after each of our window boundaries passes, making the newly-valid entry apply.
+function scheduleWindowBoundaryRebuild(loaded: LoadedBucket): void {
+    let now = Date.now();
+    let boundaries = loaded.selfEntries.flatMap(x => x.validWindow).filter(t => t > now);
+    if (!boundaries.length) return;
+    let nextBoundary = Math.min(...boundaries);
+    let key = `${loaded.account}/${loaded.bucketName}`;
+    let timer = setTimeout(() => {
+        void (async () => {
+            // A routing change may have already replaced this store; only IT gets a boundary timer
+            let current = await buckets.get(key);
+            if (current !== loaded) return;
+            if (Date.now() < nextBoundary) {
+                scheduleWindowBoundaryRebuild(loaded);
+                return;
+            }
+            await scheduleRoutingReload(loaded.account, loaded.bucketName, { force: true });
+        })();
+    }, Math.min(nextBoundary - now + REBUILD_BOUNDARY_BUFFER, MAX_REBUILD_TIMER_DELAY));
+    (timer as { unref?: () => void }).unref?.();
 }
 
 function buildBucket(account: string, bucketName: string, routing: RemoteConfig): LoadedBucket {
     let folder = getBucketFolder(account, bucketName);
-    let selfIndex = findSelfIndex(routing, account, bucketName);
-    let self: HostedConfig | undefined;
-    if (selfIndex !== -1) {
-        self = routing.sources[selfIndex] as HostedConfig;
+    let selfIndexes = findSelfIndexes(routing, account, bucketName);
+    let selfEntries = selfIndexes.map(i => routing.sources[i] as HostedConfig);
+    let self = selectEntryAt(selfEntries, Date.now());
+    let selfIndex = -1;
+    if (self) {
+        selfIndex = routing.sources.indexOf(self);
     }
     let store: IBucketStore;
     if (self?.rawDisk) {
         store = new ArchivesDisk(folder);
     } else {
         // Our own disk is the base source; only the routing entries DOWNSTREAM from us (after our
-        // own entry) become synchronization sources. Upstream sources sync from us, so writing to
-        // or scanning them would just echo our own data back (and make our availability depend on
-        // theirs). A server NOT in the list has been removed from the bucket: it keeps its disk
-        // data (the config may re-add it), but stops all synchronization - no one contacts a
-        // removed source, and scanning/pushing as if we were still one would fight the real chain.
+        // currently-valid entry) become synchronization sources. Upstream sources sync from us, so
+        // writing to or scanning them would just echo our own data back (and make our availability
+        // depend on theirs). A server NOT in the list has been removed from the bucket: it keeps
+        // its disk data (the config may re-add it), but stops all synchronization - no one
+        // contacts a removed source, and scanning/pushing as if we were still one would fight the
+        // real chain. The config-level validWindow rides on each ArchivesSource; the disk source
+        // shares our currently-valid entry's window (it holds our copy of the data).
+        let ownIndexes = new Set(selfIndexes);
+        // Our own disk gets no route filter: everything it holds is ours to index and serve
         let sources: ArchivesSource[] = [{
             source: new ArchivesDisk(folder),
-            options: self?.syncOptions || DEFAULT_BASE_SYNC_OPTIONS,
+            validWindow: self?.validWindow || FULL_VALID_WINDOW,
         }];
         if (selfIndex === -1) {
             console.log(`This server is not in the routing config for bucket ${account}/${bucketName}; keeping its data on disk but no longer synchronizing it`);
         } else {
             for (let i = selfIndex + 1; i < routing.sources.length; i++) {
                 let source = routing.sources[i];
-                if (typeof source === "string") continue;
-                sources.push({ source: createApiArchives(source), options: source.syncOptions || DEFAULT_SYNC_OPTIONS });
+                if (typeof source === "string" || ownIndexes.has(i)) continue;
+                // Disjoint-shard sources never talk to each other; a partial overlap syncs only
+                // the intersection (scans ignore the rest, writes only send matching keys)
+                let sharedRoute = routeIntersection(self?.route, source.route);
+                if (!sharedRoute) continue;
+                // A bounded-cache server (noFullSync on our own entry) must not full-sync from
+                // ANY source, or its disk would fill regardless of the limit
+                sources.push({ source: createApiArchives(source), validWindow: source.validWindow, route: sharedRoute, noFullSync: source.noFullSync || self?.noFullSync });
             }
         }
         store = new BlobStore(folder, sources, {
@@ -195,9 +269,12 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig)
                 if (key !== ROUTING_FILE) return;
                 void scheduleRoutingReload(account, bucketName);
             },
+            readerDiskLimit: self?.readerDiskLimit,
         });
     }
-    return { account, bucketName, routing, routingJSON: JSON.stringify(routing), self, store };
+    let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store };
+    scheduleWindowBoundaryRebuild(loaded);
+    return loaded;
 }
 
 async function loadBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined> {
@@ -230,16 +307,16 @@ export function getLoadedBucket(account: string, bucketName: string): Promise<Lo
 // Routing reloads are serialized per bucket, so concurrent writes/syncs can't rebuild the same
 // store twice in parallel
 const routingReloads = new Map<string, Promise<void>>();
-function scheduleRoutingReload(account: string, bucketName: string): Promise<void> {
+function scheduleRoutingReload(account: string, bucketName: string, config?: { force?: boolean }): Promise<void> {
     let key = `${account}/${bucketName}`;
     let next = (routingReloads.get(key) || Promise.resolve())
-        .then(() => checkRoutingChanged(account, bucketName))
+        .then(() => checkRoutingChanged(account, bucketName, config?.force))
         .catch(e => console.error(`Reloading routing config for bucket ${key} failed:`, e));
     routingReloads.set(key, next);
     return next;
 }
 
-async function checkRoutingChanged(account: string, bucketName: string): Promise<void> {
+async function checkRoutingChanged(account: string, bucketName: string, force?: boolean): Promise<void> {
     let key = `${account}/${bucketName}`;
     let loaded = await buckets.get(key);
     if (!loaded) return;
@@ -248,22 +325,31 @@ async function checkRoutingChanged(account: string, bucketName: string): Promise
     let data = await loaded.store.get(ROUTING_FILE);
     if (!data) return;
     let routing = parseRoutingData(data);
-    if (JSON.stringify(routing) === loaded.routingJSON) return;
-    console.log(`Routing config changed for bucket ${key}, rebuilding its store`);
+    if (!force && JSON.stringify(routing) === loaded.routingJSON) return;
+    if (force) {
+        console.log(`Rebuilding the store for bucket ${key} (a valid window boundary passed)`);
+    } else {
+        console.log(`Routing config changed for bucket ${key}, rebuilding its store`);
+    }
     if (loaded.store instanceof BlobStore) {
         await loaded.store.dispose();
     }
     buckets.set(key, Promise.resolve(buildBucket(account, bucketName, routing)));
 }
 
-function getWriteConfig(bucket: LoadedBucket): { fast?: boolean; writeDelay?: number } {
-    return { fast: bucket.self?.fast, writeDelay: bucket.self?.writeDelay };
+// Per-write options are evaluated at the WRITE's time (and the key's route), not the current
+// config: the write time is stamped exactly once (at the first node that receives the write) and
+// propagates with the data, so every node resolves the same self entry - and the same options.
+function getWriteConfig(bucket: LoadedBucket, writeTime: number, route: number): { fast?: boolean; writeDelay?: number } {
+    let self = selectEntryAt(bucket.selfEntries, writeTime, route);
+    return { fast: self?.fast, writeDelay: self?.writeDelay };
 }
 
-export async function assertMutable(bucket: LoadedBucket, filePath: string): Promise<void> {
-    if (!bucket.self?.immutable) return;
+export async function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void> {
+    let self = selectEntryAt(bucket.selfEntries, writeTime, getRoute(filePath));
+    if (!self?.immutable) return;
     if (await bucket.store.getInfo(filePath)) {
-        throw new Error(`Bucket ${bucket.account}/${bucket.bucketName} is immutable and ${JSON.stringify(filePath)} already exists, so it cannot be written to`);
+        throw new Error(`Bucket ${bucket.account}/${bucket.bucketName} is immutable (at write time ${writeTime}) and ${JSON.stringify(filePath)} already exists, so it cannot be written to`);
     }
 }
 
@@ -309,8 +395,25 @@ export async function writeBucketFile(account: string, bucketName: string, fileP
     if (!loaded) {
         throw new Error(`Bucket ${account}/${bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
     }
-    await assertMutable(loaded, filePath);
-    await loaded.store.set(filePath, data, { ...getWriteConfig(loaded), lastModified: config?.lastModified });
+    // The write time is determined exactly once, HERE at the first node that receives the write;
+    // it propagates as lastModified, so every node evaluates the bucket options at the same instant
+    let writeTime = config?.lastModified || Date.now();
+    // Only freshly-stamped writes are checked: a write with an explicit lastModified is
+    // synchronization/backfill (old data legitimately lands on sources whose window has moved on),
+    // but a fresh write reaching us outside our windows/routes means the client resolved its
+    // target from a stale view - it must re-resolve and retry at the correct source.
+    let route = getRoute(filePath);
+    if (!config?.lastModified && loaded.selfEntries.length) {
+        let timeValid = loaded.selfEntries.filter(x => writeTime >= x.validWindow[0] - WRITE_PAST_WINDOW_GRACE && writeTime <= x.validWindow[1] + WRITE_PAST_WINDOW_GRACE);
+        if (!timeValid.length) {
+            throw new Error(`${STORAGE_WRONG_VALID_WINDOW} This server is not a valid write target at ${writeTime} for bucket ${account}/${bucketName} (our valid windows: ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))}). Re-resolve the currently valid source and retry.`);
+        }
+        if (!timeValid.some(x => routeContains(x.route, route))) {
+            throw new Error(`${STORAGE_WRONG_ROUTE} This server does not handle route ${route} (key ${JSON.stringify(filePath)}) for bucket ${account}/${bucketName} (our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}). Re-resolve the source for this key and retry.`);
+        }
+    }
+    await assertMutable(loaded, filePath, writeTime);
+    await loaded.store.set(filePath, data, { ...getWriteConfig(loaded, writeTime, route), lastModified: writeTime });
 }
 
 export async function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void> {
@@ -319,7 +422,7 @@ export async function deleteBucketFile(account: string, bucketName: string, file
     }
     let loaded = await getLoadedBucket(account, bucketName);
     if (!loaded) return;
-    await loaded.store.del(filePath, getWriteConfig(loaded));
+    await loaded.store.del(filePath, getWriteConfig(loaded, Date.now(), getRoute(filePath)));
 }
 
 // ── local IArchives access ──
@@ -359,7 +462,7 @@ class ArchivesLocalBucket implements IArchives {
         if (!bucket) {
             throw new Error(`Bucket ${this.account}/${this.bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
         }
-        await assertMutable(bucket, config.path);
+        await assertMutable(bucket, config.path, Date.now());
         let id = await bucket.store.startLargeUpload();
         try {
             while (true) {
@@ -395,7 +498,15 @@ class ArchivesLocalBucket implements IArchives {
     public async getConfig(): Promise<ArchivesConfig> {
         let bucket = await this.getBucket();
         // Missing buckets say true, matching what they become once created (the default store type)
-        return { supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter, remoteConfig: bucket?.routing };
+        let progress = bucket?.store.getSyncProgress?.();
+        return {
+            supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter,
+            remoteConfig: bucket?.routing,
+            index: progress?.index,
+            indexSources: progress?.sources,
+            readerDiskLimit: progress?.readerDiskLimit,
+            syncing: progress?.syncing,
+        };
     }
     public async hasWriteAccess(): Promise<boolean> {
         return true;

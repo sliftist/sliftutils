@@ -1,6 +1,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
 export declare const MAX_LAST_MODIFIED_FUTURE: number;
+export declare const IMMUTABLE_CACHE_TIME: number;
 export declare function assertValidLastModified(lastModified: number): void;
 export type RemoteConfig = {
     version?: number;
@@ -19,8 +20,14 @@ export type RemoteConfig = {
 */
 export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
 export type CommonConfig = {
-    /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
-    syncOptions?: SyncOptions;
+    /** By default a server hosting this bucket eagerly copies this source's full contents onto its own disk (on top of the lazy read-through caching). Set this to be a front end for a very large database without copying the full database - reads still down-cache individual files on demand. */
+    noFullSync?: boolean;
+    /** Bytes of read-cache this server's disk may hold; least-recently-used files are deleted from disk to stay under it (only ever when another source verifiably holds the file - the only copy is never deleted). Requires noFullSync (a full copy can't be bounded). */
+    readerDiskLimit?: number;
+    /** The write times ([startMs, endMs]) this source is valid for (see ArchivesSource.validWindow for the synchronization semantics). Required on object configs: configuration changes must be SCHEDULED (a new source becomes valid at a future time while the old one's window ends), not flipped instantly. Plain URL-string sources default to FULL_VALID_WINDOW - once you're writing object configs, you're doing something complicated enough to think about when things change. */
+    validWindow: [number, number];
+    /** Sharding: the fraction of the key space this source handles, as [start, end) over [0, 1) (keys are routed by getRoute in remoteConfig.ts). Defaults to FULL_ROUTE (unsharded). At every point in time the sources' routes must fully cover [0, 1), or some keys could never be read. */
+    route?: [number, number];
 };
 export type HostedConfig = CommonConfig & {
     type: "remote";
@@ -35,34 +42,56 @@ export type HostedConfig = CommonConfig & {
 export type BackblazeConfig = CommonConfig & {
     type: "backblaze";
     url: string;
-    bucketName: string;
     public?: boolean;
     immutable?: boolean;
 };
-export declare const DEFAULT_BASE_SYNC_OPTIONS: SyncOptions;
-export declare const DEFAULT_SYNC_OPTIONS: SyncOptions;
+export declare const FULL_VALID_WINDOW: [number, number];
 export type ArchiveFileInfo = {
     path: string;
     createTime: number;
     size: number;
 };
+export type SyncActivity = {
+    type: "metadataScan" | "fullSync";
+    sourceDebugName: string;
+    startTime: number;
+    doneFiles?: number;
+    totalFiles?: number;
+    doneBytes?: number;
+    totalBytes?: number;
+};
 export type ArchivesConfig = {
     supportsChangesAfter?: boolean;
-};
-export type SyncOptions = {
-    copyFiles?: boolean;
-    noWriteBack?: boolean;
-    cacheReads?: boolean;
-    validWindow: [number, number];
-    required?: boolean;
+    remoteConfig?: RemoteConfig;
+    index?: {
+        fileCount: number;
+        byteCount: number;
+    };
+    indexSources?: {
+        debugName: string;
+        fileCount: number;
+        byteCount: number;
+    }[];
+    readerDiskLimit?: number;
+    syncing?: SyncActivity[];
 };
 export type ArchivesSource = {
     source: IArchives;
-    options: SyncOptions;
+    validWindow: [number, number];
+    route?: [number, number];
+    noFullSync?: boolean;
 };
+export declare const WRITE_PAST_WINDOW_GRACE: number;
+export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
+export declare const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17";
+export declare const FULL_ROUTE: [number, number];
+export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
+export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
 export type ArchivesSyncSourceStatus = {
     debugName: string;
-    options: SyncOptions;
+    validWindow: [number, number];
+    route?: [number, number];
+    noFullSync?: boolean;
     supportsChangesAfter: boolean;
     initialScanComplete: boolean;
     scannedCount: number;
@@ -74,13 +103,15 @@ export type ArchivesSyncStatus = {
 };
 export interface IArchives {
     getDebugName(): string;
+    /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc).
+     *  Checked without writing anything. */
+    hasWriteAccess(): Promise<boolean>;
     get(fileName: string, config?: {
         range?: {
             start: number;
             end: number;
         };
     }): Promise<Buffer | undefined>;
-    /** Like get, but also returns the last-write time of the file. get just calls get2. */
     get2(fileName: string, config?: {
         range?: {
             start: number;
@@ -89,6 +120,7 @@ export interface IArchives {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     /**
      * lastModified stamps the write with that last-write time instead of now. If it is OLDER than

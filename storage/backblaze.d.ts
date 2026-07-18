@@ -8,6 +8,7 @@ export declare class ArchivesBackblaze implements IArchives {
         public?: boolean;
         immutable?: boolean;
         cacheTime?: number;
+        allowedOrigins?: string[];
     });
     private bucketName;
     private bucketId;
@@ -16,6 +17,7 @@ export declare class ArchivesBackblaze implements IArchives {
     private log;
     getDebugName(): string;
     private getBucketAPI;
+    private currentReset;
     private last503Reset;
     private apiRetryLogic;
     get(fileName: string, config?: {
@@ -33,8 +35,10 @@ export declare class ArchivesBackblaze implements IArchives {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     getConfig(): Promise<ArchivesConfig>;
+    hasWriteAccess(): Promise<boolean>;
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<void>;
@@ -60,6 +64,17 @@ export declare class ArchivesBackblaze implements IArchives {
         size: number;
     }[]>;
     assertPathValid(path: string): Promise<void>;
+    move(config: {
+        path: string;
+        target: IArchives;
+        targetPath: string;
+        copyInstead?: boolean;
+    }): Promise<void>;
+    copy(config: {
+        path: string;
+        target: IArchives;
+        targetPath: string;
+    }): Promise<void>;
     getURL(path: string): Promise<string>;
     getDownloadAuthorization(config: {
         fileNamePrefix?: string;

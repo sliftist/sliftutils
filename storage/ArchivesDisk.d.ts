@@ -16,6 +16,7 @@ export declare class ArchivesDisk implements IArchives {
     };
     getDebugName(): string;
     getConfig(): Promise<ArchivesConfig>;
+    hasWriteAccess(): Promise<boolean>;
     private filePath;
     set(key: string, data: Buffer, config?: {
         lastModified?: number;
@@ -35,6 +36,7 @@ export declare class ArchivesDisk implements IArchives {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     getInfo(key: string): Promise<{
         writeTime: number;

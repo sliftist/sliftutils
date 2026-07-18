@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus } from "../IArchives";
+import { ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, SyncActivity } from "../IArchives";
 export declare const DEFAULT_FAST_WRITE_DELAY: number;
 export type WriteConfig = {
     fast?: boolean;
@@ -22,6 +22,7 @@ export type IBucketStore = {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
     del(fileName: string, config?: WriteConfig): Promise<void>;
@@ -35,6 +36,28 @@ export type IBucketStore = {
     }): Promise<ArchiveFileInfo[]>;
     getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
     getSyncStatus?(): Promise<ArchivesSyncStatus>;
+    getSyncProgress?(): {
+        index: {
+            fileCount: number;
+            byteCount: number;
+        };
+        sources: {
+            debugName: string;
+            fileCount: number;
+            byteCount: number;
+        }[];
+        readerDiskLimit?: number;
+        syncing: SyncActivity[];
+    };
+    computeIndexTotals?(): Promise<{
+        fileCount: number;
+        byteCount: number;
+        sources: {
+            debugName: string;
+            fileCount: number;
+            byteCount: number;
+        }[];
+    }>;
     startLargeUpload(): Promise<string>;
     appendLargeUpload(id: string, data: Buffer): Promise<void>;
     finishLargeUpload(id: string, key: string): Promise<void>;
@@ -46,10 +69,16 @@ export declare class BlobStore implements IBucketStore {
     private config?;
     constructor(folder: string, sources: ArchivesSource[], config?: {
         onIndexChanged?: ((key: string) => void) | undefined;
+        readerDiskLimit?: number | undefined;
     } | undefined);
     private stopped;
     private index;
     private mem;
+    private indexFileCount;
+    private indexByteCount;
+    private sourceFileCounts;
+    private sourceByteCounts;
+    private syncActivities;
     private dirty;
     private overlay;
     private sourceStates;
@@ -60,11 +89,38 @@ export declare class BlobStore implements IBucketStore {
     };
     dispose(): Promise<void>;
     private loadIndex;
+    private countEntry;
     private setIndexEntry;
     private deleteIndexEntry;
+    /** The cheap always-current totals plus any in-progress background synchronization. */
+    getSyncProgress(): {
+        index: {
+            fileCount: number;
+            byteCount: number;
+        };
+        sources: {
+            debugName: string;
+            fileCount: number;
+            byteCount: number;
+        }[];
+        readerDiskLimit?: number;
+        syncing: SyncActivity[];
+    };
+    /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to
+     *  any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
+    computeIndexTotals(): Promise<{
+        fileCount: number;
+        byteCount: number;
+        sources: {
+            debugName: string;
+            fileCount: number;
+            byteCount: number;
+        }[];
+    }>;
     private flushIndex;
     private runSourceSync;
     private scanSource;
+    private reconcileSource;
     private applyScanned;
     private pollChanges;
     private copySourceFiles;
@@ -85,12 +141,13 @@ export declare class BlobStore implements IBucketStore {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     private cacheRead;
     set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
-    private writeToSources;
     del(key: string, config?: WriteConfig): Promise<void>;
-    private deleteFromSources;
+    private getWritableSources;
+    private writeToSources;
     getInfo(key: string): Promise<{
         writeTime: number;
         size: number;
@@ -107,4 +164,7 @@ export declare class BlobStore implements IBucketStore {
     finishLargeUpload(id: string, key: string): Promise<void>;
     cancelLargeUpload(id: string): Promise<void>;
     private flushOverlay;
+    private evicting;
+    private enforceDiskLimit;
+    private cleanupTombstones;
 }

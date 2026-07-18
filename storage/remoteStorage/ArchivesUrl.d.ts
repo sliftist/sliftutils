@@ -20,6 +20,7 @@ export declare class ArchivesUrl implements IArchives {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     getInfo(fileName: string): Promise<{
         writeTime: number;
@@ -43,4 +44,5 @@ export declare class ArchivesUrl implements IArchives {
     }): Promise<ArchiveFileInfo[]>;
     getURL(path: string): Promise<string>;
     getConfig(): Promise<ArchivesConfig>;
+    hasWriteAccess(): Promise<boolean>;
 }

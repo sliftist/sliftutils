@@ -38,8 +38,14 @@ export type RemoteConfig = {
 export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
 
 export type CommonConfig = {
-    /** The default options for the first config in a list is DEFAULT_BASE_SYNC_OPTIONS. The rest default to DEFAULT_SYNC_OPTIONS. */
-    syncOptions?: SyncOptions;
+    /** By default a server hosting this bucket eagerly copies this source's full contents onto its own disk (on top of the lazy read-through caching). Set this to be a front end for a very large database without copying the full database - reads still down-cache individual files on demand. */
+    noFullSync?: boolean;
+    /** Bytes of read-cache this server's disk may hold; least-recently-used files are deleted from disk to stay under it (only ever when another source verifiably holds the file - the only copy is never deleted). Requires noFullSync (a full copy can't be bounded). */
+    readerDiskLimit?: number;
+    /** The write times ([startMs, endMs]) this source is valid for (see ArchivesSource.validWindow for the synchronization semantics). Required on object configs: configuration changes must be SCHEDULED (a new source becomes valid at a future time while the old one's window ends), not flipped instantly. Plain URL-string sources default to FULL_VALID_WINDOW - once you're writing object configs, you're doing something complicated enough to think about when things change. */
+    validWindow: [number, number];
+    /** Sharding: the fraction of the key space this source handles, as [start, end) over [0, 1) (keys are routed by getRoute in remoteConfig.ts). Defaults to FULL_ROUTE (unsharded). At every point in time the sources' routes must fully cover [0, 1), or some keys could never be read. */
+    route?: [number, number];
 };
 
 export type HostedConfig = CommonConfig & {
@@ -80,14 +86,8 @@ export type BackblazeConfig = CommonConfig & {
 };
 
 
-export const DEFAULT_BASE_SYNC_OPTIONS: SyncOptions = {
-    cacheReads: true,
-    required: true,
-    validWindow: [0, Number.MAX_SAFE_INTEGER],
-};
-export const DEFAULT_SYNC_OPTIONS: SyncOptions = {
-    validWindow: [0, Number.MAX_SAFE_INTEGER],
-};
+export const FULL_VALID_WINDOW: [number, number] = [0, Number.MAX_SAFE_INTEGER];
+
 
 
 
@@ -97,36 +97,83 @@ export const DEFAULT_SYNC_OPTIONS: SyncOptions = {
 // bytes served by get() were most recently written".
 export type ArchiveFileInfo = { path: string; createTime: number; size: number };
 
+// An in-progress background synchronization task (see ArchivesConfig.syncing)
+export type SyncActivity = {
+    // A metadata scan is a single listing call, so it has no incremental progress - just that it's
+    // running and since when. A full sync knows its exact file/byte progress.
+    type: "metadataScan" | "fullSync";
+    sourceDebugName: string;
+    startTime: number;
+    doneFiles?: number;
+    totalFiles?: number;
+    doneBytes?: number;
+    totalBytes?: number;
+};
+
 export type ArchivesConfig = {
     // Whether getChangesAfter is implemented (fast change polling, instead of full rescans)
     supportsChangesAfter?: boolean;
     // The bucket's full routing config (ROUTING_FILE). Absent for sources that don't have one (a
     // bare disk source, or a bucket that doesn't exist yet).
     remoteConfig?: RemoteConfig;
+    // Live index totals (tombstones excluded), kept up to date in memory on every mutation and
+    // recomputed on load - so any drift heals on restart
+    index?: { fileCount: number; byteCount: number };
+    // The same totals broken down by which source currently holds each file's bytes (the first
+    // entry is the server's own disk)
+    indexSources?: { debugName: string; fileCount: number; byteCount: number }[];
+    // The server's configured readerDiskLimit, when it runs as a bounded read cache
+    readerDiskLimit?: number;
+    // Background synchronization currently in progress (empty when idle)
+    syncing?: SyncActivity[];
 };
 
-// How a synchronization source behaves (see BlobStore, which synchronizes an index + local cache
-// from a list of { source, options }).
-export type SyncOptions = {
-    // After the source's metadata is copied into the index, also copy the file contents over (into
-    // the cacheReads sources), preserving their modified times.
-    copyFiles?: boolean;
-    // Writes are NOT written to this source (by default every source receives writes).
-    noWriteBack?: boolean;
-    // If a read wasn't served by this source, write the data back to it (using it as a cache), and
-    // update the index so it becomes the new source. Set for the local disk source.
-    cacheReads?: boolean;
-    // Ignore values with write times outside [start, end].
+// A synchronization source of a BlobStore (which synchronizes an index + local cache from them)
+export type ArchivesSource = {
+    source: IArchives;
+    // From the source's CommonConfig. Values with write times outside the window are ignored when
+    // scanning, and once its end is sufficiently past (see windowAcceptsWrites) the source stops
+    // receiving writes entirely - still scanned (it holds the authoritative data for its window),
+    // it just stops growing.
     validWindow: [number, number];
-    // If a file isn't in the index and this source hasn't finished its initial scan, check the
-    // source directly before declaring the file nonexistent. Set for the disk source.
-    required?: boolean;
+    // From the source's CommonConfig (intersected with the owning store's own route): only keys
+    // routing into [start, end) are accepted from this source's scans and sent to it in
+    // writes/reconciliation. The routing file is exempt - config flows everywhere. Absent = all keys.
+    route?: [number, number];
+    // From the source's CommonConfig; see there.
+    noFullSync?: boolean;
 };
-export type ArchivesSource = { source: IArchives; options: SyncOptions };
+
+// The grace covers clock uncertainty around the window edge: a write slightly past the end doesn't
+// hurt, but once clearly past, the source is an archive and must stop growing.
+export const WRITE_PAST_WINDOW_GRACE = 5 * 60 * 1000;
+
+// Error marker a server includes when a freshly-stamped write reaches it outside its valid windows
+// (the client resolved its target, then time crossed a window boundary before the write landed).
+// Clients detect this marker and re-resolve the currently-valid source, retrying ONCE - boundaries
+// are far apart, so hitting it twice in one attempt means something is actually wrong.
+export const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
+
+// Error marker a server includes when a freshly-stamped write's key routes outside the shards this
+// server handles (the client's config disagrees with the server's - clients re-resolve once)
+export const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17";
+
+export const FULL_ROUTE: [number, number] = [0, 1];
+
+// A key containing this sentinel doesn't have a fixed shard: setVariableShard picks the (lowest
+// latency, up) write shard, appends "_<value in the shard's route>" directly after the sentinel,
+// and returns the materialized key. getRoute treats that suffix as a complete route override.
+export const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
+export function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean {
+    if (!validWindow) return true;
+    return validWindow[1] + WRITE_PAST_WINDOW_GRACE > Date.now();
+}
 
 export type ArchivesSyncSourceStatus = {
     debugName: string;
-    options: SyncOptions;
+    validWindow: [number, number];
+    route?: [number, number];
+    noFullSync?: boolean;
     supportsChangesAfter: boolean;
     initialScanComplete: boolean;
     // Files seen in this source's scans / change polls so far

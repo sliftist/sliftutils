@@ -1,6 +1,6 @@
 module.allowclient = true;
 
-import { isNode } from "socket-function/src/misc";
+import { isNode, sort } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getSecret } from "../../misc/getSecret";
 import { IArchives, HostedConfig, BackblazeConfig } from "../IArchives";
@@ -14,6 +14,8 @@ export const RETRY_START_DELAY = 2 * 1000;
 export const RETRY_MAX_DELAY = 5 * 60 * 1000;
 export const RETRY_GROWTH = 1.5;
 const ACCESS_RECHECK_INTERVAL = 60 * 1000;
+const PING_INTERVAL = 60 * 1000;
+const PING_HISTORY = 10;
 
 async function hasBackblazeCreds(): Promise<boolean> {
     if (!isNode()) return false;
@@ -157,6 +159,46 @@ export class SourceWrapper {
         return await this.api.hasWriteAccess();
     }
 
+    private pings: number[] = [];
+    private pingTimer: ReturnType<typeof setInterval> | undefined;
+
+    /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
+     *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
+    public startPinging(): void {
+        const remote = this.remote;
+        if (!remote || this.pingTimer || this.disposed) return;
+        let measure = async () => {
+            let start = Date.now();
+            try {
+                await remote.ping();
+            } catch {
+                return;
+            }
+            this.pings.push(Date.now() - start);
+            if (this.pings.length > PING_HISTORY) {
+                this.pings.shift();
+            }
+        };
+        void measure();
+        this.pingTimer = setInterval(() => {
+            void measure();
+        }, PING_INTERVAL);
+        (this.pingTimer as { unref?: () => void }).unref?.();
+    }
+
+    /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our
+     *  own in-process server, which is the best possible target (0). */
+    public getLatency(): number {
+        if (!this.remote) {
+            if (this.config.type === "remote" && this.api) return 0;
+            return Infinity;
+        }
+        if (!this.pings.length) return Infinity;
+        let sorted = [...this.pings];
+        sort(sorted, x => x);
+        return sorted[Math.floor(sorted.length / 2)];
+    }
+
     /** Writes always go through the API, so a permission error throws to the caller on every write
      *  (and access granted in the meantime is picked up automatically). */
     public async write<T>(run: (archives: IArchives) => Promise<T>): Promise<T> {
@@ -174,5 +216,8 @@ export class SourceWrapper {
 
     public dispose(): void {
         this.disposed = true;
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+        }
     }
 }

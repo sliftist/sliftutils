@@ -28,6 +28,8 @@ export declare class ArchivesRemote implements IArchives {
     private controller;
     private lastDeniedLog;
     getDebugName(): string;
+    isConnected(): boolean;
+    ping(): Promise<void>;
     private authenticate;
     private callAuthed;
     waitingForAccess(): Promise<{
@@ -35,7 +37,8 @@ export declare class ArchivesRemote implements IArchives {
         machineId: string;
         ip: string;
     } | undefined>;
-    private onAccessDenied;
+    hasWriteAccess(): Promise<boolean>;
+    private registerAccessRequest;
     private call;
     get(fileName: string, config?: {
         range?: {
@@ -51,6 +54,7 @@ export declare class ArchivesRemote implements IArchives {
     }): Promise<{
         data: Buffer;
         writeTime: number;
+        size: number;
     } | undefined>;
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;

@@ -144,6 +144,9 @@ async function getBucket(account: string, bucketName: string): Promise<LoadedBuc
 }
 
 class RemoteStorageControllerBase {
+    // Latency measurement (see SourceWrapper's pinging); no auth, it measures the transport
+    async ping(): Promise<void> { }
+
     // Proves the caller owns the machine key for the machineId in its certificate. The signature
     // must be fresh and bound to this server, so it cannot be replayed to (or from) other servers.
     async authenticate(token: AuthToken): Promise<{ machineId: string; ip: string }> {
@@ -329,7 +332,22 @@ class RemoteStorageControllerBase {
     async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
         let bucket = await getBucket(account, bucketName);
         // Missing buckets say true, matching what they become once created (the default store type)
-        return { supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter, remoteConfig: bucket?.routing };
+        let progress = bucket?.store.getSyncProgress?.();
+        return {
+            supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter,
+            remoteConfig: bucket?.routing,
+            index: progress?.index,
+            indexSources: progress?.sources,
+            readerDiskLimit: progress?.readerDiskLimit,
+            syncing: progress?.syncing,
+        };
+    }
+    /** Walks the whole index for exact totals (overall and per holding source) - more expensive
+     *  than the maintained counters that getArchivesConfig returns, but immune to counter drift. */
+    async getIndexInfo(account: string, bucketName: string): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] } | undefined> {
+        let bucket = await getBucket(account, bucketName);
+        if (!bucket || !bucket.store.computeIndexTotals) return undefined;
+        return await bucket.store.computeIndexTotals();
     }
     async getSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus> {
         let bucket = await getBucket(account, bucketName);
@@ -348,7 +366,7 @@ class RemoteStorageControllerBase {
         if (!bucket) {
             throw new Error(`Bucket ${account}/${bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
         }
-        await assertMutable(bucket, path);
+        await assertMutable(bucket, path, Date.now());
         let id = await bucket.store.startLargeUpload();
         largeUploadInfo.set(id, { account, bucketName, path });
         return id;
@@ -410,17 +428,57 @@ class RemoteStorageControllerBase {
         if (!bucket.self?.public) {
             throw new Error(`Bucket ${account}/${bucketName} is not public, so its files cannot be read over plain URLs`);
         }
-        let result = await bucket.store.get2(filePath);
-        if (!result) {
+        // The index answers existence + write time + size without touching any data, so
+        // If-Modified-Since and range validation cost nothing
+        let info = await bucket.store.getInfo(filePath);
+        if (!info || !info.size) {
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
         }
         let ext = filePath.split(".").pop() || "";
         let headers: { [header: string]: string } = {
             "Content-Type": CONTENT_TYPES[ext.toLowerCase()] || "application/octet-stream",
-            "Last-Modified": new Date(result.writeTime).toUTCString(),
+            "Last-Modified": new Date(info.writeTime).toUTCString(),
+            "Accept-Ranges": "bytes",
         };
         if (bucket.self?.immutable) {
             headers["Cache-Control"] = `max-age=${IMMUTABLE_CACHE_TIME / 1000}`;
+        }
+        let ifModifiedSince = request?.headers["if-modified-since"];
+        if (typeof ifModifiedSince === "string") {
+            let since = new Date(ifModifiedSince).getTime();
+            // Last-Modified is served at 1 second resolution, so compare at that resolution
+            if (since && Math.floor(info.writeTime / 1000) * 1000 <= since) {
+                return setHTTPResultHeaders(Buffer.from(""), { ...headers, status: "304" });
+            }
+        }
+        let range: { start: number; end: number } | undefined;
+        let rangeHeader = request?.headers["range"];
+        if (typeof rangeHeader === "string") {
+            // Single-range form only (bytes=start-end / start- / -suffix); anything else serves the full file
+            let match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+            if (match && (match[1] || match[2])) {
+                let start: number;
+                let endInclusive = info.size - 1;
+                if (!match[1]) {
+                    start = Math.max(0, info.size - +match[2]);
+                } else {
+                    start = +match[1];
+                    if (match[2]) {
+                        endInclusive = Math.min(+match[2], info.size - 1);
+                    }
+                }
+                if (start >= info.size || start > endInclusive) {
+                    return setHTTPResultHeaders(Buffer.from(""), { ...headers, "Content-Range": `bytes */${info.size}`, status: "416" });
+                }
+                range = { start, end: endInclusive + 1 };
+            }
+        }
+        let result = await bucket.store.get2(filePath, { range });
+        if (!result) {
+            return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
+        }
+        if (range) {
+            return setHTTPResultHeaders(result.data, { ...headers, "Content-Range": `bytes ${range.start}-${range.end - 1}/${info.size}`, status: "206" });
         }
         return setHTTPResultHeaders(result.data, headers);
     }
@@ -447,6 +505,7 @@ export const RemoteStorageController = SocketFunction.register(
     REMOTE_STORAGE_CLASS_GUID,
     new RemoteStorageControllerBase(),
     () => ({
+        ping: {},
         authenticate: {},
         requestAccess: {},
         getAccessState: {},
@@ -462,6 +521,7 @@ export const RemoteStorageController = SocketFunction.register(
         findInfo: { hooks: [accountAccess] },
         getChangesAfter: { hooks: [accountAccess] },
         getArchivesConfig: { hooks: [accountAccess] },
+        getIndexInfo: { hooks: [accountAccess] },
         getSyncStatus: { hooks: [accountAccess] },
         startLargeFile: { hooks: [accountAccess] },
         uploadPart: { hooks: [uploadAccess] },
