@@ -1,13 +1,14 @@
 module.allowclient = true;
 
 import { SocketFunction } from "socket-function/SocketFunction";
+import { SocketFunctionHook } from "socket-function/SocketFunctionTypes";
 import { getNodeIdIP } from "socket-function/src/nodeCache";
 import { setHTTPResultHeaders, getCurrentHTTPRequest } from "socket-function/src/callHTTPHandler";
 import { performLocalCall } from "socket-function/src/callManager";
 import { RequireController } from "socket-function/require/RequireController";
 import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
-import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, IMMUTABLE_CACHE_TIME } from "../IArchives";
 import { ROUTING_FILE } from "./remoteConfig";
 import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
@@ -226,7 +227,6 @@ class RemoteStorageControllerBase {
     // volunteers a list of requesting IPs, so a trusted user can't accidentally approve a random
     // request from a machine they didn't mean to trust.
     async listRequestsForIP(account: string, ip: string): Promise<AccessRequest[]> {
-        await requireAccess(account);
         let requests = await getRequests();
         return (await requests.get(ip) || []).filter(x => x.account === account);
     }
@@ -262,12 +262,10 @@ class RemoteStorageControllerBase {
     // Only returns requests for the given IP, so you cannot accidentally grant a request from an
     // IP you didn't explicitly type in.
     async adminListRequests(ip: string): Promise<AccessRequest[]> {
-        requireAdmin();
         let requests = await getRequests();
         return await requests.get(ip) || [];
     }
     async adminGrantAccess(requestId: string): Promise<TrustRecord> {
-        requireAdmin();
         let trust = await getTrust();
         let requests = await getRequests();
         for (let ip of await requests.getKeys()) {
@@ -290,15 +288,13 @@ class RemoteStorageControllerBase {
         let result = await this.get2(account, bucketName, path, range);
         return result && result.data || undefined;
     }
-    async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number } | undefined> {
-        await requireAccess(account);
+    async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         assertValidPath(path);
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return undefined;
         return await bucket.store.get2(path, { range });
     }
     async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number): Promise<void> {
-        await requireAccess(account);
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
         // Handles bucket creation (writes of ROUTING_FILE), reconfiguration, fast mode, and
@@ -306,27 +302,23 @@ class RemoteStorageControllerBase {
         await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified });
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
-        await requireAccess(account);
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
         await deleteBucketFile(account, bucketName, path);
     }
     async getInfo(account: string, bucketName: string, path: string): Promise<{ writeTime: number; size: number } | undefined> {
-        await requireAccess(account);
         assertValidPath(path);
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return undefined;
         return await bucket.store.getInfo(path);
     }
     async findInfo(account: string, bucketName: string, prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        await requireAccess(account);
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return [];
         return await bucket.store.findInfo(prefix, config);
     }
     // Fast (served from the store's BulkDatabase2 index, not a scan) — see IArchives.getChangesAfter
     async getChangesAfter(account: string, bucketName: string, time: number): Promise<ArchiveFileInfo[]> {
-        await requireAccess(account);
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return [];
         if (!bucket.store.getChangesAfter) {
@@ -335,13 +327,11 @@ class RemoteStorageControllerBase {
         return await bucket.store.getChangesAfter(time);
     }
     async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
-        await requireAccess(account);
         let bucket = await getBucket(account, bucketName);
         // Missing buckets say true, matching what they become once created (the default store type)
-        return { supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter };
+        return { supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter, remoteConfig: bucket?.routing };
     }
     async getSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus> {
-        await requireAccess(account);
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return { allScansComplete: true, indexSize: 0, sources: [] };
         if (!bucket.store.getSyncStatus) {
@@ -352,7 +342,6 @@ class RemoteStorageControllerBase {
 
     async startLargeFile(account: string, bucketName: string, path: string): Promise<string> {
         assertWritesAllowed();
-        await requireAccess(account);
         // Validates now, so the upload doesn't fail at the end
         assertValidPath(path);
         let bucket = await getBucket(account, bucketName);
@@ -368,7 +357,6 @@ class RemoteStorageControllerBase {
         assertWritesAllowed();
         let info = largeUploadInfo.get(uploadId);
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
-        await requireAccess(info.account);
         let bucket = await getBucket(info.account, info.bucketName);
         if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
         await bucket.store.appendLargeUpload(uploadId, Buffer.from(data));
@@ -377,7 +365,6 @@ class RemoteStorageControllerBase {
         assertWritesAllowed();
         let info = largeUploadInfo.get(uploadId);
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
-        await requireAccess(info.account);
         largeUploadInfo.delete(uploadId);
         let bucket = await getBucket(info.account, info.bucketName);
         if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
@@ -386,7 +373,6 @@ class RemoteStorageControllerBase {
     async cancelLargeFile(uploadId: string): Promise<void> {
         let info = largeUploadInfo.get(uploadId);
         if (!info) return;
-        await requireAccess(info.account);
         largeUploadInfo.delete(uploadId);
         let bucket = await getBucket(info.account, info.bucketName);
         if (!bucket) return;
@@ -429,14 +415,33 @@ class RemoteStorageControllerBase {
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
         }
         let ext = filePath.split(".").pop() || "";
-        return setHTTPResultHeaders(result.data, {
+        let headers: { [header: string]: string } = {
             "Content-Type": CONTENT_TYPES[ext.toLowerCase()] || "application/octet-stream",
             "Last-Modified": new Date(result.writeTime).toUTCString(),
-        });
+        };
+        if (bucket.self?.immutable) {
+            headers["Cache-Control"] = `max-age=${IMMUTABLE_CACHE_TIME / 1000}`;
+        }
+        return setHTTPResultHeaders(result.data, headers);
     }
 }
 
 const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string }>();
+
+// Access checks run as hooks on the register shape below, keyed off the call's arguments, so the
+// method bodies don't each repeat them
+const accountAccess: SocketFunctionHook = async (context) => {
+    await requireAccess(String(context.call.args[0]));
+};
+const uploadAccess: SocketFunctionHook = async (context) => {
+    let info = largeUploadInfo.get(String(context.call.args[0]));
+    // Unknown upload ids are handled by the methods themselves (throw / no-op)
+    if (!info) return;
+    await requireAccess(info.account);
+};
+const adminAccess: SocketFunctionHook = async () => {
+    requireAdmin();
+};
 
 export const RemoteStorageController = SocketFunction.register(
     REMOTE_STORAGE_CLASS_GUID,
@@ -445,23 +450,27 @@ export const RemoteStorageController = SocketFunction.register(
         authenticate: {},
         requestAccess: {},
         getAccessState: {},
-        listRequestsForIP: {},
+        listRequestsForIP: { hooks: [accountAccess] },
         grantAccess: {},
-        adminListRequests: {},
-        adminGrantAccess: {},
-        get: {},
-        get2: {},
-        set: {},
-        del: {},
-        getInfo: {},
-        findInfo: {},
-        getChangesAfter: {},
-        getArchivesConfig: {},
-        getSyncStatus: {},
-        startLargeFile: {},
-        uploadPart: {},
-        finishLargeFile: {},
-        cancelLargeFile: {},
+        adminListRequests: { hooks: [adminAccess] },
+        adminGrantAccess: { hooks: [adminAccess] },
+        get: { hooks: [accountAccess] },
+        get2: { hooks: [accountAccess] },
+        set: { hooks: [accountAccess] },
+        del: { hooks: [accountAccess] },
+        getInfo: { hooks: [accountAccess] },
+        findInfo: { hooks: [accountAccess] },
+        getChangesAfter: { hooks: [accountAccess] },
+        getArchivesConfig: { hooks: [accountAccess] },
+        getSyncStatus: { hooks: [accountAccess] },
+        startLargeFile: { hooks: [accountAccess] },
+        uploadPart: { hooks: [uploadAccess] },
+        finishLargeFile: { hooks: [uploadAccess] },
+        cancelLargeFile: { hooks: [uploadAccess] },
         httpEntry: {},
+    }),
+    () => ({
+        noClientHooks: true,
+        noDefaultHooks: true,
     })
 );

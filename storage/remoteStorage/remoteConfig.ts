@@ -62,17 +62,30 @@ export function normalizeSource(source: RemoteConfigBase): HostedConfig | Backbl
     }
     let hostname = new URL(source).hostname;
     if (hostname.endsWith(".backblazeb2.com")) {
-        return { type: "backblaze", url: source, bucketName: parseBackblazeUrl(source).bucketName };
+        // Validates the URL (throws on malformed) before it's stored; the bucket name is read back
+        // out of the URL at use sites, never stored on the config.
+        parseBackblazeUrl(source);
+        return { type: "backblaze", url: source };
     }
     parseHostedUrl(source);
     return { type: "remote", url: source };
 }
 
 export function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig {
+    let result: RemoteConfig;
     if (typeof config !== "string" && "sources" in config) {
-        return { version: config.version, sources: config.sources.map(normalizeSource) };
+        result = { version: config.version, sources: config.sources.map(normalizeSource) };
+    } else {
+        result = { sources: [normalizeSource(config)] };
     }
-    return { sources: [normalizeSource(config)] };
+    // Mixed immutability makes no sense: a mutable source would accept overwrites that the
+    // immutable sources then refuse to synchronize, permanently forking their contents
+    let sources = result.sources.map(normalizeSource);
+    let immutableCount = sources.filter(x => x.immutable).length;
+    if (immutableCount && immutableCount !== sources.length) {
+        throw new Error(`If any source is immutable, all must be immutable: ${immutableCount} of ${sources.length} sources are. Sources: ${JSON.stringify(sources.map(x => ({ url: x.url, immutable: !!x.immutable })))}`);
+    }
+    return result;
 }
 
 export function parseRoutingData(data: Buffer): RemoteConfig {

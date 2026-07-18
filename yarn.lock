@@ -1944,10 +1944,10 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^1.2.4:
-  version "1.2.4"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.2.4.tgz#3f62a5549c663f032d9cdf21388c74bbeb6e1d91"
-  integrity sha512-tKlnF9rK+K9XKWq9SAg4EvyAFbNK74YpjT63F2F8u8XsUDoDDGCSL3H6m2rZnpt0EgpzIXX7sTD9m4OWwMHp2g==
+socket-function@^1.2.16:
+  version "1.2.16"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.2.16.tgz#6ad7fc1971202d9768582b0212f086675fba61b5"
+  integrity sha512-o3GATr5Fa+496StsPWJIb0yytY/XRMZjJQ4cgb1LOQIfFv7uJUJ3NZtcldMeN/kOmqI0hBaMvhRLC3VHke9awA==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"
@@ -1957,7 +1957,7 @@ socket-function@^1.2.4:
     preact "10.24.3"
     typedev "^0.4.0"
     typenode "^6.0.1"
-    ws "^8.17.1"
+    ws "^8.21.0"
   optionalDependencies:
     lmdb "^3.5.1"
 
@@ -2177,10 +2177,15 @@ wrappy@1:
   resolved "https://registry.yarnpkg.com/wrappy/-/wrappy-1.0.2.tgz#b5243d8f3ec1aa35f1364605bc0d1036e30ab69f"
   integrity sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==
 
-ws@^8.17.1, ws@^8.18.3:
+ws@^8.18.3:
   version "8.18.3"
   resolved "https://registry.yarnpkg.com/ws/-/ws-8.18.3.tgz#b56b88abffde62791c639170400c93dcb0c95472"
   integrity sha512-PEIGCY5tSlUt50cqyMXfCzX+oOPqN0vuGqWzbcJ2xvnkzkq46oOpz7dQaTDBdfICb4N14+GARUDw2XV2N4tvzg==
+
+ws@^8.21.0:
+  version "8.21.1"
+  resolved "https://registry.yarnpkg.com/ws/-/ws-8.21.1.tgz#045650cd4b1207809e7547146223c3814a9af586"
+  integrity sha512-+0NTnW77fFN/DjQi6k/Sq/Yvk4Sgajw7urW8V+asjXnRgDs9gyGkdb7EzgfhA4goXsRIZKE28fzIXBHEzhuiWw==
 
 y18n@^4.0.0:
   version "4.0.3"

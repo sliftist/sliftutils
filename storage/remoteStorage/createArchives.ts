@@ -1,37 +1,37 @@
 module.allowclient = true;
 
-import fs from "fs";
-import os from "os";
 import { isNode } from "socket-function/src/misc";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig,
     ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus,
 } from "../IArchives";
 import {
-    ROUTING_FILE, getConfigVersion, getBucketBaseUrl, parseHostedUrl,
+    ROUTING_FILE, getConfigVersion, parseHostedUrl, parseBackblazeUrl,
     normalizeRemoteConfig, normalizeSource, parseRoutingData, serializeRemoteConfig,
 } from "./remoteConfig";
 import { ArchivesRemote } from "./ArchivesRemote";
-import { ArchivesUrl } from "./ArchivesUrl";
 import { ArchivesBackblaze } from "../backblaze";
 import { getStorageServerConfigOptional, getLocalArchives } from "./storageServerState";
-import { STORAGE_ACCESS_DENIED } from "./storageController";
+import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
 
-// Turns a RemoteConfig into a usable IArchives (createArchives). Setup is fully lazy: on the first
-// call we read the routing file (ROUTING_FILE) from every source, adopt the newest version found
-// (exactly ONE level of indirection - we never fetch routing configs from newly adopted sources),
-// and write the adopted config to every source that is missing it (which CREATES not-yet-existing
-// buckets) or holds an older version.
+// Turns a RemoteConfig into a usable IArchives (createArchives). Initialization is lazy: on the
+// first call we walk the sources IN ORDER and the first one that answers is authoritative (sources
+// are synchronized copies of the same bucket, so we never consult the rest). Its stored routing
+// config wins over the in-memory one - unless ours has a strictly newer version, in which case we
+// write ours (creating the bucket when no routing exists at all). A failed init (all sources down,
+// or the routing write was rejected) stays failed for callers but retries itself in the background
+// with a ramping delay. Once running, we re-read the routing config every CONFIG_POLL_INTERVAL and
+// rebuild the source list when it changed (reusing wrappers for unchanged sources).
 
-const DOWN_RETRY_DELAY = 30 * 1000;
-const ENSURE_RETRY_DELAY = 30 * 1000;
+const CONFIG_POLL_INTERVAL = 5 * 60 * 1000;
 
 // The direct API IArchives for one source, with no URL-form fallback and no chaining. Used by the
-// storage server for its synchronization sources: hosted sources block waiting for account access
-// (logging instructions) when access hasn't been granted yet.
+// storage server for its synchronization sources. Denied calls throw immediately (registering the
+// access request in the background): the sync loops retry-and-log until access is granted, while
+// explicit writes surface the denial (with grant instructions) to the caller instead of hanging.
 export function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives {
     if (source.type === "backblaze") {
-        return new ArchivesBackblaze({ bucketName: source.bucketName, public: source.public, immutable: source.immutable });
+        return new ArchivesBackblaze({ bucketName: parseBackblazeUrl(source.url).bucketName, public: source.public, immutable: source.immutable });
     }
     let parsed = parseHostedUrl(source.url);
     let server = isNode() && getStorageServerConfigOptional() || undefined;
@@ -40,270 +40,276 @@ export function createApiArchives(source: HostedConfig | BackblazeConfig): IArch
         // ourselves over HTTPS
         return getLocalArchives(parsed.account, parsed.bucketName);
     }
-    return new ArchivesRemote({ url: source.url, accountName: source.accountName });
+    return new ArchivesRemote({ url: source.url, accountName: source.accountName, waitForAccess: false });
 }
 
-function hasBackblazeCreds(): boolean {
-    return isNode() && fs.existsSync(os.homedir() + "/backblaze.json");
-}
-
-type ChainSource = {
-    config: HostedConfig | BackblazeConfig;
-    // Direct API access. Missing when we can only use the public-URL form (backblaze without
-    // credentials, or backblaze in the browser).
-    api?: IArchives;
-    // Public-URL fallback, used when the API denies us access. Never created when the config
-    // explicitly says public: false (then we don't even hit the URL).
-    url?: ArchivesUrl;
-    // Why writes to this source can never work (collected into the error when a write finds no
-    // source that accepts it)
-    writeBlocked?: string;
-    // After a source errors we stop trying it until this time, so one down source doesn't stall
-    // every call
-    downUntil: number;
-    // Whether we confirmed this source holds an up-to-date routing file. Writing that file creates
-    // the bucket, so this also tracks which buckets we've initialized.
-    routingEnsured: boolean;
-    lastEnsureAttempt: number;
+type ChainState = {
+    config: RemoteConfig;
+    sources: SourceWrapper[];
 };
 
-function buildChainSource(config: HostedConfig | BackblazeConfig): ChainSource {
-    let source: ChainSource = { config, downUntil: 0, routingEnsured: false, lastEnsureAttempt: 0 };
-    if (config.type === "backblaze") {
-        if (hasBackblazeCreds()) {
-            source.api = new ArchivesBackblaze({ bucketName: config.bucketName, public: config.public, immutable: config.immutable });
-        } else if (isNode()) {
-            source.writeBlocked = `No backblaze credentials for ${config.url}. Create ~/backblaze.json with { "applicationKeyId": ..., "applicationKey": ... } to enable API access.`;
-        } else {
-            source.writeBlocked = `Browsers cannot write to backblaze (bucket ${config.url})`;
-        }
-        if (!source.api && config.public !== false) {
-            source.url = new ArchivesUrl(getBucketBaseUrl(config.url));
-        }
-        return source;
-    }
-    let parsed = parseHostedUrl(config.url);
-    let server = isNode() && getStorageServerConfigOptional() || undefined;
-    if (server && parsed.address === server.domain && parsed.port === server.port) {
-        // A bucket hosted by our own process - use it directly instead of calling ourselves
-        source.api = getLocalArchives(parsed.account, parsed.bucketName);
-        return source;
-    }
-    source.api = new ArchivesRemote({ url: config.url, accountName: config.accountName, waitForAccess: false });
-    if (config.public !== false) {
-        source.url = new ArchivesUrl(getBucketBaseUrl(config.url));
-    }
-    return source;
-}
-
 export class ArchivesChain implements IArchives {
-    private normalized: RemoteConfig;
-    // The config we operate on: ours, or a newer-versioned one adopted from a source's routing file
-    private adopted: RemoteConfig;
-    private sourcesPromise: Promise<ChainSource[]> | undefined;
+    private configured: RemoteConfig;
+    // The config we actually run on (the authoritative stored one after init)
+    private activeConfig: RemoteConfig;
+    private statePromise: Promise<ChainState> | undefined;
+    private initRetryDelay = RETRY_START_DELAY;
+    private initRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    private pollTimer: ReturnType<typeof setInterval> | undefined;
+    private disposed = false;
 
     constructor(config: RemoteConfig | RemoteConfigBase) {
-        this.normalized = normalizeRemoteConfig(config);
-        this.adopted = this.normalized;
+        this.configured = normalizeRemoteConfig(config);
+        this.activeConfig = this.configured;
     }
 
     public getDebugName() {
-        let urls = this.adopted.sources.map(x => typeof x === "string" && x || (x as HostedConfig | BackblazeConfig).url);
+        let urls = this.activeConfig.sources.map(x => typeof x === "string" && x || (x as HostedConfig | BackblazeConfig).url);
         return `chain/${urls.join(",")}`;
     }
 
-    private getSourceConfigs(config: RemoteConfig): (HostedConfig | BackblazeConfig)[] {
-        return config.sources.map(normalizeSource);
-    }
-
-    private getSources(): Promise<ChainSource[]> {
-        if (!this.sourcesPromise) {
+    // Lazy init that rethrows its error to every caller, while a background timer resets and
+    // retries it with a ramping delay - so a chain that couldn't initialize fixes itself once a
+    // source comes back, without any caller having to drive it.
+    private getState(): Promise<ChainState> {
+        if (this.disposed) {
+            return Promise.reject(new Error(`ArchivesChain ${this.getDebugName()} has been disposed`));
+        }
+        if (!this.statePromise) {
             let promise = this.init();
-            this.sourcesPromise = promise;
-            // A failed init isn't cached, so a source coming up later fixes us
-            promise.catch(() => {
-                if (this.sourcesPromise === promise) {
-                    this.sourcesPromise = undefined;
-                }
+            this.statePromise = promise;
+            promise.then(() => {
+                this.initRetryDelay = RETRY_START_DELAY;
+            }, (e: Error) => {
+                if (this.disposed || this.initRetryTimer) return;
+                console.error(`Storage init failed for ${this.getDebugName()}, retrying in ${Math.round(this.initRetryDelay / 1000)}s. ${e.stack ?? e}`);
+                this.initRetryTimer = setTimeout(() => {
+                    this.initRetryTimer = undefined;
+                    if (this.disposed) return;
+                    if (this.statePromise === promise) {
+                        this.statePromise = undefined;
+                    }
+                    this.getState().catch(() => { });
+                }, this.initRetryDelay);
+                (this.initRetryTimer as { unref?: () => void }).unref?.();
+                this.initRetryDelay = Math.min(RETRY_MAX_DELAY, this.initRetryDelay * RETRY_GROWTH);
             });
         }
-        return this.sourcesPromise;
+        return this.statePromise;
     }
 
-    private async init(): Promise<ChainSource[]> {
-        let sources = this.getSourceConfigs(this.normalized).map(buildChainSource);
-        let fetched = await Promise.all(sources.map(async source => {
+    private async init(): Promise<ChainState> {
+        let configs = this.configured.sources.map(normalizeSource);
+        let probeErrors: string[] = [];
+        let found: { probe: SourceWrapper; existing: RemoteConfig | undefined } | undefined;
+        for (let sourceConfig of configs) {
+            let probe = await SourceWrapper.create(sourceConfig, { background: false });
             try {
-                let data = await this.readFromSource(source, archives => archives.get(ROUTING_FILE));
-                return data && parseRoutingData(data) || undefined;
-            } catch {
-                // Down or access denied - ensureRouting retries reconciliation for this source later
-                return undefined;
-            }
-        }));
-        let best = this.normalized;
-        for (let config of fetched) {
-            if (config && getConfigVersion(config) > getConfigVersion(best)) {
-                best = config;
+                let data = await probe.read(archives => archives.get(ROUTING_FILE));
+                found = { probe, existing: data && parseRoutingData(data) || undefined };
+                break;
+            } catch (e) {
+                probeErrors.push(`${sourceConfig.url}: ${(e as Error).stack ?? e}`);
+                probe.dispose();
             }
         }
-        this.adopted = best;
-        if (best !== this.normalized) {
-            // Exactly one level of indirection: the adopted config's sources are used directly,
-            // and we never fetch routing configs from THEM to adopt something newer again
-            sources = this.getSourceConfigs(best).map(buildChainSource);
-            await Promise.all(sources.map(source => this.ensureRouting(source)));
-            return sources;
+        if (!found) {
+            throw new Error(`Cannot initialize storage for ${this.getDebugName()}: no source answered. ${probeErrors.join(" | ")}`);
         }
-        for (let i = 0; i < sources.length; i++) {
-            let config = fetched[i];
-            if (config && getConfigVersion(config) >= getConfigVersion(best)) {
-                sources[i].routingEnsured = true;
+        let active = this.configured;
+        let { probe, existing } = found;
+        let needsWrite = true;
+        if (existing && getConfigVersion(existing) >= getConfigVersion(this.configured)) {
+            if (getConfigVersion(existing) === getConfigVersion(this.configured) && JSON.stringify(existing) !== JSON.stringify(this.configured)) {
+                console.error(`Archives configuration updated without updating the version, for ${probe.config.url}. Updates will be ignored until you increase the version. Using: ${JSON.stringify(existing)}, ignoring: ${JSON.stringify(this.configured)}`);
+            }
+            active = existing;
+            needsWrite = false;
+        }
+        let sources = await this.buildSources(active);
+        if (needsWrite) {
+            // We decided to write (ours is newer than the authoritative first-up source's, or no
+            // routing exists yet). The write goes to all sources, so now EVERY reachable source's
+            // stored routing is read, and the write is refused unless our version is strictly
+            // greater than all of them - a source already at (or past) our version means this
+            // version number is taken, and writing anyway would leave sources at the same version
+            // with different content, each rejecting the other's pushes forever.
+            let best: RemoteConfig | undefined;
+            let conflictUrl: string | undefined;
+            for (let source of sources) {
+                let data: Buffer | undefined;
+                try {
+                    data = await source.read(archives => archives.get(ROUTING_FILE));
+                } catch {
+                    // Down sources are still protected by the server-side version guard when the
+                    // write eventually reaches them
+                    continue;
+                }
+                if (!data) continue;
+                let stored = parseRoutingData(data);
+                if (!best || getConfigVersion(stored) > getConfigVersion(best)) {
+                    best = stored;
+                }
+                if (getConfigVersion(stored) === getConfigVersion(this.configured) && JSON.stringify(stored) !== JSON.stringify(this.configured)) {
+                    conflictUrl = source.config.url;
+                }
+            }
+            if (best && getConfigVersion(best) >= getConfigVersion(this.configured)) {
+                if (conflictUrl && getConfigVersion(best) === getConfigVersion(this.configured)) {
+                    console.error(`Archives configuration updated without updating the version, for ${conflictUrl}. Updates will be ignored until you increase the version. Using: ${JSON.stringify(best)}, ignoring: ${JSON.stringify(this.configured)}`);
+                }
+                active = best;
+                needsWrite = false;
+                for (let source of sources) {
+                    source.dispose();
+                }
+                sources = await this.buildSources(active);
             }
         }
-        await Promise.all(sources.map((source, i) => this.ensureRouting(source, { known: { existing: fetched[i] } })));
+        if (needsWrite) {
+            // The update only happens when EVERY source would accept it - a partial update would
+            // leave the sources out of sync, and a client without access retrying the write forever
+            // would never initialize. Without full access we run on the stored config (when there
+            // is one) and log the problem instead.
+            let missing: string[] = [];
+            for (let source of sources) {
+                try {
+                    if (!await source.hasWriteAccess()) {
+                        missing.push(source.config.url);
+                    }
+                } catch (e) {
+                    missing.push(`${source.config.url} (check failed: ${(e as Error).stack ?? e})`);
+                }
+            }
+            if (missing.length) {
+                console.error(`Not writing the storage routing config for ${this.getDebugName()} (version ${getConfigVersion(this.configured)}): no write access to ${missing.join(", ")}. ${existing && `Running on the stored config (version ${getConfigVersion(existing)}) instead.` || `No stored config exists, so the bucket cannot be created until write access is granted.`}`);
+                if (existing) {
+                    active = existing;
+                    for (let source of sources) {
+                        source.dispose();
+                    }
+                    sources = await this.buildSources(active);
+                }
+            } else {
+                try {
+                    // A rejected write fails init, which retries from scratch - re-reading the
+                    // routing, so losing a create race to another client just adopts their config
+                    // on the next attempt.
+                    await probe.write(archives => archives.set(ROUTING_FILE, serializeRemoteConfig(this.configured)));
+                } catch (e) {
+                    for (let source of sources) {
+                        source.dispose();
+                    }
+                    probe.dispose();
+                    throw e;
+                }
+            }
+        }
+        probe.dispose();
+        this.activeConfig = active;
+        this.startConfigPoll();
+        return { config: active, sources };
+    }
+
+    private async buildSources(config: RemoteConfig): Promise<SourceWrapper[]> {
+        let sources: SourceWrapper[] = [];
+        for (let sourceConfig of config.sources.map(normalizeSource)) {
+            sources.push(await SourceWrapper.create(sourceConfig));
+        }
         return sources;
     }
 
-    // Makes sure a source holds our adopted routing config, creating the bucket when it doesn't
-    // exist yet (a bucket exists iff its routing file does) and upgrading older versions. Failures
-    // (no access, source down) are swallowed - we retry periodically, and actual writes surface
-    // the real error.
-    private async ensureRouting(source: ChainSource, config?: { known?: { existing: RemoteConfig | undefined }; force?: boolean }): Promise<void> {
-        if (source.routingEnsured) return;
-        if (!config?.force && source.lastEnsureAttempt !== 0 && Date.now() - source.lastEnsureAttempt < ENSURE_RETRY_DELAY) return;
-        source.lastEnsureAttempt = Date.now();
-        let known = config?.known;
-        try {
-            let existing = known && known.existing;
-            if (!known) {
-                let data = await this.readFromSource(source, archives => archives.get(ROUTING_FILE));
-                existing = data && parseRoutingData(data) || undefined;
-            }
-            if (existing && getConfigVersion(existing) >= getConfigVersion(this.adopted)) {
-                source.routingEnsured = true;
-                return;
-            }
-            if (!source.api) return;
-            await source.api.set(ROUTING_FILE, serializeRemoteConfig(this.adopted));
-            source.routingEnsured = true;
-        } catch { }
+    private startConfigPoll(): void {
+        if (this.pollTimer || this.disposed) return;
+        this.pollTimer = setInterval(() => {
+            void this.checkForNewConfig().catch((e: Error) => {
+                console.error(`Checking for a new storage routing config failed for ${this.getDebugName()}: ${e.stack ?? e}`);
+            });
+        }, CONFIG_POLL_INTERVAL);
+        (this.pollTimer as { unref?: () => void }).unref?.();
     }
 
-    // Reads from one source, API first, falling back to the public-URL form when the API denies us
-    // access. Access-denied does NOT mark the source down (access can be granted at any moment);
-    // genuine failures do.
-    private async readFromSource<T>(source: ChainSource, run: (archives: IArchives) => Promise<T>): Promise<T> {
-        if (source.api) {
-            try {
-                return await run(source.api);
-            } catch (e) {
-                let denied = String((e as Error).stack || e).includes(STORAGE_ACCESS_DENIED);
-                if (!denied) {
-                    source.downUntil = Date.now() + DOWN_RETRY_DELAY;
-                    throw e;
-                }
-                if (!source.url) throw e;
+    private async checkForNewConfig(): Promise<void> {
+        if (this.disposed || !this.statePromise) return;
+        let state: ChainState;
+        try {
+            state = await this.statePromise;
+        } catch {
+            // Init is failing; its own retry loop handles that
+            return;
+        }
+        let data = await this.run(state, {}, archives => archives.get(ROUTING_FILE));
+        if (!data) return;
+        let latest = parseRoutingData(data);
+        if (JSON.stringify(latest) === JSON.stringify(state.config)) return;
+        console.log(`Storage routing config changed for ${this.getDebugName()}, rebuilding sources`);
+        let oldByConfig = new Map(state.sources.map(source => [JSON.stringify(source.config), source]));
+        let sources: SourceWrapper[] = [];
+        for (let sourceConfig of latest.sources.map(normalizeSource)) {
+            let key = JSON.stringify(sourceConfig);
+            let old = oldByConfig.get(key);
+            if (old) {
+                oldByConfig.delete(key);
+                sources.push(old);
+            } else {
+                sources.push(await SourceWrapper.create(sourceConfig));
             }
         }
-        if (!source.url) {
-            throw new Error(`Source ${source.config.url} has no API access and no public URL form (public: false)`);
+        // In-flight requests still hold the old wrappers and finish fine; dispose just stops any
+        // background reconnect loops
+        for (let leftover of oldByConfig.values()) {
+            leftover.dispose();
         }
-        try {
-            return await run(source.url);
-        } catch (e) {
-            source.downUntil = Date.now() + DOWN_RETRY_DELAY;
-            throw e;
-        }
+        this.activeConfig = latest;
+        this.statePromise = Promise.resolve({ config: latest, sources });
     }
 
-    // Tries each source in turn, skipping recently-down ones. A source that answers - even with
-    // undefined / empty - is authoritative: sources are synchronized copies of the same bucket, so
-    // a miss on one is a miss everywhere (we don't scan the rest).
-    private async read<T>(config: { apiOnly?: boolean }, run: (archives: IArchives) => Promise<T>): Promise<T> {
-        let sources = await this.getSources();
+    // Runs a request against the first available source, moving to the next one ONLY when the
+    // source's WebSocket is down (checked directly - never by inspecting the error, which is
+    // arbitrary data). An error from a connected source is an application error and throws as-is,
+    // e.g. a permission error on write. A down source gets its background reconnect kicked.
+    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean }, run: (archives: IArchives) => Promise<T>): Promise<T> {
         let errors: string[] = [];
-        for (let source of sources) {
-            if (source.downUntil > Date.now()) {
-                errors.push(`${source.config.url} is down, retrying after ${new Date(source.downUntil).toISOString()}`);
+        for (let source of state.sources) {
+            if (config.write && source.config.syncOptions?.noWriteBack) continue;
+            if (!source.isConnected()) {
+                source.noteFailure();
+                errors.push(`${source.config.url} is not connected`);
                 continue;
             }
-            // Opportunistic (even on reads): create the bucket / upgrade its routing where needed
-            void this.ensureRouting(source);
-            if (config.apiOnly) {
-                let api = source.api;
-                if (!api) {
-                    errors.push(`${source.config.url} has URL-only access, which cannot serve this operation`);
-                    continue;
+            try {
+                if (config.write) {
+                    return await source.write(run);
                 }
-                try {
-                    return await run(api);
-                } catch (e) {
-                    if (!String((e as Error).stack || e).includes(STORAGE_ACCESS_DENIED)) {
-                        source.downUntil = Date.now() + DOWN_RETRY_DELAY;
+                if (config.apiOnly) {
+                    let api = source.api;
+                    if (!api) {
+                        errors.push(`${source.config.url} has URL-only access, which cannot serve this operation`);
+                        continue;
                     }
-                    errors.push(String(e));
-                    continue;
+                    return await run(api);
                 }
-            }
-            try {
-                return await this.readFromSource(source, run);
+                return await source.read(run);
             } catch (e) {
-                errors.push(String(e));
+                if (source.isConnected()) throw e;
+                source.noteFailure();
+                errors.push(String((e as Error).stack ?? e));
             }
         }
-        throw new Error(`All sources failed for ${this.getDebugName()}: ${errors.join(" | ")}`);
+        throw new Error(`All sources failed for ${this.getDebugName()}: ${errors.join(" | ") || "no sources available"}`);
     }
 
-    private getAccessHelp(source: ChainSource): string {
-        if (source.config.type === "remote") {
-            let parsed = parseHostedUrl(source.config.url);
-            let account = source.config.accountName || parsed.account;
-            return `No write access to account ${JSON.stringify(account)} on ${parsed.address}:${parsed.port}. Visit https://${parsed.address}:${parsed.port}/${account} to grant this machine access.`;
-        }
-        return `Write to ${source.config.url} was denied (check the ~/backblaze.json credentials)`;
-    }
-
-    // Writes go to the first source that accepts them - the storage servers synchronize the
-    // sources between themselves. If no source accepts the write, the error explains how to get
-    // write access (the access page link, or the backblaze secret to create).
-    private async write(run: (archives: IArchives) => Promise<void>): Promise<void> {
-        let sources = await this.getSources();
-        let errors: string[] = [];
-        for (let source of sources) {
-            if (source.config.syncOptions?.noWriteBack) continue;
-            if (source.writeBlocked) {
-                errors.push(source.writeBlocked);
-                continue;
-            }
-            let api = source.api;
-            if (!api) continue;
-            if (source.downUntil > Date.now()) {
-                errors.push(`${source.config.url} is down, retrying after ${new Date(source.downUntil).toISOString()}`);
-                continue;
-            }
-            // The write needs the bucket to exist, so this one is awaited (and never throttled)
-            await this.ensureRouting(source, { force: true });
-            try {
-                return await run(api);
-            } catch (e) {
-                if (String((e as Error).stack || e).includes(STORAGE_ACCESS_DENIED)) {
-                    errors.push(this.getAccessHelp(source));
-                } else {
-                    source.downUntil = Date.now() + DOWN_RETRY_DELAY;
-                    errors.push(String(e));
-                }
-            }
-        }
-        throw new Error(`Write failed on every source of ${this.getDebugName()}: ${errors.join(" | ") || "no sources accept writes"}`);
+    private async request<T>(config: { apiOnly?: boolean; write?: boolean }, run: (archives: IArchives) => Promise<T>): Promise<T> {
+        let state = await this.getState();
+        return await this.run(state, config, run);
     }
 
     // The access-page link (plus our machineId/ip, for the approver to match the request) for the
     // first hosted source that hasn't granted us access. undefined when we have access everywhere
     // we can have it. Also registers the access request server-side.
     public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
-        let sources = await this.getSources();
-        for (let source of sources) {
+        let state = await this.getState();
+        for (let source of state.sources) {
             if (source.api instanceof ArchivesRemote) {
                 let waiting = await source.api.waitingForAccess();
                 if (waiting) return waiting;
@@ -316,20 +322,20 @@ export class ArchivesChain implements IArchives {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
-        return await this.read({}, archives => archives.get2(fileName, config));
+    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+        return await this.request({}, archives => archives.get2(fileName, config));
     }
     public async getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined> {
-        return await this.read({}, archives => archives.getInfo(fileName));
+        return await this.request({}, archives => archives.getInfo(fileName));
     }
     public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
-        return await this.read({ apiOnly: true }, archives => archives.find(prefix, config));
+        return await this.request({ apiOnly: true }, archives => archives.find(prefix, config));
     }
     public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        return await this.read({ apiOnly: true }, archives => archives.findInfo(prefix, config));
+        return await this.request({ apiOnly: true }, archives => archives.findInfo(prefix, config));
     }
     public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
-        return await this.read({ apiOnly: true }, async archives => {
+        return await this.request({ apiOnly: true }, async archives => {
             if (!archives.getChangesAfter) {
                 throw new Error(`${archives.getDebugName()} does not support getChangesAfter`);
             }
@@ -337,7 +343,7 @@ export class ArchivesChain implements IArchives {
         });
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
-        return await this.read({ apiOnly: true }, async archives => {
+        return await this.request({ apiOnly: true }, async archives => {
             if (!archives.getSyncStatus) {
                 throw new Error(`${archives.getDebugName()} does not support getSyncStatus`);
             }
@@ -345,51 +351,74 @@ export class ArchivesChain implements IArchives {
         });
     }
     public async getConfig(): Promise<ArchivesConfig> {
-        let sources = await this.getSources();
-        if (!sources.some(x => x.api)) return {};
-        return await this.read({ apiOnly: true }, archives => archives.getConfig());
+        let state = await this.getState();
+        if (!state.sources.some(x => x.api)) return { remoteConfig: state.config };
+        let config = await this.run(state, { apiOnly: true }, archives => archives.getConfig());
+        return { ...config, remoteConfig: state.config };
+    }
+    /** True only when EVERY write-receiving source would accept our writes (partial write access
+     *  desynchronizes sources, so it counts as no access). */
+    public async hasWriteAccess(): Promise<boolean> {
+        let state = await this.getState();
+        for (let source of state.sources) {
+            if (source.config.syncOptions?.noWriteBack) continue;
+            if (!await source.hasWriteAccess()) return false;
+        }
+        return true;
     }
 
     public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
-        await this.write(archives => archives.set(fileName, data, config));
+        await this.request({ write: true }, archives => archives.set(fileName, data, config));
     }
     public async del(fileName: string): Promise<void> {
-        await this.write(archives => archives.del(fileName));
+        await this.request({ write: true }, archives => archives.del(fileName));
     }
     public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
-        let sources = await this.getSources();
-        let errors: string[] = [];
-        for (let source of sources) {
+        let state = await this.getState();
+        for (let source of state.sources) {
             if (source.config.syncOptions?.noWriteBack) continue;
-            if (source.writeBlocked) {
-                errors.push(source.writeBlocked);
+            if (!source.isConnected()) {
+                source.noteFailure();
                 continue;
             }
-            if (!source.api) continue;
-            if (source.downUntil > Date.now()) {
-                errors.push(`${source.config.url} is down, retrying after ${new Date(source.downUntil).toISOString()}`);
-                continue;
-            }
-            await this.ensureRouting(source, { force: true });
-            // The data stream cannot be rewound, so there is no failover to later sources here
-            return await source.api.setLargeFile(config);
+            // The data stream cannot be rewound, so there is no failover once the upload starts
+            return await source.write(archives => archives.setLargeFile(config));
         }
-        throw new Error(`No writable source for setLargeFile on ${this.getDebugName()}: ${errors.join(" | ") || "no sources accept writes"}`);
+        throw new Error(`No available source for setLargeFile on ${this.getDebugName()}`);
     }
 
     public async getURL(path: string): Promise<string> {
-        let sources = await this.getSources();
-        for (let source of sources) {
+        let state = await this.getState();
+        for (let source of state.sources) {
             if (source.config.public === false) continue;
             if (source.url) return await source.url.getURL(path);
             if (source.api) return await source.api.getURL(path);
         }
         throw new Error(`No public source to build a URL from for ${this.getDebugName()} (every source has public: false)`);
     }
+
+    public dispose(): void {
+        this.disposed = true;
+        if (this.pollTimer) {
+            clearInterval(this.pollTimer);
+        }
+        if (this.initRetryTimer) {
+            clearTimeout(this.initRetryTimer);
+        }
+        let statePromise = this.statePromise;
+        if (statePromise) {
+            void statePromise.then(state => {
+                for (let source of state.sources) {
+                    source.dispose();
+                }
+            }, () => { });
+        }
+    }
 }
 
 // The IArchives for a RemoteConfig (or a single source - a routing URL string works). Fully lazy:
-// nothing is contacted until the first call.
+// nothing is contacted until the first call. Call dispose() when done with it, so its background
+// retry/poll loops stop.
 export function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain {
     return new ArchivesChain(config);
 }

@@ -73,6 +73,10 @@ export class ArchivesRemote implements IArchives {
         return `remoteStorage/${this.parsed.address}:${this.parsed.port}/${this.account}/${this.bucketName}`;
     }
 
+    public isConnected(): boolean {
+        return SocketFunction.isNodeConnected(this.nodeId);
+    }
+
     private async authenticate(): Promise<void> {
         await authenticateStorage({ address: this.parsed.address, port: this.parsed.port, nodeId: this.nodeId });
     }
@@ -103,17 +107,24 @@ export class ArchivesRemote implements IArchives {
         };
     }
 
-    private async onAccessDenied(): Promise<void> {
+    public async hasWriteAccess(): Promise<boolean> {
+        let state = await this.callAuthed(() => this.controller.getAccessState(this.account));
+        return !!state.hasAccess;
+    }
+
+    // Registers our access request server-side (so an admin has a requestId to grant) and logs the
+    // grant instructions, at most once a minute
+    private async registerAccessRequest(): Promise<void> {
         let requested = await this.callAuthed(() => this.controller.requestAccess(this.account));
         if (Date.now() - this.lastDeniedLog > timeInMinute) {
             this.lastDeniedLog = Date.now();
-            console.log(`No access to storage account ${JSON.stringify(this.account)} on ${this.parsed.address}:${this.parsed.port} (our machine ${requested.machineId}, ip ${requested.ip}). Waiting for access to be granted. See https://${this.parsed.address}:${this.parsed.port}/${this.account} - or grant it with: ${requested.grantAccessCommand}`);
+            console.log(`No access to storage account ${JSON.stringify(this.account)} on ${this.parsed.address}:${this.parsed.port} (our machine ${requested.machineId}, ip ${requested.ip}). See https://${this.parsed.address}:${this.parsed.port}/${this.account} - or grant it with: ${requested.grantAccessCommand}`);
         }
-        await delay(ACCESS_RETRY_DELAY);
     }
 
     // Runs a call, authenticating (and re-authenticating after reconnects) and waiting for account
-    // access as needed (unless waitForAccess is false, in which case denied calls throw).
+    // access as needed. With waitForAccess false, denied calls throw immediately instead - but the
+    // access request is still registered (in the background), so the denial is grantable.
     private async call<T>(fnc: () => Promise<T>): Promise<T> {
         while (true) {
             try {
@@ -124,8 +135,13 @@ export class ArchivesRemote implements IArchives {
                     await this.authenticate();
                     continue;
                 }
-                if (message.includes(STORAGE_ACCESS_DENIED) && this.config.waitForAccess !== false) {
-                    await this.onAccessDenied();
+                if (message.includes(STORAGE_ACCESS_DENIED)) {
+                    if (this.config.waitForAccess === false) {
+                        void this.registerAccessRequest().catch(() => { });
+                        throw e;
+                    }
+                    await this.registerAccessRequest();
+                    await delay(ACCESS_RETRY_DELAY);
                     continue;
                 }
                 throw e;
@@ -137,9 +153,9 @@ export class ArchivesRemote implements IArchives {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         let result = await this.call(() => this.controller.get2(this.account, this.bucketName, fileName, config?.range));
-        return result && { data: Buffer.from(result.data), writeTime: result.writeTime } || undefined;
+        return result && { data: Buffer.from(result.data), writeTime: result.writeTime, size: result.size } || undefined;
     }
     public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
         await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified));

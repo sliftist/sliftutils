@@ -9,7 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest } from "socket-function/src/https";
-import { IArchives, ArchivesConfig, assertValidLastModified } from "./IArchives";
+import { IArchives, ArchivesConfig, assertValidLastModified, IMMUTABLE_CACHE_TIME } from "./IArchives";
 
 type BackblazeCreds = {
     applicationKeyId: string;
@@ -55,7 +55,6 @@ const getAPI = lazy(async () => {
             }
             try {
                 let url = auth.apiUrl + "/b2api/v2/" + name;
-                let time = Date.now();
                 let result = await httpsRequest(url, Buffer.from(JSON.stringify(arg)), type, undefined, {
                     headers: {
                         Authorization: auth.authorizationToken,
@@ -221,7 +220,7 @@ const getAPI = lazy(async () => {
         };
         action: string;
         uploadTimestamp: number;
-    }>("b2_get_file_info", "POST");
+    }>("b2_get_file_info", "POST", "noAccountId");
 
     const listFileNames = createB2Function<{
         bucketId: string;
@@ -367,6 +366,7 @@ const getAPI = lazy(async () => {
         getDownloadAuthorization,
         getDownloadURL,
         apiUrl: auth.apiUrl,
+        allowed: auth.allowed,
     };
 });
 
@@ -379,7 +379,11 @@ export class ArchivesBackblaze implements IArchives {
         public?: boolean;
         immutable?: boolean;
         cacheTime?: number;
-    }) { }
+        allowedOrigins?: string[];
+    }) {
+        // Get the api, to setup cors
+        void this.getBucketAPI();
+    }
 
     private bucketName = this.config.bucketName.replaceAll(/[^\w\d]/g, "-");
     private bucketId = "";
@@ -402,13 +406,13 @@ export class ArchivesBackblaze implements IArchives {
 
         let cacheTime = this.config.cacheTime ?? 0;
         if (this.config.immutable) {
-            cacheTime = 86400 * 1000;
+            cacheTime = IMMUTABLE_CACHE_TIME;
         }
 
         // ALWAYS set access control, as we can make urls for private buckets with getDownloadAuthorization
         let desiredCorsRules = [{
             corsRuleName: "allowAll",
-            allowedOrigins: ["https"],
+            allowedOrigins: this.config.allowedOrigins ?? ["https"],
             allowedOperations: ["b2_download_file_by_id", "b2_download_file_by_name"],
             allowedHeaders: ["range"],
             exposeHeaders: ["x-bz-content-sha1"],
@@ -421,24 +425,34 @@ export class ArchivesBackblaze implements IArchives {
 
 
         let exists = false;
-        try {
-            await api.createBucket({
-                bucketName: this.bucketName,
-                bucketType: this.config.public ? "allPublic" : "allPrivate",
-                lifecycleRules: [{
-                    "daysFromUploadingToHiding": null,
-                    // Keep files for 7 days, which should be enough time to recover accidental hiding.
-                    "daysFromHidingToDeleting": 7,
-                    "fileNamePrefix": ""
-                }],
-                corsRules: desiredCorsRules,
-                bucketInfo
-            });
-        } catch (e: any) {
-            if (!e.stack.includes(`"duplicate_bucket_name"`)) {
-                throw e;
+        let retries = 0;
+        while (true) {
+            try {
+                await api.createBucket({
+                    bucketName: this.bucketName,
+                    bucketType: this.config.public ? "allPublic" : "allPrivate",
+                    lifecycleRules: [{
+                        "daysFromUploadingToHiding": null,
+                        // Keep files for 7 days, which should be enough time to recover accidental hiding.
+                        "daysFromHidingToDeleting": 7,
+                        "fileNamePrefix": ""
+                    }],
+                    corsRules: desiredCorsRules,
+                    bucketInfo
+                });
+            } catch (e: any) {
+                if (!e.stack.includes(`"duplicate_bucket_name"`)) {
+                    if (retries < 3) {
+                        console.error(`Backblaze create bucket failed, retrying in 5s: ${e.stack}`);
+                        await delay(5000);
+                        retries++;
+                        continue;
+                    }
+                    throw e;
+                }
+                exists = true;
             }
-            exists = true;
+            break;
         }
 
         let bucketList = await api.listBuckets({
@@ -484,47 +498,57 @@ export class ArchivesBackblaze implements IArchives {
         return api;
     });
 
+    private currentReset: Promise<void> | undefined;
+
     // Keep track of when we last reset because of a 503
     private last503Reset = 0;
     // IMPORTANT! We must always CATCH AROUND the apiRetryLogic, NEVER inside of fnc. Otherwise we won't
     //  be able to recreate the auth token.
+    //  `context` is a short label (verb + file path) included in every retry/error log so a stuck
+    //   silent-retry loop is identifiable from the logs.
     private async apiRetryLogic<T>(
+        context: string,
         fnc: (api: B2Api) => Promise<T>,
         retries = 3
     ): Promise<T> {
-        let api = await this.getBucketAPI();
+        let api: B2Api | undefined;
         try {
+            api = await this.getBucketAPI();
             return await fnc(api);
         } catch (err: any) {
             if (retries <= 0) throw err;
 
-            // If it's a 503 and it's been a minute since we last reset, then Wait and reset. 
+            // If it's a 503 and it's been a minute since we last reset, then Wait and reset.
             if (
-                (err.stack.includes(`503`)
+                (err.stack.includes(`"status": 503`)
                     || err.stack.includes(`"service_unavailable"`)
                     || err.stack.includes(`"internal_error"`)
                     || err.stack.includes(`ENOBUFS`)
                 ) && Date.now() - this.last503Reset > 60 * 1000) {
-                console.error("503 error, waiting a minute and resetting: " + err.message);
-                this.log("503 error, waiting a minute and resetting: " + err.message);
-                await delay(10 * 1000);
-                // We check again in case, and in the very likely case that this is being run in parallel, we only want to reset once. 
-                if (Date.now() - this.last503Reset > 60 * 1000) {
-                    this.log("Resetting getAPI and getBucketAPI: " + err.message);
-                    this.last503Reset = Date.now();
-                    getAPI.reset();
-                    this.getBucketAPI.reset();
-                }
-                return this.apiRetryLogic(fnc, retries - 1);
+                // Backblaze is so flaky that we're just going to warn here.
+                console.warn(`[${context}] Backblaze error, waiting and resetting: ${err.message}`);
+                this.log(`[${context}] Backblaze error, waiting and resetting: ${err.message}`);
+                this.currentReset = this.currentReset || (async () => {
+                    await delay(10 * 1000);
+                    // We check again in case, and in the very likely case that this is being run in parallel, we only want to reset once.
+                    if (Date.now() - this.last503Reset > 60 * 1000) {
+                        this.log(`[${context}] Resetting getAPI and getBucketAPI: ${err.message}`);
+                        this.last503Reset = Date.now();
+                        getAPI.reset();
+                        this.getBucketAPI.reset();
+                    }
+                })().finally(() => this.currentReset = undefined);
+                await this.currentReset;
+                return this.apiRetryLogic(context, fnc, retries - 1);
             }
 
             // If the error is that the authorization token is invalid, reset getBucketAPI and getAPI
             // If the error is that the bucket isn't found, reset getBucketAPI
             if (err.stack.includes(`"expired_auth_token"`)) {
-                this.log("Authorization token expired");
+                this.log(`[${context}] Authorization token expired`);
                 getAPI.reset();
                 this.getBucketAPI.reset();
-                return this.apiRetryLogic(fnc, retries - 1);
+                return this.apiRetryLogic(context, fnc, retries - 1);
             }
 
             if (
@@ -539,29 +563,30 @@ export class ArchivesBackblaze implements IArchives {
                 || err.stack.includes(`ECONNREFUSED`)
                 || err.stack.includes(`ENOBUFS`)
             ) {
-                console.error("Retrying in 5s: " + err.message);
-                this.log(err.message + " retrying in 5s");
+                console.warn(`[${context}] Retrying in 5s: ${err.message}`);
+                this.log(`[${context}] ${err.message} retrying in 5s`);
                 await delay(5000);
-                return this.apiRetryLogic(fnc, retries - 1);
+                return this.apiRetryLogic(context, fnc, retries - 1);
             }
 
             if (err.stack.includes(`getaddrinfo ENOTFOUND`)) {
-                let urlObj = new URL(api.apiUrl);
-                let hostname = urlObj.hostname;
-                let lookupAddresses = await new Promise(resolve => {
-                    dns.lookup(hostname, (err, addresses) => {
-                        resolve(addresses);
+                if (api) {
+                    let urlObj = new URL(api.apiUrl);
+                    let hostname = urlObj.hostname;
+                    let lookupAddresses = await new Promise(resolve => {
+                        dns.lookup(hostname, (err, addresses) => {
+                            resolve(addresses);
+                        });
                     });
-                });
-                let resolveAddresses = await new Promise(resolve => {
-                    dns.resolve4(hostname, (err, addresses) => {
-                        resolve(addresses);
+                    let resolveAddresses = await new Promise(resolve => {
+                        dns.resolve4(hostname, (err, addresses) => {
+                            resolve(addresses);
+                        });
                     });
-                });
-                console.error(`getaddrinfo ENOTFOUND ${hostname}`, { lookupAddresses, resolveAddresses, apiUrl: api.apiUrl, fullError: err.stack });
+                    console.error(`[${context}] getaddrinfo ENOTFOUND ${hostname}`, { lookupAddresses, resolveAddresses, apiUrl: api.apiUrl, fullError: err.stack });
+                }
             }
 
-            // TODO: Handle if the bucket is deleted?
             throw err;
         }
     }
@@ -576,11 +601,28 @@ export class ArchivesBackblaze implements IArchives {
                 setTimeout(downloadPoll, 5000);
             };
             setTimeout(downloadPoll, 5000);
-            let result = await this.apiRetryLogic(async (api) => {
+            let result = await this.apiRetryLogic(`get ${fileName}`, async (api) => {
+                let range = config?.range;
+                if (range) {
+                    let fileInfo = await this.getInfo(fileName);
+                    if (!fileInfo) throw new Error(`File ${fileName} not found`);
+                    let rangeStart = range.start;
+                    let rangeEnd = Math.min(range.end, fileInfo.size);
+                    // NOTE: I think if we request nothing, it confuses Backblaze and ends up giving us the entire file.
+                    if (rangeEnd <= rangeStart) return Buffer.alloc(0);
+                    let result = await api.downloadFileByName({
+                        bucketName: this.bucketName,
+                        fileName,
+                        range: { start: rangeStart, end: rangeEnd },
+                    });
+                    if (result.length !== rangeEnd - rangeStart) {
+                        console.error(`Backblaze range download returned the wrong number of bytes. Tried to get ${rangeStart}-${rangeEnd}, but received ${rangeStart}-${rangeStart + result.length}. For file: ${fileName}`);
+                    }
+                    return result;
+                }
                 return await api.downloadFileByName({
                     bucketName: this.bucketName,
                     fileName,
-                    range: config?.range
                 });
             });
             let timeStr = formatTime(Date.now() - time);
@@ -594,14 +636,30 @@ export class ArchivesBackblaze implements IArchives {
             downloading = false;
         }
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number; } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+    public async get2(fileName: string, config?: { range?: { start: number; end: number; } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         // B2 downloads don't return the upload time, so this takes a second API call
         let [data, info] = await Promise.all([this.get(fileName, config), this.getInfo(fileName)]);
         if (!data || !info) return undefined;
-        return { data, writeTime: info.writeTime };
+        return { data, writeTime: info.writeTime, size: info.size };
     }
     public async getConfig(): Promise<ArchivesConfig> {
         return {};
+    }
+    public async hasWriteAccess(): Promise<boolean> {
+        try {
+            let api = await getAPI();
+            // B2 v2 documents allowed as a single object; our type says a list - handle both
+            let allowedRaw = api.allowed as unknown;
+            let allowedList = (Array.isArray(allowedRaw) && allowedRaw || [allowedRaw]) as typeof api.allowed;
+            return allowedList.some(allowed =>
+                allowed.capabilities.includes("writeFiles")
+                && (!allowed.bucketName || allowed.bucketName === this.bucketName)
+            );
+        } catch (e) {
+            // No / invalid credentials
+            this.log(`backblaze hasWriteAccess check failed: ${(e as Error).stack ?? e}`);
+            return false;
+        }
     }
     public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
         if (config?.lastModified) {
@@ -613,7 +671,7 @@ export class ArchivesBackblaze implements IArchives {
         }
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
         let f = fileName;
-        await this.apiRetryLogic(async (api) => {
+        await this.apiRetryLogic(`uploadFile ${fileName}`, async (api) => {
             await api.uploadFile({ bucketId: this.bucketId, fileName, data: data, });
         });
         let existsChecks = 30;
@@ -632,7 +690,7 @@ export class ArchivesBackblaze implements IArchives {
     public async del(fileName: string): Promise<void> {
         this.log(`backblaze delete ${fileName}`);
         try {
-            await this.apiRetryLogic(async (api) => {
+            await this.apiRetryLogic(`hideFile ${fileName}`, async (api) => {
                 await api.hideFile({ bucketId: this.bucketId, fileName: fileName });
             });
         } catch (e: any) {
@@ -701,7 +759,7 @@ export class ArchivesBackblaze implements IArchives {
             dataQueue.unshift(data, secondData);
 
 
-            let uploadInfo = await this.apiRetryLogic(async (api) => {
+            let uploadInfo = await this.apiRetryLogic(`startLargeFile ${fileName}`, async (api) => {
                 return await api.startLargeFile({
                     bucketId: this.bucketId,
                     fileName: fileName,
@@ -710,7 +768,7 @@ export class ArchivesBackblaze implements IArchives {
                 });
             });
             onError.push(async () => {
-                await this.apiRetryLogic(async (api) => {
+                await this.apiRetryLogic(`cancelLargeFile ${fileName}`, async (api) => {
                     await api.cancelLargeFile({ fileId: uploadInfo.fileId });
                 });
             });
@@ -747,7 +805,7 @@ export class ArchivesBackblaze implements IArchives {
                 sha1.update(data);
                 let sha1Hex = sha1.digest("hex");
                 partSha1Array.push(sha1Hex);
-                await this.apiRetryLogic(async (api) => {
+                await this.apiRetryLogic(`uploadPart#${partNumber} ${fileName}`, async (api) => {
                     if (!data) throw new Error("Impossible, data is undefined");
 
                     let timeStr = formatTime(Date.now() - time);
@@ -773,7 +831,7 @@ export class ArchivesBackblaze implements IArchives {
             }
             this.log(`Finished uploading large file uploaded ${green(formatNumber(totalBytes))}B`);
 
-            await this.apiRetryLogic(async (api) => {
+            await this.apiRetryLogic(`finishLargeFile ${fileName}`, async (api) => {
                 await api.finishLargeFile({
                     fileId: uploadInfo.fileId,
                     partSha1Array: partSha1Array,
@@ -793,18 +851,27 @@ export class ArchivesBackblaze implements IArchives {
     }
 
     public async getInfo(fileName: string): Promise<{ writeTime: number; size: number; } | undefined> {
-        return await this.apiRetryLogic(async (api) => {
-            let info = await api.listFileNames({ bucketId: this.bucketId, prefix: fileName, });
-            let file = info.files.find(x => x.fileName === fileName);
-            if (!file) {
-                this.log(`Backblaze file not exists ${fileName}`);
-                return undefined;
+        return await this.apiRetryLogic(`getInfo ${fileName}`, async (api) => {
+            try {
+                // NOTE: Apparently, there's no other way to do this, as the file name does not equal the file ID, and get file info requires the file ID.
+                let info = await api.listFileNames({ bucketId: this.bucketId, prefix: fileName, maxFileCount: 10 });
+                let file = info.files.find(x => x.fileName === fileName && x.action === "upload");
+                if (!file) {
+                    this.log(`Backblaze file not exists ${fileName}`);
+                    return undefined;
+                }
+                this.log(`Backblaze file exists ${fileName}`);
+                return {
+                    writeTime: file.uploadTimestamp,
+                    size: file.contentLength,
+                };
+            } catch (e: any) {
+                if (e.stack.includes(`file_not_found`)) {
+                    this.log(`Backblaze file not exists ${fileName}`);
+                    return undefined;
+                }
+                throw e;
             }
-            this.log(`Backblaze file exists ${fileName}`);
-            return {
-                writeTime: file.uploadTimestamp,
-                size: file.contentLength,
-            };
         });
     }
 
@@ -814,7 +881,7 @@ export class ArchivesBackblaze implements IArchives {
         return result.map(x => x.path);
     }
     public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<{ path: string; createTime: number; size: number; }[]> {
-        return await this.apiRetryLogic(async (api) => {
+        return await this.apiRetryLogic(`findInfo ${prefix}`, async (api) => {
             if (!config?.shallow && config?.type === "folders") {
                 let allFiles = await this.findInfo(prefix);
                 let allFolders = new Map<string, { path: string; createTime: number; size: number }>();
@@ -861,8 +928,59 @@ export class ArchivesBackblaze implements IArchives {
         }
     }
 
+    public async move(config: {
+        path: string;
+        target: IArchives;
+        targetPath: string;
+        copyInstead?: boolean;
+    }) {
+        let { path, target, targetPath } = config;
+        // A self move should NOOP (and definitely not copy, and then delete itself!)
+        if (target === this && path === targetPath) {
+            this.log(`Backblaze move path to itself. Skipping move, as there is no work to do. ${path}`);
+            return;
+        }
+        if (target instanceof ArchivesBackblaze) {
+            let targetBucketId = target.bucketId;
+            if (targetBucketId === this.bucketId && path === targetPath) return;
+            await this.apiRetryLogic(`move ${path} -> ${targetPath}`, async (api) => {
+                // Ugh... listing the file name sucks, but... I guess it's still better than
+                //  downloading and re-uploading the entire file.
+                let info = await api.listFileNames({ bucketId: this.bucketId, prefix: path, maxFileCount: 10 });
+                let file = info.files.find(x => x.fileName === path);
+                if (!file) throw new Error(`File not found to move: ${path}`);
+                await api.copyFile({
+                    sourceFileId: file.fileId,
+                    fileName: targetPath,
+                    destinationBucketId: targetBucketId,
+                });
+            });
+        } else {
+            let data = await this.get(path);
+            if (!data) throw new Error(`File not found to move: ${path}`);
+            await target.set(targetPath, data);
+        }
+
+        if (!config.copyInstead) {
+            let exists = await this.getInfo(targetPath);
+            if (!exists) {
+                console.error(`File not found after move. Leaving BOTH files. ${targetPath} was not found. Being moved from ${path}`);
+            } else {
+                await this.del(path);
+            }
+        }
+    }
+
+    public async copy(config: {
+        path: string;
+        target: IArchives;
+        targetPath: string;
+    }): Promise<void> {
+        return this.move({ ...config, copyInstead: true });
+    }
+
     public async getURL(path: string) {
-        return await this.apiRetryLogic(async (api) => {
+        return await this.apiRetryLogic(`getURL ${path}`, async (api) => {
             if (path.startsWith("/")) {
                 path = path.slice(1);
             }
@@ -884,7 +1002,7 @@ export class ArchivesBackblaze implements IArchives {
         fileNamePrefix: string;
         authorizationToken: string;
     }> {
-        return await this.apiRetryLogic(async (api) => {
+        return await this.apiRetryLogic(`getDownloadAuthorization ${config.fileNamePrefix ?? ""}`, async (api) => {
             return await api.getDownloadAuthorization({
                 bucketId: this.bucketId,
                 fileNamePrefix: config.fileNamePrefix ?? "",
@@ -916,7 +1034,8 @@ export const getArchivesBackblazePublicImmutable = cache((domain: string) => {
     return new ArchivesBackblaze({
         bucketName: domain + "-public-immutable",
         public: true,
-        immutable: true
+        immutable: true,
+        allowedOrigins: [`https://${domain}`, `https://127-0-0-1.${domain}:7007`],
     });
 });
 
@@ -928,5 +1047,6 @@ export const getArchivesBackblazePublic = cache((domain: string) => {
         bucketName: domain + "-public",
         public: true,
         cacheTime: timeInMinute,
+        allowedOrigins: [`https://${domain}`, `https://127-0-0-1.${domain}:7007`],
     });
 });

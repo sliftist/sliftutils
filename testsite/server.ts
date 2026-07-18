@@ -1,5 +1,4 @@
 process.env.NODE_ENV = "production";
-import os from "os";
 import path from "path";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { RequireController } from "socket-function/require/RequireController";
@@ -30,7 +29,6 @@ async function main() {
     await hostServer({
         domain: DOMAIN,
         port: PORT,
-        cloudflareApiToken: { path: os.homedir() + "/vidgridweb.com.key" },
         setDNSRecord: true,
     });
 }

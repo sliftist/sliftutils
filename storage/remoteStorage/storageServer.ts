@@ -5,7 +5,6 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { getExternalIP } from "socket-function/src/networking";
 import { RequireController } from "socket-function/require/RequireController";
 import { hostServer } from "../../misc/https/hostServer";
-import { getSecret } from "../../misc/getSecret";
 import { RemoteStorageController } from "./storageController";
 import { setStorageServerConfig, setWritesRejectedReason } from "./storageServerState";
 import { parseStorageUrl } from "./ArchivesRemote";
@@ -23,14 +22,13 @@ const HARD_REJECT_FRACTION = 0.1;
 // grantAccess.js bootstrap (next to this file) is what the access page's shown SSH command points at.
 
 export type HostStorageServerConfig = {
-    // Full URL of this storage server, e.g. "https://storage.example.com:4444". The domain and
-    // port are extracted from it (bucket routing URLs clients use look like
-    // https://storage.example.com:4444/file/<account>/<bucketName>/storage/storagerouting.json).
+    // Full URL of this storage server, e.g. "https://1-2-3-4.example.com:4444". The subdomain must
+    // be an ip domain - this machine's external IP with dashes, or 127-0-0-1 for local testing
+    // (see the validation in hostStorageServer). The domain and port are extracted from it (bucket
+    // routing URLs clients use look like
+    // https://1-2-3-4.example.com:4444/file/<account>/<bucketName>/storage/storagerouting.json).
     url: string;
     folder: string;
-    // Set hostServer.ts:HostServerConfig:cloudflareApiToken. Defaults to getSecret("cloudflare.json")
-    // (~/cloudflare.json, { key: string }).
-    cloudflareApiToken?: { key: string } | { path: string };
     // When free space on the folder's drive drops below this many bytes, the server console.errors
     // every 15 minutes. Below 10% of it, the server also rejects write operations (creating files,
     // large uploads, new buckets) — reads, findInfo, and deletes still work so the user can free
@@ -79,12 +77,22 @@ function getGrantAccessCliPath(): string {
 export async function hostStorageServer(config: HostStorageServerConfig): Promise<void> {
     let { url, folder } = config;
     let { address: domain, port } = parseStorageUrl(url);
+    let rootDomain = domain.split(".").slice(-2).join(".");
+    let externalIP = (await getExternalIP()).trim();
+    // The subdomain must be an ip domain: the domain's A record points at exactly one machine, so a
+    // dynamic name would let the same script run on two servers and silently fight over it. Encoding
+    // the IP makes that mistake fail loudly - the wrong machine's domain just doesn't match.
+    let allowedDomains = [`127-0-0-1.${rootDomain}`, `${externalIP.replaceAll(".", "-")}.${rootDomain}`];
+    if (!allowedDomains.includes(domain)) {
+        throw new Error(`The storage server domain is based on the machine's IP (the subdomain is the IP with dots replaced by dashes). Expected ${allowedDomains.join(" or ")}, was ${domain}. Your external IP is ${externalIP}.`);
+    }
+    await fsp.mkdir(folder, { recursive: true });
     let lowSpaceThreshold = config.lowSpaceThresholdBytes ?? DEFAULT_LOW_SPACE_THRESHOLD_BYTES;
     setStorageServerConfig({
         domain,
         port,
-        rootDomain: domain.split(".").slice(-2).join("."),
-        sshTarget: `${os.userInfo().username}@${await getExternalIP()}`,
+        rootDomain,
+        sshTarget: `${os.userInfo().username}@${externalIP}`,
         serverCommand: `node ${getGrantAccessCliPath()} --url ${url}`,
         folder: path.resolve(folder),
     });
@@ -113,7 +121,6 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     await hostServer({
         domain,
         port,
-        cloudflareApiToken: config.cloudflareApiToken || { key: await getSecret("cloudflare.json.key") },
         setDNSRecord: true,
     });
 }

@@ -1,15 +1,48 @@
-import { httpsRequest } from "socket-function/src/https";
 import { cache, lazy } from "socket-function/src/caching";
-import fs from "fs";
 import { delay } from "socket-function/src/batching";
 import { SocketFunction } from "socket-function/SocketFunction";
+import { isNode, timeInDay } from "socket-function/src/misc";
+import { magenta } from "socket-function/src/formatting/logColors";
+import { cloudflareCall, cloudflareGETCall, cloudflarePOSTCall, getCloudflareCreds } from "./cloudflareHelpers";
 
 const DNS_TTLSeconds = {
     "TXT": 60,
     "A": 60,
 };
 
-const getZoneId = cache(async (rootDomain: string): Promise<string> => {
+const DNS_REFRESH_STALE_AFTER = timeInDay;
+
+// We stamp our own "last asserted" time into the record's comment, because Cloudflare's
+//  modified_on can only be moved by an actual content change - and re-asserting an already
+//  correct record has no content change to make (a create errors with 81058, a no-op edit
+//  doesn't bump the timestamp). Reading freshness from text we control sidesteps that entirely,
+//  and lets us refresh a stale-but-correct record in place instead of deleting and recreating it.
+const FRESHNESS_REGEX = /<set on:[^>]*>/;
+
+/** Strips any prior freshness tag and appends a new one, preserving other comment text. */
+function stampFreshness(comment?: string): string {
+    let base = (comment ?? "").replace(FRESHNESS_REGEX, "").trim();
+    let stamp = `<set on: ${new Date().toString()}>`;
+    return base ? `${base} ${stamp}` : stamp;
+}
+/** Parses our tag back out; 0 (i.e. always stale) when it's absent or unparseable. */
+export function freshnessTime(comment?: string): number {
+    let match = FRESHNESS_REGEX.exec(comment ?? "");
+    if (!match) return 0;
+    return new Date(match[0].replace("<set on:", "").replace(">", "").trim()).getTime() || 0;
+}
+
+export const hasDNSWritePermissions = lazy(async () => {
+    if (!isNode()) return false;
+    try {
+        await getCloudflareCreds();
+        return true;
+    } catch {
+        return false;
+    }
+});
+
+export const getZoneId = cache(async (rootDomain: string): Promise<string> => {
     let zones = await cloudflareGETCall<{ id: string; name: string }[]>("/zones", {});
     let selected = zones.find(x => x.name === rootDomain);
     if (!selected) {
@@ -34,8 +67,35 @@ export async function getRecordsRaw(type: string, key: string) {
         name: string;
         content: string;
         proxied: boolean;
+        modified_on: string;
+        // Omitted by Cloudflare when the record has no comment.
+        comment?: string;
     }[]>(`/zones/${zoneId}/dns_records`);
-    return results.filter(x => x.type === type && x.name === key);
+    // DNS names are case-insensitive and Cloudflare returns them lowercased, so a mixed-case key
+    //  (e.g. a machine id subdomain) would never match an exact-case compare - match lowercased.
+    let keyLower = key.toLowerCase();
+    return results.filter(x => x.type === type && x.name.toLowerCase() === keyLower);
+}
+
+/** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database
+ *   transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs
+ *   aren't usable in our setup, and because it lets "remove others + assert target" happen
+ *   without a window where the name resolves to nothing. */
+export async function batchRecords(zoneId: string, batch: {
+    deletes?: { id: string }[];
+    patches?: { id: string; comment?: string }[];
+    posts?: { type: string; name: string; content: string; ttl: number; proxied: boolean; comment?: string }[];
+}) {
+    let payload: { [key: string]: unknown } = {};
+    if (batch.deletes && batch.deletes.length > 0) payload.deletes = batch.deletes;
+    if (batch.patches && batch.patches.length > 0) payload.patches = batch.patches;
+    if (batch.posts && batch.posts.length > 0) payload.posts = batch.posts;
+    try {
+        await cloudflarePOSTCall(`/zones/${zoneId}/dns_records/batch`, payload);
+    } catch (error) {
+        console.error(`Error updating DNS records:`, { error: error, batch });
+        throw new Error(`Error updating DNS records. ${JSON.stringify(batch)}. Error: ${error}`);
+    }
 }
 export async function getRecords(type: string, key: string) {
     if (key.endsWith(".")) key = key.slice(0, -1);
@@ -59,116 +119,59 @@ export async function deleteRecord(type: string, key: string, value: string) {
         await cloudflareCall(`/zones/${zoneId}/dns_records/${value.id}`, Buffer.from([]), "DELETE");
     }
 }
-/** Removes all existing records (unless the record is already present) */
-export async function setRecord(type: string, key: string, value: string, proxied?: "proxied") {
-    let stack = new Error();
+/** Removes all existing records (unless the record is already present and fresh) */
+export async function setRecord(type: string, key: string, value: string, proxied?: "proxied", staleAfter = DNS_REFRESH_STALE_AFTER) {
     if (key.endsWith(".")) key = key.slice(0, -1);
     let zoneId = await getZoneId(getRootDomain(key));
     let prevValues = await getRecordsRaw(type, key);
-    // NOTE: Apparently if we try to update by just changing proxied, cloudflare complains and
-    //  says "an identical record already exists", even though it doesn't, we changed the proxied value...
-    if (prevValues.some(x => x.content === value)) return;
+    let existing = prevValues.find(x => x.content === value);
+    let others = prevValues.filter(x => x.content !== value);
 
-    console.log(`Removing previous records of ${type} for ${key} ${JSON.stringify(prevValues.map(x => x.content))}`);
-    let didDeletions = false;
-    for (let value of prevValues) {
-        didDeletions = true;
-        await cloudflareCall(`/zones/${zoneId}/dns_records/${value.id}`, Buffer.from([]), "DELETE");
-    }
+    // Already correct and recently asserted - a prior run also cleaned up the other records,
+    //  so there is nothing left to do.
+    if (existing && Date.now() - freshnessTime(existing.comment) < staleAfter) return;
 
-    console.log(`Setting ${type} record for ${key} to ${value} (previously had ${JSON.stringify(prevValues.map(x => x.content))})`);
-    const ttl = DNS_TTLSeconds[type as "A"] || 60;
-    await cloudflarePOSTCall(`/zones/${zoneId}/dns_records`, {
-        type: type,
-        name: key,
-        content: value,
-        ttl,
-        proxied: proxied === "proxied",
+    // A single atomic batch: drop the wrong records, and either refresh the existing record's
+    //  comment in place or create it - so the name is never left resolving to nothing.
+    let ttl = DNS_TTLSeconds[type as "A"] || 60;
+    let comment = stampFreshness(existing?.comment);
+    console.log(magenta(`Setting ${type} record for ${key} to ${value} (previously had ${JSON.stringify(prevValues.map(x => x.content))})`));
+    await batchRecords(zoneId, {
+        deletes: others.map(x => ({ id: x.id })),
+        patches: existing ? [{ id: existing.id, comment }] : [],
+        posts: existing ? [] : [{ type, name: key, content: value, ttl, proxied: proxied === "proxied", comment }],
     });
-    // NOTE: Apparently... even if the record didn't exist, we still have to wait...
-    console.log(`Waiting ${ttl} seconds for DNS to propagate...`);
-    await delay(ttl * 1000);
-    console.log(`Done waiting for DNS to update.`);
-
+    // Only a brand new record needs to propagate; an in-place comment refresh doesn't change the answer.
+    if (!existing) {
+        console.log(`Waiting ${ttl} seconds for DNS to propagate...`);
+        for (let ttlLeft = ttl; ttlLeft > 0; ttlLeft--) {
+            await delay(1000);
+            console.log(`${ttlLeft} seconds left...`);
+        }
+        console.log(`Done waiting for DNS to update.`);
+    }
 }
 /** Keeps existing records */
-export async function addRecord(type: string, key: string, value: string, proxied?: "proxied") {
+export async function addRecord(type: string, key: string, value: string, proxied?: "proxied", staleAfter = DNS_REFRESH_STALE_AFTER) {
     if (key.endsWith(".")) key = key.slice(0, -1);
     let zoneId = await getZoneId(getRootDomain(key));
     let prevValues = await getRecordsRaw(type, key);
-    // NOTE: Apparently if we try to update by just changing proxied, cloudflare complains and
-    //  says "an identical record already exists", even though it doesn't, we changed the proxied value...
-    if (prevValues.some(x => x.content === value)) return;
+    let existing = prevValues.find(x => x.content === value);
+    if (existing && Date.now() - freshnessTime(existing.comment) < staleAfter) return;
+
+    // Same single-batch flow as setRecord, minus the deletes (we keep sibling records here).
+    let ttl = DNS_TTLSeconds[type as "A"] || 60;
+    let comment = stampFreshness(existing?.comment);
     console.log(`Adding ${type} record for ${key} to ${value} (previously had ${JSON.stringify(prevValues.map(x => x.content))})`);
-    const ttl = DNS_TTLSeconds[type as "A"] || 60;
-    await cloudflarePOSTCall(`/zones/${zoneId}/dns_records`, {
-        type: type,
-        name: key,
-        content: value,
-        ttl,
-        proxied: proxied === "proxied",
+    await batchRecords(zoneId, {
+        patches: existing ? [{ id: existing.id, comment }] : [],
+        posts: existing ? [] : [{ type, name: key, content: value, ttl, proxied: proxied === "proxied", comment }],
     });
+    if (existing) return;
     console.log(`Waiting ${ttl} seconds for DNS to propagate...`);
-    await delay(ttl * 1000);
+    for (let ttlLeft = ttl; ttlLeft > 0; ttlLeft--) {
+        await delay(1000);
+        console.log(`${ttlLeft} seconds left...`);
+    }
     console.log(`Done waiting for DNS to update.`);
-}
-
-
-let credsOverride: { key: string } | undefined;
-/** Provide Cloudflare credentials directly instead of relying on ./cloudflare.json. Exactly one of
- *  key (the API token itself) or path (a file to read it from) — TypeScript rejects both/neither. */
-export function setCloudflareCredentials(config: { value: { key: string } | { path: string } }) {
-    let key = "key" in config.value ? config.value.key : fs.readFileSync(config.value.path, "utf8").trim();
-    credsOverride = { key };
-}
-
-const getCloudflareCredsFromFile = lazy(async (): Promise<{ key: string; }> => {
-    const path = "cloudflare.json";
-    if (!fs.existsSync(path)) {
-        throw new Error(`Must add cloudflare.json file to root of project (or call setCloudflareCredentials).`);
-    }
-    let creds = JSON.parse(fs.readFileSync(path, "utf8")) as { key: string; };
-    return {
-        key: creds.key,
-    };
-});
-async function getCloudflareCreds() {
-    return credsOverride || await getCloudflareCredsFromFile();
-}
-
-async function cloudflareGETCall<T>(path: string, params?: { [key: string]: string }): Promise<T> {
-    let url = new URL(`https://api.cloudflare.com/client/v4` + path);
-    for (let key in params) {
-        url.searchParams.set(key, params[key]);
-    }
-    let creds = await getCloudflareCreds();
-    let result = await httpsRequest(url.toString(), [], "GET", undefined, {
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${creds.key}`,
-        }
-    });
-    let result2 = JSON.parse(result.toString()) as { result: unknown; success: boolean; errors: { code: number; message: string }[] };
-    if (!result2.success) {
-        throw new Error(`Cloudflare call failed: ${result2.errors.map(x => x.message).join(", ")}`);
-    }
-    return result2.result as T;
-}
-async function cloudflarePOSTCall<T>(path: string, params: { [key: string]: unknown }): Promise<T> {
-    return await cloudflareCall(path, Buffer.from(JSON.stringify(params)), "POST");
-}
-async function cloudflareCall<T>(path: string, payload: Buffer, method: string): Promise<T> {
-    let url = new URL(`https://api.cloudflare.com/client/v4` + path);
-    let creds = await getCloudflareCreds();
-    let result = await httpsRequest(url.toString(), payload, method, undefined, {
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${creds.key}`,
-        }
-    });
-    let result2 = JSON.parse(result.toString()) as { result: unknown; success: boolean; errors: { code: number; message: string }[] };
-    if (!result2.success) {
-        throw new Error(`Cloudflare call failed: ${result2.errors.map(x => x.message).join(", ")}`);
-    }
-    return result2.result as T;
 }

@@ -20,6 +20,11 @@ export declare function getWritesRejectedReason(): string | undefined;
 export declare function assertWritesAllowed(): void;
 export declare function getTrust(): Promise<IStorage<TrustRecord>>;
 export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
+/** Makes machineIds the complete trust list for the account: machines not in the list lose access, machines already trusted keep their existing record, and missing ones are added. */
+export declare function setTrustedMachines(config: {
+    account: string;
+    machineIds: string[];
+}): Promise<void>;
 export type LoadedBucket = {
     account: string;
     bucketName: string;

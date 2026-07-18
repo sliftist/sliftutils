@@ -19,27 +19,49 @@ export const getSecret = cache(async function getSecret(key: string): Promise<st
     if (isNode()) {
         const os = await import("os");
         const fs = await import("fs");
+        const path = await import("path");
+
+        const appSecretsPath = path.resolve("./appSecrets");
+        let appSecretsModule: { getAppSecret?: (key: string) => Promise<string | undefined> | string | undefined } | undefined;
+        try {
+            appSecretsModule = await import(appSecretsPath) as typeof appSecretsModule;
+        } catch {
+            // Module doesn't exist, fall through to the file-based approach
+        }
+        if (appSecretsModule?.getAppSecret) {
+            const result = await appSecretsModule.getAppSecret(key);
+            if (!result) {
+                throw new Error(`Expected an app secret named "${key}" from getAppSecret in ${appSecretsPath}, but it returned no result`);
+            }
+            return result;
+        }
+
         const jsonIndex = key.indexOf(".json");
-        if (jsonIndex === -1) {
-            const filePath = os.homedir() + "/" + key;
-            return fs.readFileSync(filePath, "utf-8").trim();
-        }
+        let filePath: string;
+        try {
+            if (jsonIndex === -1) {
+                filePath = os.homedir() + "/" + key;
+                return fs.readFileSync(filePath, "utf-8").trim();
+            }
 
-        const pathPart = key.slice(0, jsonIndex + ".json".length);
-        const filePath = os.homedir() + "/" + pathPart;
-        const contents = fs.readFileSync(filePath, "utf-8");
-        const json = JSON.parse(contents);
+            const pathPart = key.slice(0, jsonIndex + ".json".length);
+            filePath = os.homedir() + "/" + pathPart;
+            const contents = fs.readFileSync(filePath, "utf-8");
+            const json = JSON.parse(contents);
 
-        const keyPart = key.slice(jsonIndex + ".json.".length);
-        if (!keyPart) {
-            return JSON.stringify(json);
-        }
+            const keyPart = key.slice(jsonIndex + ".json.".length);
+            if (!keyPart) {
+                return JSON.stringify(json);
+            }
 
-        const value = json[keyPart];
-        if (value === undefined) {
-            throw new Error(`Expected key "${keyPart}" in ${filePath}, was undefined`);
+            const value = json[keyPart];
+            if (value === undefined) {
+                throw new Error(`Expected key "${keyPart}" in ${filePath}, was undefined`);
+            }
+            return String(value);
+        } catch (e) {
+            throw new Error(`Could not find secret "${key}". Expected it either from getAppSecret in the app secret module at ${appSecretsPath}, or in the file at ${os.homedir() + "/" + key}. Underlying error: ${(e as Error).stack ?? e}`);
         }
-        return String(value);
     }
 
     // Browser implementation

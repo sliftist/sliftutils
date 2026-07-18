@@ -132,6 +132,10 @@ export class ArchivesDisk implements IArchives {
         return {};
     }
 
+    public async hasWriteAccess(): Promise<boolean> {
+        return true;
+    }
+
     private filePath(key: string): string {
         let result = path.join(this.filesDir, key);
         if (!result.startsWith(this.filesDir + path.sep)) {
@@ -181,7 +185,7 @@ export class ArchivesDisk implements IArchives {
         return result && result.data || undefined;
     }
 
-    public async get2(key: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+    public async get2(key: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         await this.init();
         let range = config?.range;
         let filePath = this.filePath(key);
@@ -197,13 +201,13 @@ export class ArchivesDisk implements IArchives {
             let size = stats.size;
             let start = range && Math.min(range.start, size) || 0;
             let end = range && Math.min(range.end, size) || size;
-            if (end <= start) return { data: Buffer.alloc(0), writeTime: stats.mtimeMs };
+            if (end <= start) return { data: Buffer.alloc(0), writeTime: stats.mtimeMs, size };
             let buffer = Buffer.alloc(end - start);
             let { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
             if (bytesRead !== buffer.length) {
                 throw new Error(`Expected ${buffer.length} bytes at ${filePath}:${start}, read ${bytesRead}`);
             }
-            return { data: buffer, writeTime: stats.mtimeMs };
+            return { data: buffer, writeTime: stats.mtimeMs, size };
         });
     }
 

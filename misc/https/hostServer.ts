@@ -5,9 +5,9 @@ import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getExternalIP } from "socket-function/src/networking";
 import { magenta } from "socket-function/src/formatting/logColors";
-import { getThreadKeyCert, loadIdentityCA } from "./certs";
+import { getOwnMachineId, getThreadKeyCert, loadIdentityCA } from "./certs";
 import { generateCert, getAccountKey, parseCert } from "./httpsCerts";
-import { setCloudflareCredentials, setRecord } from "./dns";
+import { setRecord } from "./dns";
 
 // Renew somewhere randomly between 40% and 60% of the way through the cert lifetime. The random threshold staggers parallel processes on the same machine, so usually one process renews early, and the others see the renewed cert on disk (we re-read the disk before every renewal check) and never renew themselves.
 const RENEW_THRESHOLD_MIN = 0.4;
@@ -23,8 +23,6 @@ export type HostServerConfig = {
     port: number;
 
     // TODO: Eventually we should support running without Cloudflare API tokens. It's annoying though as the user will have to create a self-signed certificate and then they'll have to go through and trust it everywhere, and a lot of the stuff is transparent, and so it'll have to be non-transparent, getting the user to go to the page that owns the domain and trust it from there. It's much better just make a Cloudflare account. You can buy a domain for $15 a year, and then you can use it for GitHub pages to host your own site and do all kinds of things just like any other real site.
-    /** Cloudflare API token: either the token string ({ key }) or a path to a file containing it ({ path }). Required — pass { path: "./cloudflare.json" } explicitly for the on-disk file. */
-    cloudflareApiToken: { key: string } | { path: string };
     /** Creates an unproxied A record pointing domain at this machine (publicIp, or our detected external IP) */
     setDNSRecord?: boolean;
     publicIp?: string;
@@ -34,7 +32,6 @@ export type HostServerConfig = {
 /** Hosts a SocketFunction server on a real domain, with an automatically created and renewed Let's Encrypt HTTPS certificate (cached in the home folder, shared between processes on the machine). Expose your controllers (and any RequireController setup) before calling this. Returns the mounted nodeId. */
 export async function hostServer(config: HostServerConfig): Promise<string> {
     let { domain, port } = config;
-    setCloudflareCredentials({ value: config.cloudflareApiToken });
     // The identity CA always lives on the root domain (nodeIds are threadHash.machineHash.root.tld)
     let rootDomain = domain.split(".").slice(-2).join(".");
     await loadIdentityCA(rootDomain);
@@ -62,6 +59,13 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
             [domain]: callback => {
                 callback(keyCert);
                 certListeners.push(callback);
+            },
+            [getOwnMachineId(rootDomain) + "." + rootDomain]: async callback => {
+                let threadCert = await getThreadKeyCert(rootDomain);
+                callback({
+                    key: threadCert.key,
+                    cert: threadCert.cert,
+                });
             },
         },
         allowHostnames: config.allowHostnames,

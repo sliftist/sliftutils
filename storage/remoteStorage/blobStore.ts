@@ -6,6 +6,7 @@ import {
     IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, assertValidLastModified,
 } from "../IArchives";
 import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
+import { ArchivesBackblaze } from "../backblaze";
 import { BulkDatabaseBase, noopReactiveDeps } from "../BulkDatabase2/BulkDatabaseBase";
 import { wrapHandle, NodeJSDirectoryHandleWrapper, DirectoryWrapper } from "../FileFolderAPI";
 
@@ -30,6 +31,10 @@ const MISS_CHECK_INTERVAL = 1000 * 5;
 // Change polls re-request this much overlap, so clock skew between us and a source can't drop changes
 const CHANGES_POLL_OVERLAP = timeInMinute;
 const SCAN_RETRY_DELAY = 1000 * 30;
+// Deletes are tombstones (an empty file IS a missing file): the size-0 index entry is what lets a
+// deletion propagate/reconcile like any other write, and it expires after this long
+const TOMBSTONE_EXPIRY = 1000 * 60 * 60 * 24 * 7;
+const TOMBSTONE_CLEANUP_INTERVAL = 1000 * 60 * 60;
 
 export type WriteConfig = {
     // Resolve once the write is in memory; flush to the sources after writeDelay, coalescing
@@ -45,7 +50,7 @@ export type WriteConfig = {
 // also satisfies it (used directly for rawDisk buckets), minus the optional index-backed methods.
 export type IBucketStore = {
     get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined>;
-    get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined>;
+    get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
     set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
     del(fileName: string, config?: WriteConfig): Promise<void>;
     getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined>;
@@ -59,8 +64,8 @@ export type IBucketStore = {
 };
 
 type OverlayEntry = {
-    // undefined data means a pending delete
-    data: Buffer | undefined;
+    // A zero-length buffer is a pending delete (tombstone)
+    data: Buffer;
     t: number;
     flushAt: number;
 };
@@ -135,6 +140,7 @@ export class BlobStore implements IBucketStore {
         }
         runInfinitePoll(FAST_FLUSH_POLL, () => this.flushOverlay(), this.stopped);
         runInfinitePoll(INDEX_FLUSH_INTERVAL, () => this.flushIndex(), this.stopped);
+        runInfinitePoll(TOMBSTONE_CLEANUP_INTERVAL, () => this.cleanupTombstones(), this.stopped);
     });
 
     // Stops all synchronization scans/polls and flushes pending writes. Used when a bucket's
@@ -196,11 +202,12 @@ export class BlobStore implements IBucketStore {
     private async runSourceSync(sourceIndex: number): Promise<void> {
         let { source, options } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
+        let listing: Map<string, number> | undefined;
         while (!this.stopped.stop) {
             try {
                 let config = await source.getConfig();
                 state.supportsChangesAfter = !!(config.supportsChangesAfter && source.getChangesAfter);
-                await this.scanSource(sourceIndex);
+                listing = await this.scanSource(sourceIndex);
                 break;
             } catch (e) {
                 console.error(`Initial scan of sync source ${source.getDebugName()} failed, retrying:`, e);
@@ -210,6 +217,9 @@ export class BlobStore implements IBucketStore {
         state.scanComplete = true;
         state.initialScan.resolve(undefined);
         if (this.stopped.stop) return;
+        if (listing) {
+            await this.reconcileSource(sourceIndex, listing);
+        }
         if (options.copyFiles) {
             try {
                 await this.copySourceFiles(sourceIndex);
@@ -222,36 +232,76 @@ export class BlobStore implements IBucketStore {
                 await this.pollChanges(sourceIndex);
                 if (options.copyFiles) await this.copySourceFiles(sourceIndex);
             }, this.stopped);
+            // Change polls only show what the source HAS, never what it's missing, so pushes run on
+            // the full-rescan cadence (findInfo on an index-backed source is cheap)
+            runInfinitePoll(FULL_RESCAN_INTERVAL, async () => {
+                let files = await source.findInfo("");
+                await this.reconcileSource(sourceIndex, new Map(files.map(x => [x.path, x.createTime])));
+            }, this.stopped);
         } else {
             runInfinitePoll(FULL_RESCAN_INTERVAL, async () => {
-                await this.scanSource(sourceIndex);
+                let rescan = await this.scanSource(sourceIndex);
+                await this.reconcileSource(sourceIndex, rescan);
                 if (options.copyFiles) await this.copySourceFiles(sourceIndex);
             }, this.stopped);
         }
     }
 
-    // Full metadata scan (size, writeTime, path) of one source, applied to the index
-    private async scanSource(sourceIndex: number): Promise<void> {
+    // Full metadata scan (size, writeTime, path) of one source, applied to the index. Returns the
+    // source's listing (path -> write time), which reconcileSource uses for the push direction.
+    private async scanSource(sourceIndex: number): Promise<Map<string, number>> {
         let { source } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
         let scanStart = Date.now();
         let files = await source.findInfo("");
-        let seen = new Set<string>();
+        let seen = new Map<string, number>();
         for (let file of files) {
-            seen.add(file.path);
+            seen.set(file.path, file.createTime);
             this.applyScanned(sourceIndex, file);
         }
         state.scannedCount = files.length;
         // Index entries this source was the holder of, but that vanished from it (e.g. deleted
         // while we were offline), come out of the index. Entries changed after the scan started
-        // are kept — the scan listing may simply predate them.
+        // are kept — the scan listing may simply predate them. Tombstones have no physical file
+        // for a listing to vouch for, so they're exempt (cleanupTombstones expires them instead).
         for (let [key, entry] of this.mem) {
             if (entry.source !== sourceIndex) continue;
+            if (entry.size === 0) continue;
             if (seen.has(key)) continue;
             if (entry.changedAt >= scanStart) continue;
             this.deleteIndexEntry(key);
         }
         state.changesAfterTime = Math.max(state.changesAfterTime, scanStart - CHANGES_POLL_OVERLAP);
+        return seen;
+    }
+
+    // The push direction of synchronization: everything we know that the source is missing (or
+    // holds an older copy of) is written to it — including deletions, as tombstone writes. This is
+    // what heals a source whose background writes failed (e.g. it was down): the next scan sees
+    // what's missing and re-sends it.
+    private async reconcileSource(sourceIndex: number, listing: Map<string, number>): Promise<void> {
+        let { source, options } = this.sources[sourceIndex];
+        if (options.noWriteBack) return;
+        try {
+            for (let [key, entry] of this.mem) {
+                if (this.stopped.stop) return;
+                if (entry.source === sourceIndex) continue;
+                let theirTime = listing.get(key);
+                if (theirTime !== undefined && theirTime >= entry.writeTime) continue;
+                if (entry.size === 0) {
+                    // A deletion only needs pushing while the source still holds an older copy
+                    if (theirTime === undefined) continue;
+                    await source.set(key, Buffer.alloc(0), { lastModified: entry.writeTime });
+                    continue;
+                }
+                let result = await this.sources[entry.source].source.get2(key);
+                if (!result) continue;
+                await source.set(key, result.data, { lastModified: result.writeTime });
+            }
+        } catch (e) {
+            // Abort the pass instead of logging per file; the next scan cycle retries
+            console.error(`Reconciling sync source ${source.getDebugName()} failed: ${(e as Error).stack ?? e}`);
+        }
     }
 
     private applyScanned(sourceIndex: number, file: ArchiveFileInfo): void {
@@ -287,6 +337,7 @@ export class BlobStore implements IBucketStore {
         if (!targets.length) return;
         for (let [key, entry] of this.mem) {
             if (entry.source !== sourceIndex) continue;
+            if (entry.size === 0) continue;
             let result = await source.get2(key);
             if (!result) continue;
             for (let target of targets) {
@@ -346,20 +397,23 @@ export class BlobStore implements IBucketStore {
         return result && result.data || undefined;
     }
 
-    public async get2(key: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+    public async get2(key: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         await this.init();
         let range = config?.range;
         let overlayEntry = this.overlay.get(key);
         if (overlayEntry) {
-            if (!overlayEntry.data) return undefined;
+            // An empty file IS a missing file (tombstone)
+            if (overlayEntry.data.length === 0) return undefined;
             let data = overlayEntry.data;
+            let size = data.length;
             if (range) {
                 data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
             }
-            return { data, writeTime: overlayEntry.t };
+            return { data, writeTime: overlayEntry.t, size };
         }
         let entry = await this.getIndexEntry(key);
         if (!entry) return undefined;
+        if (entry.size === 0) return undefined;
         let { source, options } = this.sources[entry.source];
         let result = await source.get2(key, { range });
         if (!result) {
@@ -408,43 +462,51 @@ export class BlobStore implements IBucketStore {
         await this.writeToSources(key, data, writeTime);
     }
 
-    private async writeToSources(key: string, data: Buffer, writeTime: number): Promise<void> {
-        let first: number | undefined;
+    public async del(key: string, config?: WriteConfig): Promise<void> {
+        // Deletes are tombstone writes (an empty file IS a missing file): the size-0 index entry is
+        // ordered by write time like any other write, propagates through synchronization, and
+        // expires after TOMBSTONE_EXPIRY
+        await this.set(key, Buffer.alloc(0), config);
+    }
+
+    private getWritableSources(): number[] {
+        let writable: number[] = [];
         for (let i = 0; i < this.sources.length; i++) {
             if (this.sources[i].options.noWriteBack) continue;
-            await this.sources[i].source.set(key, data, { lastModified: writeTime });
-            if (first === undefined) first = i;
+            writable.push(i);
         }
+        return writable;
+    }
+
+    private async writeToSources(key: string, data: Buffer, writeTime: number): Promise<void> {
+        let writable = this.getWritableSources();
+        let first = writable.shift();
         if (first === undefined) {
             throw new Error(`Every source is noWriteBack, so writes cannot be stored (store ${this.folder})`);
         }
+        // Only our own (first) source blocks the write. Downstream sources are written in the
+        // background: a down downstream source must not fail or stall writes, and reconcileSource
+        // re-sends anything they missed once they come back.
+        if (data.length === 0) {
+            // A tombstone stores nothing on our own source - the index entry alone records it
+            await this.sources[first].source.del(key);
+        } else {
+            await this.sources[first].source.set(key, data, { lastModified: writeTime });
+        }
         this.setIndexEntry(key, { writeTime, size: data.length, source: first });
-    }
-
-    public async del(key: string, config?: WriteConfig): Promise<void> {
-        await this.init();
-        if (config?.fast) {
-            let writeDelay = config.writeDelay || DEFAULT_FAST_WRITE_DELAY;
-            this.overlay.set(key, { data: undefined, t: Date.now(), flushAt: Date.now() + writeDelay });
-            return;
+        for (let i of writable) {
+            // Downstream sources receive tombstones as actual empty writes, so their listings show
+            // the deletion (size 0) and other stores scan it in as a tombstone
+            void this.sources[i].source.set(key, data, { lastModified: writeTime }).catch((e: Error) => {
+                console.error(`Background write of ${key} to sync source ${this.sources[i].source.getDebugName()} failed: ${e.stack ?? e}`);
+            });
         }
-        this.overlay.delete(key);
-        await this.deleteFromSources(key);
-    }
-
-    private async deleteFromSources(key: string): Promise<void> {
-        for (let i = 0; i < this.sources.length; i++) {
-            if (this.sources[i].options.noWriteBack) continue;
-            await this.sources[i].source.del(key);
-        }
-        this.deleteIndexEntry(key);
     }
 
     public async getInfo(key: string): Promise<{ writeTime: number; size: number } | undefined> {
         await this.init();
         let overlayEntry = this.overlay.get(key);
         if (overlayEntry) {
-            if (!overlayEntry.data) return undefined;
             return { writeTime: overlayEntry.t, size: overlayEntry.data.length };
         }
         let entry = await this.getIndexEntry(key);
@@ -458,11 +520,13 @@ export class BlobStore implements IBucketStore {
         let infos = new Map<string, ArchiveFileInfo>();
         for (let [key, entry] of this.mem) {
             if (!key.startsWith(prefix)) continue;
+            // Tombstones are missing files, so listings hide them
+            if (entry.size === 0) continue;
             infos.set(key, { path: key, createTime: entry.writeTime, size: entry.size });
         }
         for (let [key, overlayEntry] of this.overlay) {
             if (!key.startsWith(prefix)) continue;
-            if (!overlayEntry.data) {
+            if (overlayEntry.data.length === 0) {
                 infos.delete(key);
                 continue;
             }
@@ -475,7 +539,8 @@ export class BlobStore implements IBucketStore {
 
     // All files changed after the given time — fast, straight from the in-memory index. Filters on
     // when WE learned of the change (changedAt), so files synchronized late (with old write times)
-    // are still reported. Deletions are not reported.
+    // are still reported. Deletions ARE reported, as size-0 tombstone entries — that's how they
+    // propagate to stores syncing from us.
     public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
         await this.init();
         await this.waitForRequiredScans();
@@ -486,7 +551,6 @@ export class BlobStore implements IBucketStore {
             files.push({ path: key, createTime: entry.writeTime, size: entry.size });
         }
         for (let [key, overlayEntry] of this.overlay) {
-            if (!overlayEntry.data) continue;
             if (overlayEntry.t <= time) continue;
             files.push({ path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
         }
@@ -543,14 +607,31 @@ export class BlobStore implements IBucketStore {
         let now = Date.now();
         for (let [key, entry] of this.overlay) {
             if (!force && entry.flushAt > now) continue;
-            if (entry.data) {
-                await this.writeToSources(key, entry.data, entry.t);
-            } else {
-                await this.deleteFromSources(key);
-            }
+            await this.writeToSources(key, entry.data, entry.t);
             // Only remove if it wasn't overwritten while we were flushing
             if (this.overlay.get(key) === entry) {
                 this.overlay.delete(key);
+            }
+        }
+    }
+
+    // Tombstones only need to exist long enough for every store to learn of the deletion; expired
+    // ones come out of the index. The physical empty file is removed only on backblaze sources:
+    // remote stores expire their own tombstones (a del there would just mint a fresh one), and our
+    // own disk never stored anything for it.
+    private async cleanupTombstones(): Promise<void> {
+        let cutoff = Date.now() - TOMBSTONE_EXPIRY;
+        for (let [key, entry] of this.mem) {
+            if (this.stopped.stop) return;
+            if (entry.size !== 0) continue;
+            if (entry.writeTime > cutoff) continue;
+            this.deleteIndexEntry(key);
+            for (let { source, options } of this.sources) {
+                if (options.noWriteBack) continue;
+                if (!(source instanceof ArchivesBackblaze)) continue;
+                void source.del(key).catch((e: Error) => {
+                    console.error(`Removing expired tombstone ${key} from ${source.getDebugName()} failed: ${e.stack ?? e}`);
+                });
             }
         }
     }

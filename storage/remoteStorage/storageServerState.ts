@@ -8,10 +8,11 @@ import {
     RemoteConfig, HostedConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
     ArchivesSyncStatus, DEFAULT_BASE_SYNC_OPTIONS, DEFAULT_SYNC_OPTIONS,
 } from "../IArchives";
-import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl } from "./remoteConfig";
+import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion } from "./remoteConfig";
 import { createApiArchives } from "./createArchives";
 import type { IStorage } from "../IStorage";
 import type { AccessRequest, TrustRecord } from "./storageController";
+import { getArg } from "./cliArgs";
 
 // The storage server's global server-side state. hostStorageServer sets the config once at
 // startup; everything else (system storages, buckets) is a global cache created lazily on first
@@ -69,12 +70,24 @@ export function assertWritesAllowed(): void {
 // <folder>/system2/<name> — so they share one cache, keyed by name. ("system2" because the layout
 // changed when bucket configs moved into the buckets themselves; old "system"/"buckets" folders
 // are simply ignored.)
+// setTrustedMachines is called by consumers BEFORE starting the server, so when the config isn't
+// set yet we fall back to the same --folder arg the CLI starts the server with.
+function getStorageFolder(): string {
+    let config = getStorageServerConfigOptional();
+    if (config) return config.folder;
+    let folder = getArg("folder");
+    if (!folder) {
+        throw new Error(`Storage server is not initialized and there is no --folder arg, so the storage folder is unknown`);
+    }
+    return path.resolve(folder);
+}
+
 const systemStorages = new Map<string, Promise<IStorage<unknown>>>();
 function getSystemStorage<T>(name: string): Promise<IStorage<T>> {
     let storage = systemStorages.get(name);
     if (!storage) {
         storage = (async () => {
-            let root = await getFileStorageNested2(getStorageServerConfig().folder);
+            let root = await getFileStorageNested2(getStorageFolder());
             let system = await root.folder.getStorage("system2");
             let transactionName = "storage" + name[0].toUpperCase() + name.slice(1);
             return new JSONStorage<unknown>(new TransactionStorage(await system.folder.getStorage(name), transactionName));
@@ -88,6 +101,27 @@ export function getTrust(): Promise<IStorage<TrustRecord>> {
 }
 export function getRequests(): Promise<IStorage<AccessRequest[]>> {
     return getSystemStorage<AccessRequest[]>("requests");
+}
+
+/** Makes machineIds the complete trust list for the account: machines not in the list lose access, machines already trusted keep their existing record, and missing ones are added. */
+export async function setTrustedMachines(config: { account: string; machineIds: string[] }): Promise<void> {
+    let trust = await getTrust();
+    let prefix = `${config.account}|`;
+    let desired = new Set(config.machineIds);
+    for (let key of await trust.getKeys()) {
+        if (!key.startsWith(prefix)) continue;
+        let machineId = key.slice(prefix.length);
+        if (desired.has(machineId)) {
+            desired.delete(machineId);
+            continue;
+        }
+        console.log(`Removing trust for machine ${machineId} on account ${config.account}`);
+        await trust.remove(key);
+    }
+    for (let machineId of desired) {
+        console.log(`Adding trust for machine ${machineId} on account ${config.account}`);
+        await trust.set(`${prefix}${machineId}`, { account: config.account, machineId, ip: "", time: Date.now() });
+    }
 }
 
 // ── buckets ──
@@ -111,33 +145,48 @@ function getBucketFolder(account: string, bucketName: string): string {
     return path.join(getStorageServerConfig().folder, "buckets2", account, bucketName);
 }
 
-function findSelfEntry(routing: RemoteConfig, account: string, bucketName: string): HostedConfig | undefined {
+function findSelfIndex(routing: RemoteConfig, account: string, bucketName: string): number {
     let { domain, port } = getStorageServerConfig();
-    for (let source of routing.sources) {
+    for (let i = 0; i < routing.sources.length; i++) {
+        let source = routing.sources[i];
         if (typeof source === "string" || source.type !== "remote") continue;
         let parsed = parseHostedUrl(source.url);
         if (parsed.address === domain && parsed.port === port && parsed.account === account && parsed.bucketName === bucketName) {
-            return source;
+            return i;
         }
     }
-    return undefined;
+    return -1;
 }
 
 function buildBucket(account: string, bucketName: string, routing: RemoteConfig): LoadedBucket {
     let folder = getBucketFolder(account, bucketName);
-    let self = findSelfEntry(routing, account, bucketName);
+    let selfIndex = findSelfIndex(routing, account, bucketName);
+    let self: HostedConfig | undefined;
+    if (selfIndex !== -1) {
+        self = routing.sources[selfIndex] as HostedConfig;
+    }
     let store: IBucketStore;
     if (self?.rawDisk) {
         store = new ArchivesDisk(folder);
     } else {
-        // Our own disk is the base source; the other routing entries are synchronization sources
+        // Our own disk is the base source; only the routing entries DOWNSTREAM from us (after our
+        // own entry) become synchronization sources. Upstream sources sync from us, so writing to
+        // or scanning them would just echo our own data back (and make our availability depend on
+        // theirs). A server NOT in the list has been removed from the bucket: it keeps its disk
+        // data (the config may re-add it), but stops all synchronization - no one contacts a
+        // removed source, and scanning/pushing as if we were still one would fight the real chain.
         let sources: ArchivesSource[] = [{
             source: new ArchivesDisk(folder),
             options: self?.syncOptions || DEFAULT_BASE_SYNC_OPTIONS,
         }];
-        for (let source of routing.sources) {
-            if (typeof source === "string" || source === self) continue;
-            sources.push({ source: createApiArchives(source), options: source.syncOptions || DEFAULT_SYNC_OPTIONS });
+        if (selfIndex === -1) {
+            console.log(`This server is not in the routing config for bucket ${account}/${bucketName}; keeping its data on disk but no longer synchronizing it`);
+        } else {
+            for (let i = selfIndex + 1; i < routing.sources.length; i++) {
+                let source = routing.sources[i];
+                if (typeof source === "string") continue;
+                sources.push({ source: createApiArchives(source), options: source.syncOptions || DEFAULT_SYNC_OPTIONS });
+            }
         }
         store = new BlobStore(folder, sources, {
             onIndexChanged: key => {
@@ -218,26 +267,45 @@ export async function assertMutable(bucket: LoadedBucket, filePath: string): Pro
     }
 }
 
-export async function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
-    assertWritesAllowed();
+// Routing writes are serialized per bucket, so two concurrent creates can't both build a store
+// (the loser's store would leak with its sync loops running forever)
+const routingWrites = new Map<string, Promise<void>>();
+
+async function writeRoutingConfig(account: string, bucketName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    let key = `${account}/${bucketName}`;
+    // Validates before storing anything, so a bad config can't brick the bucket
+    let incoming = parseRoutingData(data);
     let loaded = await getLoadedBucket(account, bucketName);
-    if (filePath === ROUTING_FILE) {
-        // Validates before storing anything, so a bad config can't brick the bucket
-        parseRoutingData(data);
-        if (!loaded) {
-            let key = `${account}/${bucketName}`;
-            await new ArchivesDisk(getBucketFolder(account, bucketName)).set(ROUTING_FILE, data, { lastModified: config?.lastModified });
-            buckets.set(key, Promise.resolve(buildBucket(account, bucketName, parseRoutingData(data))));
-            console.log(`Created bucket ${key}`);
-            return;
-        }
-        // Routing writes bypass fast mode (the config must apply immediately and survive a crash)
-        // and ignore immutable (the routing file must always stay updatable). An older lastModified
-        // no-ops inside set, in which case the reload below sees no change.
-        await loaded.store.set(ROUTING_FILE, data, { lastModified: config?.lastModified });
-        await scheduleRoutingReload(account, bucketName);
+    if (!loaded) {
+        await new ArchivesDisk(getBucketFolder(account, bucketName)).set(ROUTING_FILE, data, { lastModified: config?.lastModified });
+        buckets.set(key, Promise.resolve(buildBucket(account, bucketName, incoming)));
+        console.log(`Created bucket ${key}`);
         return;
     }
+    // A changed config must carry a higher version than the one currently stored — otherwise two
+    // clients with different configs at the same version would keep clobbering each other. Same
+    // content at any version is a harmless no-op and is allowed through.
+    if (JSON.stringify(incoming) !== loaded.routingJSON && getConfigVersion(incoming) <= getConfigVersion(loaded.routing)) {
+        throw new Error(`Cannot update routing config for bucket ${key}: the new config differs from the current one but its version (${getConfigVersion(incoming)}) is not greater than the current version (${getConfigVersion(loaded.routing)}). Increment the version to update it. Current: ${loaded.routingJSON}. Attempted: ${JSON.stringify(incoming)}`);
+    }
+    // Routing writes bypass fast mode (the config must apply immediately and survive a crash)
+    // and ignore immutable (the routing file must always stay updatable). An older lastModified
+    // no-ops inside set, in which case the reload below sees no change.
+    await loaded.store.set(ROUTING_FILE, data, { lastModified: config?.lastModified });
+    await scheduleRoutingReload(account, bucketName);
+}
+
+export async function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    assertWritesAllowed();
+    if (filePath === ROUTING_FILE) {
+        let key = `${account}/${bucketName}`;
+        let run = (routingWrites.get(key) || Promise.resolve()).then(() => writeRoutingConfig(account, bucketName, data, config));
+        // The chain must survive a failed write, so the stored link swallows the error (the caller
+        // still gets it from run)
+        routingWrites.set(key, run.then(() => { }, () => { }));
+        return await run;
+    }
+    let loaded = await getLoadedBucket(account, bucketName);
     if (!loaded) {
         throw new Error(`Bucket ${account}/${bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
     }
@@ -274,7 +342,7 @@ class ArchivesLocalBucket implements IArchives {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined> {
+    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         let bucket = await this.getBucket();
         if (!bucket) return undefined;
         return await bucket.store.get2(fileName, config);
@@ -327,7 +395,10 @@ class ArchivesLocalBucket implements IArchives {
     public async getConfig(): Promise<ArchivesConfig> {
         let bucket = await this.getBucket();
         // Missing buckets say true, matching what they become once created (the default store type)
-        return { supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter };
+        return { supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter, remoteConfig: bucket?.routing };
+    }
+    public async hasWriteAccess(): Promise<boolean> {
+        return true;
     }
     public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
         let bucket = await this.getBucket();

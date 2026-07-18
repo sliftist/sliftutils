@@ -6,6 +6,10 @@ module.allowclient = true;
 // A write may not be stamped more than this far in the future, or clock skew between machines
 // would let a bad timestamp block writes for a long time.
 export const MAX_LAST_MODIFIED_FUTURE = 15 * 60 * 1000;
+
+// How long browsers may cache files from immutable buckets (the Cache-Control max-age), shared by
+// every hosting path (backblaze bucket settings and our own storage server's HTTP route)
+export const IMMUTABLE_CACHE_TIME = 86400 * 1000;
 export function assertValidLastModified(lastModified: number): void {
     let max = Date.now() + MAX_LAST_MODIFIED_FUTURE;
     if (lastModified > max) {
@@ -41,7 +45,7 @@ export type CommonConfig = {
 export type HostedConfig = CommonConfig & {
     type: "remote";
 
-    // Ex: https://storage2.vidgridweb.com:4445/file/exampleaccount/examplebucket/storage/storagerouting.json
+    // Ex: https://99-250-124-91.querysubtest.com:5233/file/root/uniquebucketname/storage/storagerouting.json
     // NOTE: The account and bucket name are obtained from the URL.
     url: string;
 
@@ -67,7 +71,6 @@ export type BackblazeConfig = CommonConfig & {
     // NOTE: The bucket name is obtained from the URL.
     url: string;
     // Public buckets are served over plain HTTPS GETs (getURL). Private buckets are API-access only.
-    bucketName: string;
     public?: boolean;
     // NOTE: This isn't enforced on the backblaze level, so this is just a client-side guarantee. This can change how we cache files.
     //  - Backblaze does support immutability. However, apparently, once we enable it on a bucket, we can't disable it, which is really bad, as it means if our code could ever enable it and we accidentally enable it on an important bucket, we essentially just bricked that bucket. So we should never write any code that ever tries to use backblaze to make things immutable. 
@@ -97,6 +100,9 @@ export type ArchiveFileInfo = { path: string; createTime: number; size: number }
 export type ArchivesConfig = {
     // Whether getChangesAfter is implemented (fast change polling, instead of full rescans)
     supportsChangesAfter?: boolean;
+    // The bucket's full routing config (ROUTING_FILE). Absent for sources that don't have one (a
+    // bare disk source, or a bucket that doesn't exist yet).
+    remoteConfig?: RemoteConfig;
 };
 
 // How a synchronization source behaves (see BlobStore, which synchronizes an index + local cache
@@ -135,9 +141,11 @@ export type ArchivesSyncStatus = {
 
 export interface IArchives {
     getDebugName(): string;
+    /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc).
+     *  Checked without writing anything. */
+    hasWriteAccess(): Promise<boolean>;
     get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined>;
-    /** Like get, but also returns the last-write time of the file. get just calls get2. */
-    get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number } | undefined>;
+    get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
     /**
      * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
      * the file's current last-write time the write no-ops (so delayed / synchronized writes can
