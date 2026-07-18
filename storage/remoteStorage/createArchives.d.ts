@@ -1,6 +1,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { ServerBucketInfo } from "./storageServerState";
 export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
 export declare class ArchivesChain implements IArchives {
     private configured;
@@ -83,3 +84,18 @@ export declare class ArchivesChain implements IArchives {
     dispose(): void;
 }
 export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;
+/** Every bucket an account has on one storage server - active and inactive - with each bucket's
+ *  configuration. One authenticated call (the normal trust system applies): no ArchivesChain, no
+ *  synchronization, and inactive buckets on the server stay inactive. Any URL addressing the
+ *  server works (a bucket routing URL, or just https://host:port). */
+export declare function listServerBuckets(config: {
+    url: string;
+    account: string;
+}): Promise<ServerBucketInfo[]>;
+/** Live info for one bucket given its routing URL (getConfig: routing config, index totals, disk
+ *  limit, in-progress synchronization). One authenticated call to that server - a light, safe
+ *  alternative to instantiating an ArchivesChain, which would start synchronization machinery. */
+export declare function getBucketInfo(config: {
+    url: string;
+    accountName?: string;
+}): Promise<ArchivesConfig>;

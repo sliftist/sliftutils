@@ -13,6 +13,7 @@ import { ROUTING_FILE } from "./remoteConfig";
 import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
     deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
+    getBucketConfig, listAccountBuckets, ServerBucketInfo,
 } from "./storageServerState";
 
 // The remote storage server's API. Authentication uses certs.ts machine identities: a client
@@ -332,15 +333,13 @@ class RemoteStorageControllerBase {
     async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
         let bucket = await getBucket(account, bucketName);
         // Missing buckets say true, matching what they become once created (the default store type)
-        let progress = bucket?.store.getSyncProgress?.();
-        return {
-            supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter,
-            remoteConfig: bucket?.routing,
-            index: progress?.index,
-            indexSources: progress?.sources,
-            readerDiskLimit: progress?.readerDiskLimit,
-            syncing: progress?.syncing,
-        };
+        if (!bucket) return { supportsChangesAfter: true };
+        return getBucketConfig(bucket);
+    }
+    /** Every bucket the account has on this host - active and inactive - with each bucket's
+     *  configuration. Inactive buckets stay inactive (their routing is read straight off disk). */
+    async listBuckets(account: string): Promise<ServerBucketInfo[]> {
+        return await listAccountBuckets(account);
     }
     /** Walks the whole index for exact totals (overall and per holding source) - more expensive
      *  than the maintained counters that getArchivesConfig returns, but immune to counter drift. */
@@ -522,6 +521,7 @@ export const RemoteStorageController = SocketFunction.register(
         getChangesAfter: { hooks: [accountAccess] },
         getArchivesConfig: { hooks: [accountAccess] },
         getIndexInfo: { hooks: [accountAccess] },
+        listBuckets: { hooks: [accountAccess] },
         getSyncStatus: { hooks: [accountAccess] },
         startLargeFile: { hooks: [accountAccess] },
         uploadPart: { hooks: [uploadAccess] },

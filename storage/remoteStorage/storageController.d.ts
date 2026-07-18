@@ -1,6 +1,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { ServerBucketInfo } from "./storageServerState";
 export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
 export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
@@ -71,6 +72,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     }) => Promise<ArchiveFileInfo[]>;
     getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
     getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
+    listBuckets: (account: string) => Promise<ServerBucketInfo[]>;
     getIndexInfo: (account: string, bucketName: string) => Promise<{
         fileCount: number;
         byteCount: number;

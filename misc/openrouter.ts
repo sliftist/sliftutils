@@ -1,5 +1,6 @@
 import { parseYAML } from "./yaml";
 import { retryFunctional } from "socket-function/src/batching";
+import { httpsRequest } from "socket-function/src/https";
 
 const CANNOT_RETRY = "(CANNOT RETRY)";
 import { formatNumber } from "socket-function/src/formatting/format";
@@ -110,13 +111,11 @@ export async function openRouterCallBase(config: {
 
     try {
         return await retryFunctional(async () => {
-            let response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${openrouterKey}`,
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
+            // httpsRequest routes through socket-function's DNS cache and throws on any non-2xx (with the
+            //  response body in the message), which retryFunctional then retries.
+            let responseBody = await httpsRequest(
+                "https://openrouter.ai/api/v1/chat/completions",
+                Buffer.from(JSON.stringify({
                     model,
                     messages,
                     provider: {
@@ -124,14 +123,18 @@ export async function openRouterCallBase(config: {
                     },
                     usage: { include: true },
                     ...options,
-                }),
-            });
+                })),
+                "POST",
+                false,
+                {
+                    headers: {
+                        "Authorization": `Bearer ${openrouterKey}`,
+                        "Content-Type": "application/json",
+                    },
+                }
+            );
 
-            if (response.status !== 200) {
-                let responseText = await response.text();
-                throw new Error(`Failed to call OpenRouter: ${response.status} ${response.statusText} ${responseText}`);
-            }
-            let responseObj = await response.json() as {
+            let responseObj = JSON.parse(responseBody.toString()) as {
                 usage: {
                     cost: number;
                 };

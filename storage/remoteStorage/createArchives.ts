@@ -11,9 +11,11 @@ import {
     normalizeRemoteConfig, normalizeSource, parseRoutingData, serializeRemoteConfig,
     getRoute, routeContains, parseVariableRoute,
 } from "./remoteConfig";
-import { ArchivesRemote } from "./ArchivesRemote";
+import { SocketFunction } from "socket-function/SocketFunction";
+import { ArchivesRemote, parseStorageUrl, authenticateStorage } from "./ArchivesRemote";
 import { ArchivesBackblaze } from "../backblaze";
-import { getStorageServerConfigOptional, getLocalArchives } from "./storageServerState";
+import { getStorageServerConfigOptional, getLocalArchives, ServerBucketInfo } from "./storageServerState";
+import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageController";
 import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
 
 // Turns a RemoteConfig into a usable IArchives (createArchives). Initialization is lazy: on the
@@ -609,4 +611,30 @@ export class ArchivesChain implements IArchives {
 // retry/poll loops stop.
 export function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain {
     return new ArchivesChain(config);
+}
+
+/** Every bucket an account has on one storage server - active and inactive - with each bucket's
+ *  configuration. One authenticated call (the normal trust system applies): no ArchivesChain, no
+ *  synchronization, and inactive buckets on the server stay inactive. Any URL addressing the
+ *  server works (a bucket routing URL, or just https://host:port). */
+export async function listServerBuckets(config: { url: string; account: string }): Promise<ServerBucketInfo[]> {
+    SocketFunction.ENABLE_CLIENT_MODE = true;
+    let parsed = parseStorageUrl(config.url);
+    let nodeId = SocketFunction.connect({ address: parsed.address, port: parsed.port });
+    let controller = RemoteStorageController.nodes[nodeId];
+    try {
+        return await controller.listBuckets(config.account);
+    } catch (e) {
+        if (!String((e as Error).stack ?? e).includes(STORAGE_NOT_AUTHENTICATED)) throw e;
+        await authenticateStorage({ address: parsed.address, port: parsed.port, nodeId });
+        return await controller.listBuckets(config.account);
+    }
+}
+
+/** Live info for one bucket given its routing URL (getConfig: routing config, index totals, disk
+ *  limit, in-progress synchronization). One authenticated call to that server - a light, safe
+ *  alternative to instantiating an ArchivesChain, which would start synchronization machinery. */
+export async function getBucketInfo(config: { url: string; accountName?: string }): Promise<ArchivesConfig> {
+    let remote = new ArchivesRemote({ url: config.url, accountName: config.accountName, waitForAccess: false });
+    return await remote.getConfig();
 }

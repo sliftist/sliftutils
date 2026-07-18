@@ -1,5 +1,6 @@
 module.allowclient = true;
 
+import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
 import { IArchives, ArchiveFileInfo, ArchivesConfig } from "../IArchives";
 import { buildFileUrl } from "./remoteConfig";
 
@@ -30,25 +31,28 @@ export class ArchivesUrl implements IArchives {
         if (range) {
             headers["Range"] = `bytes=${range.start}-${range.end - 1}`;
         }
-        let response = await fetch(url, { headers });
-        if (response.status === 404) return undefined;
-        if (!response.ok) {
-            throw new Error(`Read of ${url} failed: ${response.status} ${response.statusText}`);
+        let response: HttpsResponseInfo = { headers: {} };
+        let data: Buffer;
+        try {
+            data = await httpsRequest(url, undefined, "GET", false, { headers, outResponse: response });
+        } catch (e) {
+            // httpsRequest throws on any non-2xx; a missing file is a normal absent result, not an error.
+            if (response.statusCode === 404) return undefined;
+            throw e;
         }
-        let data = Buffer.from(await response.arrayBuffer());
         // A real 206 only returns the requested slice, so the full size lives in Content-Range's total.
         let size = data.length;
-        let contentRange = response.headers.get("content-range");
+        let contentRange = response.headers["content-range"];
         let total = contentRange && Number(contentRange.split("/")[1]);
         if (total && Number.isFinite(total)) {
             size = total;
         }
         // Servers that don't support ranges return the full file with a 200 (ours serves real
         // 206s, but backblaze friendly URLs and proxies may not)
-        if (range && response.status === 200) {
+        if (range && response.statusCode === 200) {
             data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
         }
-        let lastModified = response.headers.get("last-modified");
+        let lastModified = response.headers["last-modified"];
         let writeTime = lastModified && new Date(lastModified).getTime() || 0;
         return { data, writeTime, size };
     }

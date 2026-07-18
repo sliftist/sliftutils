@@ -2683,16 +2683,6 @@ declare module "sliftutils/storage/embeddingFormats" {
 
 }
 
-declare module "sliftutils/storage/faceFramesData" {
-    export declare function ensureFaceData(fileName: string, byteLength: number): Promise<string>;
-
-}
-
-declare module "sliftutils/storage/faceFramesServer" {
-    export {};
-
-}
-
 declare module "sliftutils/storage/fileSystemPointer" {
     export type FileSystemPointer = string;
     export declare function storeFileSystemPointer(config: {
@@ -3175,6 +3165,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+    import { ServerBucketInfo } from "./storageServerState";
     export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
     export declare class ArchivesChain implements IArchives {
         private configured;
@@ -3257,6 +3248,21 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         dispose(): void;
     }
     export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;
+    /** Every bucket an account has on one storage server - active and inactive - with each bucket's
+     *  configuration. One authenticated call (the normal trust system applies): no ArchivesChain, no
+     *  synchronization, and inactive buckets on the server stay inactive. Any URL addressing the
+     *  server works (a bucket routing URL, or just https://host:port). */
+    export declare function listServerBuckets(config: {
+        url: string;
+        account: string;
+    }): Promise<ServerBucketInfo[]>;
+    /** Live info for one bucket given its routing URL (getConfig: routing config, index totals, disk
+     *  limit, in-progress synchronization). One authenticated call to that server - a light, safe
+     *  alternative to instantiating an ArchivesChain, which would start synchronization machinery. */
+    export declare function getBucketInfo(config: {
+        url: string;
+        accountName?: string;
+    }): Promise<ArchivesConfig>;
 
 }
 
@@ -3347,6 +3353,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+    import { ServerBucketInfo } from "./storageServerState";
     export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
     export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
     export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
@@ -3417,6 +3424,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         }) => Promise<ArchiveFileInfo[]>;
         getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
         getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
+        listBuckets: (account: string) => Promise<ServerBucketInfo[]>;
         getIndexInfo: (account: string, bucketName: string) => Promise<{
             fileCount: number;
             byteCount: number;
@@ -3459,7 +3467,7 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { IBucketStore } from "./blobStore";
-    import { RemoteConfig, HostedConfig, IArchives } from "../IArchives";
+    import { RemoteConfig, HostedConfig, IArchives, ArchivesConfig } from "../IArchives";
     import type { IStorage } from "../IStorage";
     import type { AccessRequest, TrustRecord } from "./storageController";
     export type StorageServerConfig = {
@@ -3497,6 +3505,18 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<void>;
+    export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
+    export type ServerBucketInfo = {
+        bucketName: string;
+        active: boolean;
+        config?: ArchivesConfig;
+        error?: string;
+    };
+    /** Every bucket the account has on this server, active or not, each with its configuration.
+     *  Inactive buckets are inspected straight from disk WITHOUT loading them - loading would start
+     *  their synchronization, and old invalid buckets must stay inert (their parse error is reported
+     *  instead). */
+    export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
     export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
     export declare function getLocalArchives(account: string, bucketName: string): IArchives;
 

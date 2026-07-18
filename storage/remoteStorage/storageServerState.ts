@@ -1,4 +1,5 @@
 import path from "path";
+import fs from "fs";
 import { getFileStorageNested2 } from "../FileFolderAPI";
 import { TransactionStorage } from "../TransactionStorage";
 import { JSONStorage } from "../JSONStorage";
@@ -416,6 +417,67 @@ export async function writeBucketFile(account: string, bucketName: string, fileP
     await loaded.store.set(filePath, data, { ...getWriteConfig(loaded, writeTime, route), lastModified: writeTime });
 }
 
+export function getBucketConfig(bucket: LoadedBucket): ArchivesConfig {
+    let progress = bucket.store.getSyncProgress?.();
+    return {
+        supportsChangesAfter: !!bucket.store.getChangesAfter,
+        remoteConfig: bucket.routing,
+        index: progress?.index,
+        indexSources: progress?.sources,
+        readerDiskLimit: progress?.readerDiskLimit,
+        syncing: progress?.syncing,
+    };
+}
+
+export type ServerBucketInfo = {
+    bucketName: string;
+    // Loaded in memory (created or accessed since startup), so its synchronization is running
+    active: boolean;
+    config?: ArchivesConfig;
+    error?: string;
+};
+
+/** Every bucket the account has on this server, active or not, each with its configuration.
+ *  Inactive buckets are inspected straight from disk WITHOUT loading them - loading would start
+ *  their synchronization, and old invalid buckets must stay inert (their parse error is reported
+ *  instead). */
+export async function listAccountBuckets(account: string): Promise<ServerBucketInfo[]> {
+    let accountFolder = path.join(getStorageServerConfig().folder, "buckets2", account);
+    let names: string[];
+    try {
+        names = await fs.promises.readdir(accountFolder);
+    } catch {
+        return [];
+    }
+    let results: ServerBucketInfo[] = [];
+    for (let bucketName of names) {
+        let loadedPromise = buckets.get(`${account}/${bucketName}`);
+        if (loadedPromise) {
+            try {
+                let loaded = await loadedPromise;
+                if (loaded) {
+                    results.push({ bucketName, active: true, config: getBucketConfig(loaded) });
+                    continue;
+                }
+            } catch (e) {
+                results.push({ bucketName, active: true, error: String((e as Error).stack ?? e).slice(0, 500) });
+                continue;
+            }
+        }
+        try {
+            let data = await new ArchivesDisk(getBucketFolder(account, bucketName)).get(ROUTING_FILE);
+            if (!data) {
+                results.push({ bucketName, active: false, error: `No routing file (${ROUTING_FILE})` });
+                continue;
+            }
+            results.push({ bucketName, active: false, config: { remoteConfig: parseRoutingData(data) } });
+        } catch (e) {
+            results.push({ bucketName, active: false, error: String((e as Error).stack ?? e).slice(0, 500) });
+        }
+    }
+    return results;
+}
+
 export async function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void> {
     if (filePath === ROUTING_FILE) {
         throw new Error(`The routing config ${JSON.stringify(ROUTING_FILE)} cannot be deleted (overwrite it to change the bucket's configuration)`);
@@ -498,15 +560,8 @@ class ArchivesLocalBucket implements IArchives {
     public async getConfig(): Promise<ArchivesConfig> {
         let bucket = await this.getBucket();
         // Missing buckets say true, matching what they become once created (the default store type)
-        let progress = bucket?.store.getSyncProgress?.();
-        return {
-            supportsChangesAfter: !bucket || !!bucket.store.getChangesAfter,
-            remoteConfig: bucket?.routing,
-            index: progress?.index,
-            indexSources: progress?.sources,
-            readerDiskLimit: progress?.readerDiskLimit,
-            syncing: progress?.syncing,
-        };
+        if (!bucket) return { supportsChangesAfter: true };
+        return getBucketConfig(bucket);
     }
     public async hasWriteAccess(): Promise<boolean> {
         return true;

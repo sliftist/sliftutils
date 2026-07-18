@@ -1,7 +1,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { IBucketStore } from "./blobStore";
-import { RemoteConfig, HostedConfig, IArchives } from "../IArchives";
+import { RemoteConfig, HostedConfig, IArchives, ArchivesConfig } from "../IArchives";
 import type { IStorage } from "../IStorage";
 import type { AccessRequest, TrustRecord } from "./storageController";
 export type StorageServerConfig = {
@@ -39,5 +39,17 @@ export declare function assertMutable(bucket: LoadedBucket, filePath: string, wr
 export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
     lastModified?: number;
 }): Promise<void>;
+export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
+export type ServerBucketInfo = {
+    bucketName: string;
+    active: boolean;
+    config?: ArchivesConfig;
+    error?: string;
+};
+/** Every bucket the account has on this server, active or not, each with its configuration.
+ *  Inactive buckets are inspected straight from disk WITHOUT loading them - loading would start
+ *  their synchronization, and old invalid buckets must stay inert (their parse error is reported
+ *  instead). */
+export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
 export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
 export declare function getLocalArchives(account: string, bucketName: string): IArchives;
