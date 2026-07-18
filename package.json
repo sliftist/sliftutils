@@ -1,6 +1,6 @@
 {
     "name": "sliftutils",
-    "version": "1.7.12",
+    "version": "1.7.13",
     "main": "index.js",
     "license": "MIT",
     "files": [
@@ -57,7 +57,7 @@
         "node-forge": "https://github.com/sliftist/forge#e618181b469b07bdc70b968b0391beb8ef5fecd6",
         "preact-old-types": "^10.28.1",
         "shell-quote": "^1.8.3",
-        "socket-function": "^1.2.16",
+        "socket-function": "^1.2.17",
         "typenode": "^6.6.1",
         "typesafecss": "*",
         "ws": "^8.18.3",
