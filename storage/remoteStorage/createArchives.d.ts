@@ -15,6 +15,7 @@ export declare class ArchivesChain implements IArchives {
     getDebugName(): string;
     private getState;
     private init;
+    private createChainSource;
     private buildSources;
     private startConfigPoll;
     private configRefreshInFlight;

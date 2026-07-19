@@ -223,6 +223,29 @@ export class ArchivesChain implements IArchives {
                     }
                 }
             }
+            // The server may be MID deploy-takeover: its getConfig returns the in-memory
+            // interpretation (window splits pointing at a successor's port), which is never in the
+            // routing file. A client connecting during the takeover must start on that
+            // interpretation, not discover it minutes later.
+            try {
+                let probeApi = found.probe.api;
+                if (probeApi) {
+                    let servedConfig = (await probeApi.getConfig()).remoteConfig;
+                    if (servedConfig) {
+                        let served = normalizeRemoteConfig(servedConfig);
+                        if (JSON.stringify(served) !== JSON.stringify(active) && getConfigVersion(served) >= getConfigVersion(active)) {
+                            console.log(`Adopting the server's in-memory routing interpretation at init for ${this.getDebugName()} (deploy takeover in progress)`);
+                            active = served;
+                            for (let source of sources) {
+                                source.dispose();
+                            }
+                            sources = await this.buildSources(active);
+                        }
+                    }
+                }
+            } catch {
+                // The raw routing config we already adopted still works
+            }
             // The routing fetches double as our first latency measurements: variable-shard picking
             // works immediately, instead of waiting for the first ping pass to land
             for (let source of sources) {
@@ -241,13 +264,23 @@ export class ArchivesChain implements IArchives {
         }
     }
 
+    private async createChainSource(sourceConfig: HostedConfig | BackblazeConfig): Promise<SourceWrapper> {
+        let source = await SourceWrapper.create(sourceConfig);
+        // A takeover stamp change in a ping means the server's routing interpretation changed
+        // (deploy takeover started/ended); refresh so we learn within one ping interval
+        source.onServedConfigChanged = () => {
+            console.log(`Storage ${source.getDebugName()} advertised a routing change (deploy takeover); refreshing config for ${this.getDebugName()}`);
+            void this.refreshActiveConfig().catch((e: Error) => console.error(`Config refresh failed for ${this.getDebugName()}: ${e.stack ?? e}`));
+        };
+        // Latency (for variable-shard target preference) is tracked from initialization on
+        source.startPinging();
+        return source;
+    }
+
     private async buildSources(config: RemoteConfig): Promise<SourceWrapper[]> {
         let sources: SourceWrapper[] = [];
         for (let sourceConfig of config.sources.map(normalizeSource)) {
-            let source = await SourceWrapper.create(sourceConfig);
-            // Latency (for variable-shard target preference) is tracked from initialization on
-            source.startPinging();
-            sources.push(source);
+            sources.push(await this.createChainSource(sourceConfig));
         }
         return sources;
     }
@@ -320,9 +353,7 @@ export class ArchivesChain implements IArchives {
                 oldByConfig.delete(key);
                 sources.push(old);
             } else {
-                let source = await SourceWrapper.create(sourceConfig);
-                source.startPinging();
-                sources.push(source);
+                sources.push(await this.createChainSource(sourceConfig));
             }
         }
         // In-flight requests still hold the old wrappers and finish fine; dispose just stops any

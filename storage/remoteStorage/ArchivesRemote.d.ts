@@ -29,7 +29,9 @@ export declare class ArchivesRemote implements IArchives {
     private lastDeniedLog;
     getDebugName(): string;
     isConnected(): boolean;
-    ping(): Promise<void>;
+    ping(): Promise<{
+        takeover?: string;
+    }>;
     private authenticate;
     private callAuthed;
     waitingForAccess(): Promise<{

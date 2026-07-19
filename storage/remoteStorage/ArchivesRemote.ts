@@ -77,8 +77,8 @@ export class ArchivesRemote implements IArchives {
         return SocketFunction.isNodeConnected(this.nodeId);
     }
 
-    public async ping(): Promise<void> {
-        await this.controller.ping();
+    public async ping(): Promise<{ takeover?: string }> {
+        return await this.controller.ping();
     }
 
     private async authenticate(): Promise<void> {

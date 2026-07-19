@@ -176,6 +176,10 @@ export class SourceWrapper {
     private pings: number[] = [];
     private pingTimer: ReturnType<typeof setInterval> | undefined;
     private loggedConnected = false;
+    private lastTakeoverStamp: string | undefined;
+    /** Fired when the source's advertised takeover stamp changes (a deploy takeover started or
+     *  ended) - the chain refreshes its config, so connected clients learn within one ping. */
+    public onServedConfigChanged: (() => void) | undefined;
 
     /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
      *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
@@ -184,8 +188,9 @@ export class SourceWrapper {
         if (!remote || this.pingTimer || this.disposed) return;
         let measure = async () => {
             let start = Date.now();
+            let result: { takeover?: string } | undefined;
             try {
-                await remote.ping();
+                result = await remote.ping();
             } catch {
                 // A failed ping is also our earliest down-detection
                 this.noteFailure();
@@ -198,6 +203,11 @@ export class SourceWrapper {
             this.pings.push(Date.now() - start);
             if (this.pings.length > PING_HISTORY) {
                 this.pings.shift();
+            }
+            let stamp = result?.takeover;
+            if (stamp !== this.lastTakeoverStamp) {
+                this.lastTakeoverStamp = stamp;
+                this.onServedConfigChanged?.();
             }
         };
         void measure();

@@ -32,7 +32,9 @@ export type AccessState = {
     trustedMachines?: TrustRecord[];
 };
 export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
-    ping: () => Promise<void>;
+    ping: () => Promise<{
+        takeover?: string;
+    }>;
     authenticate: (token: AuthToken) => Promise<{
         machineId: string;
         ip: string;

@@ -392,6 +392,15 @@ export function applyDeployRemap(routing: RemoteConfig): RemoteConfig {
     return { version: routing.version, sources };
 }
 
+/** A stamp of the current remap interpretation, advertised in ping responses - so every connected
+ *  client learns of a takeover within one ping interval, instead of waiting for its config poll
+ *  or a write rejection. */
+export function getTakeoverStamp(): string | undefined {
+    let remap = current.remap;
+    if (!remap) return undefined;
+    return JSON.stringify(remap);
+}
+
 /** For the dying process: fast-write flush delays must never extend past this time, and after it
  *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
 export function getFlushDeadline(): number | undefined {

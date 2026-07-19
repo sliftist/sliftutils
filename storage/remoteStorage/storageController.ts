@@ -10,6 +10,7 @@ import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, IMMUTABLE_CACHE_TIME } from "../IArchives";
 import { ROUTING_FILE } from "./remoteConfig";
+import { getTakeoverStamp } from "./deployTakeover";
 import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
     deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
@@ -145,8 +146,12 @@ async function getBucket(account: string, bucketName: string): Promise<LoadedBuc
 }
 
 class RemoteStorageControllerBase {
-    // Latency measurement (see SourceWrapper's pinging); no auth, it measures the transport
-    async ping(): Promise<void> { }
+    // Latency measurement (see SourceWrapper's pinging); no auth, it measures the transport. The
+    // takeover stamp piggybacks on it so every connected client learns of a deploy takeover
+    // within one ping interval.
+    async ping(): Promise<{ takeover?: string }> {
+        return { takeover: getTakeoverStamp() };
+    }
 
     // Proves the caller owns the machine key for the machineId in its certificate. The signature
     // must be fresh and bound to this server, so it cannot be replayed to (or from) other servers.

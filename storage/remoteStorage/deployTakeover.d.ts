@@ -16,6 +16,10 @@ export declare function onTakeoverEvent(listener: (event: TakeoverEvent) => void
  *  of the deploy overlap points at the alternate port. Pure, in-memory only - the stored routing
  *  config is never modified, and this must never be applied to data that gets persisted. */
 export declare function applyDeployRemap(routing: RemoteConfig): RemoteConfig;
+/** A stamp of the current remap interpretation, advertised in ping responses - so every connected
+ *  client learns of a takeover within one ping interval, instead of waiting for its config poll
+ *  or a write rejection. */
+export declare function getTakeoverStamp(): string | undefined;
 /** For the dying process: fast-write flush delays must never extend past this time, and after it
  *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
 export declare function getFlushDeadline(): number | undefined;

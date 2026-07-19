@@ -2871,7 +2871,9 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         private lastDeniedLog;
         getDebugName(): string;
         isConnected(): boolean;
-        ping(): Promise<void>;
+        ping(): Promise<{
+            takeover?: string;
+        }>;
         private authenticate;
         private callAuthed;
         waitingForAccess(): Promise<{
@@ -3185,6 +3187,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         getDebugName(): string;
         private getState;
         private init;
+        private createChainSource;
         private buildSources;
         private startConfigPoll;
         private configRefreshInFlight;
@@ -3295,6 +3298,10 @@ declare module "sliftutils/storage/remoteStorage/deployTakeover" {
      *  of the deploy overlap points at the alternate port. Pure, in-memory only - the stored routing
      *  config is never modified, and this must never be applied to data that gets persisted. */
     export declare function applyDeployRemap(routing: RemoteConfig): RemoteConfig;
+    /** A stamp of the current remap interpretation, advertised in ping responses - so every connected
+     *  client learns of a takeover within one ping interval, instead of waiting for its config poll
+     *  or a write rejection. */
+    export declare function getTakeoverStamp(): string | undefined;
     /** For the dying process: fast-write flush delays must never extend past this time, and after it
      *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
     export declare function getFlushDeadline(): number | undefined;
@@ -3375,6 +3382,10 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         private pings;
         private pingTimer;
         private loggedConnected;
+        private lastTakeoverStamp;
+        /** Fired when the source's advertised takeover stamp changes (a deploy takeover started or
+         *  ended) - the chain refreshes its config, so connected clients learn within one ping. */
+        onServedConfigChanged: (() => void) | undefined;
         /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
          *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
         startPinging(): void;
@@ -3428,7 +3439,9 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         trustedMachines?: TrustRecord[];
     };
     export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
-        ping: () => Promise<void>;
+        ping: () => Promise<{
+            takeover?: string;
+        }>;
         authenticate: (token: AuthToken) => Promise<{
             machineId: string;
             ip: string;

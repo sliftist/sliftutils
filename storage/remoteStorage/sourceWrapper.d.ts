@@ -29,6 +29,10 @@ export declare class SourceWrapper {
     private pings;
     private pingTimer;
     private loggedConnected;
+    private lastTakeoverStamp;
+    /** Fired when the source's advertised takeover stamp changes (a deploy takeover started or
+     *  ended) - the chain refreshes its config, so connected clients learn within one ping. */
+    onServedConfigChanged: (() => void) | undefined;
     /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
      *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
     startPinging(): void;
