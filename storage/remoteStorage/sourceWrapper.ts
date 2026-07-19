@@ -80,7 +80,20 @@ export class SourceWrapper {
     }
 
     public getDebugName(): string {
-        return `source/${this.config.url}`;
+        // The same URL can appear as multiple sources (different routes / valid windows), so the
+        // distinguishing slice is part of the name
+        let parts: string[] = [];
+        let route = this.config.route;
+        if (route) {
+            parts.push(`route [${route[0]}, ${route[1]})`);
+        }
+        let [start, end] = this.config.validWindow;
+        if (start !== 0 || end !== Number.MAX_SAFE_INTEGER) {
+            let startText = start === 0 && "0" || new Date(start).toISOString();
+            let endText = end === Number.MAX_SAFE_INTEGER && "forever" || new Date(end).toISOString();
+            parts.push(`validWindow [${startText}, ${endText}]`);
+        }
+        return `source/${this.config.url}${parts.length && ` (${parts.join(", ")})` || ""}`;
     }
 
     public isConnected(): boolean {
@@ -93,7 +106,7 @@ export class SourceWrapper {
     public noteFailure(): void {
         if (!this.background || this.disposed || this.reconnectRunning) return;
         if (this.isConnected()) return;
-        console.error(`Cannot connect to storage source ${this.config.url}`);
+        console.error(`Cannot connect to storage ${this.getDebugName()}`);
         this.reconnectRunning = true;
         void this.reconnectLoop();
     }
@@ -114,12 +127,12 @@ export class SourceWrapper {
             } catch (e) {
                 // Even a failing call (e.g. access denied) proves the connection is back
                 if (this.isConnected()) break;
-                console.warn(`Cannot connect to storage source ${this.config.url}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).stack ?? e}`);
+                console.warn(`Cannot connect to storage ${this.getDebugName()}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).stack ?? e}`);
             }
             retryDelay = Math.min(RETRY_MAX_DELAY, retryDelay * RETRY_GROWTH);
         }
         this.reconnectRunning = false;
-        console.log(`Reconnected to storage source ${this.config.url}`);
+        console.log(`Reconnected to storage ${this.getDebugName()}`);
     }
 
     // For hosted sources: cached access check, so reads know whether to use the API or the public
@@ -180,7 +193,7 @@ export class SourceWrapper {
             }
             if (!this.loggedConnected) {
                 this.loggedConnected = true;
-                console.log(`Connected to storage source ${this.config.url} (${Date.now() - start}ms)`);
+                console.log(`Connected to storage ${this.getDebugName()} (${Date.now() - start}ms)`);
             }
             this.pings.push(Date.now() - start);
             if (this.pings.length > PING_HISTORY) {
@@ -192,6 +205,14 @@ export class SourceWrapper {
             void measure();
         }, PING_INTERVAL);
         (this.pingTimer as { unref?: () => void }).unref?.();
+    }
+
+    /** Seeds the latency estimate before the first ping lands (e.g. from the initial routing
+     *  fetch), so variable-shard picking has something immediately. Real pings take over from the
+     *  first measurement on. */
+    public seedLatency(ms: number): void {
+        if (this.pings.length) return;
+        this.pings.push(ms);
     }
 
     /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our

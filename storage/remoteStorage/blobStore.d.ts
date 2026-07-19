@@ -169,6 +169,7 @@ export declare class BlobStore implements IBucketStore {
     cancelLargeUpload(id: string): Promise<void>;
     private flushOverlay;
     private evicting;
+    private loggedFlushDeadline;
     private enforceDiskLimit;
     private cleanupTombstones;
 }

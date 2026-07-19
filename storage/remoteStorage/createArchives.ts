@@ -133,11 +133,12 @@ export class ArchivesChain implements IArchives {
         // that answered (the first up source is authoritative).
         let fetches = await Promise.all(configs.map(async sourceConfig => {
             let probe = await SourceWrapper.create(sourceConfig, { background: false });
+            let start = Date.now();
             try {
                 let data = await probe.read(archives => archives.get(ROUTING_FILE));
-                return { probe, sourceConfig, responded: true, existing: data && parseRoutingData(data) || undefined, error: "" };
+                return { probe, sourceConfig, responded: true, latency: Date.now() - start, existing: data && parseRoutingData(data) || undefined, error: "" };
             } catch (e) {
-                return { probe, sourceConfig, responded: false, existing: undefined, error: `${sourceConfig.url}: ${(e as Error).stack ?? e}` };
+                return { probe, sourceConfig, responded: false, latency: 0, existing: undefined, error: `${sourceConfig.url}: ${(e as Error).stack ?? e}` };
             }
         }));
         try {
@@ -222,6 +223,14 @@ export class ArchivesChain implements IArchives {
                     }
                 }
             }
+            // The routing fetches double as our first latency measurements: variable-shard picking
+            // works immediately, instead of waiting for the first ping pass to land
+            for (let source of sources) {
+                let fetch = fetches.find(x => x.responded && x.sourceConfig.url === source.config.url);
+                if (fetch) {
+                    source.seedLatency(fetch.latency);
+                }
+            }
             this.activeConfig = active;
             this.startConfigPoll();
             return { config: active, sources };
@@ -295,7 +304,13 @@ export class ArchivesChain implements IArchives {
 
     private async adoptNewConfig(state: ChainState, latest: RemoteConfig): Promise<void> {
         if (JSON.stringify(latest) === JSON.stringify(state.config)) return;
-        console.log(`Storage routing config changed for ${this.getDebugName()}, rebuilding sources`);
+        // Same version but different content is a deploy switchover remap (an in-memory window
+        // split pointing at a successor's port), not an actual configuration change
+        if (getConfigVersion(latest) === getConfigVersion(state.config)) {
+            console.log(`Storage routing reinterpreted at version ${getConfigVersion(latest)} for ${this.getDebugName()} (deploy switchover in progress), rebuilding sources. Sources: ${JSON.stringify(latest.sources)}`);
+        } else {
+            console.log(`Storage routing config changed for ${this.getDebugName()} (version ${getConfigVersion(state.config)} -> ${getConfigVersion(latest)}), rebuilding sources`);
+        }
         let oldByConfig = new Map(state.sources.map(source => [JSON.stringify(source.config), source]));
         let sources: SourceWrapper[] = [];
         for (let sourceConfig of latest.sources.map(normalizeSource)) {
@@ -342,6 +357,7 @@ export class ArchivesChain implements IArchives {
             // Init is failing; its own retry loop handles that
             return;
         }
+        console.log(`Every storage source failed for ${this.getDebugName()}; re-contacting all ${state.sources.length} sources (routing re-read + connection re-attempt)`);
         let results = await Promise.all(state.sources.map(async source => {
             try {
                 let data = await source.read(archives => archives.get(ROUTING_FILE));
@@ -456,12 +472,14 @@ export class ArchivesChain implements IArchives {
             let now = Date.now();
             let nearBoundary = state.sources.some(source => source.config.validWindow.some(t => t > 0 && t < Number.MAX_SAFE_INTEGER && Math.abs(t - now) <= WRONG_TARGET_BOUNDARY_WINDOW));
             if (nearBoundary) {
+                console.log(`Write rejected by ${this.getDebugName()}: raced a valid window boundary; waiting ${WRONG_TARGET_BOUNDARY_RETRY_DELAY / 1000}s and retrying`);
                 await delay(WRONG_TARGET_BOUNDARY_RETRY_DELAY);
                 return;
             }
         }
         if (Date.now() - this.lastConfigRefresh < CONFIG_REFRESH_THROTTLE) return;
         this.lastConfigRefresh = Date.now();
+        console.log(`Write rejected by ${this.getDebugName()} (wrong ${kind}): our config is stale (likely a deploy switchover); refreshing it and retrying`);
         await this.refreshActiveConfig();
     }
 
@@ -665,6 +683,7 @@ export class ArchivesChain implements IArchives {
                     // NOTE: If we run into cases when transport level errors happen, but we are still connected, then we might want to add additional checking here, additional errors in which we will retry the other targets. However, ideally, checking if the WebSocket connection is still connected will handle all those cases. Distinguishing between application errors (which we can't retry) and transport errors.
                     if (target.isConnected()) throw e;
                     target.noteFailure();
+                    console.log(`Variable-shard write target ${target.getDebugName()} is down; moving to the next-lowest-latency shard`);
                     errors.push(String((e as Error).stack ?? e));
                 }
             }

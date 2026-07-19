@@ -674,6 +674,10 @@ export class BlobStore implements IBucketStore {
             let deadline = this.config?.getFlushDeadline?.();
             if (deadline !== undefined) {
                 if (Date.now() >= deadline) {
+                    if (!this.loggedFlushDeadline) {
+                        this.loggedFlushDeadline = true;
+                        console.log(`Deploy switchover flush deadline passed (store ${this.folder}): fast writes now write through immediately`);
+                    }
                     this.overlay.delete(key);
                     await this.writeToSources(key, data, writeTime);
                     return key;
@@ -854,11 +858,14 @@ export class BlobStore implements IBucketStore {
     // holds a same-or-newer copy (the only copy of a file is never deleted), and the index entry
     // repoints to that source so reads keep working (re-caching on the next read).
     private evicting = false;
+    private loggedFlushDeadline = false;
     private async enforceDiskLimit(): Promise<void> {
         let limit = this.config?.readerDiskLimit;
         if (!limit || this.evicting) return;
         if (this.sourceByteCounts[0] <= limit) return;
         this.evicting = true;
+        let evictedFiles = 0;
+        let evictedBytes = 0;
         try {
             let candidates: { key: string; entry: IndexEntry }[] = [];
             for (let [key, entry] of this.mem) {
@@ -885,9 +892,14 @@ export class BlobStore implements IBucketStore {
                 if (holder === undefined) continue;
                 await this.sources[0].source.del(key);
                 this.setIndexEntry(key, { writeTime: entry.writeTime, size: entry.size, source: holder });
+                evictedFiles++;
+                evictedBytes += entry.size;
             }
         } finally {
             this.evicting = false;
+            if (evictedFiles) {
+                console.log(`Disk cache over readerDiskLimit (store ${this.folder}): evicted ${evictedFiles} least-recently-used files (${formatNumber(evictedBytes)}B), now at ${formatNumber(this.sourceByteCounts[0])}B/${formatNumber(this.config?.readerDiskLimit || 0)}B`);
+            }
         }
     }
 

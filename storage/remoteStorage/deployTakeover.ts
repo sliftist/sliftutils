@@ -20,7 +20,6 @@ import { parseHostedUrl, replaceHostedUrlPort } from "./remoteConfig";
 // any point during a switchover.
 
 const PARAMETERS_TIMELINE_FILE_REGEX = /^(\d+)-parameters\.json$/;
-const ALIVE_WINDOW_FOREVER = Number.MAX_SAFE_INTEGER;
 const TIMELINE_POLL_INTERVAL = 60 * 1000;
 // Processes listening on an alternate port register it here (sibling of the storage folder), keyed
 // by their actual pid; content includes their ancestor pids so the timeline entry pid (a shell
@@ -42,8 +41,10 @@ const REMAP_EXPIRE_FRACTION = 2;
 
 type TimelineEntry = {
     pid?: number;
-    aliveWindow: [number, number];
-    parameters: unknown;
+    // releaseTime + overlapTime define everything: the newer entry's releaseTime is when it
+    // starts, and releaseTime + overlapTime is when the older one is killed (freeing the port).
+    // The files also carry an aliveWindow, which is deliberately ignored.
+    parameters: { releaseTime?: number; overlapTime?: number };
 };
 
 type TakeoverComputed = {
@@ -67,6 +68,8 @@ let current: TakeoverComputed = {};
 let currentKey = JSON.stringify(current);
 let eventListeners: ((event: TakeoverEvent) => void)[] = [];
 let eventTimers: ReturnType<typeof setTimeout>[] = [];
+let loggedNoMatch = false;
+let loggedIdentity = false;
 
 function execText(command: string): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -103,20 +106,10 @@ async function getAncestorPids(): Promise<Set<number>> {
     return pids;
 }
 
-async function findTimelineFolder(): Promise<string | undefined> {
-    let dir = process.cwd();
-    while (true) {
-        let files: string[] = [];
-        try {
-            files = await fs.promises.readdir(dir);
-        } catch { }
-        if (files.some(file => PARAMETERS_TIMELINE_FILE_REGEX.test(file))) {
-            return dir.replaceAll("\\", "/") + "/";
-        }
-        let parent = path.dirname(dir);
-        if (parent === dir) return undefined;
-        dir = parent;
-    }
+// The instance folder is ALWAYS the parent of our cwd (services run in <instance>/git/) - never
+// search for it, a walk could latch onto the wrong folder
+function getTimelineFolder(): string {
+    return path.dirname(process.cwd()).replaceAll("\\", "/") + "/";
 }
 
 function pidAlive(pid: number): boolean {
@@ -211,8 +204,11 @@ function scheduleEvents(): void {
     };
     let remap = current.remap;
     if (remap) {
+        let altPort = remap.altPort;
         schedule(remap.boundaryA - SWITCH_SCAN_LEAD, () => emit("diskScan"));
+        schedule(remap.boundaryA, () => console.log(`Deploy switchover write handoff boundary passed: fresh writes now belong to the alternate-port side (port ${altPort})`));
         schedule(remap.boundaryA + SWITCH_SCAN_LEAD, () => emit("diskScan"));
+        schedule(remap.boundaryB, () => console.log(`Deploy switchover second boundary passed: fresh writes return to the main port`));
         schedule(remap.expire, () => void recompute().catch((e: Error) => console.error(`Deploy takeover recompute failed: ${e.stack ?? e}`)));
     }
 }
@@ -228,26 +224,42 @@ async function recompute(): Promise<void> {
             us = entry;
         }
     }
+    // Matching failures must be loud, or takeover detection fails silently forever
+    if (!us && entries.length && !loggedNoMatch) {
+        loggedNoMatch = true;
+        console.warn(`No deploy timeline entry matches our pid chain (${[...ancestorPids].join(", ")}) - takeover detection cannot work. Entries: ${entries.map(x => `pid=${x.pid ?? "none"} releaseTime=${x.parameters.releaseTime}`).join(" | ")}`);
+    }
+    if (us && !loggedIdentity) {
+        loggedIdentity = true;
+        console.log(`Deploy timeline entry matched: we are pid=${us.pid}, releaseTime=${us.parameters.releaseTime !== undefined && iso(us.parameters.releaseTime) || "unknown"}, ${entries.length} entries total`);
+    }
     let computed: TakeoverComputed = {};
-    if (us) {
-        let usStart = us.aliveWindow[0];
-        let next: TimelineEntry | undefined;
-        let prev: TimelineEntry | undefined;
+    let usRelease = us?.parameters.releaseTime;
+    if (us && usRelease !== undefined) {
+        // The newer entry's releaseTime is when it starts; releaseTime + overlapTime is when the
+        // older one is killed. That's the whole timeline.
+        let next: { entry: TimelineEntry; release: number } | undefined;
+        let prev: { entry: TimelineEntry; release: number } | undefined;
         for (let entry of entries) {
             if (entry === us) continue;
-            if (entry.aliveWindow[0] > usStart && (!next || entry.aliveWindow[0] < next.aliveWindow[0])) {
-                next = entry;
+            let release = entry.parameters.releaseTime;
+            if (release === undefined) continue;
+            if (release > usRelease && (!next || release < next.release)) {
+                next = { entry, release };
             }
-            if (entry.aliveWindow[0] < usStart && (!prev || entry.aliveWindow[0] > prev.aliveWindow[0])) {
-                prev = entry;
+            if (release < usRelease && (!prev || release > prev.release)) {
+                prev = { entry, release };
             }
         }
-        if (next && us.aliveWindow[1] !== ALIVE_WINDOW_FOREVER && next.aliveWindow[0] <= us.aliveWindow[1]) {
-            let overlap = us.aliveWindow[1] - next.aliveWindow[0];
-            let successorStart = next.aliveWindow[0];
+        if (next) {
+            let successorStart = next.release;
+            let overlap = next.entry.parameters.overlapTime || us.parameters.overlapTime || 0;
+            // Even a ZERO-overlap deploy needs the dying behaviors - draining fast-write flushes
+            // by the release and writing through after it, or acknowledged data dies with us.
+            // Only the remap (the alternate-port middle window) needs an actual overlap.
+            computed.dying = { successorStart, overlap };
             if (overlap > 0 && now < successorStart + overlap * REMAP_EXPIRE_FRACTION) {
-                computed.dying = { successorStart, overlap };
-                const successorPid = next.pid;
+                const successorPid = next.entry.pid;
                 if (successorPid) {
                     let successorEntry = registry.find(x => x.ancestorPids.includes(successorPid));
                     if (successorEntry) {
@@ -256,21 +268,43 @@ async function recompute(): Promise<void> {
                 }
             }
         }
-        if (prev && prev.aliveWindow[1] > usStart) {
-            let overlap = prev.aliveWindow[1] - usStart;
-            computed.predecessorEnd = prev.aliveWindow[1];
-            if (overlap > 0 && ourAltPort && now < usStart + overlap * REMAP_EXPIRE_FRACTION && !computed.remap) {
-                computed.remap = makeRemap(usStart, overlap, ourAltPort);
+        if (prev) {
+            let overlap = us.parameters.overlapTime || prev.entry.parameters.overlapTime || 0;
+            // The predecessor holds the main port until OUR release + the overlap
+            computed.predecessorEnd = usRelease + overlap;
+            if (overlap > 0 && ourAltPort && now < usRelease + overlap * REMAP_EXPIRE_FRACTION && !computed.remap) {
+                computed.remap = makeRemap(usRelease, overlap, ourAltPort);
             }
         }
     }
     let key = JSON.stringify(computed);
     if (key === currentKey) return;
+    logTransitions(current, computed);
     current = computed;
     currentKey = key;
-    console.log(`Deploy takeover state changed: ${key}`);
     scheduleEvents();
     emit("remapChanged");
+}
+
+function iso(time: number): string {
+    return new Date(time).toISOString();
+}
+
+// The switchover lifecycle is rare and important, so every stage gets a clear line
+function logTransitions(prev: TakeoverComputed, next: TakeoverComputed): void {
+    if (!prev.dying && next.dying) {
+        let { successorStart, overlap } = next.dying;
+        console.log(`Deploy switchover scheduled: our successor starts at ${iso(successorStart)}; fast-write flushes drain by ${iso(successorStart + overlap * FLUSH_DEADLINE_FRACTION)}, fresh writes hand off at ${iso(successorStart + overlap * BOUNDARY_A_FRACTION)}, and we are killed at ${iso(successorStart + overlap)}`);
+    }
+    if (!prev.predecessorEnd && next.predecessorEnd) {
+        console.log(`We are a deploy successor: our predecessor holds the main port until ${iso(next.predecessorEnd)}`);
+    }
+    if (!prev.remap && next.remap) {
+        console.log(`Deploy switchover remap active: sources pointing at us are split so [${iso(next.remap.boundaryA)} .. ${iso(next.remap.boundaryB)}] routes to alternate port ${next.remap.altPort} (remap expires at ${iso(next.remap.expire)})`);
+    }
+    if (prev.remap && !next.remap) {
+        console.log(`Deploy switchover remap ended; running on the plain stored routing config`);
+    }
 }
 
 /** Starts the takeover machinery. Port fallback (alternate port + registry + acquisition polling)
@@ -279,8 +313,13 @@ async function recompute(): Promise<void> {
 export async function initDeployTakeover(config: { domain: string; mainPort: number; storageFolder: string }): Promise<void> {
     initialized = config;
     ancestorPids = await getAncestorPids();
-    timelineFolder = await findTimelineFolder();
-    if (!timelineFolder) return;
+    timelineFolder = getTimelineFolder();
+    let entries = await readTimelineEntries();
+    if (!entries.length) {
+        console.log(`No deploy timeline entries in ${timelineFolder}; deploy takeover inactive until they appear (port fallback still works)`);
+    } else {
+        console.log(`Deploy timeline found at ${timelineFolder} (${entries.length} entries); our pid chain: ${[...ancestorPids].join(" -> ")}`);
+    }
     await recompute();
     let poll = setInterval(() => {
         void recompute().catch((e: Error) => console.error(`Deploy takeover recompute failed: ${e.stack ?? e}`));

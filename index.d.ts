@@ -3155,6 +3155,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         cancelLargeUpload(id: string): Promise<void>;
         private flushOverlay;
         private evicting;
+        private loggedFlushDeadline;
         private enforceDiskLimit;
         private cleanupTombstones;
     }
@@ -3377,6 +3378,10 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
          *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
         startPinging(): void;
+        /** Seeds the latency estimate before the first ping lands (e.g. from the initial routing
+         *  fetch), so variable-shard picking has something immediately. Real pings take over from the
+         *  first measurement on. */
+        seedLatency(ms: number): void;
         /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our
          *  own in-process server, which is the best possible target (0). */
         getLatency(): number;

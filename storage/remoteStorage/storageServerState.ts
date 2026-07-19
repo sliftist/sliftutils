@@ -223,7 +223,7 @@ function scheduleWindowBoundaryRebuild(loaded: LoadedBucket): void {
                 scheduleWindowBoundaryRebuild(loaded);
                 return;
             }
-            await scheduleRoutingReload(loaded.account, loaded.bucketName, { force: true });
+            await scheduleRoutingReload(loaded.account, loaded.bucketName, { force: true, reason: "a valid window boundary passed" });
         })();
     }, Math.min(nextBoundary - now + REBUILD_BOUNDARY_BUFFER, MAX_REBUILD_TIMER_DELAY));
     (timer as { unref?: () => void }).unref?.();
@@ -322,16 +322,16 @@ export function getLoadedBucket(account: string, bucketName: string): Promise<Lo
 // Routing reloads are serialized per bucket, so concurrent writes/syncs can't rebuild the same
 // store twice in parallel
 const routingReloads = new Map<string, Promise<void>>();
-function scheduleRoutingReload(account: string, bucketName: string, config?: { force?: boolean }): Promise<void> {
+function scheduleRoutingReload(account: string, bucketName: string, config?: { force?: boolean; reason?: string }): Promise<void> {
     let key = `${account}/${bucketName}`;
     let next = (routingReloads.get(key) || Promise.resolve())
-        .then(() => checkRoutingChanged(account, bucketName, config?.force))
+        .then(() => checkRoutingChanged(account, bucketName, config))
         .catch(e => console.error(`Reloading routing config for bucket ${key} failed:`, e));
     routingReloads.set(key, next);
     return next;
 }
 
-async function checkRoutingChanged(account: string, bucketName: string, force?: boolean): Promise<void> {
+async function checkRoutingChanged(account: string, bucketName: string, config?: { force?: boolean; reason?: string }): Promise<void> {
     let key = `${account}/${bucketName}`;
     let loaded = await buckets.get(key);
     if (!loaded) return;
@@ -340,9 +340,9 @@ async function checkRoutingChanged(account: string, bucketName: string, force?: 
     let data = await loaded.store.get(ROUTING_FILE);
     if (!data) return;
     let routing = parseRoutingData(data);
-    if (!force && JSON.stringify(routing) === loaded.routingJSON) return;
-    if (force) {
-        console.log(`Rebuilding the store for bucket ${key} (a valid window boundary passed)`);
+    if (!config?.force && JSON.stringify(routing) === loaded.routingJSON) return;
+    if (config?.force) {
+        console.log(`Rebuilding the store for bucket ${key} (${config.reason || "forced"})`);
     } else {
         console.log(`Routing config changed for bucket ${key}, rebuilding its store`);
     }
@@ -366,6 +366,16 @@ export async function assertMutable(bucket: LoadedBucket, filePath: string, writ
     if (await bucket.store.getInfo(filePath)) {
         throw new Error(`Bucket ${bucket.account}/${bucket.bucketName} is immutable (at write time ${writeTime}) and ${JSON.stringify(filePath)} already exists, so it cannot be written to`);
     }
+}
+
+// Wrong-target rejections are rare and important (they ARE the switchover handoff), but a burst of
+// racing writes at a boundary must not flood the log - so at most one line a minute
+const WRONG_TARGET_LOG_THROTTLE = 60 * 1000;
+let lastWrongTargetLog = 0;
+function logWrongTargetRejection(message: string): void {
+    if (Date.now() - lastWrongTargetLog < WRONG_TARGET_LOG_THROTTLE) return;
+    lastWrongTargetLog = Date.now();
+    console.log(message);
 }
 
 // Routing writes are serialized per bucket, so two concurrent creates can't both build a store
@@ -421,9 +431,11 @@ export async function writeBucketFile(account: string, bucketName: string, fileP
     if (!config?.lastModified && loaded.selfEntries.length) {
         let timeValid = loaded.selfEntries.filter(x => writeTime >= x.validWindow[0] - WRITE_PAST_WINDOW_GRACE && writeTime <= x.validWindow[1] + WRITE_PAST_WINDOW_GRACE);
         if (!timeValid.length) {
+            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: outside our valid windows (a switchover moved the write target)`);
             throw new Error(`${STORAGE_WRONG_VALID_WINDOW} This server is not a valid write target at ${writeTime} for bucket ${account}/${bucketName} (our valid windows: ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))}). Re-resolve the currently valid source and retry.`);
         }
         if (!timeValid.some(x => routeContains(x.route, route))) {
+            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: route ${route} is not ours (the client's shard config is stale)`);
             throw new Error(`${STORAGE_WRONG_ROUTE} This server does not handle route ${route} (key ${JSON.stringify(filePath)}) for bucket ${account}/${bucketName} (our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}). Re-resolve the source for this key and retry.`);
         }
     }
@@ -448,11 +460,12 @@ export function getBucketConfig(bucket: LoadedBucket): ArchivesConfig {
 export async function rebuildAllLoadedBuckets(): Promise<void> {
     for (let key of [...buckets.keys()]) {
         let slash = key.indexOf("/");
-        await scheduleRoutingReload(key.slice(0, slash), key.slice(slash + 1), { force: true });
+        await scheduleRoutingReload(key.slice(0, slash), key.slice(slash + 1), { force: true, reason: "deploy takeover state changed" });
     }
 }
 
 export async function rescanAllLoadedBucketDisks(): Promise<void> {
+    console.log(`Deploy switchover disk rescan starting (${buckets.size} loaded buckets) - catching files the other process wrote`);
     for (let loadedPromise of [...buckets.values()]) {
         let loaded = await loadedPromise.catch(() => undefined);
         if (!loaded) continue;
