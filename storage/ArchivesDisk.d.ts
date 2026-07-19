@@ -20,7 +20,7 @@ export declare class ArchivesDisk implements IArchives {
     private filePath;
     set(key: string, data: Buffer, config?: {
         lastModified?: number;
-    }): Promise<void>;
+    }): Promise<string>;
     del(key: string): Promise<void>;
     get(key: string, config?: {
         range?: {

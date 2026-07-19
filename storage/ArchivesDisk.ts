@@ -144,7 +144,7 @@ export class ArchivesDisk implements IArchives {
         return result;
     }
 
-    public async set(key: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    public async set(key: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
         await this.init();
         let lastModified = config?.lastModified;
         if (lastModified) {
@@ -165,6 +165,7 @@ export class ArchivesDisk implements IArchives {
                 await handle.utimes(new Date(lastModified), new Date(lastModified));
             }
         });
+        return key;
     }
 
     public async del(key: string): Promise<void> {

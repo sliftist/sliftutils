@@ -17,9 +17,19 @@ export declare class ArchivesChain implements IArchives {
     private init;
     private buildSources;
     private startConfigPoll;
+    private configRefreshInFlight;
+    private refreshActiveConfig;
+    private fetchLatestConfig;
     private checkForNewConfig;
+    private adoptNewConfig;
+    private lastAvailabilityRecheck;
+    private availabilityRecheckInFlight;
+    private recheckAvailability;
+    private recheckAvailabilityNow;
     private run;
     private runWrite;
+    private lastConfigRefresh;
+    private prepareWrongTargetRetry;
     private request;
     waitingForAccess(): Promise<{
         link: string;
@@ -47,7 +57,7 @@ export declare class ArchivesChain implements IArchives {
         size: number;
     } | undefined>;
     private selectCoveringSources;
-    private runOnApi;
+    private runOnCovering;
     find(prefix: string, config?: {
         shallow?: boolean;
         type: "files" | "folders";
@@ -62,20 +72,14 @@ export declare class ArchivesChain implements IArchives {
     /** True only when EVERY write-receiving source would accept our writes (partial write access
      *  desynchronizes sources, so it counts as no access). */
     hasWriteAccess(): Promise<boolean>;
-    private assertNotBareVariableShard;
+    /** Returns the full key written. Plain keys come back unchanged; keys containing VARIABLE_SHARD
+     *  are automatically materialized (a shard value is picked and embedded, see setVariableShard)
+     *  and the caller needs the returned key to ever read the value back. */
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;
-    }): Promise<void>;
-    del(fileName: string): Promise<void>;
-    /** Writes a key containing the VARIABLE_SHARD sentinel: picks the lowest-latency up write
-     *  shard, materializes the key with a random value inside that shard's route, writes it, and
-     *  returns the FULL key actually written (the caller needs it to ever read the value back).
-     *  Unlike normal writes this CAN move to another shard when the preferred one is down (error +
-     *  socket down, same rule as reads) - each shard receives a different key, so write
-     *  consistency is preserved. */
-    setVariableShard(key: string, data: Buffer, config?: {
-        lastModified?: number;
     }): Promise<string>;
+    del(fileName: string): Promise<void>;
+    private setVariableShard;
     setLargeFile(config: {
         path: string;
         getNextData(): Promise<Buffer | undefined>;

@@ -11,6 +11,7 @@ import {
     WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
+import { applyDeployRemap, getFlushDeadline, onTakeoverEvent } from "./deployTakeover";
 import { createApiArchives } from "./createArchives";
 import type { IStorage } from "../IStorage";
 import type { AccessRequest, TrustRecord } from "./storageController";
@@ -157,6 +158,13 @@ function getBucketFolder(account: string, bucketName: string): string {
     return path.join(getStorageServerConfig().folder, "buckets2", account, bucketName);
 }
 
+// Ports we are listening on beyond the main config port - a deploy-takeover successor serves on a
+// temporary alternate port, and must recognize alternate-port source URLs as itself
+const extraListenPorts = new Set<number>();
+export function addExtraListenPort(port: number): void {
+    extraListenPorts.add(port);
+}
+
 function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[] {
     let { domain, port } = getStorageServerConfig();
     let indexes: number[] = [];
@@ -164,7 +172,7 @@ function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: str
         let source = routing.sources[i];
         if (typeof source === "string" || source.type !== "remote") continue;
         let parsed = parseHostedUrl(source.url);
-        if (parsed.address === domain && parsed.port === port && parsed.account === account && parsed.bucketName === bucketName) {
+        if (parsed.address === domain && (parsed.port === port || extraListenPorts.has(parsed.port)) && parsed.account === account && parsed.bucketName === bucketName) {
             indexes.push(i);
         }
     }
@@ -223,12 +231,17 @@ function scheduleWindowBoundaryRebuild(loaded: LoadedBucket): void {
 
 function buildBucket(account: string, bucketName: string, routing: RemoteConfig): LoadedBucket {
     let folder = getBucketFolder(account, bucketName);
-    let selfIndexes = findSelfIndexes(routing, account, bucketName);
-    let selfEntries = selfIndexes.map(i => routing.sources[i] as HostedConfig);
+    // The deploy-takeover remap is an INTERPRETATION overlay: everything behavioral (self entries,
+    // windows, downstream sources) uses the remapped view, while loaded.routing/routingJSON stay
+    // the STORED config - so version guards, change detection, and synchronization never see (or
+    // persist) the remap
+    let effective = applyDeployRemap(routing);
+    let selfIndexes = findSelfIndexes(effective, account, bucketName);
+    let selfEntries = selfIndexes.map(i => effective.sources[i] as HostedConfig);
     let self = selectEntryAt(selfEntries, Date.now());
     let selfIndex = -1;
     if (self) {
-        selfIndex = routing.sources.indexOf(self);
+        selfIndex = effective.sources.indexOf(self);
     }
     let store: IBucketStore;
     if (self?.rawDisk) {
@@ -251,8 +264,8 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig)
         if (selfIndex === -1) {
             console.log(`This server is not in the routing config for bucket ${account}/${bucketName}; keeping its data on disk but no longer synchronizing it`);
         } else {
-            for (let i = selfIndex + 1; i < routing.sources.length; i++) {
-                let source = routing.sources[i];
+            for (let i = selfIndex + 1; i < effective.sources.length; i++) {
+                let source = effective.sources[i];
                 if (typeof source === "string" || ownIndexes.has(i)) continue;
                 // Disjoint-shard sources never talk to each other; a partial overlap syncs only
                 // the intersection (scans ignore the rest, writes only send matching keys)
@@ -271,6 +284,7 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig)
                 void scheduleRoutingReload(account, bucketName);
             },
             readerDiskLimit: self?.readerDiskLimit,
+            getFlushDeadline,
         });
     }
     let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store };
@@ -421,13 +435,45 @@ export function getBucketConfig(bucket: LoadedBucket): ArchivesConfig {
     let progress = bucket.store.getSyncProgress?.();
     return {
         supportsChangesAfter: !!bucket.store.getChangesAfter,
-        remoteConfig: bucket.routing,
+        // The remapped (interpretation) view: getConfig is how clients learn of an in-progress
+        // deploy takeover, since the remap is never written into the routing file itself
+        remoteConfig: applyDeployRemap(bucket.routing),
         index: progress?.index,
         indexSources: progress?.sources,
         readerDiskLimit: progress?.readerDiskLimit,
         syncing: progress?.syncing,
     };
 }
+
+export async function rebuildAllLoadedBuckets(): Promise<void> {
+    for (let key of [...buckets.keys()]) {
+        let slash = key.indexOf("/");
+        await scheduleRoutingReload(key.slice(0, slash), key.slice(slash + 1), { force: true });
+    }
+}
+
+export async function rescanAllLoadedBucketDisks(): Promise<void> {
+    for (let loadedPromise of [...buckets.values()]) {
+        let loaded = await loadedPromise.catch(() => undefined);
+        if (!loaded) continue;
+        let store = loaded.store;
+        if (!(store instanceof BlobStore)) continue;
+        try {
+            await store.rescanBase();
+        } catch (e) {
+            console.error(`Deploy switchover disk rescan failed for bucket ${loaded.account}/${loaded.bucketName}: ${(e as Error).stack ?? e}`);
+        }
+    }
+}
+
+onTakeoverEvent(event => {
+    if (event === "remapChanged") {
+        void rebuildAllLoadedBuckets();
+    }
+    if (event === "diskScan") {
+        void rescanAllLoadedBucketDisks();
+    }
+});
 
 export type ServerBucketInfo = {
     bucketName: string;
@@ -512,8 +558,9 @@ class ArchivesLocalBucket implements IArchives {
         if (!bucket) return undefined;
         return await bucket.store.get2(fileName, config);
     }
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
         await writeBucketFile(this.account, this.bucketName, fileName, data, config);
+        return fileName;
     }
     public async del(fileName: string): Promise<void> {
         await deleteBucketFile(this.account, this.bucketName, fileName);

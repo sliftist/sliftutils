@@ -2,7 +2,7 @@ import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll, delay } from "socket-function/src/batching";
 import { timeInMinute, sort, promiseObj } from "socket-function/src/misc";
-import { formatNumber } from "socket-function/src/formatting/format";
+import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import {
     IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, assertValidLastModified,
     windowAcceptsWrites, SyncActivity,
@@ -44,6 +44,9 @@ const DISK_LIMIT_CHECK_INTERVAL = 1000 * 60;
 // Full syncs download this many files concurrently (high-latency sources like backblaze would
 // otherwise crawl one round-trip at a time)
 const FULL_SYNC_PARALLEL = 8;
+// A full sync running longer than this is console.errored (and again every interval after), so a
+// sync that will take days is loud instead of a quiet console.log every minute
+const FULL_SYNC_SLOW_ERROR_INTERVAL = 1000 * 60 * 60;
 
 export type WriteConfig = {
     // Resolve once the write is in memory; flush to the sources after writeDelay, coalescing
@@ -60,7 +63,7 @@ export type WriteConfig = {
 export type IBucketStore = {
     get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined>;
     get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
-    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
+    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
     del(fileName: string, config?: WriteConfig): Promise<void>;
     getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined>;
     findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]>;
@@ -127,6 +130,10 @@ export class BlobStore implements IBucketStore {
             onIndexChanged?: (key: string) => void;
             // LRU-bound the disk (base source) to this many bytes; see CommonConfig.readerDiskLimit
             readerDiskLimit?: number;
+            // Deploy takeover: fast-write flush delays never extend past this time, and after it
+            // fast writes flush immediately (nothing may sit in memory when the write window
+            // transfers to the successor process)
+            getFlushDeadline?: () => number | undefined;
         }
     ) { }
 
@@ -229,6 +236,13 @@ export class BlobStore implements IBucketStore {
         this.countEntry(existing, -1);
         this.mem.delete(key);
         this.dirty.set(key, undefined);
+    }
+
+    /** Rescans our own disk's metadata into the index - used around deploy switchovers, where the
+     *  other process wrote files to the shared folder that our index hasn't seen. */
+    public async rescanBase(): Promise<void> {
+        await this.init();
+        await this.scanSource(0);
     }
 
     /** The cheap always-current totals plus any in-progress background synchronization. */
@@ -478,6 +492,20 @@ export class BlobStore implements IBucketStore {
         };
         let progressTimer = setInterval(logProgress, SYNC_PROGRESS_LOG_INTERVAL);
         (progressTimer as { unref?: () => void }).unref?.();
+        let slowErrorTimer = setInterval(() => {
+            let elapsed = Date.now() - activity.startTime;
+            let doneFiles = activity.doneFiles || 0;
+            let doneBytes = activity.doneBytes || 0;
+            let bytesPerSecond = doneBytes / (elapsed / 1000);
+            let remainingBytes = totalBytes - doneBytes;
+            let etaText = "unknown (no bytes transferred yet)";
+            if (bytesPerSecond > 0) {
+                let remainingMs = remainingBytes / bytesPerSecond * 1000;
+                etaText = `${formatTime(remainingMs)} remaining, completing around ${new Date(Date.now() + remainingMs).toISOString()}`;
+            }
+            console.error(`Full sync from ${source.getDebugName()} (store ${this.folder}) has been running for ${formatTime(elapsed)}: ${doneFiles}/${pending.length} files (${(doneFiles / pending.length * 100).toFixed(1)}%), ${formatNumber(doneBytes)}B/${formatNumber(totalBytes)}B (${(totalBytes && doneBytes / totalBytes * 100 || 100).toFixed(1)}%), ${formatNumber(bytesPerSecond)}B/s. Estimated ${etaText}.`);
+        }, FULL_SYNC_SLOW_ERROR_INTERVAL);
+        (slowErrorTimer as { unref?: () => void }).unref?.();
         try {
             let nextIndex = 0;
             let failed = false;
@@ -509,6 +537,7 @@ export class BlobStore implements IBucketStore {
             await Promise.all(workers);
         } finally {
             clearInterval(progressTimer);
+            clearInterval(slowErrorTimer);
             this.syncActivities.delete(activity);
             // A sync slow enough to have logged progress also logs its completion
             if (progressLogged) {
@@ -627,7 +656,7 @@ export class BlobStore implements IBucketStore {
         this.setIndexEntry(key, { writeTime: result.writeTime, size: result.data.length, source: 0 });
     }
 
-    public async set(key: string, data: Buffer, config?: WriteConfig): Promise<void> {
+    public async set(key: string, data: Buffer, config?: WriteConfig): Promise<string> {
         await this.init();
         let lastModified = config?.lastModified;
         if (lastModified) {
@@ -636,16 +665,27 @@ export class BlobStore implements IBucketStore {
             let entry = this.mem.get(key);
             let currentTime = overlayEntry && overlayEntry.t || entry && entry.writeTime || 0;
             // An older write never overwrites a newer one (see IArchives.set)
-            if (lastModified < currentTime) return;
+            if (lastModified < currentTime) return key;
         }
         let writeTime = lastModified || Date.now();
         if (config?.fast) {
             let writeDelay = config.writeDelay || DEFAULT_FAST_WRITE_DELAY;
-            this.overlay.set(key, { data, t: writeTime, flushAt: Date.now() + writeDelay });
-            return;
+            let flushAt = Date.now() + writeDelay;
+            let deadline = this.config?.getFlushDeadline?.();
+            if (deadline !== undefined) {
+                if (Date.now() >= deadline) {
+                    this.overlay.delete(key);
+                    await this.writeToSources(key, data, writeTime);
+                    return key;
+                }
+                flushAt = Math.min(flushAt, deadline);
+            }
+            this.overlay.set(key, { data, t: writeTime, flushAt });
+            return key;
         }
         this.overlay.delete(key);
         await this.writeToSources(key, data, writeTime);
+        return key;
     }
 
     public async del(key: string, config?: WriteConfig): Promise<void> {

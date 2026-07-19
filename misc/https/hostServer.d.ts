@@ -6,6 +6,13 @@ export type HostServerConfig = {
     setDNSRecord?: boolean;
     publicIp?: string;
     allowHostnames?: string[];
+    /** When the port is busy (e.g. the previous deploy still holds it), mount on an alternate port instead (the socket server's built-in free-port scan), and keep trying to take the real port - once it frees, a raw TCP relay on the real port forwards to our listener (SocketFunction can only mount once per process). */
+    portFallback?: {
+        /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
+        getAcquireDelay: () => number;
+        /** Reports every port we become reachable on (the alternate at mount, the main port once relayed) */
+        onListening: (port: number, isMainPort: boolean) => void;
+    };
 };
 /** Hosts a SocketFunction server on a real domain, with an automatically created and renewed Let's Encrypt HTTPS certificate (cached in the home folder, shared between processes on the machine). Expose your controllers (and any RequireController setup) before calling this. Returns the mounted nodeId. */
 export declare function hostServer(config: HostServerConfig): Promise<string>;

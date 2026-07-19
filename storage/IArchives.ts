@@ -197,8 +197,12 @@ export interface IArchives {
      * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
      * the file's current last-write time the write no-ops (so delayed / synchronized writes can
      * never clobber newer data). Times more than 15 minutes in the future are rejected.
+     *
+     * Returns the full key actually written - identical to fileName, EXCEPT for keys containing
+     * VARIABLE_SHARD, where the shard value is materialized into the key (picked by shard latency,
+     * see ArchivesChain) and the caller needs the returned key to ever read the value back.
      */
-    set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void>;
+    set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string>;
     del(fileName: string): Promise<void>;
     /** Streams a file too large to hold in memory. getNextData returns undefined when done. */
     setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void>;

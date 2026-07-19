@@ -93,6 +93,7 @@ export class SourceWrapper {
     public noteFailure(): void {
         if (!this.background || this.disposed || this.reconnectRunning) return;
         if (this.isConnected()) return;
+        console.error(`Cannot connect to storage source ${this.config.url}`);
         this.reconnectRunning = true;
         void this.reconnectLoop();
     }
@@ -161,6 +162,7 @@ export class SourceWrapper {
 
     private pings: number[] = [];
     private pingTimer: ReturnType<typeof setInterval> | undefined;
+    private loggedConnected = false;
 
     /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
      *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
@@ -172,7 +174,13 @@ export class SourceWrapper {
             try {
                 await remote.ping();
             } catch {
+                // A failed ping is also our earliest down-detection
+                this.noteFailure();
                 return;
+            }
+            if (!this.loggedConnected) {
+                this.loggedConnected = true;
+                console.log(`Connected to storage source ${this.config.url} (${Date.now() - start}ms)`);
             }
             this.pings.push(Date.now() - start);
             if (this.pings.length > PING_HISTORY) {

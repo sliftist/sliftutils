@@ -58,7 +58,7 @@ export declare class ArchivesRemote implements IArchives {
     } | undefined>;
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;
-    }): Promise<void>;
+    }): Promise<string>;
     del(fileName: string): Promise<void>;
     getInfo(fileName: string): Promise<{
         writeTime: number;

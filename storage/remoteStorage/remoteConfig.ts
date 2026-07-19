@@ -93,6 +93,12 @@ export function parseBackblazeUrl(url: string): { bucketName: string } {
     return { bucketName: decodeURIComponent(parts[1]) };
 }
 
+export function replaceHostedUrlPort(url: string, port: number): string {
+    let u = new URL(url);
+    u.port = String(port);
+    return u.toString();
+}
+
 export function normalizeSource(source: RemoteConfigBase): HostedConfig | BackblazeConfig {
     if (typeof source !== "string") {
         let window = source.validWindow;

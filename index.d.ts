@@ -223,6 +223,13 @@ declare module "sliftutils/misc/https/hostServer" {
         setDNSRecord?: boolean;
         publicIp?: string;
         allowHostnames?: string[];
+        /** When the port is busy (e.g. the previous deploy still holds it), mount on an alternate port instead (the socket server's built-in free-port scan), and keep trying to take the real port - once it frees, a raw TCP relay on the real port forwards to our listener (SocketFunction can only mount once per process). */
+        portFallback?: {
+            /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
+            getAcquireDelay: () => number;
+            /** Reports every port we become reachable on (the alternate at mount, the main port once relayed) */
+            onListening: (port: number, isMainPort: boolean) => void;
+        };
     };
     /** Hosts a SocketFunction server on a real domain, with an automatically created and renewed Let's Encrypt HTTPS certificate (cached in the home folder, shared between processes on the machine). Expose your controllers (and any RequireController setup) before calling this. Returns the mounted nodeId. */
     export declare function hostServer(config: HostServerConfig): Promise<string>;
@@ -872,7 +879,7 @@ declare module "sliftutils/storage/ArchivesDisk" {
         private filePath;
         set(key: string, data: Buffer, config?: {
             lastModified?: number;
-        }): Promise<void>;
+        }): Promise<string>;
         del(key: string): Promise<void>;
         get(key: string, config?: {
             range?: {
@@ -2222,10 +2229,14 @@ declare module "sliftutils/storage/IArchives" {
          * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
          * the file's current last-write time the write no-ops (so delayed / synchronized writes can
          * never clobber newer data). Times more than 15 minutes in the future are rejected.
+         *
+         * Returns the full key actually written - identical to fileName, EXCEPT for keys containing
+         * VARIABLE_SHARD, where the shard value is materialized into the key (picked by shard latency,
+         * see ArchivesChain) and the caller needs the returned key to ever read the value back.
          */
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
-        }): Promise<void>;
+        }): Promise<string>;
         del(fileName: string): Promise<void>;
         /** Streams a file too large to hold in memory. getNextData returns undefined when done. */
         setLargeFile(config: {
@@ -2557,7 +2568,7 @@ declare module "sliftutils/storage/backblaze" {
         hasWriteAccess(): Promise<boolean>;
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
-        }): Promise<void>;
+        }): Promise<string>;
         del(fileName: string): Promise<void>;
         setLargeFile(config: {
             path: string;
@@ -2642,11 +2653,6 @@ declare module "sliftutils/storage/backblaze" {
 
 }
 
-declare module "sliftutils/storage/embeddingBench" {
-    export {};
-
-}
-
 declare module "sliftutils/storage/embeddingFormats" {
     export type EmbeddingFormat = "q8g8_2048" | "q8_g16_2048" | "q8_g16_1024" | "float32";
     export declare const EMBEDDING_FORMATS: EmbeddingFormat[];
@@ -2723,11 +2729,6 @@ declare module "sliftutils/storage/proxydatabase/inMemoryDatabase" {
         writeData<Value>(deref: (root: Root) => Value, newValue: Value): void;
         deleteData(deref: (root: Root) => unknown): void;
     }
-
-}
-
-declare module "sliftutils/storage/proxydatabase/ivfDbCheck" {
-    export {};
 
 }
 
@@ -2899,7 +2900,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         } | undefined>;
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
-        }): Promise<void>;
+        }): Promise<string>;
         del(fileName: string): Promise<void>;
         getInfo(fileName: string): Promise<{
             writeTime: number;
@@ -2956,7 +2957,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
         } | undefined>;
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
-        }): Promise<void>;
+        }): Promise<string>;
         del(fileName: string): Promise<void>;
         setLargeFile(config: {
             path: string;
@@ -3009,7 +3010,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             writeTime: number;
             size: number;
         } | undefined>;
-        set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
+        set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
         del(fileName: string, config?: WriteConfig): Promise<void>;
         getInfo(fileName: string): Promise<{
             writeTime: number;
@@ -3055,6 +3056,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         constructor(folder: string, sources: ArchivesSource[], config?: {
             onIndexChanged?: ((key: string) => void) | undefined;
             readerDiskLimit?: number | undefined;
+            getFlushDeadline?: (() => number | undefined) | undefined;
         } | undefined);
         private stopped;
         private index;
@@ -3077,6 +3079,9 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private countEntry;
         private setIndexEntry;
         private deleteIndexEntry;
+        /** Rescans our own disk's metadata into the index - used around deploy switchovers, where the
+         *  other process wrote files to the shared folder that our index hasn't seen. */
+        rescanBase(): Promise<void>;
         /** The cheap always-current totals plus any in-progress background synchronization. */
         getSyncProgress(): {
             index: {
@@ -3129,7 +3134,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             size: number;
         } | undefined>;
         private cacheRead;
-        set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
+        set(key: string, data: Buffer, config?: WriteConfig): Promise<string>;
         del(key: string, config?: WriteConfig): Promise<void>;
         private getWritableSources;
         private writeToSources;
@@ -3181,9 +3186,19 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         private init;
         private buildSources;
         private startConfigPoll;
+        private configRefreshInFlight;
+        private refreshActiveConfig;
+        private fetchLatestConfig;
         private checkForNewConfig;
+        private adoptNewConfig;
+        private lastAvailabilityRecheck;
+        private availabilityRecheckInFlight;
+        private recheckAvailability;
+        private recheckAvailabilityNow;
         private run;
         private runWrite;
+        private lastConfigRefresh;
+        private prepareWrongTargetRetry;
         private request;
         waitingForAccess(): Promise<{
             link: string;
@@ -3211,7 +3226,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
             size: number;
         } | undefined>;
         private selectCoveringSources;
-        private runOnApi;
+        private runOnCovering;
         find(prefix: string, config?: {
             shallow?: boolean;
             type: "files" | "folders";
@@ -3226,20 +3241,14 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         /** True only when EVERY write-receiving source would accept our writes (partial write access
          *  desynchronizes sources, so it counts as no access). */
         hasWriteAccess(): Promise<boolean>;
-        private assertNotBareVariableShard;
+        /** Returns the full key written. Plain keys come back unchanged; keys containing VARIABLE_SHARD
+         *  are automatically materialized (a shard value is picked and embedded, see setVariableShard)
+         *  and the caller needs the returned key to ever read the value back. */
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
-        }): Promise<void>;
-        del(fileName: string): Promise<void>;
-        /** Writes a key containing the VARIABLE_SHARD sentinel: picks the lowest-latency up write
-         *  shard, materializes the key with a random value inside that shard's route, writes it, and
-         *  returns the FULL key actually written (the caller needs it to ever read the value back).
-         *  Unlike normal writes this CAN move to another shard when the preferred one is down (error +
-         *  socket down, same rule as reads) - each shard receives a different key, so write
-         *  consistency is preserved. */
-        setVariableShard(key: string, data: Buffer, config?: {
-            lastModified?: number;
         }): Promise<string>;
+        del(fileName: string): Promise<void>;
+        private setVariableShard;
         setLargeFile(config: {
             path: string;
             getNextData(): Promise<Buffer | undefined>;
@@ -3263,6 +3272,34 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         url: string;
         accountName?: string;
     }): Promise<ArchivesConfig>;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/deployTakeover" {
+    import { RemoteConfig } from "../IArchives";
+    export type TakeoverEvent = "remapChanged" | "diskScan";
+    /** Starts the takeover machinery. Port fallback (alternate port + registry + acquisition polling)
+     *  works regardless; without a deploy timeline folder the switchover-specific parts (the remap,
+     *  the flush deadline, the tighter acquisition pacing) simply stay inert. */
+    export declare function initDeployTakeover(config: {
+        domain: string;
+        mainPort: number;
+        storageFolder: string;
+    }): Promise<void>;
+    /** Called when we had to listen on an alternate port (the main port was still held by our
+     *  predecessor): registers it so the predecessor can route the middle overlap window to us. */
+    export declare function registerAltPort(port: number): Promise<void>;
+    export declare function onTakeoverEvent(listener: (event: TakeoverEvent) => void): void;
+    /** The interpretation overlay: splits every source pointing at our domain+main port so the middle
+     *  of the deploy overlap points at the alternate port. Pure, in-memory only - the stored routing
+     *  config is never modified, and this must never be applied to data that gets persisted. */
+    export declare function applyDeployRemap(routing: RemoteConfig): RemoteConfig;
+    /** For the dying process: fast-write flush delays must never extend past this time, and after it
+     *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
+    export declare function getFlushDeadline(): number | undefined;
+    /** How long to wait between main-port acquisition attempts: tight around the predecessor's
+     *  scheduled death (when the port actually frees), relaxed otherwise. */
+    export declare function getMainPortAcquireDelay(): number;
 
 }
 
@@ -3297,6 +3334,7 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
     export declare function parseBackblazeUrl(url: string): {
         bucketName: string;
     };
+    export declare function replaceHostedUrlPort(url: string, port: number): string;
     export declare function normalizeSource(source: RemoteConfigBase): HostedConfig | BackblazeConfig;
     export declare function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig;
     export declare function parseRoutingData(data: Buffer): RemoteConfig;
@@ -3335,6 +3373,7 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         hasWriteAccess(): Promise<boolean>;
         private pings;
         private pingTimer;
+        private loggedConnected;
         /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
          *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
         startPinging(): void;
@@ -3500,12 +3539,15 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         self: HostedConfig | undefined;
         store: IBucketStore;
     };
+    export declare function addExtraListenPort(port: number): void;
     export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
     export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
     export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<void>;
     export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
+    export declare function rebuildAllLoadedBuckets(): Promise<void>;
+    export declare function rescanAllLoadedBucketDisks(): Promise<void>;
     export type ServerBucketInfo = {
         bucketName: string;
         active: boolean;

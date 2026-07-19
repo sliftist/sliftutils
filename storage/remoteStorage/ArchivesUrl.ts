@@ -61,7 +61,7 @@ export class ArchivesUrl implements IArchives {
         return result && { writeTime: result.writeTime, size: result.size } || undefined;
     }
 
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
         throw this.readOnlyError("set");
     }
     public async del(fileName: string): Promise<void> {

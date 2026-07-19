@@ -28,6 +28,7 @@ export declare class SourceWrapper {
     hasWriteAccess(): Promise<boolean>;
     private pings;
     private pingTimer;
+    private loggedConnected;
     /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
      *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
     startPinging(): void;

@@ -1,6 +1,8 @@
 import os from "os";
 import fs from "fs";
+import net from "net";
 import { SocketFunction } from "socket-function/SocketFunction";
+import { getNodeIdLocation } from "socket-function/src/nodeCache";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getExternalIP } from "socket-function/src/networking";
@@ -27,6 +29,13 @@ export type HostServerConfig = {
     setDNSRecord?: boolean;
     publicIp?: string;
     allowHostnames?: string[];
+    /** When the port is busy (e.g. the previous deploy still holds it), mount on an alternate port instead (the socket server's built-in free-port scan), and keep trying to take the real port - once it frees, a raw TCP relay on the real port forwards to our listener (SocketFunction can only mount once per process). */
+    portFallback?: {
+        /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
+        getAcquireDelay: () => number;
+        /** Reports every port we become reachable on (the alternate at mount, the main port once relayed) */
+        onListening: (port: number, isMainPort: boolean) => void;
+    };
 };
 
 /** Hosts a SocketFunction server on a real domain, with an automatically created and renewed Let's Encrypt HTTPS certificate (cached in the home folder, shared between processes on the machine). Expose your controllers (and any RequireController setup) before calling this. Returns the mounted nodeId. */
@@ -50,10 +59,13 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
         }
     });
 
+    // With portFallback, a busy port is not an error: the underlying server scans for a free port
+    // instead (useAvailablePortIfPortInUse), and the nodeId tells us which port we actually got
     let nodeId = await SocketFunction.mount({
         public: true,
         autoForwardPort: true,
         port,
+        useAvailablePortIfPortInUse: !!config.portFallback,
         ...getThreadKeyCert(rootDomain),
         SNICerts: {
             [domain]: callback => {
@@ -67,11 +79,51 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
                     cert: threadCert.cert,
                 });
             },
+            ["127-0-0-1." + domain]: async callback => {
+                callback(keyCert);
+                certListeners.push(callback);
+            },
         },
         allowHostnames: config.allowHostnames,
     });
-    console.log(magenta(`Hosting https://${domain}:${port} (nodeId ${nodeId})`));
+    let servingPort = getNodeIdLocation(nodeId)?.port || port;
+    let fallback = config.portFallback;
+    if (fallback && servingPort !== port) {
+        console.log(magenta(`Port ${port} is in use (presumably by our predecessor); serving on alternate port ${servingPort} until it frees`));
+        void runMainPortAcquireLoop(domain, port, servingPort, fallback);
+    }
+    fallback?.onListening(servingPort, servingPort === port);
+    console.log(magenta(`Hosting https://${domain}:${servingPort} (nodeId ${nodeId})`));
     return nodeId;
+}
+
+// SocketFunction can only mount once per process, so "taking over" the main port is a raw TCP
+// relay forwarding to our real listener - TLS/SNI passes straight through, and clients address
+// servers by ip domain (wildcard negotiation), so the extra hop is invisible.
+async function runMainPortAcquireLoop(domain: string, mainPort: number, servingPort: number, fallback: NonNullable<HostServerConfig["portFallback"]>): Promise<void> {
+    while (true) {
+        await delay(fallback.getAcquireDelay());
+        let acquired = await new Promise<boolean>(resolve => {
+            let relay = net.createServer(client => {
+                let upstream = net.connect({ host: "127.0.0.1", port: servingPort });
+                client.pipe(upstream);
+                upstream.pipe(client);
+                let cleanup = () => {
+                    client.destroy();
+                    upstream.destroy();
+                };
+                client.on("error", cleanup);
+                upstream.on("error", cleanup);
+            });
+            relay.once("error", () => resolve(false));
+            relay.listen(mainPort, () => resolve(true));
+        });
+        if (acquired) {
+            console.log(magenta(`Acquired main port ${mainPort} for https://${domain} (relaying to our listener on ${servingPort})`));
+            fallback.onListening(mainPort, true);
+            return;
+        }
+    }
 }
 
 function getCertDiskPath(domain: string) {

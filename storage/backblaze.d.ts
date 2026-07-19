@@ -41,7 +41,7 @@ export declare class ArchivesBackblaze implements IArchives {
     hasWriteAccess(): Promise<boolean>;
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;
-    }): Promise<void>;
+    }): Promise<string>;
     del(fileName: string): Promise<void>;
     setLargeFile(config: {
         path: string;

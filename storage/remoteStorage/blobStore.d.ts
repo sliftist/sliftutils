@@ -24,7 +24,7 @@ export type IBucketStore = {
         writeTime: number;
         size: number;
     } | undefined>;
-    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<void>;
+    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
     del(fileName: string, config?: WriteConfig): Promise<void>;
     getInfo(fileName: string): Promise<{
         writeTime: number;
@@ -70,6 +70,7 @@ export declare class BlobStore implements IBucketStore {
     constructor(folder: string, sources: ArchivesSource[], config?: {
         onIndexChanged?: ((key: string) => void) | undefined;
         readerDiskLimit?: number | undefined;
+        getFlushDeadline?: (() => number | undefined) | undefined;
     } | undefined);
     private stopped;
     private index;
@@ -92,6 +93,9 @@ export declare class BlobStore implements IBucketStore {
     private countEntry;
     private setIndexEntry;
     private deleteIndexEntry;
+    /** Rescans our own disk's metadata into the index - used around deploy switchovers, where the
+     *  other process wrote files to the shared folder that our index hasn't seen. */
+    rescanBase(): Promise<void>;
     /** The cheap always-current totals plus any in-progress background synchronization. */
     getSyncProgress(): {
         index: {
@@ -144,7 +148,7 @@ export declare class BlobStore implements IBucketStore {
         size: number;
     } | undefined>;
     private cacheRead;
-    set(key: string, data: Buffer, config?: WriteConfig): Promise<void>;
+    set(key: string, data: Buffer, config?: WriteConfig): Promise<string>;
     del(key: string, config?: WriteConfig): Promise<void>;
     private getWritableSources;
     private writeToSources;

@@ -23,6 +23,7 @@ export declare function parseHostedUrl(url: string): {
 export declare function parseBackblazeUrl(url: string): {
     bucketName: string;
 };
+export declare function replaceHostedUrlPort(url: string, port: number): string;
 export declare function normalizeSource(source: RemoteConfigBase): HostedConfig | BackblazeConfig;
 export declare function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig;
 export declare function parseRoutingData(data: Buffer): RemoteConfig;

@@ -661,13 +661,13 @@ export class ArchivesBackblaze implements IArchives {
             return false;
         }
     }
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
         if (config?.lastModified) {
             assertValidLastModified(config.lastModified);
             let existing = await this.getInfo(fileName);
             // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own
             // upload time, so the exact lastModified is not preserved on the stored file.
-            if (existing && config.lastModified < existing.writeTime) return;
+            if (existing && config.lastModified < existing.writeTime) return fileName;
         }
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
         let f = fileName;
@@ -685,7 +685,7 @@ export class ArchivesBackblaze implements IArchives {
             let exists = await this.getInfo(fileName);
             console.warn(`File ${fileName}/${f} was uploaded, but could not be found afterwards. Hopefully it was just deleted, very quickly? If backblaze is taking too long for files to propagate, then we might run into issues with the database atomicity.`);
         }
-
+        return fileName;
     }
     public async del(fileName: string): Promise<void> {
         this.log(`backblaze delete ${fileName}`);
@@ -743,17 +743,20 @@ export class ArchivesBackblaze implements IArchives {
             if (!data?.length) return;
             // Backblaze disallows overly small files
             if (data.length < MIN_CHUNK_SIZE) {
-                return await this.set(fileName, data);
+                await this.set(fileName, data);
+                return;
             }
             // Backblaze disallows less than 2 chunks
             let secondData = await getNextData();
             if (!secondData?.length) {
-                return await this.set(fileName, data);
+                await this.set(fileName, data);
+                return;
             }
             // ALSO, if there are two chunks, but one is too small, combine it. This helps allow us never
             //  send small chunks.
             if (secondData.length < MIN_CHUNK_SIZE) {
-                return await this.set(fileName, Buffer.concat([data, secondData]));
+                await this.set(fileName, Buffer.concat([data, secondData]));
+                return;
             }
             this.log(`Uploading large file ${config.path}`);
             dataQueue.unshift(data, secondData);

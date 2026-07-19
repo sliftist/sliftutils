@@ -161,8 +161,9 @@ export class ArchivesRemote implements IArchives {
         let result = await this.call(() => this.controller.get2(this.account, this.bucketName, fileName, config?.range));
         return result && { data: Buffer.from(result.data), writeTime: result.writeTime, size: result.size } || undefined;
     }
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
         await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified));
+        return fileName;
     }
     public async del(fileName: string): Promise<void> {
         await this.call(() => this.controller.del(this.account, this.bucketName, fileName));

@@ -6,7 +6,8 @@ import { getExternalIP } from "socket-function/src/networking";
 import { RequireController } from "socket-function/require/RequireController";
 import { hostServer } from "../../misc/https/hostServer";
 import { RemoteStorageController } from "./storageController";
-import { setStorageServerConfig, setWritesRejectedReason } from "./storageServerState";
+import { setStorageServerConfig, setWritesRejectedReason, addExtraListenPort } from "./storageServerState";
+import { initDeployTakeover, registerAltPort, getMainPortAcquireDelay } from "./deployTakeover";
 import { parseStorageUrl } from "./ArchivesRemote";
 // Import browser code, so it is allowed to be required by the client
 import "./accessPage";
@@ -118,9 +119,22 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     }, DISK_SPACE_CHECK_INTERVAL_MS);
     (interval as { unref?: () => void }).unref?.();
 
+    // Port fallback is always on: a busy port means listening on an alternate, registering it, and
+    // polling to take the real port. The deploy takeover machinery merely rides on top (tighter
+    // polling around a scheduled switchover, and the valid-window remap once a successor is known).
+    await initDeployTakeover({ domain, mainPort: port, storageFolder: path.resolve(folder) });
+
     await hostServer({
         domain,
         port,
         setDNSRecord: true,
+        portFallback: {
+            getAcquireDelay: getMainPortAcquireDelay,
+            onListening: (listeningPort, isMainPort) => {
+                if (isMainPort) return;
+                addExtraListenPort(listeningPort);
+                void registerAltPort(listeningPort).catch((e: Error) => console.error(`Registering alternate port ${listeningPort} failed: ${e.stack ?? e}`));
+            },
+        },
     });
 }
