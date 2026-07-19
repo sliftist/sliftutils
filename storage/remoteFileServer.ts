@@ -671,14 +671,7 @@ export async function runFileHoster(): Promise<void> {
     console.log("  self-signed certificate warning, then connect from the app.");
     console.log("");
 
-    // Keep the UPnP port mapping alive — leases expire ~hourly, so refresh well within that. No-op on
-    // Linux (forwardPort returns early there).
-    const refresh = async () => {
-        try { await forwardPort({ externalPort: info.port, internalPort: info.port }); }
-        catch (e) { console.warn("  port forwarding failed:", (e as Error).message); }
-    };
-    await refresh();
-    setInterval(refresh, 30 * 60 * 1000);
+    await forwardPort({ externalPort: info.port, internalPort: info.port });
 
     console.log("  [access] request logging on (batched every 5s)\n");
 

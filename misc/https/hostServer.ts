@@ -6,6 +6,7 @@ import { getNodeIdLocation } from "socket-function/src/nodeCache";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getExternalIP } from "socket-function/src/networking";
+import { forwardPort } from "socket-function/src/forwardPort";
 import { magenta } from "socket-function/src/formatting/logColors";
 import { getOwnMachineId, getThreadKeyCert, loadIdentityCA } from "./certs";
 import { generateCert, getAccountKey, parseCert } from "./httpsCerts";
@@ -79,7 +80,7 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
                     cert: threadCert.cert,
                 });
             },
-            ["127-0-0-1." + domain]: async callback => {
+            ["127-0-0-1." + rootDomain]: async callback => {
                 callback(keyCert);
                 certListeners.push(callback);
             },
@@ -120,6 +121,9 @@ async function runMainPortAcquireLoop(domain: string, mainPort: number, servingP
         });
         if (acquired) {
             console.log(magenta(`Acquired main port ${mainPort} for https://${domain} (relaying to our listener on ${servingPort})`));
+            // The mount only forwarded OUR serving port; the main port needs its own mapping (the
+            // predecessor's mapping pointed at the same machine+port, but dies with it)
+            await forwardPort({ externalPort: mainPort, internalPort: mainPort });
             fallback.onListening(mainPort, true);
             return;
         }
