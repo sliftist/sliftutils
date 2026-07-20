@@ -64,6 +64,13 @@ export type IBucketStore = {
     finishLargeUpload(id: string, key: string): Promise<void>;
     cancelLargeUpload(id: string): Promise<void>;
 };
+export type BlobSourceSpec = {
+    identity: string;
+    validWindow: [number, number];
+    route?: [number, number];
+    noFullSync?: boolean;
+    create: () => IArchives;
+};
 export declare class BlobStore implements IBucketStore {
     private folder;
     private sources;
@@ -83,6 +90,8 @@ export declare class BlobStore implements IBucketStore {
     private dirty;
     private overlay;
     private sourceStates;
+    private syncStarted;
+    private isLive;
     init: {
         (): Promise<void>;
         reset(): void;
@@ -93,6 +102,14 @@ export declare class BlobStore implements IBucketStore {
     private countEntry;
     private setIndexEntry;
     private deleteIndexEntry;
+    /** Applies a config change to the RUNNING store: windows/routes update in place, new sources
+     *  are added (their sync starts immediately), and removed sources' slots go dead (their scans
+     *  stop, their index entries drop). The store survives every routine config evolution - it is
+     *  never destroyed for a source-list change, only for structural flips it cannot express
+     *  (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing
+     *  immediately when it has already passed). */
+    updateSources(specs: BlobSourceSpec[]): void;
+    private removeSource;
     /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
      *  another process wrote files to the shared folder that our index hasn't seen. */
     rescanBase(): Promise<void>;

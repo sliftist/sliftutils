@@ -49,6 +49,16 @@ export class SourceWrapper {
         private background: boolean,
     ) { }
 
+    /** Config updates routinely just move a source's valid window (the last window extends
+     *  forever, then gets reduced when a new entry is appended). The wrapper survives that: only
+     *  the window changes, keeping the connection, pings, and latency history. */
+    public updateValidWindow(validWindow: [number, number]): void {
+        let old = this.config.validWindow;
+        if (old[0] === validWindow[0] && old[1] === validWindow[1]) return;
+        console.log(`Valid window changed for ${this.getDebugName()}: [${old.join(", ")}] -> [${validWindow.join(", ")}]`);
+        this.config.validWindow = validWindow;
+    }
+
     public static async create(config: HostedConfig | BackblazeConfig, options?: { background?: boolean }): Promise<SourceWrapper> {
         let wrapper = new SourceWrapper(config, options?.background !== false);
         if (config.type === "backblaze") {

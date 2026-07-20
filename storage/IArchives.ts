@@ -146,6 +146,10 @@ export type ArchivesSource = {
     route?: [number, number];
     // From the source's CommonConfig; see there.
     noFullSync?: boolean;
+    // Stable identity of the underlying endpoint (its config with windows/routes stripped) - how
+    // BlobStore.updateSources recognizes a source across config changes so it can update it in
+    // place instead of removing and re-adding it
+    identity?: string;
 };
 
 // The grace covers clock uncertainty around the window edge: a write slightly past the end doesn't

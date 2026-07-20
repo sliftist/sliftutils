@@ -6,8 +6,8 @@ import { JSONStorage } from "../JSONStorage";
 import { ArchivesDisk } from "../ArchivesDisk";
 import { BlobStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MARGIN } from "./blobStore";
 import {
-    RemoteConfig, HostedConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
-    ArchivesSyncStatus, FULL_VALID_WINDOW,
+    RemoteConfig, HostedConfig, BackblazeConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
+    ArchivesSyncStatus,
     WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
@@ -145,6 +145,9 @@ export type LoadedBucket = {
     // time, see getWriteConfig/assertMutable. undefined when the config doesn't mention us.
     self: HostedConfig | undefined;
     store: IBucketStore;
+    // The store plan minus its valid windows (see StorePlan.structureKey): when only windows
+    // change, the store is updated in place instead of rebuilt
+    structureKey: string;
 };
 
 const buckets = new Map<string, Promise<LoadedBucket | undefined>>();
@@ -241,6 +244,8 @@ const BOUNDARY_SCAN_OFFSETS = [-30 * 1000, 2 * 1000, 30 * 1000];
 // How far back a boundary scan asks the previous owner for changes: anything older has already
 // arrived through normal synchronization, and this covers the longest a write can sit unflushed
 const BOUNDARY_SCAN_LOOKBACK = DEFAULT_FAST_WRITE_DELAY + WINDOW_END_FLUSH_MARGIN;
+// The catch-up scan for a window that was already active when we built the store
+const STARTUP_BOUNDARY_SCAN_DELAY = 30 * 1000;
 
 // Each (bucket, boundary, offset) is scheduled exactly once, surviving store rebuilds - the timer
 // re-resolves the bucket (and recomputes owners from the then-current routing) when it fires
@@ -256,6 +261,22 @@ function scheduleBoundaryScans(loaded: LoadedBucket): void {
         if (start > now && start < Number.MAX_SAFE_INTEGER) {
             starts.add(start);
         }
+    }
+    // A window we are ALREADY inside when the store is built (startup, or a config that made us
+    // valid immediately) got none of the lead-up scans - so one runs shortly after, in case we
+    // came up just as the previous owner is realizing it must shut down. Only recent boundaries
+    // qualify: older trailing writes have long since propagated through normal synchronization.
+    for (let self of loaded.selfEntries) {
+        let [start, end] = self.validWindow;
+        if (!(start <= now && now < end) || start <= 0) continue;
+        if (now - start > BOUNDARY_SCAN_LOOKBACK) continue;
+        let scheduleKey = `${key}|${start}|startup`;
+        if (scheduledBoundaryScans.has(scheduleKey)) continue;
+        scheduledBoundaryScans.add(scheduleKey);
+        let timer = setTimeout(() => {
+            void runBoundaryScan(key, start, STARTUP_BOUNDARY_SCAN_DELAY, "startup+30s").catch((e: Error) => console.error(`Boundary scan for bucket ${key} failed: ${e.stack ?? e}`));
+        }, STARTUP_BOUNDARY_SCAN_DELAY);
+        (timer as { unref?: () => void }).unref?.();
     }
     for (let start of starts) {
         for (let offset of BOUNDARY_SCAN_OFFSETS) {
@@ -281,8 +302,8 @@ function scheduleBoundaryScans(loaded: LoadedBucket): void {
     }
 }
 
-async function runBoundaryScan(bucketKey: string, windowStart: number, offset: number): Promise<void> {
-    let label = `bucket ${bucketKey}, window starting ${new Date(windowStart).toISOString()}, offset ${offset / 1000}s`;
+async function runBoundaryScan(bucketKey: string, windowStart: number, offset: number, offsetLabel?: string): Promise<void> {
+    let label = `bucket ${bucketKey}, window starting ${new Date(windowStart).toISOString()}, offset ${offsetLabel || `${offset / 1000}s`}`;
     if (boundaryScansRunning.has(bucketKey)) {
         // Boundary scans never run in parallel; a slow one simply swallows later scheduled points
         console.log(`Skipping boundary scan (${label}): the previous boundary scan is still running`);
@@ -377,8 +398,29 @@ async function runBoundaryScan(bucketKey: string, windowStart: number, offset: n
     }
 }
 
-function buildBucket(account: string, bucketName: string, routing: RemoteConfig): LoadedBucket {
-    let folder = getBucketFolder(account, bucketName);
+type StorePlan = {
+    effective: RemoteConfig;
+    selfEntries: HostedConfig[];
+    self: HostedConfig | undefined;
+    rawDisk: boolean;
+    // The BlobStore sources this plan builds: [0] is the disk, the rest are downstream configs
+    sourceSpecs: { sourceConfig?: HostedConfig | BackblazeConfig; validWindow: [number, number]; route?: [number, number]; noFullSync?: boolean }[];
+    readerDiskLimit?: number;
+    // Everything about the plan EXCEPT the valid windows. Two plans with equal structure keys
+    // differ only in windows, which the running store applies in place - it must survive the
+    // routine config evolution of reducing the last forever-window and appending a new entry,
+    // instead of being disposed and rebuilt (losing sync state and rescanning everything).
+    structureKey: string;
+};
+
+// The stable identity of a source endpoint: its config with the in-place-updatable parts
+// (windows, routes) stripped, so a source is recognized across config changes
+function sourceIdentity(sourceConfig: HostedConfig | BackblazeConfig | undefined): string {
+    if (!sourceConfig) return "disk";
+    return JSON.stringify({ ...sourceConfig, validWindow: undefined, route: undefined });
+}
+
+function computeStorePlan(account: string, bucketName: string, routing: RemoteConfig): StorePlan {
     // The deploy-takeover remap is an INTERPRETATION overlay: everything behavioral (self entries,
     // windows, downstream sources) uses the remapped view, while loaded.routing/routingJSON stay
     // the STORED config - so version guards, change detection, and synchronization never see (or
@@ -391,39 +433,66 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig)
     if (self) {
         selfIndex = effective.sources.indexOf(self);
     }
+    // Our own disk is the base source; only the routing entries DOWNSTREAM from us (after our
+    // currently-valid entry) become synchronization sources. Upstream sources sync from us, so
+    // writing to or scanning them would just echo our own data back (and make our availability
+    // depend on theirs). A server NOT in the list has been removed from the bucket: it keeps
+    // its disk data (the config may re-add it), but stops all synchronization - no one
+    // contacts a removed source, and scanning/pushing as if we were still one would fight the
+    // real chain. The config-level validWindow rides on each ArchivesSource; the disk source
+    // shares our currently-valid entry's window (it holds our copy of the data).
+    // Our own disk gets no route filter: everything it holds is ours to index and serve.
+    // Being removed from the config entirely is a valid window of NOTHING ([0, 0]): fast
+    // writes flush immediately (nothing may sit in memory on a node that's been cut out),
+    // while the disk data and index stay served.
+    let ownIndexes = new Set(selfIndexes);
+    let sourceSpecs: StorePlan["sourceSpecs"] = [{
+        validWindow: self && self.validWindow || [0, 0],
+    }];
+    if (selfIndex !== -1) {
+        for (let i = selfIndex + 1; i < effective.sources.length; i++) {
+            let source = effective.sources[i];
+            if (typeof source === "string" || ownIndexes.has(i)) continue;
+            // Disjoint-shard sources never talk to each other; a partial overlap syncs only
+            // the intersection (scans ignore the rest, writes only send matching keys)
+            let sharedRoute = routeIntersection(self?.route, source.route);
+            if (!sharedRoute) continue;
+            // A bounded-cache server (noFullSync on our own entry) must not full-sync from
+            // ANY source, or its disk would fill regardless of the limit
+            sourceSpecs.push({ sourceConfig: source, validWindow: source.validWindow, route: sharedRoute, noFullSync: source.noFullSync || self?.noFullSync });
+        }
+    }
+    let rawDisk = !!self?.rawDisk;
+    // Only what the running store genuinely cannot change in place: the store TYPE (rawDisk) and
+    // whether the disk-limit poll runs. Source additions/removals and window/route changes are all
+    // applied live via updateSources - a config change must never destroy the running store.
+    let structureKey = JSON.stringify({
+        rawDisk,
+        readerDiskLimit: self?.readerDiskLimit,
+    });
+    return { effective, selfEntries, self, rawDisk, sourceSpecs, readerDiskLimit: self?.readerDiskLimit, structureKey };
+}
+
+function buildBucket(account: string, bucketName: string, routing: RemoteConfig, plan?: StorePlan): LoadedBucket {
+    let folder = getBucketFolder(account, bucketName);
+    if (!plan) {
+        plan = computeStorePlan(account, bucketName, routing);
+    }
+    let { selfEntries, self } = plan;
     let store: IBucketStore;
-    if (self?.rawDisk) {
+    if (plan.rawDisk) {
         store = new ArchivesDisk(folder);
     } else {
-        // Our own disk is the base source; only the routing entries DOWNSTREAM from us (after our
-        // currently-valid entry) become synchronization sources. Upstream sources sync from us, so
-        // writing to or scanning them would just echo our own data back (and make our availability
-        // depend on theirs). A server NOT in the list has been removed from the bucket: it keeps
-        // its disk data (the config may re-add it), but stops all synchronization - no one
-        // contacts a removed source, and scanning/pushing as if we were still one would fight the
-        // real chain. The config-level validWindow rides on each ArchivesSource; the disk source
-        // shares our currently-valid entry's window (it holds our copy of the data).
-        let ownIndexes = new Set(selfIndexes);
-        // Our own disk gets no route filter: everything it holds is ours to index and serve
-        let sources: ArchivesSource[] = [{
-            source: new ArchivesDisk(folder),
-            validWindow: self?.validWindow || FULL_VALID_WINDOW,
-        }];
-        if (selfIndex === -1) {
-            console.log(`This server is not in the routing config for bucket ${account}/${bucketName}; keeping its data on disk but no longer synchronizing it`);
-        } else {
-            for (let i = selfIndex + 1; i < effective.sources.length; i++) {
-                let source = effective.sources[i];
-                if (typeof source === "string" || ownIndexes.has(i)) continue;
-                // Disjoint-shard sources never talk to each other; a partial overlap syncs only
-                // the intersection (scans ignore the rest, writes only send matching keys)
-                let sharedRoute = routeIntersection(self?.route, source.route);
-                if (!sharedRoute) continue;
-                // A bounded-cache server (noFullSync on our own entry) must not full-sync from
-                // ANY source, or its disk would fill regardless of the limit
-                sources.push({ source: createApiArchives(source), validWindow: source.validWindow, route: sharedRoute, noFullSync: source.noFullSync || self?.noFullSync });
-            }
+        if (!self) {
+            console.log(`This server is not in the routing config for bucket ${account}/${bucketName}: no longer synchronizing, valid window treated as [0, 0] (fast writes flush immediately), disk data kept and served`);
         }
+        let sources: ArchivesSource[] = plan.sourceSpecs.map(spec => ({
+            source: spec.sourceConfig && createApiArchives(spec.sourceConfig) || new ArchivesDisk(folder),
+            validWindow: spec.validWindow,
+            route: spec.route,
+            noFullSync: spec.noFullSync,
+            identity: sourceIdentity(spec.sourceConfig),
+        }));
         store = new BlobStore(folder, sources, {
             onIndexChanged: key => {
                 // Fires for our own routing writes AND routing files pulled in via synchronization
@@ -431,10 +500,10 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig)
                 if (key !== ROUTING_FILE) return;
                 void scheduleRoutingReload(account, bucketName);
             },
-            readerDiskLimit: self?.readerDiskLimit,
+            readerDiskLimit: plan.readerDiskLimit,
         });
     }
-    let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store };
+    let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store, structureKey: plan.structureKey };
     scheduleWindowBoundaryRebuild(loaded);
     scheduleBoundaryScans(loaded);
     return loaded;
@@ -489,15 +558,38 @@ async function checkRoutingChanged(account: string, bucketName: string, config?:
     if (!data) return;
     let routing = parseRoutingData(data);
     if (!config?.force && JSON.stringify(routing) === loaded.routingJSON) return;
-    if (config?.force) {
-        console.log(`Rebuilding the store for bucket ${key} (${config.reason || "forced"})`);
-    } else {
-        console.log(`Routing config changed for bucket ${key}, rebuilding its store`);
+    let reason = config?.force && (config.reason || "forced") || "routing config changed";
+    let plan = computeStorePlan(account, bucketName, routing);
+    // Config changes are applied to the RUNNING store in place - windows/routes mutate, added
+    // sources start syncing, removed sources' slots go dead - so the index, pending fast writes
+    // (re-capped to the new deadline), and unaffected sync loops all survive. The store is only
+    // destroyed for what it structurally cannot express (a rawDisk flip).
+    if (plan.structureKey === loaded.structureKey && loaded.store instanceof BlobStore) {
+        console.log(`Applying the routing config to the running store for bucket ${key} (${reason})`);
+        loaded.store.updateSources(plan.sourceSpecs.map(spec => {
+            const sourceConfig = spec.sourceConfig;
+            if (!sourceConfig) {
+                return { identity: sourceIdentity(undefined), validWindow: spec.validWindow, create: (): IArchives => new ArchivesDisk(getBucketFolder(account, bucketName)) };
+            }
+            return {
+                identity: sourceIdentity(sourceConfig),
+                validWindow: spec.validWindow,
+                route: spec.route,
+                noFullSync: spec.noFullSync,
+                create: () => createApiArchives(sourceConfig),
+            };
+        }));
+        let updated: LoadedBucket = { ...loaded, routing, routingJSON: JSON.stringify(routing), selfEntries: plan.selfEntries, self: plan.self };
+        buckets.set(key, Promise.resolve(updated));
+        scheduleWindowBoundaryRebuild(updated);
+        scheduleBoundaryScans(updated);
+        return;
     }
+    console.log(`Rebuilding the store for bucket ${key} (${reason})`);
     if (loaded.store instanceof BlobStore) {
         await loaded.store.dispose();
     }
-    buckets.set(key, Promise.resolve(buildBucket(account, bucketName, routing)));
+    buckets.set(key, Promise.resolve(buildBucket(account, bucketName, routing, plan)));
 }
 
 // Per-write options are evaluated at the WRITE's time (and the key's route), not the current

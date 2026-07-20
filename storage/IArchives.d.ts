@@ -81,6 +81,7 @@ export type ArchivesSource = {
     validWindow: [number, number];
     route?: [number, number];
     noFullSync?: boolean;
+    identity?: string;
 };
 export declare const WRITE_PAST_WINDOW_GRACE: number;
 export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";

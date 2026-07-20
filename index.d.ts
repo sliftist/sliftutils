@@ -2184,6 +2184,7 @@ declare module "sliftutils/storage/IArchives" {
         validWindow: [number, number];
         route?: [number, number];
         noFullSync?: boolean;
+        identity?: string;
     };
     export declare const WRITE_PAST_WINDOW_GRACE: number;
     export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
@@ -3053,6 +3054,13 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         finishLargeUpload(id: string, key: string): Promise<void>;
         cancelLargeUpload(id: string): Promise<void>;
     };
+    export type BlobSourceSpec = {
+        identity: string;
+        validWindow: [number, number];
+        route?: [number, number];
+        noFullSync?: boolean;
+        create: () => IArchives;
+    };
     export declare class BlobStore implements IBucketStore {
         private folder;
         private sources;
@@ -3072,6 +3080,8 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private dirty;
         private overlay;
         private sourceStates;
+        private syncStarted;
+        private isLive;
         init: {
             (): Promise<void>;
             reset(): void;
@@ -3082,6 +3092,14 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private countEntry;
         private setIndexEntry;
         private deleteIndexEntry;
+        /** Applies a config change to the RUNNING store: windows/routes update in place, new sources
+         *  are added (their sync starts immediately), and removed sources' slots go dead (their scans
+         *  stop, their index entries drop). The store survives every routine config evolution - it is
+         *  never destroyed for a source-list change, only for structural flips it cannot express
+         *  (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing
+         *  immediately when it has already passed). */
+        updateSources(specs: BlobSourceSpec[]): void;
+        private removeSource;
         /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
          *  another process wrote files to the shared folder that our index hasn't seen. */
         rescanBase(): Promise<void>;
@@ -3374,6 +3392,10 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         private reconnectRunning;
         private accessCache?;
         private constructor();
+        /** Config updates routinely just move a source's valid window (the last window extends
+         *  forever, then gets reduced when a new entry is appended). The wrapper survives that: only
+         *  the window changes, keeping the connection, pings, and latency history. */
+        updateValidWindow(validWindow: [number, number]): void;
         static create(config: HostedConfig | BackblazeConfig, options?: {
             background?: boolean;
         }): Promise<SourceWrapper>;
@@ -3568,6 +3590,7 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         selfEntries: HostedConfig[];
         self: HostedConfig | undefined;
         store: IBucketStore;
+        structureKey: string;
     };
     export declare function addExtraListenPort(port: number): void;
     export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;

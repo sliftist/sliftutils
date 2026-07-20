@@ -14,6 +14,10 @@ export declare class SourceWrapper {
     private reconnectRunning;
     private accessCache?;
     private constructor();
+    /** Config updates routinely just move a source's valid window (the last window extends
+     *  forever, then gets reduced when a new entry is appended). The wrapper survives that: only
+     *  the window changes, keeping the connection, pings, and latency history. */
+    updateValidWindow(validWindow: [number, number]): void;
     static create(config: HostedConfig | BackblazeConfig, options?: {
         background?: boolean;
     }): Promise<SourceWrapper>;

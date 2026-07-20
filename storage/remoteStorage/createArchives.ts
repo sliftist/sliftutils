@@ -354,13 +354,27 @@ export class ArchivesChain implements IArchives {
         } else {
             console.log(`Storage routing config changed for ${this.getDebugName()} (version ${getConfigVersion(state.config)} -> ${getConfigVersion(latest)}), rebuilding sources`);
         }
-        let oldByConfig = new Map(state.sources.map(source => [JSON.stringify(source.config), source]));
+        // Sources are matched IGNORING the valid window: config updates routinely just move
+        // windows (reduce the forever-window, append a new entry after it), and a window-only
+        // change must reuse the existing wrapper (connection, pings, latency history) instead of
+        // dispose-and-reconnect. The same URL can appear several times differing only by window
+        // (deploy window splits), so equal keys pair off in order.
+        let strippedKey = (config: HostedConfig | BackblazeConfig) => JSON.stringify({ ...config, validWindow: undefined });
+        let oldByConfig = new Map<string, SourceWrapper[]>();
+        for (let source of state.sources) {
+            let key = strippedKey(source.config);
+            let list = oldByConfig.get(key);
+            if (!list) {
+                list = [];
+                oldByConfig.set(key, list);
+            }
+            list.push(source);
+        }
         let sources: SourceWrapper[] = [];
         for (let sourceConfig of latest.sources.map(normalizeSource)) {
-            let key = JSON.stringify(sourceConfig);
-            let old = oldByConfig.get(key);
+            let old = oldByConfig.get(strippedKey(sourceConfig))?.shift();
             if (old) {
-                oldByConfig.delete(key);
+                old.updateValidWindow(sourceConfig.validWindow);
                 sources.push(old);
             } else {
                 sources.push(await this.createChainSource(sourceConfig));
@@ -368,8 +382,10 @@ export class ArchivesChain implements IArchives {
         }
         // In-flight requests still hold the old wrappers and finish fine; dispose just stops any
         // background reconnect/ping loops
-        for (let leftover of oldByConfig.values()) {
-            leftover.dispose();
+        for (let leftovers of oldByConfig.values()) {
+            for (let leftover of leftovers) {
+                leftover.dispose();
+            }
         }
         this.activeConfig = latest;
         this.statePromise = Promise.resolve({ config: latest, sources });

@@ -33,6 +33,7 @@ export type LoadedBucket = {
     selfEntries: HostedConfig[];
     self: HostedConfig | undefined;
     store: IBucketStore;
+    structureKey: string;
 };
 export declare function addExtraListenPort(port: number): void;
 export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
