@@ -2,10 +2,6 @@
 
 This is the reasoning behind the remote storage system (createArchives / storageServer / BlobStore). The code documents the mechanics; this documents the ideas that must survive refactors.
 
-## Configuration updates happen only on startup
-
-A client adopts a routing config once, during initialization, and then runs on it. Configs never automatically upgrade mid-run: the 5-minute poll picks up whatever the sources currently hold (so a developer's change spreads), but the version-gated *upgrade* — writing a newer configured version over an older stored one — happens only at startup. This is deliberate: config changes are made by a developer running code, and that developer is present at startup. It also prevents reversion loops — if a server briefly held a newer version and then went away, running clients don't cling to that phantom version; they follow what the surviving sources actually hold, and only a fresh startup with an explicitly newer configured version moves things forward again.
-
 ## Scanning + tombstones + versions make any two sources mergeable
 
 Every store fully rescans its sources' metadata (on startup and periodically), and every write — including deletions — is ordered by last-write time. Deletions are tombstones: an empty file IS a missing file, kept as a size-0 index entry (for a week) so the deletion itself propagates and reconciles like any other write. Because everything is a timestamped write and scans are bidirectional (pull what they have, push what they're missing), any two sources can be merged in any order and converge to the same state: newest write time wins, per file. There is no operation whose loss corrupts the system — a failed background write, a missed delete, a source that was down for a day — the next scan reconciles it.
@@ -15,6 +11,16 @@ Every store fully rescans its sources' metadata (on startup and periodically), a
 Each bucket stores its complete routing config (the full redundancy list) inside itself, at storage/storagerouting.json, on every source. Discovery is therefore trivial: as long as ONE node is up, a client reading it gets the full overview of the intended sources. And because clients re-discover on every startup (and re-read every 5 minutes), a developer can change the configuration in one place and clients rapidly accept it — no redeploy, no coordinated restart of the fleet.
 
 If the client tries to do a write where the valid state is far enough away or the sharding is wrong, it will re-download the routing config throttled, so it only does this at most once every 30 seconds, and retry the request.
+
+Storage routing JSON is only written to if we have write access and it's only written to on startup, it doesn't propagate. that way things don't revert without the developer intentionally rerunning it. 
+
+## Redundancy, sharding, and deployment
+
+For redundancy, we can just have multiple different configurations that will satisfy the same request. The first one is the one that we write to. If that one's down, we don't do writes.
+
+However, there's also sharding, where we have different route ranges that values can hash to. Values can explicitly try to write to a specific value via a special like hash override key. This allows us to sometimes make our rights hit a server which has less latency. In the case that the client writer will accept the fact that we might change the key.
+
+The valid windows allow us to schedule deployments, so the nodes can switch over gracefully.
 
 ## BulkDatabase2 index + our own disk as just another source
 

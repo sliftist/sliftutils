@@ -4,7 +4,7 @@ import { isNode, sort } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig,
-    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW,
+    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, STORAGE_WRONG_VALID_WINDOW,
     STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD,
 } from "../IArchives";
 import {
@@ -63,10 +63,13 @@ type ChainState = {
     sources: SourceWrapper[];
 };
 
+// The window must CONTAIN now (half-open, so a boundary resolves unambiguously). No grace in
+// either direction: a boundary is a hard handoff, and a write racing it is simply rejected by the
+// server and retried against the newly-valid source.
 function configWindowCurrent(config: HostedConfig | BackblazeConfig): boolean {
     let now = Date.now();
     let [start, end] = config.validWindow;
-    return start - WRITE_PAST_WINDOW_GRACE <= now && now <= end + WRITE_PAST_WINDOW_GRACE;
+    return start <= now && now < end;
 }
 
 // Client writes target only the CURRENTLY valid source: a future-window source receives its data

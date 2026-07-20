@@ -8,7 +8,7 @@ import { BlobStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MAR
 import {
     RemoteConfig, HostedConfig, BackblazeConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
     ArchivesSyncStatus,
-    WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
+    STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
 import { applyDeployRemap, getTakeoverAltPort, getOwnWindowEndClip, onTakeoverEvent } from "./deployTakeover";
@@ -696,9 +696,9 @@ export async function writeBucketFile(account: string, bucketName: string, fileP
     // target from a stale view - it must re-resolve and retry at the correct source.
     let route = getRoute(filePath);
     if (!config?.lastModified && loaded.selfEntries.length) {
-        let timeValid = loaded.selfEntries.filter(x => writeTime >= x.validWindow[0] - WRITE_PAST_WINDOW_GRACE && writeTime <= x.validWindow[1] + WRITE_PAST_WINDOW_GRACE);
+        let timeValid = loaded.selfEntries.filter(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1]);
         if (!timeValid.length) {
-            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) is outside all our valid windows ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))} even with the ${WRITE_PAST_WINDOW_GRACE}ms grace (a switchover moved the write target)`);
+            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) is outside all our valid windows ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))} (a switchover moved the write target)`);
             throw new Error(`${STORAGE_WRONG_VALID_WINDOW} This server is not a valid write target at ${writeTime} for bucket ${account}/${bucketName} (our valid windows: ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))}). Re-resolve the currently valid source and retry.`);
         }
         if (!timeValid.some(x => routeContains(x.route, route))) {

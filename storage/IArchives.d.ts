@@ -83,7 +83,6 @@ export type ArchivesSource = {
     noFullSync?: boolean;
     identity?: string;
 };
-export declare const WRITE_PAST_WINDOW_GRACE: number;
 export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
 export declare const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17";
 export declare const FULL_ROUTE: [number, number];

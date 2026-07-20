@@ -136,7 +136,7 @@ export type ArchivesConfig = {
 export type ArchivesSource = {
     source: IArchives;
     // From the source's CommonConfig. Values with write times outside the window are ignored when
-    // scanning, and once its end is sufficiently past (see windowAcceptsWrites) the source stops
+    // scanning, and once its end is past (see windowAcceptsWrites) the source stops
     // receiving writes entirely - still scanned (it holds the authoritative data for its window),
     // it just stops growing.
     validWindow: [number, number];
@@ -151,10 +151,6 @@ export type ArchivesSource = {
     // place instead of removing and re-adding it
     identity?: string;
 };
-
-// The grace covers clock uncertainty around the window edge: a write slightly past the end doesn't
-// hurt, but once clearly past, the source is an archive and must stop growing.
-export const WRITE_PAST_WINDOW_GRACE = 5 * 60 * 1000;
 
 // Error marker a server includes when a freshly-stamped write reaches it outside its valid windows
 // (the client resolved its target, then time crossed a window boundary before the write landed).
@@ -172,9 +168,11 @@ export const FULL_ROUTE: [number, number] = [0, 1];
 // latency, up) write shard, appends "_<value in the shard's route>" directly after the sentinel,
 // and returns the materialized key. getRoute treats that suffix as a complete route override.
 export const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
+// No grace past the end: a window boundary is a hard handoff (clients retry a rejected write
+// against the newly-valid source, so leniency here would only desynchronize the handoff)
 export function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean {
     if (!validWindow) return true;
-    return validWindow[1] + WRITE_PAST_WINDOW_GRACE > Date.now();
+    return validWindow[1] > Date.now();
 }
 
 export type ArchivesSyncSourceStatus = {
