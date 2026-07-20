@@ -3207,6 +3207,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         private initRetryTimer;
         private pollTimer;
         private disposed;
+        private unsubscribeRoutingPush;
         constructor(config: RemoteConfig | RemoteConfigBase);
         getDebugName(): string;
         private getState;
@@ -3275,6 +3276,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
         }): Promise<string>;
+        private setRoutingConfig;
         del(fileName: string): Promise<void>;
         private setVariableShard;
         setLargeFile(config: {
@@ -3434,6 +3436,15 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         write<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;
         dispose(): void;
     }
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storageClientController" {
+    /** Subscribe to server-pushed routing change notifications. Returns the unsubscribe function. */
+    export declare function onServerRoutingChanged(listener: () => void): () => void;
+    export declare const StorageClientController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
+        routingConfigChanged: () => Promise<void>;
+    }>;
 
 }
 
@@ -3598,6 +3609,7 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     };
     export declare function addExtraListenPort(port: number): void;
     export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
+    export declare function setRoutingChangedBroadcaster(broadcaster: () => void): void;
     export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
     export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
         lastModified?: number;

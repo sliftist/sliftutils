@@ -11,6 +11,7 @@ export declare class ArchivesChain implements IArchives {
     private initRetryTimer;
     private pollTimer;
     private disposed;
+    private unsubscribeRoutingPush;
     constructor(config: RemoteConfig | RemoteConfigBase);
     getDebugName(): string;
     private getState;
@@ -79,6 +80,7 @@ export declare class ArchivesChain implements IArchives {
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<string>;
+    private setRoutingConfig;
     del(fileName: string): Promise<void>;
     private setVariableShard;
     setLargeFile(config: {
