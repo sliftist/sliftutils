@@ -25,12 +25,10 @@ export type IStorage<T> = {
     // Allows watching for when the storage detects and underlying changes, and resyncs all of it's data (which might 
     watchResync?: (callback: () => void) => void;
 };
-// NOTE: In the file system some characters are disallowed, and some characters do special things
-//  (/ makes a folder). And there are even more rules, such as lengths per folder, etc, etc.
+// NOTE: In the file system some characters are disallowed, and some characters do special things (/ makes a folder). And there are even more rules, such as lengths per folder, etc, etc.
 export type IStorageRaw = {
     get(key: string): Promise<Buffer | undefined>;
-    // Reads bytes in the range [start, end) (end is exclusive, clamped to the file size).
-    //  Returns undefined if the file doesn't exist.
+    // Reads bytes in the range [start, end) (end is exclusive, clamped to the file size). Returns undefined if the file doesn't exist.
     getRange(key: string, config: { start: number; end: number }): Promise<Buffer | undefined>;
     // May or may not be efficient in the underlying storage
     append(key: string, value: Buffer): Promise<void>;

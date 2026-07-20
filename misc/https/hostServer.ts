@@ -34,6 +34,8 @@ export type HostServerConfig = {
     portFallback?: {
         /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
         getAcquireDelay: () => number;
+        /** Called when the main port turned out to be busy, before we act as its successor in any way. Throwing aborts startup - a busy port with no deploy in progress means something else holds it, which is not a state to keep running in. */
+        onPortInUse?: () => Promise<void>;
         /** Reports every port we become reachable on (the alternate at mount, the main port once relayed) */
         onListening: (port: number, isMainPort: boolean) => void;
     };
@@ -60,8 +62,7 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
         }
     });
 
-    // With portFallback, a busy port is not an error: the underlying server scans for a free port
-    // instead (useAvailablePortIfPortInUse), and the nodeId tells us which port we actually got
+    // With portFallback, a busy port is not an error: the underlying server scans for a free port instead (useAvailablePortIfPortInUse), and the nodeId tells us which port we actually got
     let nodeId = await SocketFunction.mount({
         public: true,
         autoForwardPort: true,
@@ -91,6 +92,7 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
     let fallback = config.portFallback;
     if (fallback && servingPort !== port) {
         console.log(magenta(`Port ${port} is in use (presumably by our predecessor); serving on alternate port ${servingPort} until it frees`));
+        await fallback.onPortInUse?.();
         void runMainPortAcquireLoop(domain, port, servingPort, fallback);
     }
     fallback?.onListening(servingPort, servingPort === port);
@@ -98,9 +100,7 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
     return nodeId;
 }
 
-// SocketFunction can only mount once per process, so "taking over" the main port is a raw TCP
-// relay forwarding to our real listener - TLS/SNI passes straight through, and clients address
-// servers by ip domain (wildcard negotiation), so the extra hop is invisible.
+// SocketFunction can only mount once per process, so "taking over" the main port is a raw TCP relay forwarding to our real listener - TLS/SNI passes straight through, and clients address servers by ip domain (wildcard negotiation), so the extra hop is invisible.
 async function runMainPortAcquireLoop(domain: string, mainPort: number, servingPort: number, fallback: NonNullable<HostServerConfig["portFallback"]>): Promise<void> {
     while (true) {
         await delay(fallback.getAcquireDelay());
@@ -121,8 +121,7 @@ async function runMainPortAcquireLoop(domain: string, mainPort: number, servingP
         });
         if (acquired) {
             console.log(magenta(`Acquired main port ${mainPort} for https://${domain} (relaying to our listener on ${servingPort})`));
-            // The mount only forwarded OUR serving port; the main port needs its own mapping (the
-            // predecessor's mapping pointed at the same machine+port, but dies with it)
+            // The mount only forwarded OUR serving port; the main port needs its own mapping (the predecessor's mapping pointed at the same machine+port, but dies with it)
             await forwardPort({ externalPort: mainPort, internalPort: mainPort });
             fallback.onListening(mainPort, true);
             return;

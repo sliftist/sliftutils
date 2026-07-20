@@ -1,8 +1,6 @@
 import { SocketFunction } from "socket-function/SocketFunction";
 
-// The client half of routing-change broadcasts: the storage server tracks its connected clients
-// (see trackCaller in storageController) and calls routingConfigChanged on every one of them the
-// moment a routing config changes - clients react immediately instead of waiting for a poll.
+// The client half of routing-change broadcasts: the storage server tracks its connected clients (see trackCaller in storageController) and calls routingConfigChanged on every one of them the moment a routing config changes - clients react immediately instead of waiting for a poll.
 
 const listeners = new Set<() => void>();
 

@@ -9,11 +9,9 @@ export async function bundle(config: {
     rootPath: string;
     entryPoints: string[];
 }): Promise<{
-    // The runnable bundle, WITHOUT the sourcemap comment (the sourcemap is usually bigger than the
-    // code itself, so the default artifact ships without it).
+    // The runnable bundle, WITHOUT the sourcemap comment (the sourcemap is usually bigger than the code itself, so the default artifact ships without it).
     bundle: string;
-    // The trailing inline-sourcemap line comment. Append to `bundle` (with a newline) for the debug
-    // variant of the bundle.
+    // The trailing inline-sourcemap line comment. Append to `bundle` (with a newline) for the debug variant of the bundle.
     sourceMapComment: string;
 }> {
     const { modules, rootPath, entryPoints } = config;

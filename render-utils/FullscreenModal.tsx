@@ -48,10 +48,7 @@ export class FullscreenModal extends preact.Component<{
                         cursor: "pointer",
                         ...this.props.outerStyle,
                     }}
-                    // Close on mouse DOWN on the backdrop, not click — otherwise a drag that starts
-                    // inside the modal (e.g. selecting text) and releases out on the backdrop fires a
-                    // click on the backdrop and wrongly closes it. currentTarget === target means the
-                    // press began on the backdrop itself, not bubbled up from the modal content.
+                    // Close on mouse DOWN on the backdrop, not click — otherwise a drag that starts inside the modal (e.g. selecting text) and releases out on the backdrop fires a click on the backdrop and wrongly closes it. currentTarget === target means the press began on the backdrop itself, not bubbled up from the modal content.
                     onMouseDown={e => {
                         if (e.currentTarget === e.target) {
                             if (parentState) parentState.open = false;

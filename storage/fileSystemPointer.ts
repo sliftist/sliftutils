@@ -55,10 +55,7 @@ export async function deleteFileSystemPointer(pointer: FileSystemPointer) {
     });
 }
 
-// Enumerates every stored pointer handle whose permission is already granted for `mode`, newest first
-// (pointer keys start with Date.now(), which sorts lexicographically). Callable from a Web Worker —
-// unlike getFileSystemPointer's onUserActivation flow, this only uses queryPermission, which does
-// NOT require user activation.
+// Enumerates every stored pointer handle whose permission is already granted for `mode`, newest first (pointer keys start with Date.now(), which sorts lexicographically). Callable from a Web Worker — unlike getFileSystemPointer's onUserActivation flow, this only uses queryPermission, which does NOT require user activation.
 export async function findGrantedPointerHandle(mode: "read" | "readwrite"): Promise<FileSystemDirectoryHandle | undefined> {
     let database = await db();
     if (!database) return undefined;
@@ -90,9 +87,7 @@ export async function getFileSystemPointer(config: {
 }): Promise<{
     // NOTE: We have to call requestPermission, so... user activation is required (as in,
     //  this need to be called inside of a button).
-    // IMPORTANT! In some circumstances user activation is not required (with multiple tabs,
-    //      and potentially with https://developer.chrome.com/blog/persistent-permissions-for-the-file-system-access-api),
-    //      so... trying to call onUserActivation immmediately is a good idea (although it might throw).
+    // IMPORTANT! In some circumstances user activation is not required (with multiple tabs, and potentially with https://developer.chrome.com/blog/persistent-permissions-for-the-file-system-access-api), so... trying to call onUserActivation immmediately is a good idea (although it might throw).
     onUserActivation(modeOverride?: "read" | "readwrite"): Promise<FileSystemFileHandle | FileSystemDirectoryHandle>
 } | undefined
 > {

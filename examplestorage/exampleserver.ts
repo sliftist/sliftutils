@@ -6,8 +6,7 @@ import { hostServer } from "../misc/https/hostServer";
 // Import browser code, so it is allowed to be required by the client
 import "./browser";
 
-// Static example site for the remote storage system (storage/remoteStorage). The browser talks to
-// the storage server directly, so this server only serves the page.
+// Static example site for the remote storage system (storage/remoteStorage). The browser talks to the storage server directly, so this server only serves the page.
 
 const DOMAIN = "storageexample.vidgridweb.com";
 const PORT = 4445;

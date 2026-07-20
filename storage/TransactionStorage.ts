@@ -13,27 +13,20 @@ import { runInfinitePoll } from "socket-function/src/batching";
 //      - Zip individual large values
 //      - Stores a transaction log
 //          - Transaction log has a header, which is JSON, for things such as "zipped"
-//          - Transaction log uses length prefixed values, with a special 8 bytes to denote the end,
-//              and 8 for the start.
-//          - When transaction log is iterated on, if the bytes at the end (using the length prefix)
-//              don't match the end bytes OR the start bytes are wrong, we skip the start bytes,
-//              and iterating until we find new start bytes that match our special bytes. Then we try
-//              to read these values.
+//          - Transaction log uses length prefixed values, with a special 8 bytes to denote the end, and 8 for the start.
+//          - When transaction log is iterated on, if the bytes at the end (using the length prefix) don't match the end bytes OR the start bytes are wrong, we skip the start bytes, and iterating until we find new start bytes that match our special bytes. Then we try to read these values.
 //          - Each transaction entry has a byte for flags, one bit which denotes if the value is zipped or not.
 //      - Compresses the log after there are 3X entries than keys (and > 100)
 //          - Both dedupe keys, and zip
 //      - Assumes all files in rawStorage ending with .tx are transaction logs
 //      - Names files like `${generation}.tx`
-//          - When compressing, we increment the generation, and write to a new file, and delete
-//              any generations that are older than the new one
+//          - When compressing, we increment the generation, and write to a new file, and delete any generations that are older than the new one
 //          - On reading, we read from all generation files that exist, in case some are corrupted
 //      - On load, loads in all transaction logs, and stores all values in a Map<string, Buffer>
 //      - On writes immediately updates the in memory Map, and then writes to the transaction log
 //      - Caches the last transaction file name in memory
-//      - Makes sure all file system writes (but not Map updates) are done with fileLockSection,
-//          so they never overlap.
-//      - Buffers pending appends in memory, so they can written all at once (after the first one
-//          is blocking in fileLockSection).
+//      - Makes sure all file system writes (but not Map updates) are done with fileLockSection, so they never overlap.
+//      - Buffers pending appends in memory, so they can written all at once (after the first one is blocking in fileLockSection).
 
 UPDATE now we use chunks, because append is too slow.
 
@@ -93,9 +86,7 @@ export class TransactionStorage implements IStorage<Buffer> {
         private rawStorage: IStorageRaw,
         private debugName: string,
         private writeDelay = WRITE_DELAY,
-        // When set, we poll the underlying storage and reload if another process/tab writes new
-        // chunk files. Off by default, as it costs a periodic disk scan and most collections are
-        // only written by a single process.
+        // When set, we poll the underlying storage and reload if another process/tab writes new chunk files. Off by default, as it costs a periodic disk scan and most collections are only written by a single process.
         private resyncFromDisk = false
     ) {
         TransactionStorage.allStorage.push(this);
@@ -241,7 +232,7 @@ export class TransactionStorage implements IStorage<Buffer> {
     private updatePendingAppends = throttleFunction(100, async () => {
         let appendCount = this.pendingAppends.length + this.extraAppends;
         let group = `Transaction (${this.debugName})`;
-        //console.log(`Update pending appends ${group}: ${appendCount}`);
+        // console.log(`Update pending appends ${group}: ${appendCount}`);
         if (!appendCount) {
             setPending(group, "");
             return;
@@ -322,7 +313,7 @@ export class TransactionStorage implements IStorage<Buffer> {
         const fullFile = await this.rawStorage.get(filename);
         if (!fullFile) return [];
         if (fullFile.length < 4) {
-            //console.error(`Transaction in ${this.debugName} file ${filename} is too small, skipping`);
+            // console.error(`Transaction in ${this.debugName} file ${filename} is too small, skipping`);
             return [];
         }
         size.value += fullFile.length;
@@ -549,8 +540,7 @@ export class TransactionStorage implements IStorage<Buffer> {
             existingDiskEntries = existingDiskEntries.filter(x => x.endsWith(CHUNK_EXT));
             let compressNow = force || (
                 this.entryCount > 100 && this.entryCount > this.cache.size * 3
-                // NOTE: This compress check breaks down if we only have very large values, but... those
-                //  don't work ANYWAYS (it is better to use one file per value instead).
+                // NOTE: This compress check breaks down if we only have very large values, but... those don't work ANYWAYS (it is better to use one file per value instead).
                 //  - Maybe we should throw, or at least warn, on sets of value > 1MB,
                 //      at which point they should just use a file per value
                 || existingDiskEntries.length > Math.max(10, Math.ceil(this.entryCount / 1000))
@@ -559,8 +549,7 @@ export class TransactionStorage implements IStorage<Buffer> {
             if (!compressNow) return;
             console.log(`Compressing ${this.debugName} transaction log, ${this.entryCount} entries, ${this.cache.size} keys`);
 
-            // Load off disk, in case there are other writes. We still race with them, but at least
-            //  this reduces the race condition considerably
+            // Load off disk, in case there are other writes. We still race with them, but at least this reduces the race condition considerably
             existingDiskEntries = await this.loadAllTransactions();
 
             this.entryCount = this.cache.size;
@@ -598,9 +587,7 @@ export class TransactionStorage implements IStorage<Buffer> {
                 }
             }
 
-            // This is the ONLY time we can delete old files, as we know for sure the new file has all of our data.
-            //  Any future readers won't know this, unless they write it themselves (or unless they audit it against
-            //      the other generations, which is annoying).
+            // This is the ONLY time we can delete old files, as we know for sure the new file has all of our data. Any future readers won't know this, unless they write it themselves (or unless they audit it against the other generations, which is annoying).
             for (const file of existingDiskEntries) {
                 await this.rawStorage.remove(file);
                 this.diskFiles.delete(file);

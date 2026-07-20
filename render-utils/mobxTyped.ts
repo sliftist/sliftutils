@@ -1,8 +1,7 @@
 import * as mobx from "mobx";
 import { batchFunction } from "socket-function/src/batching";
 
-// Re-export the core mobx primitives so downstream packages (which may have their own duplicate mobx
-// in node_modules) can share THIS mobx instance, otherwise reactivity doesn't cross package boundaries.
+// Re-export the core mobx primitives so downstream packages (which may have their own duplicate mobx in node_modules) can share THIS mobx instance, otherwise reactivity doesn't cross package boundaries.
 export { observable, runInAction, computed, autorun, onBecomeObserved, onBecomeUnobserved } from "mobx";
 export function configureMobxNextFrameScheduler() {
     // NOTE: This makes a big difference if we do await calls in a loop which mutates observable state. BUT... we should probably just do those await calls before the loop?
@@ -10,7 +9,7 @@ export function configureMobxNextFrameScheduler() {
         delay: 16,
         name: "reactionScheduler",
     }, (callbacks: (() => void)[]) => {
-        //console.log(`Triggering ${callbacks.length} reactions`);
+        // console.log(`Triggering ${callbacks.length} reactions`);
         for (let callback of callbacks) {
             callback();
         }

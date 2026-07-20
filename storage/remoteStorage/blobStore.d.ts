@@ -78,6 +78,7 @@ export declare class BlobStore implements IBucketStore {
     constructor(folder: string, sources: ArchivesSource[], config?: {
         onIndexChanged?: ((key: string) => void) | undefined;
         readerDiskLimit?: number | undefined;
+        onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
     } | undefined);
     private stopped;
     private index;
@@ -102,20 +103,12 @@ export declare class BlobStore implements IBucketStore {
     private countEntry;
     private setIndexEntry;
     private deleteIndexEntry;
-    /** Applies a config change to the RUNNING store: windows/routes update in place, new sources
-     *  are added (their sync starts immediately), and removed sources' slots go dead (their scans
-     *  stop, their index entries drop). The store survives every routine config evolution - it is
-     *  never destroyed for a source-list change, only for structural flips it cannot express
-     *  (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing
-     *  immediately when it has already passed). */
+    /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
     updateSources(specs: BlobSourceSpec[]): void;
     private removeSource;
-    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
-     *  another process wrote files to the shared folder that our index hasn't seen. */
+    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
     rescanBase(): Promise<void>;
-    /** A boundary scan of the node that owned (part of) our route in the valid window before ours,
-     *  when that node is different storage (a disk rescan can't see its writes): just its changes
-     *  since the boundary neighborhood, with matching values pulled onto our own disk. */
+    /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
     boundaryScanRemote(source: IArchives, config: {
         since: number;
         route?: [number, number];
@@ -134,8 +127,7 @@ export declare class BlobStore implements IBucketStore {
         readerDiskLimit?: number;
         syncing: SyncActivity[];
     };
-    /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to
-     *  any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
+    /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
     computeIndexTotals(): Promise<{
         fileCount: number;
         byteCount: number;

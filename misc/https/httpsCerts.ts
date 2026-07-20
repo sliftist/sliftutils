@@ -64,16 +64,10 @@ export const getHTTPSCert = cache(async (domain: string): Promise<{ key: string;
     let altDomains: string[] = [];
 
     // altDomains.push("noproxy." + domain);
-    // // NOTE: Allowing local access is just an optimization, not to avoid having to forward ports
-    // //  (unless you type 127-0-0-1.domain into the browser... then I guess you don't have to forward ports?)
-    // altDomains.push("127-0-0-1." + domain);
+    // // NOTE: Allowing local access is just an optimization, not to avoid having to forward ports //  (unless you type 127-0-0-1.domain into the browser... then I guess you don't have to forward ports?) altDomains.push("127-0-0-1." + domain);
 
-    // NOTE: I forget why we were not allowing wildcard domains. I think it was to prevent
-    //  any HTTPS domains from impersonating servers. But... servers have two levels, so that isn't
-    //  an issue. And even if they didn't they store their public key in their domain, so you
-    //  can't really impersonate them anyways...
-    //  - AND, we need this for IP type A records, which... we need to pick the server we want
-    //      to connect to.
+    // NOTE: I forget why we were not allowing wildcard domains. I think it was to prevent any HTTPS domains from impersonating servers. But... servers have two levels, so that isn't an issue. And even if they didn't they store their public key in their domain, so you can't really impersonate them anyways...
+    //  - AND, we need this for IP type A records, which... we need to pick the server we want to connect to.
     altDomains.push("*." + domain);
 
     try {

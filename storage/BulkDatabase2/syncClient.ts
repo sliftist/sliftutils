@@ -1,14 +1,8 @@
-// Browser-side cross-tab write sync for BulkDatabase2, over BroadcastChannel (one channel per
-// collection, same-origin tabs and workers). It does NOT persist anything — each side writes to disk
-// itself; this just relays live writes to other open tabs/workers and, when one starts up, asks peers
-// for writes they've made recently that may not be on disk yet. No-op in Node / where
-// BroadcastChannel is unavailable, so BulkDatabase2 can call these unconditionally. This is an
-// optional feature, so there is no fallback.
+// Browser-side cross-tab write sync for BulkDatabase2, over BroadcastChannel (one channel per collection, same-origin tabs and workers). It does NOT persist anything — each side writes to disk itself; this just relays live writes to other open tabs/workers and, when one starts up, asks peers for writes they've made recently that may not be on disk yet. No-op in Node / where BroadcastChannel is unavailable, so BulkDatabase2 can call these unconditionally. This is an optional feature, so there is no fallback.
 
 export type RemoteWrite = { key: string; time: number; deleted?: boolean; value?: unknown };
 
-// Writes older than this are assumed already flushed to disk (a freshly-opened tab gets those by
-// reading disk), so a tab only replays writes newer than this when a peer says hello.
+// Writes older than this are assumed already flushed to disk (a freshly-opened tab gets those by reading disk), so a tab only replays writes newer than this when a peer says hello.
 const RECENT_WINDOW_MS = 60_000;
 
 type Channel = {
@@ -23,8 +17,7 @@ type Channel = {
 const channels = new Map<string, Channel>();
 
 export function isSyncSupported(): boolean {
-    // window (main-thread browser) or WorkerGlobalScope (Web/Service/Shared worker) — but not Node
-    // (typesafecss's isNode is `typeof window === "undefined"`, which misclassifies workers)
+    // window (main-thread browser) or WorkerGlobalScope (Web/Service/Shared worker) — but not Node (typesafecss's isNode is `typeof window === "undefined"`, which misclassifies workers)
     let isBrowserOrWorker = typeof window !== "undefined"
         || "WorkerGlobalScope" in globalThis;
     return isBrowserOrWorker && typeof BroadcastChannel !== "undefined";
@@ -43,8 +36,7 @@ function ensure(collection: string): Channel | undefined {
     if (!isSyncSupported()) return undefined;
     let channel = channels.get(collection);
     if (channel) return channel;
-    // BroadcastChannel never delivers a message back to the instance that sent it, so a tab never
-    // hears its own writes — only the other open tabs do.
+    // BroadcastChannel never delivers a message back to the instance that sent it, so a tab never hears its own writes — only the other open tabs do.
     const bc = new BroadcastChannel(`bulkDatabase2:${collection}`);
     const created: Channel = { bc, subscribers: [], sealSubscribers: [], recent: [] };
     bc.onmessage = (event: MessageEvent) => {
@@ -55,13 +47,10 @@ function ensure(collection: string): Channel | undefined {
         } else if (msg.type === "recent" && msg.writes) {
             for (const write of msg.writes) deliver(created, write);
         } else if (msg.type === "seal") {
-            // A peer is about to fold recent data; stop appending to our current stream file so it
-            // becomes complete and the merge can fold it whole. Our next write starts a fresh file.
+            // A peer is about to fold recent data; stop appending to our current stream file so it becomes complete and the merge can fold it whole. Our next write starts a fresh file.
             for (const sub of created.sealSubscribers) sub();
         } else if (msg.type === "hello") {
-            // Another tab just started; replay our recent writes so it doesn't miss any. The reply goes
-            // to every tab, but peers that already have a write ignore it (its timestamp isn't newer
-            // than what they hold), so the redundant broadcast is harmless.
+            // Another tab just started; replay our recent writes so it doesn't miss any. The reply goes to every tab, but peers that already have a write ignore it (its timestamp isn't newer than what they hold), so the redundant broadcast is harmless.
             pruneRecent(created);
             if (created.recent.length) created.bc.postMessage({ type: "recent", writes: created.recent });
         }
@@ -70,9 +59,7 @@ function ensure(collection: string): Channel | undefined {
     return created;
 }
 
-// Subscribe to remote writes for a collection. Recent writes from already-open tabs arrive through the
-// same onWrite callback (as the reply to our hello), so the returned array is always empty — it's kept
-// only for API compatibility with callers that await it.
+// Subscribe to remote writes for a collection. Recent writes from already-open tabs arrive through the same onWrite callback (as the reply to our hello), so the returned array is always empty — it's kept only for API compatibility with callers that await it.
 export function connect(collection: string, onWrite: (write: RemoteWrite) => void, onSeal?: () => void): Promise<RemoteWrite[]> {
     const channel = ensure(collection);
     if (!channel) return Promise.resolve([]);
@@ -90,10 +77,7 @@ export function broadcast(collection: string, write: RemoteWrite): void {
     channel.bc.postMessage({ type: "write", write });
 }
 
-// Ask every other open tab of this collection to seal (stop appending to) its current stream file, so
-// a merge can fold recent data up to the present without racing an append. Best-effort: no-op in Node,
-// and a peer that misses it just keeps appending — worst case the merge folds a prefix and the rest
-// folds later (duplication, resolved by write-time), never data loss.
+// Ask every other open tab of this collection to seal (stop appending to) its current stream file, so a merge can fold recent data up to the present without racing an append. Best-effort: no-op in Node, and a peer that misses it just keeps appending — worst case the merge folds a prefix and the rest folds later (duplication, resolved by write-time), never data loss.
 export function broadcastSeal(collection: string): void {
     const channel = ensure(collection);
     if (!channel) return;

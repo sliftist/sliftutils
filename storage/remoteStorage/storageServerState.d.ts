@@ -20,7 +20,16 @@ export declare function getWritesRejectedReason(): string | undefined;
 export declare function assertWritesAllowed(): void;
 export declare function getTrust(): Promise<IStorage<TrustRecord>>;
 export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
-/** Makes machineIds the complete trust list for the account: machines not in the list lose access, machines already trusted keep their existing record, and missing ones are added. */
+export type BucketWriteStats = {
+    /** Every set call the bucket accepted */
+    originalWrites: number;
+    originalBytes: number;
+    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+    flushedWrites: number;
+    flushedBytes: number;
+};
+/** Zeroes the write statistics of every bucket in the account, including counts not yet flushed. */
+export declare function clearAccountWriteStats(account: string): Promise<number>;
 export declare function setTrustedMachines(config: {
     account: string;
     machineIds: string[];
@@ -36,6 +45,7 @@ export type LoadedBucket = {
     structureKey: string;
 };
 export declare function addExtraListenPort(port: number): void;
+export declare function removeExtraListenPort(port: number): void;
 export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
 export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
 export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
@@ -43,16 +53,29 @@ export declare function writeBucketFile(account: string, bucketName: string, fil
 }): Promise<void>;
 export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
 export declare function rebuildAllLoadedBuckets(): Promise<void>;
+/** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
+export declare const startIntermediateMaintenance: {
+    (): void;
+    reset(): void;
+    set(newValue: void): void;
+};
+export type BucketDiskInfo = {
+    totalBytes: number;
+    freeBytes: number;
+    usedBytes: number;
+};
 export type ServerBucketInfo = {
     bucketName: string;
     active: boolean;
+    /** Where the bucket's data lives on this server */
+    folder: string;
+    /** The drive that folder is on. Buckets sharing a drive report the same numbers. */
+    disk?: BucketDiskInfo;
+    diskError?: string;
+    writeStats?: BucketWriteStats;
     config?: ArchivesConfig;
     error?: string;
 };
-/** Every bucket the account has on this server, active or not, each with its configuration.
- *  Inactive buckets are inspected straight from disk WITHOUT loading them - loading would start
- *  their synchronization, and old invalid buckets must stay inert (their parse error is reported
- *  instead). */
 export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
 export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
 export declare function getLocalArchives(account: string, bucketName: string): IArchives;

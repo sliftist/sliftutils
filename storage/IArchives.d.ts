@@ -28,11 +28,12 @@ export type CommonConfig = {
     validWindow: [number, number];
     /** Sharding: the fraction of the key space this source handles, as [start, end) over [0, 1) (keys are routed by getRoute in remoteConfig.ts). Defaults to FULL_ROUTE (unsharded). At every point in time the sources' routes must fully cover [0, 1), or some keys could never be read. */
     route?: [number, number];
+    /** Set on entries injected into the in-memory config by an overlay (a deploy switchover's alternate-port window). Never written to disk: resolveIntermediateSources strips these and rejoins the windows around them, which is also how a client tells whether an update is a real configuration change or just an overlay. */
+    intermediate?: boolean;
 };
 export type HostedConfig = CommonConfig & {
     type: "remote";
     url: string;
-    accountName?: string;
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
@@ -104,8 +105,7 @@ export type ArchivesSyncStatus = {
 };
 export interface IArchives {
     getDebugName(): string;
-    /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc).
-     *  Checked without writing anything. */
+    /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc). Checked without writing anything. */
     hasWriteAccess(): Promise<boolean>;
     get(fileName: string, config?: {
         range?: {

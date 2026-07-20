@@ -139,19 +139,14 @@ export interface IBulkDatabase2<T extends { key: string }> {
      */
     tryMergeNow(): Promise<MergeAttemptResult>;
 
-    /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
-     * most callers want compact() or tryMergeNow(). */
+    /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level; most callers want compact() or tryMergeNow(). */
     merge(timeLo: number, timeHi: number): Promise<void>;
 }
 
-// mobx-backed reactivity: each signal string gets its own observable box. observe() reads it (so an
-// observer/autorun that calls it tracks that box) and invalidate() bumps it (so those reactions re-run).
-// This reproduces the fine-grained per-key + load-version reactivity the class had when it used
-// observable.map/observable.box directly, while keeping all that logic in the mobx-free base.
+// mobx-backed reactivity: each signal string gets its own observable box. observe() reads it (so an observer/autorun that calls it tracks that box) and invalidate() bumps it (so those reactions re-run). This reproduces the fine-grained per-key + load-version reactivity the class had when it used observable.map/observable.box directly, while keeping all that logic in the mobx-free base.
 export class MobxReactiveDeps implements ReactiveDeps {
     private boxes = new Map<string, { get(): number; set(value: number): void }>();
-    // Signals that currently have at least one observer, kept current via mobx's onBecomeObserved/
-    // onBecomeUnobserved hooks. Lets isObserved() answer "is anything watching this row" cheaply.
+    // Signals that currently have at least one observer, kept current via mobx's onBecomeObserved/ onBecomeUnobserved hooks. Lets isObserved() answer "is anything watching this row" cheaply.
     private observed = new Set<string>();
     private box(signal: string) {
         let box = this.boxes.get(signal);
@@ -178,9 +173,7 @@ export class MobxReactiveDeps implements ReactiveDeps {
     }
 }
 
-// Backwards-compatible BulkDatabase2: the mobx-reactive flavor. All behavior lives in BulkDatabaseBase;
-// this just supplies mobx reactivity and the default (getFileStorageNested2) storage backend, so the
-// sync reads (getSingleFieldSync / getColumnSync) stay observable for mobx components.
+// Backwards-compatible BulkDatabase2: the mobx-reactive flavor. All behavior lives in BulkDatabaseBase; this just supplies mobx reactivity and the default (getFileStorageNested2) storage backend, so the sync reads (getSingleFieldSync / getColumnSync) stay observable for mobx components.
 export class BulkDatabase2<T extends { key: string }> extends BulkDatabaseBase<T> implements IBulkDatabase2<T> {
     constructor(name: string, config?: BulkDatabase2Config) {
         super(name, new MobxReactiveDeps(), getFileStorageNested2, config);

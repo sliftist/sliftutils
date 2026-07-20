@@ -19,13 +19,9 @@ process.on("unhandledRejection", reason => {
     console.error(`[writeServer] unhandledRejection (continuing):`, (reason as Error)?.stack ?? reason);
 });
 
-// Remote file server for sliftutils getRemoteFileStorage / BulkDatabase2. Serves one folder on disk over
-// self-signed HTTPS, authenticated with an auto-generated 6-word password (sent as
-// `Authorization: Bearer <password>`). Run it with `yarn filehoster <folder>` (or the `filehoster` bin).
-//
-// SECURITY: the cert is self-signed, so a browser must accept it once (open the printed https URL and
-// click through), and the Node client connects with cert verification disabled. The password is what
-// authorizes access; keep it secret.
+// Remote file server for sliftutils getRemoteFileStorage / BulkDatabase2. Serves one folder on disk over self-signed HTTPS, authenticated with an auto-generated 6-word password (sent as `Authorization: Bearer <password>`). Run it with `yarn filehoster <folder>` (or the `filehoster` bin).
+// 
+// SECURITY: the cert is self-signed, so a browser must accept it once (open the printed https URL and click through), and the Node client connects with cert verification disabled. The password is what authorizes access; keep it secret.
 
 // Common, memorable words (frequency-ordered subset) for passphrase generation.
 const WORDS: string[] = [
@@ -207,16 +203,12 @@ export function generatePassword(wordCount: number): string {
     return words.join(" ");
 }
 
-// The password is always a list of words, so we compare case-insensitively and ignore any non-letter
-// characters. That makes it forgiving of voice dictation and mobile autocorrect (spacing, capitals,
-// stray punctuation) without meaningfully weakening a 6-word passphrase.
+// The password is always a list of words, so we compare case-insensitively and ignore any non-letter characters. That makes it forgiving of voice dictation and mobile autocorrect (spacing, capitals, stray punctuation) without meaningfully weakening a 6-word passphrase.
 function normalizePassword(p: string): string {
     return String(p || "").toLowerCase().replace(/[^a-z]/g, "");
 }
 
-// The password is generated once and saved (next to the cert, outside the served folder), then reused
-// across restarts — so connected clients keep working after the server bounces, instead of getting a
-// new password every time. Override with the PASSWORD env var.
+// The password is generated once and saved (next to the cert, outside the served folder), then reused across restarts — so connected clients keep working after the server bounces, instead of getting a new password every time. Override with the PASSWORD env var.
 function getOrCreatePassword(): string {
     const dir = path.join(os.homedir(), ".sliftutils-remote");
     fs.mkdirSync(dir, { recursive: true });
@@ -230,8 +222,7 @@ function getOrCreatePassword(): string {
     return pw;
 }
 
-// Generate (once) and cache a self-signed key + cert via openssl, outside the served folder so its
-// private key is never reachable through the API.
+// Generate (once) and cache a self-signed key + cert via openssl, outside the served folder so its private key is never reachable through the API.
 function getCert(): { key: Buffer; cert: Buffer } {
     const dir = path.join(os.homedir(), ".sliftutils-remote");
     fs.mkdirSync(dir, { recursive: true });
@@ -284,9 +275,7 @@ function formatBytes(n: number): string {
     return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
 }
 
-// Parse a single-range HTTP Range header ("bytes=start-end", "bytes=start-", "bytes=-suffix") into an
-// INCLUSIVE [start, end]. Returns "unsatisfiable" for a range past the file, or undefined for no/garbled
-// range (caller then serves the whole file). Only single ranges are supported (what media players use).
+// Parse a single-range HTTP Range header ("bytes=start-end", "bytes=start-", "bytes=-suffix") into an INCLUSIVE [start, end]. Returns "unsatisfiable" for a range past the file, or undefined for no/garbled range (caller then serves the whole file). Only single ranges are supported (what media players use).
 function parseRange(header: string, size: number): { start: number; end: number } | "unsatisfiable" | undefined {
     const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
     if (!m) return undefined;
@@ -318,9 +307,7 @@ function mediaContentType(filePath: string): string {
     return MEDIA_TYPES[ext] || "application/octet-stream";
 }
 
-// Public (no-auth) landing page. The browser can't trust a self-signed cert from a background fetch, so
-// the user opens this URL once, accepts the browser's security warning, and the cert becomes trusted for
-// the origin — then the app's fetches work. This page is what they see after accepting.
+// Public (no-auth) landing page. The browser can't trust a self-signed cert from a background fetch, so the user opens this URL once, accepts the browser's security warning, and the cert becomes trusted for the origin — then the app's fetches work. This page is what they see after accepting.
 const CERT_LANDING_HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>sliftutils file server</title></head><body style="font-family:system-ui,sans-serif;max-width:34em;margin:3em auto;padding:0 1em;line-height:1.5;color:#222"><h2>&#10003; Certificate accepted</h2><p>This is your <b>sliftutils file server</b>. Your browser now trusts its self-signed certificate for this address.</p><p>Return to the app and click <b>Retry</b> (or <b>Connect</b>) to finish connecting with your password.</p><p style="color:#888;font-size:.9em">You can close this tab.</p></body></html>`;
 
 export type RemoteFileServerOptions = {
@@ -328,8 +315,7 @@ export type RemoteFileServerOptions = {
     port?: number;
     host?: string;
     password?: string;
-    // When true, log batched per-(client, file) access totals every 5s. The CLI turns this on; the
-    // library (tests) leaves it off.
+    // When true, log batched per-(client, file) access totals every 5s. The CLI turns this on; the library (tests) leaves it off.
     logAccess?: boolean;
 };
 export type RemoteFileServerHandle = { port: number; password: string; url: string; close: () => Promise<void> };
@@ -343,8 +329,7 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
     const normPassword = normalizePassword(password);
     const { key, cert } = getCert();
 
-    // Batched access log: aggregate per (ip, op, file) so hammering one file logs once per 5s with the
-    // total request count and bytes, instead of a line per request.
+    // Batched access log: aggregate per (ip, op, file) so hammering one file logs once per 5s with the total request count and bytes, instead of a line per request.
     type Acc = { ip: string; op: string; path: string; count: number; bytes: number };
     const accessLog = new Map<string, Acc>();
     let flushTimer: ReturnType<typeof setInterval> | undefined;
@@ -361,8 +346,7 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
             if (!accessLog.size) return;
             const rows = [...accessLog.values()].sort((a, b) => b.bytes - a.bytes);
             accessLog.clear();
-            // Fixed-width columns first so lines align, then the variable-length path last. count is the
-            // number of requests folded into this row (R = requests, not a multiplier).
+            // Fixed-width columns first so lines align, then the variable-length path last. count is the number of requests folded into this row (R = requests, not a multiplier).
             const time = new Date().toTimeString().slice(0, 8);
             for (const e of rows) {
                 const size = formatBytes(e.bytes).padStart(9);
@@ -437,8 +421,7 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
                 fs.createReadStream(full, { start, end: end - 1 }).on("error", () => res.end()).pipe(res);
                 return;
             }
-            // Range-capable media endpoint for <video>/<img>/fetch: honors the Range header (206 +
-            // Content-Range + Accept-Ranges) so seeking works. Auth came from the ?token= query above.
+            // Range-capable media endpoint for <video>/<img>/fetch: honors the Range header (206 + Content-Range + Accept-Ranges) so seeking works. Auth came from the ?token= query above.
             if ((req.method === "GET" || req.method === "HEAD") && op === "/media") {
                 let st: fs.Stats;
                 try { st = fs.statSync(full); } catch { return sendJson(404, { error: "not found" }); }
@@ -483,9 +466,7 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
         }
     });
 
-    // WebSocket transport: same operations as the HTTP handler, but binary-framed and multiplexed over one
-    // socket so large concurrent reads don't pay per-request HTTP overhead. Frame: [u32 headerLen LE][header
-    // JSON][body bytes]. Request header {id, op, path, start?, end?, password?}; response {id, status, error?}.
+    // WebSocket transport: same operations as the HTTP handler, but binary-framed and multiplexed over one socket so large concurrent reads don't pay per-request HTTP overhead. Frame: [u32 headerLen LE][header JSON][body bytes]. Request header {id, op, path, start?, end?, password?}; response {id, status, error?}.
     const EMPTY = Buffer.alloc(0);
     const wss = new WebSocketServer({ server });
     wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
@@ -579,13 +560,9 @@ export function startRemoteFileServer(options: RemoteFileServerOptions): Promise
 }
 
 // ── server-side compaction (--autocompact) ──
-// Remote clients (e.g. a TV) skip compaction by default — it's expensive to read/rewrite whole files over
-// the network. So the host can do it locally instead: load each bulk database's index and run one merge
-// pass, on startup and every 3 hours. Far more efficient (local disk, no network), and the data still gets
-// compacted eventually.
+// Remote clients (e.g. a TV) skip compaction by default — it's expensive to read/rewrite whole files over the network. So the host can do it locally instead: load each bulk database's index and run one merge pass, on startup and every 3 hours. Far more efficient (local disk, no network), and the data still gets compacted eventually.
 const AUTOCOMPACT_INTERVAL_MS = 3 * 60 * 60 * 1000;
-// One reused compactor instance per collection (keyed by baseDir\0name), so we don't leak the per-instance
-// timers/caches by recreating instances each loop.
+// One reused compactor instance per collection (keyed by baseDir\0name), so we don't leak the per-instance timers/caches by recreating instances each loop.
 const compactors = new Map<string, BulkDatabaseBase<{ key: string }>>();
 function getCompactor(baseDir: string, name: string): BulkDatabaseBase<{ key: string }> {
     const key = baseDir + "\0" + name;
@@ -603,11 +580,9 @@ function getCompactor(baseDir: string, name: string): BulkDatabaseBase<{ key: st
     return db;
 }
 
-// One full pass: rescan the disk for collections (new ones may have appeared) and run a merge on each,
-// strictly one after another (never in parallel).
+// One full pass: rescan the disk for collections (new ones may have appeared) and run a merge on each, strictly one after another (never in parallel).
 export async function autocompactBulkDatabases(root: string): Promise<void> {
-    // Collections live under <baseDir>/bulkDatabases2/<name>/. The app may nest its data under a "data"
-    // subfolder (see getFileStorageNested2's heuristic), so look in both <root> and <root>/data.
+    // Collections live under <baseDir>/bulkDatabases2/<name>/. The app may nest its data under a "data" subfolder (see getFileStorageNested2's heuristic), so look in both <root> and <root>/data.
     const collections: { baseDir: string; name: string }[] = [];
     for (const baseDir of [root, path.join(root, "data")]) {
         try {
@@ -641,8 +616,7 @@ export async function autocompactBulkDatabases(root: string): Promise<void> {
     console.log(`  [autocompact] done all ${total} collection(s) (${Date.now() - passStart}ms)`);
 }
 
-// CLI entry (invoked by bin/filehoster.js or `yarn filehoster <folder>`). Starts the server, logs the
-// password + local/public URLs + batched access, and keeps the UPnP port mapping alive.
+// CLI entry (invoked by bin/filehoster.js or `yarn filehoster <folder>`). Starts the server, logs the password + local/public URLs + batched access, and keeps the UPnP port mapping alive.
 export async function runFileHoster(): Promise<void> {
     const args = process.argv.slice(2);
     const root = args.find(a => !a.startsWith("--") && !a.endsWith(".ts") && !a.endsWith(".js"));
@@ -657,8 +631,7 @@ export async function runFileHoster(): Promise<void> {
     let externalIP: string | undefined;
     try { externalIP = (await getExternalIP()).trim(); } catch { /* offline / unreachable */ }
 
-    // What the user types into the app: just the host, plus ":port" only if it's not the default. No
-    // scheme — the app always uses https.
+    // What the user types into the app: just the host, plus ":port" only if it's not the default. No scheme — the app always uses https.
     const host = externalIP || "localhost";
     const appAddress = host + (info.port === 8787 ? "" : ":" + info.port);
     const certUrl = "https://" + host + ":" + info.port;
@@ -679,8 +652,7 @@ export async function runFileHoster(): Promise<void> {
         // No UI to protect on a host, so don't space merges out — compact promptly each pass.
         bulkDatabase2Timing.mergeSpacingMs = 0;
         console.log("  [autocompact] compacting bulk databases on startup, then every 3h (serial)\n");
-        // Fire-and-forget: runs the first pass now and re-runs every 3h. Not awaited, so it doesn't block
-        // startup; each pass rescans the disk for new collections and merges them one at a time.
+        // Fire-and-forget: runs the first pass now and re-runs every 3h. Not awaited, so it doesn't block startup; each pass rescans the disk for new collections and merges them one at a time.
         void runInfinitePollCallAtStart(AUTOCOMPACT_INTERVAL_MS, () => autocompactBulkDatabases(root))
             .catch(e => console.error("  [autocompact] poll error:", (e as Error).stack));
     }

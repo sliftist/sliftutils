@@ -111,8 +111,7 @@ export async function openRouterCallBase(config: {
 
     try {
         return await retryFunctional(async () => {
-            // httpsRequest routes through socket-function's DNS cache and throws on any non-2xx (with the
-            //  response body in the message), which retryFunctional then retries.
+            // httpsRequest routes through socket-function's DNS cache and throws on any non-2xx (with the response body in the message), which retryFunctional then retries.
             let responseBody = await httpsRequest(
                 "https://openrouter.ai/api/v1/chat/completions",
                 Buffer.from(JSON.stringify({

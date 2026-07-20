@@ -12,8 +12,7 @@ import { redButton, greenButton, errorMessage } from "../render-utils/colors";
 import { createArchives } from "../storage/remoteStorage/createArchives";
 import { ArchiveFileInfo } from "../storage/IArchives";
 
-// The bucket's routing URL: server, account ("example"), and bucket ("examplefiles") in one.
-// Nothing else is needed - the first call creates the bucket if it doesn't exist yet.
+// The bucket's routing URL: server, account ("example"), and bucket ("examplefiles") in one. Nothing else is needed - the first call creates the bucket if it doesn't exist yet.
 const STORAGE_URL = "https://storage.vidgridweb.com:4444/file/example/examplefiles/storage/storagerouting.json";
 const ACCESS_CHECK_INTERVAL = 1000 * 15;
 

@@ -3,8 +3,8 @@ module.allowclient = true;
 import { isNode, sort } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getSecret } from "../../misc/getSecret";
-import { IArchives, HostedConfig, BackblazeConfig } from "../IArchives";
-import { ROUTING_FILE, getBucketBaseUrl, parseHostedUrl, parseBackblazeUrl } from "./remoteConfig";
+import { IArchives, HostedConfig, BackblazeConfig, RemoteConfig } from "../IArchives";
+import { ROUTING_FILE, getBucketBaseUrl, parseHostedUrl, parseBackblazeUrl, parseRoutingData } from "./remoteConfig";
 import { ArchivesRemote } from "./ArchivesRemote";
 import { ArchivesUrl } from "./ArchivesUrl";
 import { ArchivesBackblaze } from "../backblaze";
@@ -28,12 +28,7 @@ async function hasBackblazeCreds(): Promise<boolean> {
     }
 }
 
-// One source of a RemoteConfig, as a usable IArchives. Reads fall back to the public-URL form when
-// we don't have API access; writes always attempt the API (so access granted later is picked up on
-// the next write). When a call fails while the WebSocket is down, noteFailure starts a background
-// reconnect loop with a ramping delay - it never blocks callers, it just keeps trying so the
-// connection eventually comes back. Sources without a WebSocket (backblaze, URL-form, our own
-// local server) report always-connected: they're last-resort sources where throwing is fine.
+// One source of a RemoteConfig, as a usable IArchives. Reads fall back to the public-URL form when we don't have API access; writes always attempt the API (so access granted later is picked up on the next write). When a call fails while the WebSocket is down, noteFailure starts a background reconnect loop with a ramping delay - it never blocks callers, it just keeps trying so the connection eventually comes back. Sources without a WebSocket (backblaze, URL-form, our own local server) report always-connected: they're last-resort sources where throwing is fine.
 export class SourceWrapper {
     public api?: IArchives;
     public url?: ArchivesUrl;
@@ -49,9 +44,7 @@ export class SourceWrapper {
         private background: boolean,
     ) { }
 
-    /** Config updates routinely just move a source's valid window (the last window extends
-     *  forever, then gets reduced when a new entry is appended). The wrapper survives that: only
-     *  the window changes, keeping the connection, pings, and latency history. */
+    /** Config updates routinely just move a source's valid window (the last window extends forever, then gets reduced when a new entry is appended). The wrapper survives that: only the window changes, keeping the connection, pings, and latency history. */
     public updateValidWindow(validWindow: [number, number]): void {
         let old = this.config.validWindow;
         if (old[0] === validWindow[0] && old[1] === validWindow[1]) return;
@@ -81,7 +74,7 @@ export class SourceWrapper {
             wrapper.api = getLocalArchives(parsed.account, parsed.bucketName);
             return wrapper;
         }
-        wrapper.remote = new ArchivesRemote({ url: config.url, accountName: config.accountName, waitForAccess: false });
+        wrapper.remote = new ArchivesRemote({ url: config.url, waitForAccess: false });
         wrapper.api = wrapper.remote;
         if (config.public !== false) {
             wrapper.url = new ArchivesUrl(getBucketBaseUrl(config.url));
@@ -90,8 +83,7 @@ export class SourceWrapper {
     }
 
     public getDebugName(): string {
-        // The same URL can appear as multiple sources (different routes / valid windows), so the
-        // distinguishing slice is part of the name
+        // The same URL can appear as multiple sources (different routes / valid windows), so the distinguishing slice is part of the name
         let parts: string[] = [];
         let route = this.config.route;
         if (route) {
@@ -111,8 +103,7 @@ export class SourceWrapper {
         return this.remote.isConnected();
     }
 
-    /** Call after a request failed while isConnected() was false: starts (if not already running)
-     *  the background reconnect loop. Never blocks - the failed request still throws. */
+    /** Call after a request failed while isConnected() was false: starts (if not already running) the background reconnect loop. Never blocks - the failed request still throws. */
     public noteFailure(): void {
         if (!this.background || this.disposed || this.reconnectRunning) return;
         if (this.isConnected()) return;
@@ -145,9 +136,7 @@ export class SourceWrapper {
         console.log(`Reconnected to storage ${this.getDebugName()}`);
     }
 
-    // For hosted sources: cached access check, so reads know whether to use the API or the public
-    // URL form. Access, once seen, is assumed to stick; no-access is re-checked periodically (the
-    // check also registers our access request server-side, which logs the grant link).
+    // For hosted sources: cached access check, so reads know whether to use the API or the public URL form. Access, once seen, is assumed to stick; no-access is re-checked periodically (the check also registers our access request server-side, which logs the grant link).
     private async checkAccess(): Promise<boolean> {
         let remote = this.remote;
         if (!remote) return !!this.api;
@@ -171,11 +160,15 @@ export class SourceWrapper {
             return await run(this.url);
         }
         if (this.api) {
-            // No public URL form - let the API call throw its own error (which includes the access
-            // instructions for hosted sources)
+            // No public URL form - let the API call throw its own error (which includes the access instructions for hosted sources)
             return await run(this.api);
         }
         throw new Error(`Source ${this.config.url} has no API access and no public URL form (public: false)`);
+    }
+
+    public async readRoutingConfig(): Promise<RemoteConfig | undefined> {
+        let data = await this.read(archives => archives.get(ROUTING_FILE));
+        return data && parseRoutingData(data) || undefined;
     }
 
     public async hasWriteAccess(): Promise<boolean> {
@@ -186,21 +179,15 @@ export class SourceWrapper {
     private pings: number[] = [];
     private pingTimer: ReturnType<typeof setInterval> | undefined;
     private loggedConnected = false;
-    private lastTakeoverStamp: string | undefined;
-    /** Fired when the source's advertised takeover stamp changes (a deploy takeover started or
-     *  ended) - the chain refreshes its config, so connected clients learn within one ping. */
-    public onServedConfigChanged: (() => void) | undefined;
 
-    /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
-     *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
+    /** Starts measuring this source's latency (for variable-shard target preference). Only hosted remotes are pinged; our own local server counts as 0, everything else as Infinity. */
     public startPinging(): void {
         const remote = this.remote;
         if (!remote || this.pingTimer || this.disposed) return;
         let measure = async () => {
             let start = Date.now();
-            let result: { takeover?: string } | undefined;
             try {
-                result = await remote.ping();
+                await remote.ping();
             } catch {
                 // A failed ping is also our earliest down-detection
                 this.noteFailure();
@@ -214,11 +201,6 @@ export class SourceWrapper {
             if (this.pings.length > PING_HISTORY) {
                 this.pings.shift();
             }
-            let stamp = result?.takeover;
-            if (stamp !== this.lastTakeoverStamp) {
-                this.lastTakeoverStamp = stamp;
-                this.onServedConfigChanged?.();
-            }
         };
         void measure();
         this.pingTimer = setInterval(() => {
@@ -227,16 +209,13 @@ export class SourceWrapper {
         (this.pingTimer as { unref?: () => void }).unref?.();
     }
 
-    /** Seeds the latency estimate before the first ping lands (e.g. from the initial routing
-     *  fetch), so variable-shard picking has something immediately. Real pings take over from the
-     *  first measurement on. */
+    /** Seeds the latency estimate before the first ping lands (e.g. from the initial routing fetch), so variable-shard picking has something immediately. Real pings take over from the first measurement on. */
     public seedLatency(ms: number): void {
         if (this.pings.length) return;
         this.pings.push(ms);
     }
 
-    /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our
-     *  own in-process server, which is the best possible target (0). */
+    /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our own in-process server, which is the best possible target (0). */
     public getLatency(): number {
         if (!this.remote) {
             if (this.config.type === "remote" && this.api) return 0;
@@ -248,8 +227,7 @@ export class SourceWrapper {
         return sorted[Math.floor(sorted.length / 2)];
     }
 
-    /** Writes always go through the API, so a permission error throws to the caller on every write
-     *  (and access granted in the meantime is picked up automatically). */
+    /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */
     public async write<T>(run: (archives: IArchives) => Promise<T>): Promise<T> {
         if (this.writeBlocked) {
             throw new Error(this.writeBlocked);

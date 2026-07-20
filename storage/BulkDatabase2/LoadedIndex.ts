@@ -39,10 +39,7 @@ function nullJoin(a: string, b: string): string {
     return a + String.fromCharCode(0) + b;
 }
 
-// A loaded snapshot of one collection's on-disk state: the resolved reader + the per-file decoded sub-
-// readers it stitched, the stream file sizes/times it observed, and the sync (reactive) caches that
-// surface column/field reads. Built once via LoadedIndex.build — eagerly, so the swap into a fresh
-// LoadedIndex never blocks a read on a synchronous rebuild.
+// A loaded snapshot of one collection's on-disk state: the resolved reader + the per-file decoded sub- readers it stitched, the stream file sizes/times it observed, and the sync (reactive) caches that surface column/field reads. Built once via LoadedIndex.build — eagerly, so the swap into a fresh LoadedIndex never blocks a read on a synchronous rebuild.
 export class LoadedIndex<T extends { key: string }> {
     private constructor(
         public readonly name: string,
@@ -67,8 +64,7 @@ export class LoadedIndex<T extends { key: string }> {
     private baseColumnsLoading = new Set<string>();
     private baseFields = new Map<string, { value: unknown; time: number } | undefined>();
     private baseFieldsLoading = new Set<string>();
-    // Last-known values from the previous index, served until this index loads its own fresh value, so
-    // a swap doesn't flash empty in sync reads. Cleared per-entry when the fresh value lands.
+    // Last-known values from the previous index, served until this index loads its own fresh value, so a swap doesn't flash empty in sync reads. Cleared per-entry when the fresh value lands.
     private staleBaseColumns = new Map<string, { key: string; value: unknown; time: number }[]>();
     private staleBaseFields = new Map<string, { value: unknown; time: number } | undefined>();
 
@@ -150,9 +146,7 @@ export class LoadedIndex<T extends { key: string }> {
         }
     }
 
-    // Adopts the previous index's loaded base values as STALE on this one, so a sync read mid-swap can
-    // serve the old value (patched with the current overlay) instead of flashing empty while the fresh
-    // load runs. Per-entry: dropped when the fresh value lands here.
+    // Adopts the previous index's loaded base values as STALE on this one, so a sync read mid-swap can serve the old value (patched with the current overlay) instead of flashing empty while the fresh load runs. Per-entry: dropped when the fresh value lands here.
     inheritStaleFrom(prev: LoadedIndex<T>): void {
         for (const [k, v] of prev.baseColumns) this.staleBaseColumns.set(k, v);
         for (const [k, v] of prev.staleBaseColumns) if (!this.staleBaseColumns.has(k)) this.staleBaseColumns.set(k, v);
@@ -203,9 +197,7 @@ export class LoadedIndex<T extends { key: string }> {
         })();
     }
 
-    // Returns the loaded value (fresh if available, else last-known stale) for the column, or undefined
-    // if neither is present yet. The boolean indicates whether the returned value is fresh; callers may
-    // skip caching a stale value.
+    // Returns the loaded value (fresh if available, else last-known stale) for the column, or undefined if neither is present yet. The boolean indicates whether the returned value is fresh; callers may skip caching a stale value.
     getBaseColumn(column: string): { entries: { key: string; value: unknown; time: number }[]; fresh: boolean } | undefined {
         const fresh = this.baseColumns.get(column);
         if (fresh) return { entries: fresh, fresh: true };
@@ -230,8 +222,7 @@ export class LoadedIndex<T extends { key: string }> {
         return this.baseFields.has(ck) || this.staleBaseFields.has(ck);
     }
 
-    // Drops in-memory loaded values for this index, so a subsequent read reloads fresh from disk. Used
-    // by reloadFromDisk() — a hard reset, no stale fallback survives.
+    // Drops in-memory loaded values for this index, so a subsequent read reloads fresh from disk. Used by reloadFromDisk() — a hard reset, no stale fallback survives.
     dropLoadedValues(): void {
         this.baseColumns.clear();
         this.baseColumnsLoading.clear();
@@ -330,10 +321,7 @@ function pruneSubCaches(bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[]
     for (const n of subCaches.stream.keys()) if (!liveStream.has(n)) subCaches.stream.delete(n);
 }
 
-// A corrupt/unreadable column in ONE underlying file must not break the whole joined read. When a
-// source's column read throws, we drop that source for that column (falling through to older readers,
-// exactly as if the file never set the column) and warn once per (file, column) so the corruption is
-// visible without flooding the log on every rebuild.
+// A corrupt/unreadable column in ONE underlying file must not break the whole joined read. When a source's column read throws, we drop that source for that column (falling through to older readers, exactly as if the file never set the column) and warn once per (file, column) so the corruption is visible without flooding the log on every rebuild.
 const warnedCorruptReads = new Set<string>();
 function warnCorruptRead(db: BaseBulkDatabaseReader, column: string, e: unknown): void {
     const path = db.name || "(unknown source)";

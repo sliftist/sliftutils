@@ -1,9 +1,7 @@
 import { measureWrap } from "socket-function/src/profiling/measure";
 import { asBuffer, asFloat32 } from "socket-function/src/buffers";
 
-// The formats an embedding can be stored & compared in. The trailing number is the Matryoshka
-// truncation length (the count of leading dimensions kept). "q8gN" means signed int8 values with
-// one scale shared across every N dimensions. "float32" keeps the raw (truncated) vector.
+// The formats an embedding can be stored & compared in. The trailing number is the Matryoshka truncation length (the count of leading dimensions kept). "q8gN" means signed int8 values with one scale shared across every N dimensions. "float32" keeps the raw (truncated) vector.
 export type EmbeddingFormat = "q8g8_2048" | "q8_g16_2048" | "q8_g16_1024" | "float32";
 
 export const EMBEDDING_FORMATS: EmbeddingFormat[] = ["q8g8_2048", "q8_g16_2048", "q8_g16_1024", "float32"];
@@ -44,8 +42,7 @@ export type StoredEmbedding = {
     scales: Uint8Array;
 };
 
-// Float16Array isn't in our TypeScript lib and isn't guaranteed at runtime, so we read it off
-// globalThis and fall back to a manual half<->float conversion when it's missing.
+// Float16Array isn't in our TypeScript lib and isn't guaranteed at runtime, so we read it off globalThis and fall back to a manual half<->float conversion when it's missing.
 interface Float16ArrayLike {
     readonly length: number;
     [index: number]: number;
@@ -138,12 +135,9 @@ export function embeddingLength(input: Float32Array | StoredEmbedding): number {
     return input.data.length;
 }
 
-// A pool of reusable Float32 buffers keyed by length. Most embeddings share a size, so internal hot paths
-// borrow a buffer (embeddingToFloat32 with usePool) and return it (releaseFloat32) to avoid per-op
-// allocations and GC thrashing. A borrowed buffer holds stale data; whoever borrows it overwrites it fully.
-//
-// Each free buffer records when it was last released; an hourly sweep drops any that have sat idle for over
-// an hour, so the runtime can free buffers a burst of work allocated but isn't actually reusing anymore.
+// A pool of reusable Float32 buffers keyed by length. Most embeddings share a size, so internal hot paths borrow a buffer (embeddingToFloat32 with usePool) and return it (releaseFloat32) to avoid per-op allocations and GC thrashing. A borrowed buffer holds stale data; whoever borrows it overwrites it fully.
+// 
+// Each free buffer records when it was last released; an hourly sweep drops any that have sat idle for over an hour, so the runtime can free buffers a burst of work allocated but isn't actually reusing anymore.
 const POOL_MAX_IDLE_MS = 60 * 60 * 1000;
 type PooledFloat32 = { buffer: Float32Array; releasedAt: number };
 const float32Pool = new Map<number, PooledFloat32[]>();
@@ -179,10 +173,7 @@ if (typeof poolSweepTimer.unref === "function") {
     poolSweepTimer.unref();
 }
 
-// Decode to a Float32Array (full length). Stored values are already unit-normalized (encodeEmbedding does
-// that), so this only de-quantizes. By default it allocates a fresh array (a float input is returned as-is,
-// no copy). With usePool it borrows a pooled buffer the caller must releaseFloat32 — used by hot internal
-// paths so repeated decodes don't allocate.
+// Decode to a Float32Array (full length). Stored values are already unit-normalized (encodeEmbedding does that), so this only de-quantizes. By default it allocates a fresh array (a float input is returned as-is, no copy). With usePool it borrows a pooled buffer the caller must releaseFloat32 — used by hot internal paths so repeated decodes don't allocate.
 export function embeddingToFloat32(input: Float32Array | StoredEmbedding, usePool = false): Float32Array {
     if (input instanceof Float32Array) {
         if (!usePool) return input;
@@ -226,9 +217,7 @@ function dotFloat32(a: Float32Array, b: Float32Array): number {
     return dot;
 }
 
-// Closeness = 1 - euclidean distance of two unit vectors. Always decode both to (pooled) float32 and dot:
-// simple, and once the decodes are pooled it's the fastest per-call path. Batch callers (k-means) decode
-// every vector once themselves instead of going through here.
+// Closeness = 1 - euclidean distance of two unit vectors. Always decode both to (pooled) float32 and dot: simple, and once the decodes are pooled it's the fastest per-call path. Batch callers (k-means) decode every vector once themselves instead of going through here.
 export const getCloseness = measureWrap(function getCloseness(a: Float32Array | StoredEmbedding, b: Float32Array | StoredEmbedding): number {
     let va = embeddingToFloat32(a, true);
     let vb = embeddingToFloat32(b, true);
@@ -238,9 +227,7 @@ export const getCloseness = measureWrap(function getCloseness(a: Float32Array | 
     return result;
 });
 
-// Encode a vector (or re-encode an embedding) into the requested format. This is THE place we normalize:
-// the (truncated) vector is made unit length here, so anything that's been encoded is reliably normalized
-// and the comparison/decoding paths never have to re-normalize.
+// Encode a vector (or re-encode an embedding) into the requested format. This is THE place we normalize: the (truncated) vector is made unit length here, so anything that's been encoded is reliably normalized and the comparison/decoding paths never have to re-normalize.
 export function encodeEmbedding(config: {
     input: Float32Array | StoredEmbedding;
     format: EmbeddingFormat;
@@ -305,8 +292,7 @@ type SerializedHeader =
     | { kind: "float32"; model: string }
     | { kind: "quant"; model: string; type: QuantType; groupSize: number; dataBytes: number };
 
-// Serialize to base64 so a StoredEmbedding can travel through the (string) API call result. Layout:
-// [4-byte little-endian header length][JSON header][raw typed-array payload(s)].
+// Serialize to base64 so a StoredEmbedding can travel through the (string) API call result. Layout: [4-byte little-endian header length][JSON header][raw typed-array payload(s)].
 export function serializeStoredEmbedding(stored: StoredEmbedding): string {
     let header: SerializedHeader;
     let payload: Uint8Array[];
@@ -347,8 +333,7 @@ export function deserializeStoredEmbedding(base64: string): StoredEmbedding {
     };
 }
 
-// Mean of several embeddings (encodeEmbedding normalizes the result to a unit centroid). Borrows a pooled
-// accumulator.
+// Mean of several embeddings (encodeEmbedding normalizes the result to a unit centroid). Borrows a pooled accumulator.
 export function averageEmbeddings(embeddings: StoredEmbedding[], config: { format: EmbeddingFormat; model: string }): StoredEmbedding {
     let length = Infinity;
     for (let embedding of embeddings) {
@@ -368,8 +353,7 @@ export function averageEmbeddings(embeddings: StoredEmbedding[], config: { forma
     return result;
 }
 
-// A stable 16-byte (base64) content hash of an embedding's values, for use as a cell id derived from its
-// centroid. Iterates via the accessor (the value bits are hashed, so any format hashes consistently).
+// A stable 16-byte (base64) content hash of an embedding's values, for use as a cell id derived from its centroid. Iterates via the accessor (the value bits are hashed, so any format hashes consistently).
 export function hashEmbedding(stored: StoredEmbedding): string {
     let vector = embeddingToFloat32(stored, true);
     let length = vector.length;

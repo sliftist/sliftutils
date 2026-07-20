@@ -145,8 +145,7 @@ export interface IBulkDatabase2<T extends {
      * "someone else is already merging".
      */
     tryMergeNow(): Promise<MergeAttemptResult>;
-    /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
-     * most callers want compact() or tryMergeNow(). */
+    /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level; most callers want compact() or tryMergeNow(). */
     merge(timeLo: number, timeHi: number): Promise<void>;
 }
 export declare class MobxReactiveDeps implements ReactiveDeps {

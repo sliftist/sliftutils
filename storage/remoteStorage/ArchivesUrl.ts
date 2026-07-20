@@ -5,8 +5,7 @@ import { IArchives, ArchiveFileInfo, ArchivesConfig } from "../IArchives";
 import { buildFileUrl } from "./remoteConfig";
 
 // Read-only IArchives over a public bucket's plain-URL form (our storage server's
-// /file/<account>/<bucketName>/... route, or a backblaze friendly URL). Used when we have no API
-// access to a source. Only single-file reads work: there is no listing, and writes always throw.
+// /file/<account>/<bucketName>/... route, or a backblaze friendly URL). Used when we have no API access to a source. Only single-file reads work: there is no listing, and writes always throw.
 
 export class ArchivesUrl implements IArchives {
     // base is the bucket's public base URL, e.g. https://host:port/file/<account>/<bucketName>
@@ -47,8 +46,7 @@ export class ArchivesUrl implements IArchives {
         if (total && Number.isFinite(total)) {
             size = total;
         }
-        // Servers that don't support ranges return the full file with a 200 (ours serves real
-        // 206s, but backblaze friendly URLs and proxies may not)
+        // Servers that don't support ranges return the full file with a 200 (ours serves real 206s, but backblaze friendly URLs and proxies may not)
         if (range && response.statusCode === 200) {
             data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
         }

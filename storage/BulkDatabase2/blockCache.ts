@@ -1,21 +1,14 @@
 import { LZ4 } from "socket-function/src/lz4/LZ4";
 
 // Block-aligned, promise-deduped, decompressing range cache for BulkDatabase2's on-disk files.
-//
-// On-disk format (produced by encodeCompressedBlocks): the logical (uncompressed) bulk buffer is
-// split into fixed BLOCK_SIZE blocks; each block is LZ4-compressed unless that wouldn't shrink it by
-// at least 2x, in which case it's stored raw. The file starts with a JSON index mapping each block to
-// its stored length + a compressed flag, so a reader can seek straight to any block:
-//
+// 
+// On-disk format (produced by encodeCompressedBlocks): the logical (uncompressed) bulk buffer is split into fixed BLOCK_SIZE blocks; each block is LZ4-compressed unless that wouldn't shrink it by at least 2x, in which case it's stored raw. The file starts with a JSON index mapping each block to its stored length + a compressed flag, so a reader can seek straight to any block:
+// 
 //   [u32 indexLength][index JSON][block 0 stored bytes][block 1 stored bytes]...
-//
-// The cache presents a *logical* getRange (over uncompressed bytes) so BulkDatabase2's reader is
-// oblivious to compression. It reads compressed bytes via the underlying getRange, decompresses, and
-// caches the uncompressed blocks. Reads are promise-deduped and contiguous missing blocks are
-// coalesced into one underlying read. Files are immutable, so cached blocks are valid forever.
-//
-// Per-block compression mainly helps slow storage (HDD): fewer bytes off disk per block, at the cost
-// of a fast in-memory LZ4 decompress.
+// 
+// The cache presents a *logical* getRange (over uncompressed bytes) so BulkDatabase2's reader is oblivious to compression. It reads compressed bytes via the underlying getRange, decompresses, and caches the uncompressed blocks. Reads are promise-deduped and contiguous missing blocks are coalesced into one underlying read. Files are immutable, so cached blocks are valid forever.
+// 
+// Per-block compression mainly helps slow storage (HDD): fewer bytes off disk per block, at the cost of a fast in-memory LZ4 decompress.
 
 const BLOCK_SIZE = 256 * 1024;
 const MAX_BLOCKS = Math.floor((512 * 1024 * 1024) / BLOCK_SIZE);
@@ -84,9 +77,7 @@ export class BlockCache {
         }
     }
 
-    // Reads + validates the file index. Rejects the WHOLE file if it isn't exactly the size its index
-    // implies — a truncated/partial write (e.g. a crash mid-write) is detected here rather than
-    // silently returning corrupted values for the rows near the end.
+    // Reads + validates the file index. Rejects the WHOLE file if it isn't exactly the size its index implies — a truncated/partial write (e.g. a crash mid-write) is detected here rather than silently returning corrupted values for the rows near the end.
     private async readIndex(rawGetRange: GetRange, fileSize: number): Promise<FileIndex> {
         let head = await rawGetRange(0, 4);
         if (head.length < 4) throw new Error(`bulk file too short for an index header (${fileSize} bytes)`);
@@ -103,17 +94,14 @@ export class BlockCache {
             offsets.push(offset);
             offset += block.len;
         }
-        // The blocks must account for exactly the rest of the file. Any mismatch means the file is
-        // truncated or otherwise corrupt — reject it entirely.
+        // The blocks must account for exactly the rest of the file. Any mismatch means the file is truncated or otherwise corrupt — reject it entirely.
         if (offset !== fileSize) {
             throw new Error(`bulk file is ${fileSize} bytes but its index implies ${offset} (truncated/corrupt)`);
         }
         return { ...parsed, offsets };
     }
 
-    // Opens an immutable file: reads + validates its index (cached) and returns the logical
-    // (uncompressed) size plus a logical getRange that the caller can use exactly like an
-    // uncompressed file. `fileSize` is the actual on-disk byte length, used to detect truncation.
+    // Opens an immutable file: reads + validates its index (cached) and returns the logical (uncompressed) size plus a logical getRange that the caller can use exactly like an uncompressed file. `fileSize` is the actual on-disk byte length, used to detect truncation.
     public async open(fileId: string, fileSize: number, rawGetRange: GetRange): Promise<{ uncompressedSize: number; getRange: GetRange }> {
         let indexPromise = this.indexes.get(fileId);
         if (!indexPromise) {
@@ -150,10 +138,7 @@ export class BlockCache {
                 let lastMeta = index.blocks[runEnd - 1];
                 let compEnd = index.offsets[runEnd - 1] + lastMeta.len;
                 let runCompressed = rawGetRange(compStart, compEnd);
-                // Hold this run's promises locally. Registering them in the LRU can evict earlier
-                // blocks of the same run (or of a concurrent run) before we get to await them, so
-                // reading them back out of the cache would silently drop blocks and return a short
-                // buffer. We still register in the LRU so concurrent reads dedupe onto them.
+                // Hold this run's promises locally. Registering them in the LRU can evict earlier blocks of the same run (or of a concurrent run) before we get to await them, so reading them back out of the cache would silently drop blocks and return a short buffer. We still register in the LRU so concurrent reads dedupe onto them.
                 let runPromises: Promise<Buffer>[] = [];
                 for (let i = runStart; i < runEnd; i++) {
                     let meta = index.blocks[i];
@@ -172,8 +157,7 @@ export class BlockCache {
 
             let combined = parts.length === 1 && parts[0] || Buffer.concat(parts);
             let sliceStart = start - firstBlock * blockSize;
-            // A short combined buffer means we lost blocks; subarray would clamp and hand back
-            // truncated data that every caller treats as valid. Fail loudly instead.
+            // A short combined buffer means we lost blocks; subarray would clamp and hand back truncated data that every caller treats as valid. Fail loudly instead.
             if (combined.length < sliceStart + (end - start)) {
                 throw new Error(`Expected ${sliceStart + (end - start)} bytes of blocks for range [${start}, ${end}) of ${fileId}, was ${combined.length}`);
             }

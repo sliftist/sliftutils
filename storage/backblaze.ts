@@ -137,8 +137,7 @@ const getAPI = lazy(async () => {
         if (path.endsWith("/")) path = path.slice(0, -1) + "%2F";
         // NOTE: For some reason, this won't render in the web UI correctly. BUT, it'll
         //  work get get/set and find
-        //  - ALSO, it seems to add duplicate files? This might also be a web UI thing. It
-        //      seems to work though.
+        //  - ALSO, it seems to add duplicate files? This might also be a web UI thing. It seems to work though.
         while (path.includes("//")) {
             path = path.replaceAll("//", "/%2F");
         }
@@ -167,7 +166,7 @@ const getAPI = lazy(async () => {
 
     // Oh... apparently, we can't reuse these? Huh...
     const getUploadURL = (async (bucketId: string) => {
-        //setTimeout(() => getUploadURL.clear(bucketId), timeInHour * 1);
+        // setTimeout(() => getUploadURL.clear(bucketId), timeInHour * 1);
         let getUploadUrlRaw = await httpsRequest(auth.apiUrl + "/b2api/v2/b2_get_upload_url?bucketId=" + bucketId, undefined, "GET", undefined, {
             headers: {
                 Authorization: auth.authorizationToken,
@@ -502,10 +501,7 @@ export class ArchivesBackblaze implements IArchives {
 
     // Keep track of when we last reset because of a 503
     private last503Reset = 0;
-    // IMPORTANT! We must always CATCH AROUND the apiRetryLogic, NEVER inside of fnc. Otherwise we won't
-    //  be able to recreate the auth token.
-    //  `context` is a short label (verb + file path) included in every retry/error log so a stuck
-    //   silent-retry loop is identifiable from the logs.
+    // IMPORTANT! We must always CATCH AROUND the apiRetryLogic, NEVER inside of fnc. Otherwise we won't be able to recreate the auth token. `context` is a short label (verb + file path) included in every retry/error log so a stuck silent-retry loop is identifiable from the logs.
     private async apiRetryLogic<T>(
         context: string,
         fnc: (api: B2Api) => Promise<T>,
@@ -542,8 +538,7 @@ export class ArchivesBackblaze implements IArchives {
                 return this.apiRetryLogic(context, fnc, retries - 1);
             }
 
-            // If the error is that the authorization token is invalid, reset getBucketAPI and getAPI
-            // If the error is that the bucket isn't found, reset getBucketAPI
+            // If the error is that the authorization token is invalid, reset getBucketAPI and getAPI If the error is that the bucket isn't found, reset getBucketAPI
             if (err.stack.includes(`"expired_auth_token"`)) {
                 this.log(`[${context}] Authorization token expired`);
                 getAPI.reset();
@@ -555,8 +550,7 @@ export class ArchivesBackblaze implements IArchives {
                 err.stack.includes(`no tomes available`)
                 || err.stack.includes(`ETIMEDOUT`)
                 || err.stack.includes(`socket hang up`)
-                // Eh... this might be bad, but... I think we just get random 400 errors. If this spams errors,
-                //  we can remove this line.
+                // Eh... this might be bad, but... I think we just get random 400 errors. If this spams errors, we can remove this line.
                 || err.stack.includes(`400 Bad Request`)
                 || err.stack.includes(`getaddrinfo ENOTFOUND`)
                 || err.stack.includes(`ECONNRESET`)
@@ -665,8 +659,7 @@ export class ArchivesBackblaze implements IArchives {
         if (config?.lastModified) {
             assertValidLastModified(config.lastModified);
             let existing = await this.getInfo(fileName);
-            // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own
-            // upload time, so the exact lastModified is not preserved on the stored file.
+            // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
             if (existing && config.lastModified < existing.writeTime) return fileName;
         }
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
@@ -697,21 +690,7 @@ export class ArchivesBackblaze implements IArchives {
             this.log(`backblaze error in hide, possibly already hidden ${fileName}\n${e.stack}`);
         }
 
-        // NOTE: Deletion SEEMS to work. This DOES break if we delete a file which keeps being recreated,
-        //  ex, the heartbeat.
-        // let existsChecks = 10;
-        // while (existsChecks > 0) {
-        //     let exists = await this.getInfo(fileName);
-        //     if (!exists) break;
-        //     await delay(1000);
-        //     existsChecks--;
-        // }
-        // if (existsChecks === 0) {
-        //     let exists = await this.getInfo(fileName);
-        //     devDebugbreak();
-        //     console.warn(`File ${fileName} was deleted, but was still found afterwards`);
-        //     exists = await this.getInfo(fileName);
-        // }
+        // NOTE: Deletion SEEMS to work. This DOES break if we delete a file which keeps being recreated, ex, the heartbeat. let existsChecks = 10; while (existsChecks > 0) { let exists = await this.getInfo(fileName); if (!exists) break; await delay(1000); existsChecks--; } if (existsChecks === 0) { let exists = await this.getInfo(fileName); devDebugbreak(); console.warn(`File ${fileName} was deleted, but was still found afterwards`); exists = await this.getInfo(fileName); }
     }
 
     public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined>; }): Promise<void> {
@@ -752,8 +731,7 @@ export class ArchivesBackblaze implements IArchives {
                 await this.set(fileName, data);
                 return;
             }
-            // ALSO, if there are two chunks, but one is too small, combine it. This helps allow us never
-            //  send small chunks.
+            // ALSO, if there are two chunks, but one is too small, combine it. This helps allow us never send small chunks.
             if (secondData.length < MIN_CHUNK_SIZE) {
                 await this.set(fileName, Buffer.concat([data, secondData]));
                 return;
@@ -785,12 +763,7 @@ export class ArchivesBackblaze implements IArchives {
             while (true) {
                 data = await getNextData();
                 if (!data) break;
-                // So... if the next chunk is the last one, combine it with the current one. This
-                //  prevents ANY uploads from being < the threshold, as apparently the "last part"
-                //  check in backblaze fails when we have to retry an upload (due to "no tomes available").
-                //  Well it can't fail if even the last part is > 5MB, now can it!
-                // BUT, only if this isn't the first chunk, otherwise we might try to send
-                //  a single chunk, which we can't do.
+                // So... if the next chunk is the last one, combine it with the current one. This prevents ANY uploads from being < the threshold, as apparently the "last part" check in backblaze fails when we have to retry an upload (due to "no tomes available"). Well it can't fail if even the last part is > 5MB, now can it! BUT, only if this isn't the first chunk, otherwise we might try to send a single chunk, which we can't do.
                 if (partSha1Array.length > 0) {
                     let maybeLastData = await getNextData();
                     if (maybeLastData) {
@@ -798,8 +771,7 @@ export class ArchivesBackblaze implements IArchives {
                             // It's the last one, so consume it now
                             data = Buffer.concat([data, maybeLastData]);
                         } else {
-                            // It's not the last one. Put it back, in case the one AFTER is the last
-                            //  one, in which case we need to merge maybeLastData with the next next data.
+                            // It's not the last one. Put it back, in case the one AFTER is the last one, in which case we need to merge maybeLastData with the next next data.
                             dataQueue.unshift(maybeLastData);
                         }
                     }
@@ -947,8 +919,7 @@ export class ArchivesBackblaze implements IArchives {
             let targetBucketId = target.bucketId;
             if (targetBucketId === this.bucketId && path === targetPath) return;
             await this.apiRetryLogic(`move ${path} -> ${targetPath}`, async (api) => {
-                // Ugh... listing the file name sucks, but... I guess it's still better than
-                //  downloading and re-uploading the entire file.
+                // Ugh... listing the file name sucks, but... I guess it's still better than downloading and re-uploading the entire file.
                 let info = await api.listFileNames({ bucketId: this.bucketId, prefix: path, maxFileCount: 10 });
                 let file = info.files.find(x => x.fileName === path);
                 if (!file) throw new Error(`File not found to move: ${path}`);
@@ -1042,9 +1013,7 @@ export const getArchivesBackblazePublicImmutable = cache((domain: string) => {
     });
 });
 
-// NOTE: Cache by a minute. This might be a bad idea, but... usually whole reason for public is
-//  for cloudflare caching (as otherwise we can just access it through a server), or for large files
-//  (which should be cached anyways, and probably even use immutable caching).
+// NOTE: Cache by a minute. This might be a bad idea, but... usually whole reason for public is for cloudflare caching (as otherwise we can just access it through a server), or for large files (which should be cached anyways, and probably even use immutable caching).
 export const getArchivesBackblazePublic = cache((domain: string) => {
     return new ArchivesBackblaze({
         bucketName: domain + "-public",

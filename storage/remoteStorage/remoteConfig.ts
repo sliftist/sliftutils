@@ -4,10 +4,7 @@ import { sort, sha256HashBuffer } from "socket-function/src/misc";
 import { getBufferInt } from "socket-function/src/bits";
 import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, FULL_VALID_WINDOW, FULL_ROUTE, VARIABLE_SHARD } from "../IArchives";
 
-// Parsing / normalization of RemoteConfig (see IArchives.ts). Every bucket stores its own
-// configuration (a RemoteConfig) inside itself, at ROUTING_FILE. Writing that file creates the
-// bucket / reconfigures it (see storageServerState.ts); clients reconcile it by version (see
-// createArchives.ts).
+// Parsing / normalization of RemoteConfig (see IArchives.ts). Every bucket stores its own configuration (a RemoteConfig) inside itself, at ROUTING_FILE. Writing that file creates the bucket / reconfigures it (see storageServerState.ts); clients reconcile it by version (see createArchives.ts).
 
 export const ROUTING_FILE = "storage/storagerouting.json";
 const ROUTING_SUFFIX = "/" + ROUTING_FILE;
@@ -125,13 +122,24 @@ export function normalizeSource(source: RemoteConfigBase): HostedConfig | Backbl
     }
     let hostname = new URL(source).hostname;
     if (hostname.endsWith(".backblazeb2.com")) {
-        // Validates the URL (throws on malformed) before it's stored; the bucket name is read back
-        // out of the URL at use sites, never stored on the config.
+        // Validates the URL (throws on malformed) before it's stored; the bucket name is read back out of the URL at use sites, never stored on the config.
         parseBackblazeUrl(source);
         return { type: "backblaze", url: source, validWindow: FULL_VALID_WINDOW };
     }
     parseHostedUrl(source);
     return { type: "remote", url: source, validWindow: FULL_VALID_WINDOW };
+}
+
+/** How far up from 0 the sources' routes reach without a gap (1 means the whole key space). */
+function getRouteCoverage(sources: (HostedConfig | BackblazeConfig)[]): number {
+    let routes = sources.map(x => x.route || FULL_ROUTE);
+    sort(routes, x => x[0]);
+    let covered = 0;
+    for (let route of routes) {
+        if (route[0] > covered) break;
+        covered = Math.max(covered, route[1]);
+    }
+    return covered;
 }
 
 export function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig {
@@ -141,11 +149,7 @@ export function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): 
     } else {
         result = { sources: [normalizeSource(config)] };
     }
-    // Mixed immutability makes no sense AMONG sources valid at the same time: a mutable source
-    // would accept overwrites that its immutable peers refuse to synchronize, forking their
-    // contents. Sources are grouped by transitively overlapping valid windows (absorb everything
-    // overlapping the group, extend the group's end, repeat) - a soft check that is correct as
-    // long as windows have clean breaks (a group ends exactly where the next begins).
+    // Mixed immutability makes no sense AMONG sources valid at the same time: a mutable source would accept overwrites that its immutable peers refuse to synchronize, forking their contents. Sources are grouped by transitively overlapping valid windows (absorb everything overlapping the group, extend the group's end, repeat) - a soft check that is correct as long as windows have clean breaks (a group ends exactly where the next begins).
     let sources = result.sources.map(normalizeSource);
     let sorted = [...sources];
     sort(sorted, x => x.validWindow[0]);
@@ -156,17 +160,26 @@ export function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): 
         if (immutableCount && immutableCount !== group.length) {
             throw new Error(`Sources with overlapping valid windows must agree on immutability: ${immutableCount} of ${group.length} are immutable. Sources: ${JSON.stringify(group.map(x => ({ url: x.url, validWindow: x.validWindow, immutable: !!x.immutable })))}`);
         }
-        // The sources valid at any instant must cover the whole key space, or keys routing into a
-        // gap could never be read
-        let routes = group.map(x => x.route || FULL_ROUTE);
-        sort(routes, x => x[0]);
-        let covered = 0;
-        for (let route of routes) {
-            if (route[0] > covered) break;
-            covered = Math.max(covered, route[1]);
-        }
+        // The sources valid at any instant must cover the whole key space, or keys routing into a gap could never be read
+        let covered = getRouteCoverage(group);
         if (covered < 1) {
             throw new Error(`Sources with overlapping valid windows must cover the full route space [0, 1); coverage stops at ${covered}. Sources: ${JSON.stringify(group.map(x => ({ url: x.url, validWindow: x.validWindow, route: x.route || FULL_ROUTE })))}`);
+        }
+        // Every bucket must ALSO cover the full route space across its own entries, because all of a bucket's entries share one disk. A bucket that only ever synchronizes part of the key space never learns about deletions in the rest of it - and tombstones expire, so files it still holds from a route it no longer serves eventually look like live files again, and get resurrected into the chain by its next scan. An entry with no route (implicitly the full space) satisfies this on its own, which is why the usual configuration lists each bucket once per shard AND once unsharded.
+        let byUrl = new Map<string, typeof group>();
+        for (let source of group) {
+            let entries = byUrl.get(source.url);
+            if (!entries) {
+                entries = [];
+                byUrl.set(source.url, entries);
+            }
+            entries.push(source);
+        }
+        for (let [url, entries] of byUrl) {
+            let urlCovered = getRouteCoverage(entries);
+            if (urlCovered < 1) {
+                throw new Error(`Every bucket must cover the full route space [0, 1) across its own entries with overlapping valid windows, but ${url} only covers up to ${urlCovered} (its routes: ${JSON.stringify(entries.map(x => x.route || FULL_ROUTE))}). Add an entry for it with no route (or entries whose routes span the rest), alongside its sharded entries. This is enforced because a bucket's entries all share one disk: if it only ever synchronizes part of the key space, it never sees deletions in the rest, and once those tombstones expire the files it still holds are resurrected into the chain by its next scan.`);
+            }
         }
     }
     for (let source of sorted) {

@@ -1,13 +1,9 @@
 import { isNode } from "typesafecss";
 import type { DirectoryWrapper, FileWrapper } from "./FileFolderAPI";
 
-// A remote server (remoteFileServer.js) exposed as a DirectoryWrapper — the SAME interface as the
-// Node.js and File-System-Access handles. So getDirectoryHandle can return one of these and everything
-// downstream (wrapHandle, navigation, BulkDatabase2) works unchanged; nothing else knows it's remote.
-//
-// Files here are immutable (written once) or append-only, so the range cache (raw compressed bytes, in
-// ~1MB aligned chunks) is always valid — over the network latency dominates, so reading 1MB costs about
-// the same as 64KB and far fewer round trips wins.
+// A remote server (remoteFileServer.js) exposed as a DirectoryWrapper — the SAME interface as the Node.js and File-System-Access handles. So getDirectoryHandle can return one of these and everything downstream (wrapHandle, navigation, BulkDatabase2) works unchanged; nothing else knows it's remote.
+// 
+// Files here are immutable (written once) or append-only, so the range cache (raw compressed bytes, in ~1MB aligned chunks) is always valid — over the network latency dominates, so reading 1MB costs about the same as 64KB and far fewer round trips wins.
 
 const EMPTY = Buffer.alloc(0);
 const DEFAULT_CHUNK_BYTES = 1024 * 1024;
@@ -31,15 +27,11 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 type Stat = { size: number; lastModified: number; dir: boolean };
 
-// A stat is cached this long, so the burst of size lookups during a single read pass is one request per
-// file, not one per block. Short enough that an append by another writer shows up promptly; our own
-// writes invalidate it immediately.
+// A stat is cached this long, so the burst of size lookups during a single read pass is one request per file, not one per block. Short enough that an append by another writer shows up promptly; our own writes invalidate it immediately.
 const INFO_TTL_MS = 2000;
-// We keep at most this many bytes of read/write requests in flight at once (the rest queue), so a big
-// read doesn't fire hundreds of MB of requests at the server simultaneously.
+// We keep at most this many bytes of read/write requests in flight at once (the rest queue), so a big read doesn't fire hundreds of MB of requests at the server simultaneously.
 const MAX_INFLIGHT_BYTES = 64 * 1024 * 1024;
-// A single read request fetches at most this much; large reads are split into this many concurrent
-// requests (bounded by MAX_INFLIGHT_BYTES).
+// A single read request fetches at most this much; large reads are split into this many concurrent requests (bounded by MAX_INFLIGHT_BYTES).
 const DEFAULT_MAX_FETCH_BYTES = 4 * 1024 * 1024;
 const STATS_LOG_INTERVAL_MS = 10 * 1000;
 const RECV_WINDOW_MS = 60 * 1000;
@@ -86,9 +78,7 @@ function decodeFrame(buf: Buffer): { header: any; body: Buffer } {
 
 type QueuedRequest = { id: number; frame: Buffer; bytes: number; resolve: (r: { status: number; body: Buffer }) => void; reject: (e: Error) => void };
 
-// One WebSocket to a remote server, multiplexing all ops over it. Requests are queued and only sent
-// while < MAX_INFLIGHT_BYTES are outstanding; every 10s (when there's traffic) it logs the queue depth
-// and throughput.
+// One WebSocket to a remote server, multiplexing all ops over it. Requests are queued and only sent while < MAX_INFLIGHT_BYTES are outstanding; every 10s (when there's traffic) it logs the queue depth and throughput.
 class Connection {
     private cache: RangeCache;
     private infoCache = new Map<string, { stat: Stat | undefined; at: number }>();
@@ -197,8 +187,7 @@ class Connection {
         }
     }
 
-    // Sends one request over the WebSocket (queued + throttled). `bytes` is the expected payload size,
-    // used for the in-flight cap.
+    // Sends one request over the WebSocket (queued + throttled). `bytes` is the expected payload size, used for the in-flight cap.
     private async request(op: string, params: Record<string, unknown>, body: Buffer | undefined, bytes: number): Promise<{ status: number; body: Buffer }> {
         if (this.opts.latencyMs) await sleep(this.opts.latencyMs);
         await this.ensureConnected();
@@ -254,9 +243,7 @@ class Connection {
     }
 }
 
-// Caches the longest-known prefix of each aligned chunk per path. Valid because files are immutable or
-// append-only (the bytes at an offset never change). It only does range reads — it doesn't care what
-// the files are.
+// Caches the longest-known prefix of each aligned chunk per path. Valid because files are immutable or append-only (the bytes at an offset never change). It only does range reads — it doesn't care what the files are.
 class RangeCache {
     private chunks = new Map<string, Buffer>(); // path + "" + chunkIndex, insertion-ordered (LRU)
     private bytes = 0;
@@ -337,8 +324,7 @@ const joinPath = (base: string, key: string) => (base ? base + "/" + key : key);
 const baseName = (p: string) => p.split("/").filter(Boolean).pop() || "";
 
 class RemoteFileWrapper implements FileWrapper {
-    // `stat` is supplied when the parent already statted us (avoids a second /info). `createIntent` means
-    // this was opened with create:true, so a missing file reads as empty (it'll be created on write).
+    // `stat` is supplied when the parent already statted us (avoids a second /info). `createIntent` means this was opened with create:true, so a missing file reads as empty (it'll be created on write).
     constructor(private conn: Connection, private filePath: string, private stat?: Stat, private createIntent = false) { }
     // Mirror the native FileSystemFileHandle shape so code written against it works unchanged.
     readonly kind = "file" as const;
@@ -359,8 +345,7 @@ class RemoteFileWrapper implements FileWrapper {
         };
     }
     async getURL() {
-        // HTTPS URL into the server's range-capable /media endpoint. The token rides in the query because a
-        // <video>/<img> element can't send an Authorization header.
+        // HTTPS URL into the server's range-capable /media endpoint. The token rides in the query because a <video>/<img> element can't send an Authorization header.
         return `${this.conn.url}/media?path=${encodeURIComponent(this.filePath)}&token=${encodeURIComponent(this.conn.password)}`;
     }
     async createWritable(config?: { keepExistingData?: boolean }) {
@@ -379,8 +364,7 @@ class RemoteFileWrapper implements FileWrapper {
 
 class RemoteDirectoryWrapper implements DirectoryWrapper {
     constructor(private conn: Connection, private dirPath: string) { }
-    // Mirror the native FileSystemDirectoryHandle shape (name/kind/entries) so code written against the
-    // native API — e.g. recursive walks using `handle.entries()` — works the same over the network.
+    // Mirror the native FileSystemDirectoryHandle shape (name/kind/entries) so code written against the native API — e.g. recursive walks using `handle.entries()` — works the same over the network.
     readonly kind = "directory" as const;
     readonly isRemote = true;
     get name() { return baseName(this.dirPath); }
@@ -403,8 +387,7 @@ class RemoteDirectoryWrapper implements DirectoryWrapper {
         }
         return new RemoteDirectoryWrapper(this.conn, p);       // dirs are created lazily on first write
     }
-    // Each entry is itself a real handle (a sub-wrapper), so a recursive walk over .entries() keeps
-    // working at every level — exactly like the native API.
+    // Each entry is itself a real handle (a sub-wrapper), so a recursive walk over .entries() keeps working at every level — exactly like the native API.
     async *[Symbol.asyncIterator](): AsyncIterableIterator<[string, RemoteFileWrapper | RemoteDirectoryWrapper]> {
         const entries = await this.conn.list(this.dirPath);
         for (const e of entries) {
@@ -428,9 +411,7 @@ export function getRemoteDirectoryHandle(url: string, password: string, options:
 
 export type RemoteConnectResult = { status: "ok" } | { status: "unauthorized" } | { status: "unreachable"; error: string };
 
-// Verifies a server is reachable and the password works — by opening the WebSocket, authenticating, and
-// listing the root. Distinguishes "connected" / "wrong password" / "couldn't reach it" (the last usually
-// meaning the self-signed cert isn't trusted yet in the browser, since the socket just fails to open).
+// Verifies a server is reachable and the password works — by opening the WebSocket, authenticating, and listing the root. Distinguishes "connected" / "wrong password" / "couldn't reach it" (the last usually meaning the self-signed cert isn't trusted yet in the browser, since the socket just fails to open).
 export async function testRemoteConnection(url: string, password: string, options: RemoteOptions = {}): Promise<RemoteConnectResult> {
     const conn = new Connection(url, password, options);
     try {

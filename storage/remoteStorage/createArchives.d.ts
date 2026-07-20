@@ -2,6 +2,8 @@
 /// <reference types="node" />
 import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 import { ServerBucketInfo } from "./storageServerState";
+/** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
+export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
 export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
 export declare class ArchivesChain implements IArchives {
     private configured;
@@ -71,12 +73,7 @@ export declare class ArchivesChain implements IArchives {
     getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
     getSyncStatus(): Promise<ArchivesSyncStatus>;
     getConfig(): Promise<ArchivesConfig>;
-    /** True only when EVERY write-receiving source would accept our writes (partial write access
-     *  desynchronizes sources, so it counts as no access). */
     hasWriteAccess(): Promise<boolean>;
-    /** Returns the full key written. Plain keys come back unchanged; keys containing VARIABLE_SHARD
-     *  are automatically materialized (a shard value is picked and embedded, see setVariableShard)
-     *  and the caller needs the returned key to ever read the value back. */
     set(fileName: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<string>;
@@ -91,18 +88,17 @@ export declare class ArchivesChain implements IArchives {
     dispose(): void;
 }
 export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;
-/** Every bucket an account has on one storage server - active and inactive - with each bucket's
- *  configuration. One authenticated call (the normal trust system applies): no ArchivesChain, no
- *  synchronization, and inactive buckets on the server stay inactive. Any URL addressing the
- *  server works (a bucket routing URL, or just https://host:port). */
 export declare function listServerBuckets(config: {
     url: string;
     account: string;
 }): Promise<ServerBucketInfo[]>;
-/** Live info for one bucket given its routing URL (getConfig: routing config, index totals, disk
- *  limit, in-progress synchronization). One authenticated call to that server - a light, safe
- *  alternative to instantiating an ArchivesChain, which would start synchronization machinery. */
+/** Zeroes the write statistics listServerBuckets reports, for every bucket in the account. */
+export declare function clearServerWriteStats(config: {
+    url: string;
+    account: string;
+}): Promise<{
+    clearedBuckets: number;
+}>;
 export declare function getBucketInfo(config: {
     url: string;
-    accountName?: string;
 }): Promise<ArchivesConfig>;

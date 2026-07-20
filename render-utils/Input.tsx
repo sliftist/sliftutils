@@ -46,8 +46,7 @@ export type InputProps = (
         forceInputValueUpdatesWhenFocused?: boolean;
 
         // NOTE: We trigger onChange (and onChangeValue) whenever
-        //      e.ctrlKey && (e.code.startsWith("Key") || e.code === "Enter") || e.code === "Enter" && e.shiftKey
-        //  This is because ctrl usually means a hotkey, and hotkeys usually want committed values.
+        //      e.ctrlKey && (e.code.startsWith("Key") || e.code === "Enter") || e.code === "Enter" && e.shiftKey This is because ctrl usually means a hotkey, and hotkeys usually want committed values.
         onChangeValue?: (value: string) => void;
     }
 );
@@ -104,9 +103,7 @@ export class Input extends preact.Component<InputProps> {
             };
         }
 
-        // IMPORTANT! When focused, preserve the input value, otherwise typing is annoying.
-        //  This doesn't usually happen, but can if background tasks are updating the UI
-        //  while the user is typing.
+        // IMPORTANT! When focused, preserve the input value, otherwise typing is annoying. This doesn't usually happen, but can if background tasks are updating the UI while the user is typing.
 
 
         let attributes: preact.JSX.HTMLAttributes<HTMLInputElement> = {
@@ -230,10 +227,7 @@ export class Input extends preact.Component<InputProps> {
                     }
                 }
                 let { noEnterKeyBlur, onInput, onChange } = props;
-                // Detach from the synced function, to prevent double calls. This is important, as apparently .blur()
-                //  synchronously triggers onChange, BUT, only if the input is changing the first time. Which means
-                //  if this function reruns, it won't trigger the change again. Detaching it causes any triggered
-                //  functions to become root synced functions, which will allow them to correctly run the sync loop.
+                // Detach from the synced function, to prevent double calls. This is important, as apparently .blur() synchronously triggers onChange, BUT, only if the input is changing the first time. Which means if this function reruns, it won't trigger the change again. Detaching it causes any triggered functions to become root synced functions, which will allow them to correctly run the sync loop.
                 void Promise.resolve().finally(() => {
                     if (e.defaultPrevented) return;
                     if (e.code === "Escape") {
@@ -307,8 +301,7 @@ export class Input extends preact.Component<InputProps> {
         } else if (hot) {
             attributes.onInput = attributes.onChange;
         } else {
-            // We use onChange from onBlur, so don't use the onChange handler, as preact will hook this up
-            //  with onInput, which will cause it to trigger as if the component is hot!
+            // We use onChange from onBlur, so don't use the onChange handler, as preact will hook this up with onInput, which will cause it to trigger as if the component is hot!
             delete attributes.onChange;
         }
         if (textarea) {
@@ -344,8 +337,7 @@ function niceNumberStringify(valueIn: number) {
         if (value.endsWith(".")) {
             value = value.slice(0, -1);
         }
-        // NOTE: Interestingly enough... because we remove all trailing 9s, it means if the last number is not 9,
-        //  so... we can do this hack to round up
+        // NOTE: Interestingly enough... because we remove all trailing 9s, it means if the last number is not 9, so... we can do this hack to round up
         value = value.slice(0, -1) + (parseInt(value.slice(-1)) + 1);
         return value;
     }

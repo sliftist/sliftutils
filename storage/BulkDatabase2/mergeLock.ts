@@ -1,17 +1,6 @@
-// Best-effort "only one tab merges this collection at a time" guard. This is purely an efficiency
-// measure: correctness does NOT depend on it. Reads resolve by per-row write-time, merges write new
-// files before deleting consumed ones, and a duplicate-heavy region gets re-merged — so two tabs
-// merging at once only waste work and briefly duplicate data, never corrupt or lose it. The lock just
-// stops that wasted work. It uses localStorage (shared across same-origin tabs) and is a no-op where
-// localStorage is unavailable (Node) — there concurrent merges are harmless, which the Node stress
-// tests exercise. localStorage has no atomic compare-and-swap, so we write-then-reread to shrink the
-// race window, and a TTL frees a lock left behind by a tab that crashed or closed mid-merge.
-//
-// File-lock layer (see acquireMergeFileLock at the bottom): for cross-PROCESS safety (different
-// browsers, different machines pointing at the same remote storage), we ALSO write a `.merge-lock`
-// file inside the collection's storage with our ID. The protocol is check-write-wait-recheck — last
-// writer wins after the 15s settle window. The localStorage lock above covers same-origin tabs; this
-// covers everything else (separate processes, remote shared storage).
+// Best-effort "only one tab merges this collection at a time" guard. This is purely an efficiency measure: correctness does NOT depend on it. Reads resolve by per-row write-time, merges write new files before deleting consumed ones, and a duplicate-heavy region gets re-merged — so two tabs merging at once only waste work and briefly duplicate data, never corrupt or lose it. The lock just stops that wasted work. It uses localStorage (shared across same-origin tabs) and is a no-op where localStorage is unavailable (Node) — there concurrent merges are harmless, which the Node stress tests exercise. localStorage has no atomic compare-and-swap, so we write-then-reread to shrink the race window, and a TTL frees a lock left behind by a tab that crashed or closed mid-merge.
+// 
+// File-lock layer (see acquireMergeFileLock at the bottom): for cross-PROCESS safety (different browsers, different machines pointing at the same remote storage), we ALSO write a `.merge-lock` file inside the collection's storage with our ID. The protocol is check-write-wait-recheck — last writer wins after the 15s settle window. The localStorage lock above covers same-origin tabs; this covers everything else (separate processes, remote shared storage).
 
 import type { FileStorage } from "../FileFolderAPI";
 
@@ -39,10 +28,7 @@ function lockKey(collection: string): string {
     return "bulkDatabase2-merge:" + collection;
 }
 
-// Returns true if we now hold the lock (or there's no localStorage to coordinate through, in which case
-// we proceed — concurrent merges are harmless). Returns false only if a DIFFERENT holder has a fresh
-// lock. Re-stamping our own lock always succeeds, so this doubles as a heartbeat: call it periodically
-// during a long, spaced-out merge to keep the lock alive (and detect if another tab took it over).
+// Returns true if we now hold the lock (or there's no localStorage to coordinate through, in which case we proceed — concurrent merges are harmless). Returns false only if a DIFFERENT holder has a fresh lock. Re-stamping our own lock always succeeds, so this doubles as a heartbeat: call it periodically during a long, spaced-out merge to keep the lock alive (and detect if another tab took it over).
 export function tryAcquireMergeLock(collection: string, holderId: string): boolean {
     const ls = getLocalStorage();
     if (!ls) return true;
@@ -59,8 +45,7 @@ export function tryAcquireMergeLock(collection: string, holderId: string): boole
     return ls.getItem(key) === token;
 }
 
-// Non-mutating look at the tab lock: who holds it and how long until it goes stale (negative = already
-// stale). For logging why a merge was skipped.
+// Non-mutating look at the tab lock: who holds it and how long until it goes stale (negative = already stale). For logging why a merge was skipped.
 export function peekMergeLock(collection: string): MergeLockInfo | undefined {
     const ls = getLocalStorage();
     if (!ls) return undefined;
@@ -104,9 +89,7 @@ async function writeMergeFileLock(storage: FileStorage, holderId: string, time: 
     await storage.set(FILE_LOCK_KEY, Buffer.from(`${holderId}:${time}`, "utf8") as Buffer);
 }
 
-// Acquire the cross-process file lock. Resolves to true ONLY if, after writing our ID and waiting
-// FILE_LOCK_SETTLE_MS for concurrent writers to settle, the file still names us. Caller must
-// releaseMergeFileLock() on the same storage + holderId when done.
+// Acquire the cross-process file lock. Resolves to true ONLY if, after writing our ID and waiting FILE_LOCK_SETTLE_MS for concurrent writers to settle, the file still names us. Caller must releaseMergeFileLock() on the same storage + holderId when done.
 export async function tryAcquireMergeFileLock(storage: FileStorage, holderId: string): Promise<boolean> {
     const now = Date.now();
     const existing = await readMergeFileLock(storage);
@@ -117,9 +100,7 @@ export async function tryAcquireMergeFileLock(storage: FileStorage, holderId: st
     return !!after && after.holderId === holderId;
 }
 
-// Keep the lock fresh. The merge might run longer than FILE_LOCK_TTL_MS; without periodic re-stamping,
-// another process would see the lock as stale and acquire it. Returns a stop function the caller calls
-// in `finally`. Heartbeat is best-effort: a failed write is logged but not propagated.
+// Keep the lock fresh. The merge might run longer than FILE_LOCK_TTL_MS; without periodic re-stamping, another process would see the lock as stale and acquire it. Returns a stop function the caller calls in `finally`. Heartbeat is best-effort: a failed write is logged but not propagated.
 export function startMergeFileLockHeartbeat(storage: FileStorage, holderId: string): () => void {
     const interval = setInterval(() => {
         void writeMergeFileLock(storage, holderId, Date.now()).catch(() => { /* best-effort */ });

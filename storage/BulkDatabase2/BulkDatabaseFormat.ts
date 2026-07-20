@@ -1,7 +1,5 @@
 // File format (all integers little-endian):
-//   u32 headerLength, then headerLength bytes of JSON: { rowCount, columns: [{ name, offset, length }] }, where offset is relative to the end of the header.
-//   Each column blob is: u32 offsets[rowCount + 1] (byte offsets into the column's data section), u8 types[rowCount], then the data section (each value's bytes, concatenated).
-// Values are encoded with an explicit type tag per value (see the TYPE_ constants). Reads only fetch the byte ranges they need.
+//   u32 headerLength, then headerLength bytes of JSON: { rowCount, columns: [{ name, offset, length }] }, where offset is relative to the end of the header. Each column blob is: u32 offsets[rowCount + 1] (byte offsets into the column's data section), u8 types[rowCount], then the data section (each value's bytes, concatenated). Values are encoded with an explicit type tag per value (see the TYPE_ constants). Reads only fetch the byte ranges they need.
 
 export const KEY_COLUMN = "key";
 
@@ -20,9 +18,7 @@ const TYPE_INT32_ARRAY = 10;
 const TYPE_UINT32_ARRAY = 11;
 const TYPE_FLOAT32_ARRAY = 12;
 const TYPE_FLOAT64_ARRAY = 13;
-// A cell whose row never set this column at all — as opposed to TYPE_UNDEFINED, an explicitly stored
-// undefined. On read, ABSENT falls through to older readers for that column; a stored undefined stops
-// the fall-through (it's a real value that clears the column).
+// A cell whose row never set this column at all — as opposed to TYPE_UNDEFINED, an explicitly stored undefined. On read, ABSENT falls through to older readers for that column; a stored undefined stops the fall-through (it's a real value that clears the column).
 const TYPE_ABSENT = 14;
 
 const TYPED_ARRAY_TYPES: { type: number; ctor: { new(buffer: ArrayBuffer): ArrayBufferView; BYTES_PER_ELEMENT: number; name: string } }[] = [
@@ -39,54 +35,35 @@ const TYPED_ARRAY_TYPES: { type: number; ctor: { new(buffer: ArrayBuffer): Array
 
 export const EMPTY_BUFFER = Buffer.alloc(0) as Buffer;
 
-// Sentinel a reader returns for a cell whose row never set this column, so the join can fall through
-// to an older reader for that column. Distinct from a stored undefined, which is a real clearing value.
+// Sentinel a reader returns for a cell whose row never set this column, so the join can fall through to an older reader for that column. Distinct from a stored undefined, which is a real clearing value.
 export const ABSENT = Symbol("absent");
 
-// One value exactly as it sits on disk: its type tag + raw bytes. A cell's encoding is position-
-// independent (nothing about it depends on which row/file it lives in), so a merge copies the winning
-// RawCell straight from an input column into the output — never decoding it to a JS value and
-// re-encoding. That's far less memory (no object materialization) and much faster (a byte copy, not a
-// JPEG/typed-array decode + re-encode).
+// One value exactly as it sits on disk: its type tag + raw bytes. A cell's encoding is position- independent (nothing about it depends on which row/file it lives in), so a merge copies the winning RawCell straight from an input column into the output — never decoding it to a JS value and re-encoding. That's far less memory (no object materialization) and much faster (a byte copy, not a JPEG/typed-array decode + re-encode).
 export type RawCell = { type: number; bytes: Buffer };
 
-// The type tag a cell carries when its row never set this column — read it from the column's `types`
-// array to detect ABSENT without decoding. Re-exported so the merge planner (which works at the
-// column-index level, no value materialization) can check it.
+// The type tag a cell carries when its row never set this column — read it from the column's `types` array to detect ABSENT without decoding. Re-exported so the merge planner (which works at the column-index level, no value materialization) can check it.
 export const TYPE_ABSENT_TAG = TYPE_ABSENT;
 
-// A column's index alone (offsets + types — small, ~5 bytes/row) plus a primitive to read a CONTIGUOUS
-// row range's raw value bytes. Used by the planned merge: it loads the index across every (source,
-// column) once (cheap), uses types to detect ABSENT and offsets to size each cell, plans the byte
-// layout of every output file from those — then in the execute phase reads only the runs of bytes it
-// actually needs, copying them straight into pre-laid-out output buffers. No cell value is ever
-// materialized as a JS object.
+// A column's index alone (offsets + types — small, ~5 bytes/row) plus a primitive to read a CONTIGUOUS row range's raw value bytes. Used by the planned merge: it loads the index across every (source, column) once (cheap), uses types to detect ABSENT and offsets to size each cell, plans the byte layout of every output file from those — then in the execute phase reads only the runs of bytes it actually needs, copying them straight into pre-laid-out output buffers. No cell value is ever materialized as a JS object.
 export type ColumnIndex = {
     // offsets[i]..offsets[i+1] is row i's value byte range within the column's data section.
     offsets: Uint32Array;
     // Per-row type tag; TYPE_ABSENT_TAG marks "this row never set this column" (fall-through).
     types: Uint8Array;
-    // Read the contiguous bytes of value(s) for rows [startRow, endRow). Length is exactly
-    // offsets[endRow] - offsets[startRow] — the cells in that range concatenated. The caller composes
-    // larger reads from consecutive rows (one source-side getRange per run).
+    // Read the contiguous bytes of value(s) for rows [startRow, endRow). Length is exactly offsets[endRow] - offsets[startRow] — the cells in that range concatenated. The caller composes larger reads from consecutive rows (one source-side getRange per run).
     readValueBytes: (startRow: number, endRow: number) => Promise<Buffer>;
 };
 
-// Hidden per-row column holding each row's write-time (so reads can resolve a key to its latest value
-// by actual time). NUL-prefixed so it can't collide with a user column; excluded from `columns`.
+// Hidden per-row column holding each row's write-time (so reads can resolve a key to its latest value by actual time). NUL-prefixed so it can't collide with a user column; excluded from `columns`.
 const TIME_COLUMN = String.fromCharCode(0) + "t";
 
 type FileHeader = {
     rowCount: number;
     columns: { name: string; offset: number; length: number }[];
-    // Oldest/newest write-time of the data in this file (from the stream entries it was folded from,
-    // carried through merges). Lets the merge planner pick files overlapping a time range. Absent (0)
-    // in files written before this existed.
+    // Oldest/newest write-time of the data in this file (from the stream entries it was folded from, carried through merges). Lets the merge planner pick files overlapping a time range. Absent (0) in files written before this existed.
     minTime?: number;
     maxTime?: number;
-    // Lexicographically smallest/largest key in this file (rows are stored key-sorted). Lets the merge
-    // planner group/dedup by key range and lets a single-key read skip files whose range excludes the
-    // key. Absent (undefined) in files written before this existed — treated as "spans all keys".
+    // Lexicographically smallest/largest key in this file (rows are stored key-sorted). Lets the merge planner group/dedup by key range and lets a single-key read skip files whose range excludes the key. Absent (undefined) in files written before this existed — treated as "spans all keys".
     minKey?: string;
     maxKey?: string;
 };
@@ -177,9 +154,7 @@ function encodeBulkData(data: unknown[]): Buffer {
     return Buffer.concat([offsets, types, ...parts]);
 }
 
-// Like encodeBulkData but the values are already encoded (a merge supplies the winning cells' raw bytes
-// straight from the input files). Lays out the same offsets / types / data section without touching the
-// values themselves.
+// Like encodeBulkData but the values are already encoded (a merge supplies the winning cells' raw bytes straight from the input files). Lays out the same offsets / types / data section without touching the values themselves.
 function encodeBulkDataRaw(cells: RawCell[]): Buffer {
     const n = cells.length;
     const offsets = Buffer.alloc(4 * (n + 1));
@@ -209,11 +184,7 @@ function decodeBulkData(blob: Buffer, rowCount: number): unknown[] {
     return values;
 }
 
-// Target logical (uncompressed) size of one bulk file. A rows array bigger than this is split across
-// multiple key-contiguous files, so files stay around this size (the merge policy's target) and no
-// single column blob / Buffer.concat ever approaches the ~2GB Buffer length limit. The estimate is
-// rough on purpose — it only needs to keep each chunk near the target, not be exact. A single row
-// bigger than the target still becomes its own (oversized) file, since we never split within a key.
+// Target logical (uncompressed) size of one bulk file. A rows array bigger than this is split across multiple key-contiguous files, so files stay around this size (the merge policy's target) and no single column blob / Buffer.concat ever approaches the ~2GB Buffer length limit. The estimate is rough on purpose — it only needs to keep each chunk near the target, not be exact. A single row bigger than the target still becomes its own (oversized) file, since we never split within a key.
 export const TARGET_FILE_BYTES = 256 * 1024 * 1024;
 
 // Per-value on-disk overhead: a 4-byte offset entry plus a 1-byte type tag.
@@ -237,9 +208,7 @@ function estimateRowBytes(row: Record<string, unknown>): number {
     return total;
 }
 
-// Concatenates already-encoded column blobs into a complete file (4-byte header length + header JSON +
-// blobs), computing the header's time + key bounds from the per-row times and keys. Shared by the
-// object-based builder (buildOneFile) and the raw-splice builder (buildOneFileRaw).
+// Concatenates already-encoded column blobs into a complete file (4-byte header length + header JSON + blobs), computing the header's time + key bounds from the per-row times and keys. Shared by the object-based builder (buildOneFile) and the raw-splice builder (buildOneFileRaw).
 function assembleFile(columnNames: string[], blobs: Buffer[], rowCount: number, times: number[], keys: string[]): Buffer {
     let offset = 0;
     const columns = columnNames.map((name, i) => {
@@ -281,21 +250,15 @@ function buildOneFile(rows: Record<string, unknown>[], times: number[]): Buffer 
     return assembleFile(columnNames, blobs, rows.length, times, rows.map(r => r[KEY_COLUMN] as string));
 }
 
-// A resolved output row for the raw-splice merge: its key, write-time, and the winning raw cell for each
-// column it has (a column it lacks is written ABSENT — fall-through). The cell bytes are copied straight
-// from the input files; no value is ever decoded.
+// A resolved output row for the raw-splice merge: its key, write-time, and the winning raw cell for each column it has (a column it lacks is written ABSENT — fall-through). The cell bytes are copied straight from the input files; no value is ever decoded.
 export type RawRow = { key: string; time: number; cells: Map<string, RawCell> };
 
-// Size of a column blob's INDEX section (offsets array + types array) for a column of N rows. The data
-// section follows immediately after. The planned merge uses this to size output buffers exactly.
+// Size of a column blob's INDEX section (offsets array + types array) for a column of N rows. The data section follows immediately after. The planned merge uses this to size output buffers exactly.
 export function columnIndexByteLength(rowCount: number): number {
     return 4 * (rowCount + 1) + rowCount;
 }
 
-// Assembles a complete bulk file from a set of pre-built value column blobs plus the keys + times. Auto-
-// adds the KEY_COLUMN (keys) and hidden TIME_COLUMN (times) — they're small enough to encode in one shot
-// here. Used by the planned merge: it builds each value column's blob by-hand (offsets/types + raw bytes
-// copied directly from inputs, no value materialization) and hands the result here for header + bounds.
+// Assembles a complete bulk file from a set of pre-built value column blobs plus the keys + times. Auto- adds the KEY_COLUMN (keys) and hidden TIME_COLUMN (times) — they're small enough to encode in one shot here. Used by the planned merge: it builds each value column's blob by-hand (offsets/types + raw bytes copied directly from inputs, no value materialization) and hands the result here for header + bounds.
 export function assemblePlannedFile(config: {
     valueColumns: { name: string; blob: Buffer }[];
     keys: string[];
@@ -313,8 +276,7 @@ export function assemblePlannedFile(config: {
 const ABSENT_CELL: RawCell = { type: TYPE_ABSENT, bytes: EMPTY_BUFFER };
 
 function buildOneFileRaw(rows: RawRow[]): Buffer {
-    // Columns present in this chunk, in first-seen order (matches buildOneFile, which only emits columns
-    // some row actually has).
+    // Columns present in this chunk, in first-seen order (matches buildOneFile, which only emits columns some row actually has).
     const valueColumns: string[] = [];
     const seen = new Set<string>();
     for (const row of rows) for (const col of row.cells.keys()) {
@@ -338,16 +300,10 @@ function estimateRawRowBytes(row: RawRow): number {
     return total;
 }
 
-// One complete, independent file: the encoded buffer plus its key range + row count (the caller logs the
-// range when a merge splits across several files).
+// One complete, independent file: the encoded buffer plus its key range + row count (the caller logs the range when a merge splits across several files).
 export interface BuiltFile { buffer: Buffer; minKey: string; maxKey: string; rowCount: number; }
 
-// Returns one complete, independent file per chunk of rows. Rows are first sorted by key, then
-// partitioned into key-contiguous chunks of ~targetBytes each — so every returned file is key-sorted
-// (tight minKey/maxKey for the read-skip + merge planner) and stays near the target size, and no
-// single column blob / Buffer.concat approaches the ~2GB limit. The chunks have disjoint key ranges,
-// so the caller just writes each as its own file. A normal-sized write returns a single file.
-// `times[i]` is row i's write-time, stored per row so reads resolve a key to its latest value by time.
+// Returns one complete, independent file per chunk of rows. Rows are first sorted by key, then partitioned into key-contiguous chunks of ~targetBytes each — so every returned file is key-sorted (tight minKey/maxKey for the read-skip + merge planner) and stays near the target size, and no single column blob / Buffer.concat approaches the ~2GB limit. The chunks have disjoint key ranges, so the caller just writes each as its own file. A normal-sized write returns a single file. `times[i]` is row i's write-time, stored per row so reads resolve a key to its latest value by time.
 export function buildFileBuffer(rows: Record<string, unknown>[], times: number[], targetBytes = TARGET_FILE_BYTES): BuiltFile[] {
     // A chunk is already key-sorted, so its first/last row are its min/max key.
     const make = (rs: Record<string, unknown>[], ts: number[]): BuiltFile => ({
@@ -381,9 +337,7 @@ export function buildFileBuffer(rows: Record<string, unknown>[], times: number[]
     return result;
 }
 
-// The raw-splice counterpart of buildFileBuffer, used by merges: the rows already carry their winning
-// cells as raw on-disk bytes (no JS values), so this just sorts by key, chunks to ~targetBytes, and
-// concatenates the bytes. Same output guarantees: key-contiguous, disjoint, ascending files.
+// The raw-splice counterpart of buildFileBuffer, used by merges: the rows already carry their winning cells as raw on-disk bytes (no JS values), so this just sorts by key, chunks to ~targetBytes, and concatenates the bytes. Same output guarantees: key-contiguous, disjoint, ascending files.
 export function buildFileBufferRaw(rows: RawRow[], targetBytes = TARGET_FILE_BYTES): BuiltFile[] {
     const make = (rs: RawRow[]): BuiltFile => ({
         buffer: buildOneFileRaw(rs),
@@ -410,8 +364,7 @@ export function buildFileBufferRaw(rows: RawRow[], targetBytes = TARGET_FILE_BYT
 }
 
 export type BaseBulkDatabaseReader = {
-    // Identifies the source this reader came from (the bulk file name, or "(streams)") so the join can
-    // name the offending file when one of its reads fails. Undefined for readers built without one.
+    // Identifies the source this reader came from (the bulk file name, or "(streams)") so the join can name the offending file when one of its reads fails. Undefined for readers built without one.
     name?: string;
     rowCount: number;
     totalBytes: number;
@@ -424,33 +377,23 @@ export type BaseBulkDatabaseReader = {
     // Keys is special, it's always automatically decoded, even though it is stored as a normal column
     keys: string[];
     columns: { column: string; byteSize: number }[];
-    // Each key's row write-time (the time of its newest write in this reader). The join compares these
-    // across readers to resolve a key to its latest value.
+    // Each key's row write-time (the time of its newest write in this reader). The join compares these across readers to resolve a key to its latest value.
     keyTimes: Map<string, number>;
-    // Per-key tombstone time: the key was deleted at this time. The join treats a delete like any other
-    // event — a delete only wins if it's newer than every set for the key. Only the stream reader sets it.
+    // Per-key tombstone time: the key was deleted at this time. The join treats a delete like any other event — a delete only wins if it's newer than every set for the key. Only the stream reader sets it.
     deleteTimes?: Map<string, number>;
-    // Each key's value for the column plus the row's write-time. value may be ABSENT (the row never set
-    // this column — the join then falls through to an older reader for that key/column).
+    // Each key's value for the column plus the row's write-time. value may be ABSENT (the row never set this column — the join then falls through to an older reader for that key/column).
     getColumn: (column: string) => Promise<{ key: string; value: unknown; time: number }[]>;
-    // Like getColumn but returns each cell's raw on-disk encoding (type tag + bytes) keyed by key, WITHOUT
-    // decoding the value — for merges, which splice the winning bytes straight into the output. ABSENT
-    // cells are omitted (a missing key means this reader didn't set this column, so the merge falls
-    // through to an older reader). Each cell's write-time is the reader's keyTimes value for that key.
+    // Like getColumn but returns each cell's raw on-disk encoding (type tag + bytes) keyed by key, WITHOUT decoding the value — for merges, which splice the winning bytes straight into the output. ABSENT cells are omitted (a missing key means this reader didn't set this column, so the merge falls through to an older reader). Each cell's write-time is the reader's keyTimes value for that key.
     getRawColumn: (column: string) => Promise<Map<string, RawCell>>;
-    // Returns the column's INDEX (offsets + types) plus a contiguous row-range byte reader. The planned
-    // merge loads this for every (source, column) once — small (~5B/row), no value bytes pulled — and
-    // uses types/offsets to plan the output's byte layout. Execute then reads only the needed runs.
+    // Returns the column's INDEX (offsets + types) plus a contiguous row-range byte reader. The planned merge loads this for every (source, column) once — small (~5B/row), no value bytes pulled — and uses types/offsets to plan the output's byte layout. Execute then reads only the needed runs.
     getColumnIndex: (column: string) => Promise<ColumnIndex>;
-    // Maps a key to its row index in this reader (and undefined if absent). The planned merge uses this
-    // to look up a winning cell's source row without going through a column read.
+    // Maps a key to its row index in this reader (and undefined if absent). The planned merge uses this to look up a winning cell's source row without going through a column read.
     rowOfKey: (key: string) => number | undefined;
     // The value + write-time for (key, column), or ABSENT if this reader has no such cell.
     getSingleField: (key: string, column: string) => Promise<{ value: unknown; time: number } | typeof ABSENT>;
 };
 
-// Reads just the file header (the 4-byte length + header JSON) — no column data. Used by the merge
-// planner to get each file's row count, time range, and key range cheaply across many files.
+// Reads just the file header (the 4-byte length + header JSON) — no column data. Used by the merge planner to get each file's row count, time range, and key range cheaply across many files.
 export type BulkHeaderInfo = { rowCount: number; minTime: number; maxTime: number; minKey?: string; maxKey?: string; columns: { column: string; byteSize: number }[] };
 export async function loadBulkHeader(getRange: (start: number, end: number) => Promise<Buffer>, totalBytes: number): Promise<BulkHeaderInfo> {
     const headerLength = (await getRange(0, 4)).readUInt32LE(0);
@@ -499,8 +442,7 @@ export async function loadBulkDatabase(config: {
     });
     const keyIndex = new Map(keys.map((key, i) => [key, i]));
 
-    // Per-row write-times. Old files (written before this column existed) fall back to the file's header
-    // time (or 0) for every row — fine, since such files predate concurrent-time resolution.
+    // Per-row write-times. Old files (written before this column existed) fall back to the file's header time (or 0) for every row — fine, since such files predate concurrent-time resolution.
     const times: number[] = colByName.has(TIME_COLUMN)
         ? (await readWholeColumn(TIME_COLUMN)).map(v => typeof v === "number" ? v : 0)
         : keys.map(() => header.maxTime || 0);
@@ -538,8 +480,7 @@ export async function loadBulkDatabase(config: {
         async getColumnIndex(column) {
             const col = colByName.get(column);
             if (!col) {
-                // File lacks this column — present an all-ABSENT index so the planner can treat it
-                // uniformly with files that have the column.
+                // File lacks this column — present an all-ABSENT index so the planner can treat it uniformly with files that have the column.
                 const offsets = new Uint32Array(rowCount + 1);
                 const types = new Uint8Array(rowCount).fill(TYPE_ABSENT);
                 return {
@@ -550,8 +491,7 @@ export async function loadBulkDatabase(config: {
             }
             const colBase = dataBase + col.offset;
             const indexSize = 4 * (rowCount + 1) + rowCount;
-            // One read pulls offsets + types (small — ~5 B/row). Block cache makes subsequent value reads
-            // of nearby rows cheap. Decoded into aligned typed arrays so the executor can do O(1) lookups.
+            // One read pulls offsets + types (small — ~5 B/row). Block cache makes subsequent value reads of nearby rows cheap. Decoded into aligned typed arrays so the executor can do O(1) lookups.
             const indexBuf = await config.getRange(colBase, colBase + indexSize);
             const offsets = new Uint32Array(rowCount + 1);
             for (let i = 0; i <= rowCount; i++) offsets[i] = indexBuf.readUInt32LE(4 * i);

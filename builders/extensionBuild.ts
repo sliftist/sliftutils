@@ -8,7 +8,7 @@ import { getAllFiles } from "../misc/fs";
 
 async function main() {
     let time = Date.now();
-    //todonext
+    // todonext
     // We need to build both the extBackground.ts and extContentScript.ts
     // And copy the manifest.json
     // AND copy everything in ./assets which has updated

@@ -36,13 +36,9 @@ export type AccessState = {
     grantAccessCommand?: string;
     trustedMachines?: TrustRecord[];
 };
-/** Called by storageServerState the moment any routing config is applied - clients must never
- *  have to wait for a poll to learn the topology changed. */
 export declare function broadcastRoutingChanged(): void;
 export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
-    ping: () => Promise<{
-        takeover?: string;
-    }>;
+    ping: () => Promise<{}>;
     authenticate: (token: AuthToken) => Promise<{
         machineId: string;
         ip: string;
@@ -83,6 +79,9 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
     getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
     listBuckets: (account: string) => Promise<ServerBucketInfo[]>;
+    clearWriteStats: (account: string) => Promise<{
+        clearedBuckets: number;
+    }>;
     getIndexInfo: (account: string, bucketName: string) => Promise<{
         fileCount: number;
         byteCount: number;

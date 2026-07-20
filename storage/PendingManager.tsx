@@ -22,8 +22,7 @@ export function hasPending(): boolean {
     return Object.keys(watchState.pending).length > 0;
 }
 
-// NOTE: This not only prevents render overload, but also means any pending that are < this
-//  delay don't show up (which is useful to reduce unnecessary pending messages).
+// NOTE: This not only prevents render overload, but also means any pending that are < this delay don't show up (which is useful to reduce unnecessary pending messages).
 const setPendingBase = throttleFunction(500, function setPendingBase() {
     for (let [group, message] of pendingCache) {
 
@@ -38,7 +37,7 @@ const setPendingBase = throttleFunction(500, function setPendingBase() {
             }
             delete watchState.pending[group];
         } else {
-            //console.log("setPending", group, message);
+            // console.log("setPending", group, message);
             if (!(group in watchState.pending)) {
                 pendingLastSets.set(group, Date.now());
             }

@@ -38,8 +38,7 @@ export function removeSourceMap(content: string): {
     }
 
     let sourceMapJson = Buffer.from(match[1], "base64").toString();
-    // HACK: If the sourcemap is invalid, try to remove trailing characters. For some reason we sometimes have
-    //  extra characters at the end? Also try to add some characters too?
+    // HACK: If the sourcemap is invalid, try to remove trailing characters. For some reason we sometimes have extra characters at the end? Also try to add some characters too?
     function isJSON(str: string): boolean {
         try {
             JSON.parse(str);

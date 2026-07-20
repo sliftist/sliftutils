@@ -123,8 +123,7 @@ export class InputPicker<T> extends preact.Component<{
                             <button
                                 key={`add-${option.matchText}`}
                                 className={css.hbox(5).button + greenButton}
-                                // On mouse down, so we can add picked BEFORE we blur (otherwise
-                                //  this button disappears before it can be clicked)
+                                // On mouse down, so we can add picked BEFORE we blur (otherwise this button disappears before it can be clicked)
                                 onMouseDown={() => {
                                     this.props.addPicked(option.value);
                                 }}

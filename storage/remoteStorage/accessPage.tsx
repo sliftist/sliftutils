@@ -9,11 +9,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { RemoteStorageController, AccessState, AccessRequest } from "./storageController";
 import { authenticateStorage } from "./ArchivesRemote";
 
-// The storage server's access page. Visit https://<storageDomain>:<port>/<accountName> to request
-// access to that account for this browser's machine identity. Once granted, lists the machines that
-// have access. To approve someone else's request, the user must type in the requester's IP —
-// pending requests are NEVER shown unsolicited (so a trusted user can't accidentally approve a
-// random machine's request).
+// The storage server's access page. Visit https://<storageDomain>:<port>/<accountName> to request access to that account for this browser's machine identity. Once granted, lists the machines that have access. To approve someone else's request, the user must type in the requester's IP — pending requests are NEVER shown unsolicited (so a trusted user can't accidentally approve a random machine's request).
 
 const REFRESH_INTERVAL = 1000 * 15;
 const COPIED_RESET_DELAY = 2000;

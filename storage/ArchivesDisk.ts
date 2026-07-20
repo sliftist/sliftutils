@@ -5,11 +5,7 @@ import { runInfinitePoll } from "socket-function/src/batching";
 import { sort, binarySearchBasic } from "socket-function/src/misc";
 import { IArchives, ArchiveFileInfo, ArchivesConfig, assertValidLastModified } from "./IArchives";
 
-// The base file-system IArchives: storage is one-to-one with the file system, every key is exactly
-// one real file under <folder>/files, so the file system itself is the index. File handles are
-// cached and reused, and closed once idle (see FileHandleCache). All operations on a file run in
-// serial, so they can't collide with each other or with handle closing. Used as the disk
-// synchronization source of BlobStore (see remoteStorage/blobStore.ts).
+// The base file-system IArchives: storage is one-to-one with the file system, every key is exactly one real file under <folder>/files, so the file system itself is the index. File handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a file run in serial, so they can't collide with each other or with handle closing. Used as the disk synchronization source of BlobStore (see remoteStorage/blobStore.ts).
 
 const HANDLE_IDLE_TIMEOUT = 1000 * 60;
 const HANDLE_SWEEP_INTERVAL = 1000 * 15;
@@ -20,11 +16,7 @@ type HandleEntry = {
     lastUse: number;
 };
 
-// Caches open file handles, closing them once idle for HANDLE_IDLE_TIMEOUT. Instead of one
-// setTimeout per handle, a list sorted by last use is swept periodically (entries are moved via
-// binary search on access, and lastUse values only increase, so touched entries append at the
-// end). Also serializes operations per file: each operation only starts once the previous one on
-// the same file finished, and a handle is never closed while an operation is pending on it.
+// Caches open file handles, closing them once idle for HANDLE_IDLE_TIMEOUT. Instead of one setTimeout per handle, a list sorted by last use is swept periodically (entries are moved via binary search on access, and lastUse values only increase, so touched entries append at the end). Also serializes operations per file: each operation only starts once the previous one on the same file finished, and a handle is never closed while an operation is pending on it.
 class FileHandleCache {
     private entries = new Map<string, HandleEntry>();
     // Sorted by lastUse ascending (least recently used first)
@@ -278,8 +270,7 @@ export class ArchivesDisk implements IArchives {
         }
     }
 
-    // Large files stream into their own file under uploads/, then move into place on finish. No
-    // handle is opened until the first append actually happens.
+    // Large files stream into their own file under uploads/, then move into place on finish. No handle is opened until the first append actually happens.
     public async startLargeUpload(): Promise<string> {
         await this.init();
         let id = `${Date.now()}_${this.nextLargeUploadId++}`;
@@ -344,8 +335,7 @@ async function statOrUndefined(filePath: string): Promise<fs.Stats | undefined> 
     }
 }
 
-// The folders/shallow post-processing shared by findInfo implementations that list flat files
-// (used by ArchivesDisk on the raw disk walk, and by BlobStore on its index).
+// The folders/shallow post-processing shared by findInfo implementations that list flat files (used by ArchivesDisk on the raw disk walk, and by BlobStore on its index).
 export function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): ArchiveFileInfo[] {
     if (config?.type === "folders") {
         let folders = new Map<string, ArchiveFileInfo>();

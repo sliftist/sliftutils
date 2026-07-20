@@ -184,10 +184,7 @@ declare module "sliftutils/misc/https/dns" {
         modified_on: string;
         comment?: string | undefined;
     }[]>;
-    /** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database
-     *   transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs
-     *   aren't usable in our setup, and because it lets "remove others + assert target" happen
-     *   without a window where the name resolves to nothing. */
+    /** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs aren't usable in our setup, and because it lets "remove others + assert target" happen without a window where the name resolves to nothing. */
     export declare function batchRecords(zoneId: string, batch: {
         deletes?: {
             id: string;
@@ -227,6 +224,8 @@ declare module "sliftutils/misc/https/hostServer" {
         portFallback?: {
             /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
             getAcquireDelay: () => number;
+            /** Called when the main port turned out to be busy, before we act as its successor in any way. Throwing aborts startup - a busy port with no deploy in progress means something else holds it, which is not a state to keep running in. */
+            onPortInUse?: () => Promise<void>;
             /** Reports every port we become reachable on (the alternate at mount, the main port once relayed) */
             onListening: (port: number, isMainPort: boolean) => void;
         };
@@ -1075,8 +1074,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
          * "someone else is already merging".
          */
         tryMergeNow(): Promise<MergeAttemptResult>;
-        /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level;
-         * most callers want compact() or tryMergeNow(). */
+        /** Rewrite everything written in [timeLo, timeHi] into fresh key-sorted bulk file(s). Low-level; most callers want compact() or tryMergeNow(). */
         merge(timeLo: number, timeHi: number): Promise<void>;
     }
     export declare class MobxReactiveDeps implements ReactiveDeps {
@@ -2131,11 +2129,12 @@ declare module "sliftutils/storage/IArchives" {
         validWindow: [number, number];
         /** Sharding: the fraction of the key space this source handles, as [start, end) over [0, 1) (keys are routed by getRoute in remoteConfig.ts). Defaults to FULL_ROUTE (unsharded). At every point in time the sources' routes must fully cover [0, 1), or some keys could never be read. */
         route?: [number, number];
+        /** Set on entries injected into the in-memory config by an overlay (a deploy switchover's alternate-port window). Never written to disk: resolveIntermediateSources strips these and rejoins the windows around them, which is also how a client tells whether an update is a real configuration change or just an overlay. */
+        intermediate?: boolean;
     };
     export type HostedConfig = CommonConfig & {
         type: "remote";
         url: string;
-        accountName?: string;
         public?: boolean;
         fast?: boolean;
         writeDelay?: number;
@@ -2207,8 +2206,7 @@ declare module "sliftutils/storage/IArchives" {
     };
     export interface IArchives {
         getDebugName(): string;
-        /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc).
-         *  Checked without writing anything. */
+        /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc). Checked without writing anything. */
         hasWriteAccess(): Promise<boolean>;
         get(fileName: string, config?: {
             range?: {
@@ -2846,7 +2844,6 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
     import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
     export type ArchivesRemoteConfig = {
         url: string;
-        accountName?: string;
         waitForAccess?: boolean;
     };
     export declare function parseStorageUrl(url: string): {
@@ -2872,9 +2869,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         private lastDeniedLog;
         getDebugName(): string;
         isConnected(): boolean;
-        ping(): Promise<{
-            takeover?: string;
-        }>;
+        ping(): Promise<{}>;
         private authenticate;
         private callAuthed;
         waitingForAccess(): Promise<{
@@ -3067,6 +3062,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         constructor(folder: string, sources: ArchivesSource[], config?: {
             onIndexChanged?: ((key: string) => void) | undefined;
             readerDiskLimit?: number | undefined;
+            onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
         } | undefined);
         private stopped;
         private index;
@@ -3091,20 +3087,12 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private countEntry;
         private setIndexEntry;
         private deleteIndexEntry;
-        /** Applies a config change to the RUNNING store: windows/routes update in place, new sources
-         *  are added (their sync starts immediately), and removed sources' slots go dead (their scans
-         *  stop, their index entries drop). The store survives every routine config evolution - it is
-         *  never destroyed for a source-list change, only for structural flips it cannot express
-         *  (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing
-         *  immediately when it has already passed). */
+        /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
         updateSources(specs: BlobSourceSpec[]): void;
         private removeSource;
-        /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
-         *  another process wrote files to the shared folder that our index hasn't seen. */
+        /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
         rescanBase(): Promise<void>;
-        /** A boundary scan of the node that owned (part of) our route in the valid window before ours,
-         *  when that node is different storage (a disk rescan can't see its writes): just its changes
-         *  since the boundary neighborhood, with matching values pulled onto our own disk. */
+        /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
         boundaryScanRemote(source: IArchives, config: {
             since: number;
             route?: [number, number];
@@ -3123,8 +3111,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             readerDiskLimit?: number;
             syncing: SyncActivity[];
         };
-        /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to
-         *  any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
+        /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
         computeIndexTotals(): Promise<{
             fileCount: number;
             byteCount: number;
@@ -3198,6 +3185,8 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
     /// <reference types="node" />
     import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
     import { ServerBucketInfo } from "./storageServerState";
+    /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
+    export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
     export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
     export declare class ArchivesChain implements IArchives {
         private configured;
@@ -3267,12 +3256,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
         getSyncStatus(): Promise<ArchivesSyncStatus>;
         getConfig(): Promise<ArchivesConfig>;
-        /** True only when EVERY write-receiving source would accept our writes (partial write access
-         *  desynchronizes sources, so it counts as no access). */
         hasWriteAccess(): Promise<boolean>;
-        /** Returns the full key written. Plain keys come back unchanged; keys containing VARIABLE_SHARD
-         *  are automatically materialized (a shard value is picked and embedded, see setVariableShard)
-         *  and the caller needs the returned key to ever read the value back. */
         set(fileName: string, data: Buffer, config?: {
             lastModified?: number;
         }): Promise<string>;
@@ -3287,62 +3271,72 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         dispose(): void;
     }
     export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;
-    /** Every bucket an account has on one storage server - active and inactive - with each bucket's
-     *  configuration. One authenticated call (the normal trust system applies): no ArchivesChain, no
-     *  synchronization, and inactive buckets on the server stay inactive. Any URL addressing the
-     *  server works (a bucket routing URL, or just https://host:port). */
     export declare function listServerBuckets(config: {
         url: string;
         account: string;
     }): Promise<ServerBucketInfo[]>;
-    /** Live info for one bucket given its routing URL (getConfig: routing config, index totals, disk
-     *  limit, in-progress synchronization). One authenticated call to that server - a light, safe
-     *  alternative to instantiating an ArchivesChain, which would start synchronization machinery. */
+    /** Zeroes the write statistics listServerBuckets reports, for every bucket in the account. */
+    export declare function clearServerWriteStats(config: {
+        url: string;
+        account: string;
+    }): Promise<{
+        clearedBuckets: number;
+    }>;
     export declare function getBucketInfo(config: {
         url: string;
-        accountName?: string;
     }): Promise<ArchivesConfig>;
 
 }
 
 declare module "sliftutils/storage/remoteStorage/deployTakeover" {
-    import { RemoteConfig } from "../IArchives";
-    export type TakeoverEvent = "remapChanged";
-    /** Starts the takeover machinery. Port fallback (alternate port + registry + acquisition polling)
-     *  works regardless; without a deploy timeline folder the switchover-specific parts (the remap,
-     *  the tighter acquisition pacing) simply stay inert. */
-    export declare function initDeployTakeover(config: {
-        domain: string;
-        mainPort: number;
-        storageFolder: string;
-    }): Promise<void>;
-    /** Called when we had to listen on an alternate port (the main port was still held by our
-     *  predecessor): registers it so the predecessor can route the middle overlap window to us. */
-    export declare function registerAltPort(port: number): Promise<void>;
-    export declare function onTakeoverEvent(listener: (event: TakeoverEvent) => void): void;
-    /** The interpretation overlay: splits every source pointing at our domain+main port so the middle
-     *  of the deploy overlap points at the alternate port. Pure, in-memory only - the stored routing
-     *  config is never modified, and this must never be applied to data that gets persisted. */
-    export declare function applyDeployRemap(routing: RemoteConfig): RemoteConfig;
-    /** A stamp of the current remap interpretation, advertised in ping responses - so every connected
-     *  client learns of a takeover within one ping interval, instead of waiting for its config poll
-     *  or a write rejection. */
-    export declare function getTakeoverStamp(): string | undefined;
-    /** The middle-window alternate port of an active remap. The OTHER process of the takeover lives on
-     *  this port on OUR machine (same disk!), so sources pointing at it are self, never sync targets. */
-    export declare function getTakeoverAltPort(): number | undefined;
-    /** For the dying process of a takeover: our own process's data ends at the write handoff - fast
-     *  writes must be on disk by then. Undefined for the successor and in normal operation. Both
-     *  processes share the config identity (all self windows look like "ours" to both), so this is
-     *  the only way the dying side knows the post-handoff windows belong to the other process. */
-    export declare function getOwnWindowEndClip(): number | undefined;
-    /** How long to wait between main-port acquisition attempts: tight around the predecessor's
-     *  scheduled death (when the port actually frees), relaxed otherwise. */
+    type DeployTakeover = {
+        releaseTime: number;
+        overlapTime: number;
+        altPort?: number;
+    };
+    /** Called when the main port is already in use, which on a healthy machine only happens while our predecessor is still running a deploy overlap. Confirms that against the deploy timeline; if no deploy is in progress we are in a bad state (someone else holds our port) and the process must not keep running. */
+    export declare function detectDeployTakeover(): Promise<DeployTakeover>;
+    export declare function setAltPort(port: number): void;
+    /** The window in which writes belong to our alternate port: from the release until our predecessor is killed and we take the main port. */
+    export declare function getTakeoverIntermediate(): {
+        start: number;
+        end: number;
+        altPort: number;
+    } | undefined;
+    /** We never stop listening on the alternate port while its window is still valid, and hold it well past that for clients that have not caught up yet. */
+    export declare function getAltPortListenEnd(): number;
+    /** How long to wait between main-port acquisition attempts: tight around our predecessor's scheduled death (when the port actually frees), relaxed otherwise. */
     export declare function getMainPortAcquireDelay(): number;
+    export {};
 
 }
 
 declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
+    export {};
+
+}
+
+declare module "sliftutils/storage/remoteStorage/intermediateSources" {
+    import { RemoteConfig, HostedConfig, BackblazeConfig } from "../IArchives";
+    export declare const INTERMEDIATE_EXPIRE_GRACE: number;
+    /** Adding or removing intermediates is a real config update, so it takes a real version increment - but a proportional one, so it stays far below whatever the author's next version would be (whether they count 1, 2, 3 or use timestamps), and a million of them still fit under it. */
+    export declare function nextIntermediateVersion(version: number): number;
+    type ObjectSource = HostedConfig | BackblazeConfig;
+    export declare function getIntermediateSources(config: RemoteConfig): ObjectSource[];
+    export declare function hasIntermediateSources(config: RemoteConfig): boolean;
+    /** Removes every intermediate entry and rejoins the windows it split, giving back the underlying configuration. Two configs that resolve equal differ only by intermediates. */
+    export declare function resolveIntermediateSources(config: RemoteConfig): RemoteConfig;
+    /** Splits every source at splitUrl covering [start, end) so that middle window points at intermediateUrl instead, flagged as intermediate. Idempotent: a config that already contains the exact intermediate comes back unchanged. */
+    export declare function injectIntermediateSource(config: RemoteConfig, inject: {
+        splitUrl: string;
+        intermediateUrl: string;
+        start: number;
+        end: number;
+    }): RemoteConfig;
+    /** Intermediates whose window ended more than INTERMEDIATE_EXPIRE_GRACE ago are removed, and the windows they split are rejoined. */
+    export declare function expireIntermediateSources(config: RemoteConfig, now: number): RemoteConfig;
+    /** The url of the entry an intermediate was split out of - the neighbour it touches. */
+    export declare function findSplitUrl(config: RemoteConfig, intermediate: ObjectSource): string | undefined;
     export {};
 
 }
@@ -3382,7 +3376,7 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
 }
 
 declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
-    import { IArchives, HostedConfig, BackblazeConfig } from "../IArchives";
+    import { IArchives, HostedConfig, BackblazeConfig, RemoteConfig } from "../IArchives";
     import { ArchivesUrl } from "./ArchivesUrl";
     export declare const RETRY_START_DELAY: number;
     export declare const RETRY_MAX_DELAY: number;
@@ -3398,41 +3392,30 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         private reconnectRunning;
         private accessCache?;
         private constructor();
-        /** Config updates routinely just move a source's valid window (the last window extends
-         *  forever, then gets reduced when a new entry is appended). The wrapper survives that: only
-         *  the window changes, keeping the connection, pings, and latency history. */
+        /** Config updates routinely just move a source's valid window (the last window extends forever, then gets reduced when a new entry is appended). The wrapper survives that: only the window changes, keeping the connection, pings, and latency history. */
         updateValidWindow(validWindow: [number, number]): void;
         static create(config: HostedConfig | BackblazeConfig, options?: {
             background?: boolean;
         }): Promise<SourceWrapper>;
         getDebugName(): string;
         isConnected(): boolean;
-        /** Call after a request failed while isConnected() was false: starts (if not already running)
-         *  the background reconnect loop. Never blocks - the failed request still throws. */
+        /** Call after a request failed while isConnected() was false: starts (if not already running) the background reconnect loop. Never blocks - the failed request still throws. */
         noteFailure(): void;
         private reconnectLoop;
         private checkAccess;
         read<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;
+        readRoutingConfig(): Promise<RemoteConfig | undefined>;
         hasWriteAccess(): Promise<boolean>;
         private pings;
         private pingTimer;
         private loggedConnected;
-        private lastTakeoverStamp;
-        /** Fired when the source's advertised takeover stamp changes (a deploy takeover started or
-         *  ended) - the chain refreshes its config, so connected clients learn within one ping. */
-        onServedConfigChanged: (() => void) | undefined;
-        /** Starts measuring this source's latency (for variable-shard target preference). Only hosted
-         *  remotes are pinged; our own local server counts as 0, everything else as Infinity. */
+        /** Starts measuring this source's latency (for variable-shard target preference). Only hosted remotes are pinged; our own local server counts as 0, everything else as Infinity. */
         startPinging(): void;
-        /** Seeds the latency estimate before the first ping lands (e.g. from the initial routing
-         *  fetch), so variable-shard picking has something immediately. Real pings take over from the
-         *  first measurement on. */
+        /** Seeds the latency estimate before the first ping lands (e.g. from the initial routing fetch), so variable-shard picking has something immediately. Real pings take over from the first measurement on. */
         seedLatency(ms: number): void;
-        /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our
-         *  own in-process server, which is the best possible target (0). */
+        /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our own in-process server, which is the best possible target (0). */
         getLatency(): number;
-        /** Writes always go through the API, so a permission error throws to the caller on every write
-         *  (and access granted in the meantime is picked up automatically). */
+        /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */
         write<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;
         dispose(): void;
     }
@@ -3487,13 +3470,9 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         grantAccessCommand?: string;
         trustedMachines?: TrustRecord[];
     };
-    /** Called by storageServerState the moment any routing config is applied - clients must never
-     *  have to wait for a poll to learn the topology changed. */
     export declare function broadcastRoutingChanged(): void;
     export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
-        ping: () => Promise<{
-            takeover?: string;
-        }>;
+        ping: () => Promise<{}>;
         authenticate: (token: AuthToken) => Promise<{
             machineId: string;
             ip: string;
@@ -3534,6 +3513,9 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         getChangesAfter: (account: string, bucketName: string, time: number) => Promise<ArchiveFileInfo[]>;
         getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
         listBuckets: (account: string) => Promise<ServerBucketInfo[]>;
+        clearWriteStats: (account: string) => Promise<{
+            clearedBuckets: number;
+        }>;
         getIndexInfo: (account: string, bucketName: string) => Promise<{
             fileCount: number;
             byteCount: number;
@@ -3595,7 +3577,16 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     export declare function assertWritesAllowed(): void;
     export declare function getTrust(): Promise<IStorage<TrustRecord>>;
     export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
-    /** Makes machineIds the complete trust list for the account: machines not in the list lose access, machines already trusted keep their existing record, and missing ones are added. */
+    export type BucketWriteStats = {
+        /** Every set call the bucket accepted */
+        originalWrites: number;
+        originalBytes: number;
+        /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+        flushedWrites: number;
+        flushedBytes: number;
+    };
+    /** Zeroes the write statistics of every bucket in the account, including counts not yet flushed. */
+    export declare function clearAccountWriteStats(account: string): Promise<number>;
     export declare function setTrustedMachines(config: {
         account: string;
         machineIds: string[];
@@ -3611,6 +3602,7 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         structureKey: string;
     };
     export declare function addExtraListenPort(port: number): void;
+    export declare function removeExtraListenPort(port: number): void;
     export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
     export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
     export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
@@ -3618,16 +3610,29 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     }): Promise<void>;
     export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
     export declare function rebuildAllLoadedBuckets(): Promise<void>;
+    /** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
+    export declare const startIntermediateMaintenance: {
+        (): void;
+        reset(): void;
+        set(newValue: void): void;
+    };
+    export type BucketDiskInfo = {
+        totalBytes: number;
+        freeBytes: number;
+        usedBytes: number;
+    };
     export type ServerBucketInfo = {
         bucketName: string;
         active: boolean;
+        /** Where the bucket's data lives on this server */
+        folder: string;
+        /** The drive that folder is on. Buckets sharing a drive report the same numbers. */
+        disk?: BucketDiskInfo;
+        diskError?: string;
+        writeStats?: BucketWriteStats;
         config?: ArchivesConfig;
         error?: string;
     };
-    /** Every bucket the account has on this server, active or not, each with its configuration.
-     *  Inactive buckets are inspected straight from disk WITHOUT loading them - loading would start
-     *  their synchronization, and old invalid buckets must stay inert (their parse error is reported
-     *  instead). */
     export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
     export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
     export declare function getLocalArchives(account: string, bucketName: string): IArchives;

@@ -96,8 +96,7 @@ export function replayTransactionStore<Value>(store: TransactionSetStore<Value> 
     return replay(decodeBuffers(Object.values(store))) as Map<string, Value>;
 }
 
-// Fire-and-forget: no caller should care whether this "succeeded". If the set isn't synced for reading
-// yet it simply does nothing this pass and the caller's retry wrapper re-runs the whole operation later.
+// Fire-and-forget: no caller should care whether this "succeeded". If the set isn't synced for reading yet it simply does nothing this pass and the caller's retry wrapper re-runs the whole operation later.
 export function transactionMutate<Value>(
     database: Database<TransactionSetStore<Value>>,
     transactions: { key: string; value: Value | undefined }[],
@@ -121,9 +120,7 @@ export function transactionMutate<Value>(
     }
 }
 
-// Fire-and-forget like transactionMutate: clears the whole set by deleting every file. deleteData only removes
-// a primitive leaf (not a store object), so we delete each file key individually. No-ops (the retry re-runs)
-// if the store isn't synced yet.
+// Fire-and-forget like transactionMutate: clears the whole set by deleting every file. deleteData only removes a primitive leaf (not a store object), so we delete each file key individually. No-ops (the retry re-runs) if the store isn't synced yet.
 export function transactionDelete<Value>(
     database: Database<TransactionSetStore<Value>>,
 ): void {

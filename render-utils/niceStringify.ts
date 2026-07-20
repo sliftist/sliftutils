@@ -8,8 +8,7 @@ export const niceStringifyNan = `{NaN}`;
 export const niceStringifyUndefined = `{Undefined}`;
 
 
-// BUG: This is actually broken for hex strings. Hex strings may sometimes be entirely numbers,
-//  which means they will randomly change type.
+// BUG: This is actually broken for hex strings. Hex strings may sometimes be entirely numbers, which means they will randomly change type.
 function looksLikeJSON(str: string) {
     return (
         str === "null"
@@ -32,8 +31,7 @@ export function niceStringify(value: unknown): string {
     if (value === true) return niceStringifyTrue;
     if (Number.isNaN(value)) return niceStringifyNan;
 
-    // Any strings that don't look like JSON, don't need to encoded as JSON, and can instead
-    //  just be stored as strings.
+    // Any strings that don't look like JSON, don't need to encoded as JSON, and can instead just be stored as strings.
     if (typeof value === "string" && !looksLikeJSON(value)) {
         return value;
     }

@@ -3,7 +3,6 @@
 import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 export type ArchivesRemoteConfig = {
     url: string;
-    accountName?: string;
     waitForAccess?: boolean;
 };
 export declare function parseStorageUrl(url: string): {
@@ -29,9 +28,7 @@ export declare class ArchivesRemote implements IArchives {
     private lastDeniedLog;
     getDebugName(): string;
     isConnected(): boolean;
-    ping(): Promise<{
-        takeover?: string;
-    }>;
+    ping(): Promise<{}>;
     private authenticate;
     private callAuthed;
     waitingForAccess(): Promise<{

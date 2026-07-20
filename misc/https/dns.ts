@@ -13,10 +13,7 @@ const DNS_TTLSeconds = {
 const DNS_REFRESH_STALE_AFTER = timeInDay;
 
 // We stamp our own "last asserted" time into the record's comment, because Cloudflare's
-//  modified_on can only be moved by an actual content change - and re-asserting an already
-//  correct record has no content change to make (a create errors with 81058, a no-op edit
-//  doesn't bump the timestamp). Reading freshness from text we control sidesteps that entirely,
-//  and lets us refresh a stale-but-correct record in place instead of deleting and recreating it.
+//  modified_on can only be moved by an actual content change - and re-asserting an already correct record has no content change to make (a create errors with 81058, a no-op edit doesn't bump the timestamp). Reading freshness from text we control sidesteps that entirely, and lets us refresh a stale-but-correct record in place instead of deleting and recreating it.
 const FRESHNESS_REGEX = /<set on:[^>]*>/;
 
 /** Strips any prior freshness tag and appends a new one, preserving other comment text. */
@@ -71,16 +68,12 @@ export async function getRecordsRaw(type: string, key: string) {
         // Omitted by Cloudflare when the record has no comment.
         comment?: string;
     }[]>(`/zones/${zoneId}/dns_records`);
-    // DNS names are case-insensitive and Cloudflare returns them lowercased, so a mixed-case key
-    //  (e.g. a machine id subdomain) would never match an exact-case compare - match lowercased.
+    // DNS names are case-insensitive and Cloudflare returns them lowercased, so a mixed-case key (e.g. a machine id subdomain) would never match an exact-case compare - match lowercased.
     let keyLower = key.toLowerCase();
     return results.filter(x => x.type === type && x.name.toLowerCase() === keyLower);
 }
 
-/** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database
- *   transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs
- *   aren't usable in our setup, and because it lets "remove others + assert target" happen
- *   without a window where the name resolves to nothing. */
+/** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs aren't usable in our setup, and because it lets "remove others + assert target" happen without a window where the name resolves to nothing. */
 export async function batchRecords(zoneId: string, batch: {
     deletes?: { id: string }[];
     patches?: { id: string; comment?: string }[];
@@ -127,12 +120,10 @@ export async function setRecord(type: string, key: string, value: string, proxie
     let existing = prevValues.find(x => x.content === value);
     let others = prevValues.filter(x => x.content !== value);
 
-    // Already correct and recently asserted - a prior run also cleaned up the other records,
-    //  so there is nothing left to do.
+    // Already correct and recently asserted - a prior run also cleaned up the other records, so there is nothing left to do.
     if (existing && Date.now() - freshnessTime(existing.comment) < staleAfter) return;
 
-    // A single atomic batch: drop the wrong records, and either refresh the existing record's
-    //  comment in place or create it - so the name is never left resolving to nothing.
+    // A single atomic batch: drop the wrong records, and either refresh the existing record's comment in place or create it - so the name is never left resolving to nothing.
     let ttl = DNS_TTLSeconds[type as "A"] || 60;
     let comment = stampFreshness(existing?.comment);
     console.log(magenta(`Setting ${type} record for ${key} to ${value} (previously had ${JSON.stringify(prevValues.map(x => x.content))})`));

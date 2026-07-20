@@ -2,10 +2,7 @@ export const DELETED = Symbol("deleted");
 
 export type OverlayEntry = { time: number; value: Record<string, unknown> | typeof DELETED };
 
-// In-memory pending mutations layered on top of a LoadedIndex. Each entry carries the write's unique
-// timestamp so cross-tab writes can be ordered + the swap can drop entries the new index already
-// covers. Methods that mutate report which columns invalidate ("all" if the key's liveness flipped),
-// so the host can drop the right caches without scanning every column.
+// In-memory pending mutations layered on top of a LoadedIndex. Each entry carries the write's unique timestamp so cross-tab writes can be ordered + the swap can drop entries the new index already covers. Methods that mutate report which columns invalidate ("all" if the key's liveness flipped), so the host can drop the right caches without scanning every column.
 export class WriteOverlay {
     private entries = new Map<string, OverlayEntry>();
 
@@ -29,16 +26,14 @@ export class WriteOverlay {
 
     clear(): void { this.entries.clear(); }
 
-    // Drop entries the new index already reflects (its keyTime or deleteTime ≥ the entry's time). The
-    // remaining entries are writes the index doesn't yet see — they have to keep serving reads.
+    // Drop entries the new index already reflects (its keyTime or deleteTime ≥ the entry's time). The remaining entries are writes the index doesn't yet see — they have to keep serving reads.
     sweepCovered(authority: (key: string) => number): void {
         for (const [key, entry] of this.entries) {
             if (entry.time <= authority(key)) this.entries.delete(key);
         }
     }
 
-    // Apply this overlay onto the base column entries. A column-unset overlay entry leaves the base
-    // value+time in place (a partial write only overrides the columns it set).
+    // Apply this overlay onto the base column entries. A column-unset overlay entry leaves the base value+time in place (a partial write only overrides the columns it set).
     patchColumn(base: { key: string; value: unknown; time: number }[], column: string): { key: string; value: unknown; time: number }[] {
         if (this.entries.size === 0) return base;
         const map = new Map(base.map(e => [e.key, { value: e.value, time: e.time }]));

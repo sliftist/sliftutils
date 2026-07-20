@@ -21,10 +21,7 @@ export type ReaderConfig = {
     maxTriggerThrottleMs?: number;
 };
 
-// Owns the current LoadedIndex and WriteOverlay and serves every read (async + sync reactive). Apply
-// writes/deletes through applyWrite/applyDelete so the right signals fire. The host swaps in a fresh
-// LoadedIndex atomically via setIndex once the new one has fully built — no lazy rebuild on the next
-// read, no synchronous lag spike.
+// Owns the current LoadedIndex and WriteOverlay and serves every read (async + sync reactive). Apply writes/deletes through applyWrite/applyDelete so the right signals fire. The host swaps in a fresh LoadedIndex atomically via setIndex once the new one has fully built — no lazy rebuild on the next read, no synchronous lag spike.
 export class BulkDatabaseReader<T extends { key: string }> {
     constructor(private readonly cfg: ReaderConfig) { }
 
@@ -89,8 +86,7 @@ export class BulkDatabaseReader<T extends { key: string }> {
         return -Infinity;
     }
 
-    // Counter (so concurrent / nested merges in the same instance compose correctly). Signal fires
-    // immediately, not through the trigger throttle — UI spinners should show right away.
+    // Counter (so concurrent / nested merges in the same instance compose correctly). Signal fires immediately, not through the trigger throttle — UI spinners should show right away.
     private compactingCount = 0;
     beginCompaction(): void {
         this.compactingCount++;
@@ -247,9 +243,7 @@ export class BulkDatabaseReader<T extends { key: string }> {
         return false;
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────────────────────────────────
-    // Both async reads await this. The host wires an `ensureIndex` that triggers the initial build if
-    // no index is loaded yet — reads that race the first load all wait on the same promise.
+    // ── helpers ────────────────────────────────────────────────────────────────────────────────────── Both async reads await this. The host wires an `ensureIndex` that triggers the initial build if no index is loaded yet — reads that race the first load all wait on the same promise.
     setEnsureIndex(fn: () => Promise<LoadedIndex<T>>): void { this.ensureIndexFn = fn; }
     private ensureIndexFn: (() => Promise<LoadedIndex<T>>) | undefined;
     private async requireIndex(): Promise<LoadedIndex<T>> {
@@ -262,9 +256,7 @@ export class BulkDatabaseReader<T extends { key: string }> {
         return `(collection has ${blue(formatNumber(index.reader.rowCount))} rows, ${blue(formatNumber(index.reader.totalBytes))}B)`;
     }
 
-    // Notifications are rampingly delayed under sustained changes (so a high-rate writer can't re-run
-    // watchers per change). Underlying data is always current — only the observable notification is
-    // batched/delayed.
+    // Notifications are rampingly delayed under sustained changes (so a high-rate writer can't re-run watchers per change). Underlying data is always current — only the observable notification is batched/delayed.
     private invalidateSignal(signal: string): void {
         const maxMs = this.cfg.maxTriggerThrottleMs ?? 0;
         if (maxMs <= 0) { this.cfg.deps.invalidate(signal); return; }

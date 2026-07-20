@@ -75,9 +75,7 @@ function deletePath(root: Record<string, unknown>, path: string[]): void {
     delete node[path[path.length - 1]];
 }
 
-// In-memory Database for tests/dev: holds the whole root as a plain object and counts every call plus the
-// bytes flowing through. Synchronous and always "synced", so reads only return undefined for a genuinely
-// missing scalar (a missing transaction set reads as empty inside the set helpers).
+// In-memory Database for tests/dev: holds the whole root as a plain object and counts every call plus the bytes flowing through. Synchronous and always "synced", so reads only return undefined for a genuinely missing scalar (a missing transaction set reads as empty inside the set helpers).
 export class InMemoryDatabase<Root> implements Database<Root> {
     public readCalls = 0;
     public writeCalls = 0;

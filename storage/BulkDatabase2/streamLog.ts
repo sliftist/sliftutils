@@ -1,16 +1,11 @@
 import cborx from "cbor-x";
 import { ABSENT, BaseBulkDatabaseReader, ColumnIndex, EMPTY_BUFFER, encodeValue, RawCell, TYPE_ABSENT_TAG } from "./BulkDatabaseFormat";
 
-// Tier-0 streaming format: an append log of whole-row writes and deletes (row-format, not columnar),
-// so small mutations are a single cheap append instead of rewriting a columnar file. Each block is:
-//
+// Tier-0 streaming format: an append log of whole-row writes and deletes (row-format, not columnar), so small mutations are a single cheap append instead of rewriting a columnar file. Each block is:
+// 
 //   [u32 len][CBOR({ t, v })  or  CBOR({ t, d })][u32 len]
-//
-// `t` is a per-write unique timestamp (getTimeUnique); `v` is a set row; `d` is a deleted key. Because
-// every thread streams to its own file, the only way to recover the global mutation order — needed
-// for newest-wins — is a per-write timestamp, with ties broken by file name. The trailing length must
-// match the leading one; a torn/incomplete append leaves a mismatched or missing suffix, so we stop
-// there and report trailing bad bytes instead of throwing. structuredClone preserves typed arrays.
+// 
+// `t` is a per-write unique timestamp (getTimeUnique); `v` is a set row; `d` is a deleted key. Because every thread streams to its own file, the only way to recover the global mutation order — needed for newest-wins — is a per-write timestamp, with ties broken by file name. The trailing length must match the leading one; a torn/incomplete append leaves a mismatched or missing suffix, so we stop there and report trailing bad bytes instead of throwing. structuredClone preserves typed arrays.
 
 export const STREAM_EXTENSION = ".stream";
 
@@ -24,13 +19,9 @@ function frame(payload: Buffer): Buffer {
     return Buffer.concat([len, payload, len]);
 }
 
-// Framing only — no batching here. BulkDatabase2 coalesces and flushes these framed bytes on a ramping
-// per-collection schedule (see streamAppend in BulkDatabaseBase), because the browser File System Access
-// API rewrites the whole file on every append, so one-append-per-write is quadratic. The first write
-// after a lull still flushes immediately, so a single action then a tab close is saved at once.
+// Framing only — no batching here. BulkDatabase2 coalesces and flushes these framed bytes on a ramping per-collection schedule (see streamAppend in BulkDatabaseBase), because the browser File System Access API rewrites the whole file on every append, so one-append-per-write is quadratic. The first write after a lull still flushes immediately, so a single action then a tab close is saved at once.
 
-// Times are assigned by the caller (BulkDatabase2) so the exact same timestamp lands on disk, in the
-// in-memory overlay, and in the cross-tab broadcast — keeping the global write order consistent.
+// Times are assigned by the caller (BulkDatabase2) so the exact same timestamp lands on disk, in the in-memory overlay, and in the cross-tab broadcast — keeping the global write order consistent.
 export function frameRows(entries: { time: number; row: Record<string, unknown> }[]): Buffer {
     return Buffer.concat(entries.map(e => frame(Buffer.from(cborEncoder.encode({ t: e.time, v: e.row })))));
 }
@@ -61,12 +52,7 @@ export function parseStream(buffer: Buffer): { entries: StreamEntry[]; badBytes:
     return { entries, badBytes: buffer.length - pos };
 }
 
-// Wraps streamed entries (already ordered oldest-first) as a BaseBulkDatabaseReader. Each set MERGES
-// its fields onto the key's current row (so a partial write/update only changes the columns it
-// includes); a delete tombstones the key (exposed via deletedKeys so the join suppresses it in older
-// bulk readers) and resets the merge. A column the merged row never set reads as ABSENT, so the join
-// falls through to older readers for it. Also returns the latest timestamp seen per key (live or
-// deleted), used for cross-tab conflict resolution.
+// Wraps streamed entries (already ordered oldest-first) as a BaseBulkDatabaseReader. Each set MERGES its fields onto the key's current row (so a partial write/update only changes the columns it includes); a delete tombstones the key (exposed via deletedKeys so the join suppresses it in older bulk readers) and resets the merge. A column the merged row never set reads as ABSENT, so the join falls through to older readers for it. Also returns the latest timestamp seen per key (live or deleted), used for cross-tab conflict resolution.
 export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: number): { reader: BaseBulkDatabaseReader; times: Map<string, number> } {
     let byKey = new Map<string, Record<string, unknown>>();
     let deletedKeys = new Set<string>();
@@ -97,8 +83,7 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
     // Per-key tombstone times for the join's delete resolution.
     let deleteTimes = new Map<string, number>();
     for (let key of deletedKeys) deleteTimes.set(key, times.get(key) || 0);
-    // Iterate to find min/max — NOT Math.min(...times)/Math.max(...times): spreading a large array as call
-    // arguments overflows the stack ("Maximum call stack size exceeded") once a stream has many keys.
+    // Iterate to find min/max — NOT Math.min(...times)/Math.max(...times): spreading a large array as call arguments overflows the stack ("Maximum call stack size exceeded") once a stream has many keys.
     let minTime = Infinity, maxTime = -Infinity;
     for (let t of times.values()) {
         if (t < minTime) minTime = t;
@@ -115,8 +100,7 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
         keyTimes: new Map(keys.map(key => [key, times.get(key) || 0])),
         columns,
         deleteTimes,
-        // A key's time is its latest write across all columns (per-key, not per-column). For a column
-        // it never set we return ABSENT so the join falls through to an older reader.
+        // A key's time is its latest write across all columns (per-key, not per-column). For a column it never set we return ABSENT so the join falls through to an older reader.
         async getColumn(column) {
             return keys.map(key => {
                 let row = byKey.get(key);
@@ -128,9 +112,7 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
             if (!row || !(column in row)) return ABSENT;
             return { value: row[column], time: times.get(key) || 0 };
         },
-        // Stream values are decoded objects (CBOR), so unlike a bulk file we have to encode them to raw
-        // cells here. Stream data is small (tier-0, size-capped), so this is cheap. A column the row never
-        // set is omitted (ABSENT → fall through); a stored undefined is kept (a real clear).
+        // Stream values are decoded objects (CBOR), so unlike a bulk file we have to encode them to raw cells here. Stream data is small (tier-0, size-capped), so this is cheap. A column the row never set is omitted (ABSENT → fall through); a stored undefined is kept (a real clear).
         async getRawColumn(column) {
             let map = new Map<string, RawCell>();
             for (let key of keys) {
@@ -140,10 +122,7 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
             }
             return map;
         },
-        // Per-column index in the same shape a bulk file exposes, materialized in memory once (stream data
-        // is tier-0, size-capped, so the encode is cheap). Lets the planned merge treat stream + bulk
-        // sources uniformly: it loads each (source, column) index, uses offsets/types to plan the output's
-        // byte layout, and reads contiguous runs from this index's in-memory data buffer during execute.
+        // Per-column index in the same shape a bulk file exposes, materialized in memory once (stream data is tier-0, size-capped, so the encode is cheap). Lets the planned merge treat stream + bulk sources uniformly: it loads each (source, column) index, uses offsets/types to plan the output's byte layout, and reads contiguous runs from this index's in-memory data buffer during execute.
         async getColumnIndex(column) {
             return getStreamColumnIndex(keys, byKey, column);
         },
@@ -154,18 +133,14 @@ export function streamReaderFromEntries(entries: StreamEntry[], totalBytes: numb
     return { reader, times };
 }
 
-// keys[] is the column-side row order for this stream reader; rowOfKey is used by the planner to look up
-// a winning cell's source row without going through a column read. Stays consistent with getColumnIndex,
-// which builds its offsets/types over the same `keys` array in the same order.
+// keys[] is the column-side row order for this stream reader; rowOfKey is used by the planner to look up a winning cell's source row without going through a column read. Stays consistent with getColumnIndex, which builds its offsets/types over the same `keys` array in the same order.
 function buildKeyIndex(keys: string[]): Map<string, number> {
     const m = new Map<string, number>();
     for (let i = 0; i < keys.length; i++) m.set(keys[i], i);
     return m;
 }
 
-// Build a stream-side ColumnIndex (offsets + types + a contiguous-row byte slicer) over the in-memory
-// merged rows. Encodes each row's value for this column once into a single backing buffer; readValueBytes
-// then slices it. Cached per (reader, column) so a merge planning + execution pass doesn't re-encode.
+// Build a stream-side ColumnIndex (offsets + types + a contiguous-row byte slicer) over the in-memory merged rows. Encodes each row's value for this column once into a single backing buffer; readValueBytes then slices it. Cached per (reader, column) so a merge planning + execution pass doesn't re-encode.
 function getStreamColumnIndex(keys: string[], byKey: Map<string, Record<string, unknown>>, column: string): ColumnIndex {
     let cached = columnIndexCache.get(byKey)?.get(column);
     if (cached) return cached;
@@ -204,6 +179,5 @@ function getStreamColumnIndex(keys: string[], byKey: Map<string, Record<string, 
     return idx;
 }
 
-// Per stream-reader cache of its column indexes. Keyed by the reader's byKey map (a fresh
-// streamReaderFromEntries call produces a fresh map, so this is effectively per-reader).
+// Per stream-reader cache of its column indexes. Keyed by the reader's byKey map (a fresh streamReaderFromEntries call produces a fresh map, so this is effectively per-reader).
 const columnIndexCache = new WeakMap<Map<string, Record<string, unknown>>, Map<string, ColumnIndex>>();

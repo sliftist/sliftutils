@@ -41,9 +41,7 @@ async function main() {
         entryPoints: [entryPoint],
     });
 
-    // Two artifacts: `name.js` without the sourcemap (the sourcemap is usually bigger than the code
-    // itself, so this is what production serves) and `name.debug.js` with the inline sourcemap
-    // appended (serve it behind something like a ?debug query param).
+    // Two artifacts: `name.js` without the sourcemap (the sourcemap is usually bigger than the code itself, so this is what production serves) and `name.debug.js` with the inline sourcemap appended (serve it behind something like a ?debug query param).
     async function write(finalPath: string, contents: string) {
         let tempPath = `${finalPath}.tmp`;
         try {

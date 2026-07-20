@@ -10,6 +10,8 @@ export type HostServerConfig = {
     portFallback?: {
         /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
         getAcquireDelay: () => number;
+        /** Called when the main port turned out to be busy, before we act as its successor in any way. Throwing aborts startup - a busy port with no deploy in progress means something else holds it, which is not a state to keep running in. */
+        onPortInUse?: () => Promise<void>;
         /** Reports every port we become reachable on (the alternate at mount, the main port once relayed) */
         onListening: (port: number, isMainPort: boolean) => void;
     };

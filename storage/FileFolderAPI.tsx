@@ -39,10 +39,7 @@ const USE_INDEXED_DB = false;
 // How often a worker rechecks the pointer IndexedDB for a granted handle when none is available yet.
 const WORKER_POLL_INTERVAL_MS = 60 * 1000;
 
-// These mirror the subset of the native FileSystemFileHandle / FileSystemDirectoryHandle API we use, so
-// the native browser handles, the Node handles, and the remote handles are all interchangeable — and
-// code written against the native handle (e.g. a recursive walk over `handle.entries()`) works on any of
-// them. kind/name and entries() are part of that contract.
+// These mirror the subset of the native FileSystemFileHandle / FileSystemDirectoryHandle API we use, so the native browser handles, the Node handles, and the remote handles are all interchangeable — and code written against the native handle (e.g. a recursive walk over `handle.entries()`) works on any of them. kind/name and entries() are part of that contract.
 export type FileWrapper = {
     readonly kind: "file";
     readonly name: string;
@@ -59,19 +56,15 @@ export type FileWrapper = {
         write(value: Buffer): Promise<void>;
         close(): Promise<void>;
     }>;
-    // Returns a URL for the file's bytes, usable in <video>/<img>/fetch. Optional — the native browser
-    // FileSystemFileHandle has no such method, so prefer the getFileURL() helper, which falls back to a
-    // blob: URL via createObjectURL for native handles. Always release it with disposeFileURL when done.
+    // Returns a URL for the file's bytes, usable in <video>/<img>/fetch. Optional — the native browser FileSystemFileHandle has no such method, so prefer the getFileURL() helper, which falls back to a blob: URL via createObjectURL for native handles. Always release it with disposeFileURL when done.
     getURL?(): Promise<string>;
 };
 export type DirectoryWrapper = {
     readonly kind: "directory";
     readonly name: string;
-    // Full path from the storage root, for diagnostics/logging (the native handle doesn't expose paths,
-    // so it's optional). e.g. "bulkDatabases2/myCollection".
+    // Full path from the storage root, for diagnostics/logging (the native handle doesn't expose paths, so it's optional). e.g. "bulkDatabases2/myCollection".
     readonly fullPath?: string;
-    // True when this storage is served over the network (a remote server) rather than a local disk, so
-    // callers can adapt for the higher latency/cost (local/native handles leave it undefined = false).
+    // True when this storage is served over the network (a remote server) rather than a local disk, so callers can adapt for the higher latency/cost (local/native handles leave it undefined = false).
     readonly isRemote?: boolean;
     removeEntry(key: string, options?: { recursive?: boolean }): Promise<void>;
     getFileHandle(key: string, options?: { create?: boolean }): Promise<FileWrapper>;
@@ -107,8 +100,7 @@ export function setStorageRootOverride(handle: FileSystemDirectoryHandle | undef
 }
 
 // ---- remote (server) storage config ----
-// Instead of a local folder, the user can point at a remoteFileServer.js instance (URL + password).
-// When configured, getFileStorageNested2 serves everything from that server. Persisted in localStorage.
+// Instead of a local folder, the user can point at a remoteFileServer.js instance (URL + password). When configured, getFileStorageNested2 serves everything from that server. Persisted in localStorage.
 type RemoteConfig = { url: string; password: string };
 function remoteConfigKey() { return getFileAPIKey() + ":remote"; }
 function loadRemoteConfig(): RemoteConfig | undefined {
@@ -122,8 +114,7 @@ function loadRemoteConfig(): RemoteConfig | undefined {
 }
 function saveRemoteConfig(c: RemoteConfig) { localStorage.setItem(remoteConfigKey(), JSON.stringify(c)); }
 
-// The server is always HTTPS on the filehoster's default port, so the user only needs to type the host
-// (e.g. "65.109.93.113"). We strip any scheme/path they include and default the port if omitted.
+// The server is always HTTPS on the filehoster's default port, so the user only needs to type the host (e.g. "65.109.93.113"). We strip any scheme/path they include and default the port if omitted.
 const DEFAULT_REMOTE_PORT = 8787; // matches remoteFileServer.js's default
 function normalizeServerUrl(raw: string): string {
     let s = raw.trim().replace(/^\w+:\/\//, "").replace(/\/.*$/, "");
@@ -160,11 +151,7 @@ class DirectoryPrompter extends preact.Component {
     }
 }
 
-// "Connect to a server" option for the directory prompt: collapses to a button, expands to address +
-// password fields. On connect it ACTUALLY connects (testRemoteConnection); only on success does it
-// persist the config and call onConnected, so the caller (getDirectoryHandle) resolves with a working
-// remote handle. Failures are shown to the user (and logged, without the password), never swallowed.
-// `initial` pre-fills + expands the form (used to retry a remembered server that stopped working).
+// "Connect to a server" option for the directory prompt: collapses to a button, expands to address + password fields. On connect it ACTUALLY connects (testRemoteConnection); only on success does it persist the config and call onConnected, so the caller (getDirectoryHandle) resolves with a working remote handle. Failures are shown to the user (and logged, without the password), never swallowed. `initial` pre-fills + expands the form (used to retry a remembered server that stopped working).
 @observer
 class ServerConnectForm extends preact.Component<{ onConnected: (config: RemoteConfig) => void; initial?: RemoteConfig }> {
     private obs = observable({
@@ -193,8 +180,7 @@ class ServerConnectForm extends preact.Component<{ onConnected: (config: RemoteC
                 s.error = "The server rejected that password.";
                 console.error("Remote connect: unauthorized for", url);
             } else {
-                // Got nothing back — usually the self-signed certificate isn't trusted yet, but show the
-                // actual error too so a wrong address / down server / CORS issue is diagnosable.
+                // Got nothing back — usually the self-signed certificate isn't trusted yet, but show the actual error too so a wrong address / down server / CORS issue is diagnosable.
                 s.needsCert = true;
                 s.error = "Couldn't reach the server: " + result.error;
                 console.error("Remote connect: unreachable", url, "-", result.error);
@@ -343,9 +329,7 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
             // Create the file
             await fs.promises.writeFile(filePath, Buffer.alloc(0));
         } else if (!exists) {
-            // Tag as ENOENT so readWithRetry treats it as a genuinely-missing file (return undefined now)
-            // rather than a transient read failure to retry 6× with backoff — missing files are normal
-            // (a concurrent merge deletes a file mid-read), and retrying them is catastrophically slow.
+            // Tag as ENOENT so readWithRetry treats it as a genuinely-missing file (return undefined now) rather than a transient read failure to retry 6× with backoff — missing files are normal (a concurrent merge deletes a file mid-read), and retrying them is catastrophically slow.
             const err = new Error(`File not found: ${filePath}`) as Error & { code?: string };
             err.code = "ENOENT";
             throw err;
@@ -387,9 +371,7 @@ export class NodeJSDirectoryHandleWrapper implements DirectoryWrapper {
 }
 
 
-// When set, getDirectoryHandle skips every prompt + remote check and serves from the browser's Origin
-// Private File System (OPFS). One named subfolder is "current" per fileAPIKey; pickPrivateFolder /
-// resetStorageLocation switch which one. Set this in app startup BEFORE the first getDirectoryHandle.
+// When set, getDirectoryHandle skips every prompt + remote check and serves from the browser's Origin Private File System (OPFS). One named subfolder is "current" per fileAPIKey; pickPrivateFolder / resetStorageLocation switch which one. Set this in app startup BEFORE the first getDirectoryHandle.
 let opfsEnabled = false;
 const OPFS_FOLDERS_DIR = "folders";
 const OPFS_DEFAULT_FOLDER = "default";
@@ -401,14 +383,12 @@ function setCurrentOpfsFolder(name: string): void {
     localStorage.setItem(opfsCurrentKey(), name);
 }
 
-// Switches getDirectoryHandle to the Origin Private File System. No directory picker, no permission
-// prompt, no remote server check. Persists nothing — call on every app start before reading storage.
+// Switches getDirectoryHandle to the Origin Private File System. No directory picker, no permission prompt, no remote server check. Persists nothing — call on every app start before reading storage.
 export function usePrivateFileSystem(): void {
     opfsEnabled = true;
 }
 
-// Whether the OPFS branch is in effect (so other callers can adapt — e.g. skip the "find data subdir"
-// hack in getFileStorageNested2 since OPFS is always a clean root we own end-to-end).
+// Whether the OPFS branch is in effect (so other callers can adapt — e.g. skip the "find data subdir" hack in getFileStorageNested2 since OPFS is always a clean root we own end-to-end).
 export function isPrivateFileSystemActive(): boolean {
     return opfsEnabled;
 }
@@ -431,9 +411,7 @@ async function getCurrentOpfsHandle(): Promise<DirectoryWrapper> {
     return folder as unknown as DirectoryWrapper;
 }
 
-// All previously-used OPFS subfolders under this fileAPIKey, sorted alphabetically (timestamp-named
-// auto-generated folders therefore sort chronologically). Use this to surface a list, then call
-// pickPrivateFolder(name) to switch.
+// All previously-used OPFS subfolders under this fileAPIKey, sorted alphabetically (timestamp-named auto-generated folders therefore sort chronologically). Use this to surface a list, then call pickPrivateFolder(name) to switch.
 export async function listPrivateFolders(): Promise<string[]> {
     if (!navigator.storage?.getDirectory) return [];
     let folders: FileSystemDirectoryHandle;
@@ -445,17 +423,13 @@ export async function listPrivateFolders(): Promise<string[]> {
     return names.sort();
 }
 
-// Switch to a specific OPFS subfolder and reload so getDirectoryHandle re-resolves to it. The folder
-// is created if it doesn't exist yet.
+// Switch to a specific OPFS subfolder and reload so getDirectoryHandle re-resolves to it. The folder is created if it doesn't exist yet.
 export function pickPrivateFolder(name: string): void {
     setCurrentOpfsFolder(name);
     window.location.reload();
 }
 
-// Returns the directory handle to use — local (Node / picked folder) OR a remote server, both as the
-// same DirectoryWrapper, so callers don't know or care which it is. A remembered server is VERIFIED
-// (we actually connect) before use; if it no longer works we re-prompt, just like a local folder whose
-// permission was lost. Blocks until ready (or the user dismisses, which rejects).
+// Returns the directory handle to use — local (Node / picked folder) OR a remote server, both as the same DirectoryWrapper, so callers don't know or care which it is. A remembered server is VERIFIED (we actually connect) before use; if it no longer works we re-prompt, just like a local folder whose permission was lost. Blocks until ready (or the user dismisses, which rejects).
 export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Promise<DirectoryWrapper> {
     // An injected root (e.g. a Web Worker handed the handle by its owning window)
     // short-circuits the whole interactive resolution — no picker, no DOM, no
@@ -463,12 +437,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
     if (storageRootOverride) {
         return storageRootOverride as unknown as DirectoryWrapper;
     }
-    // A worker can't show the picker (no DOM / no user activation) and can't read localStorage, but
-    // it CAN open the pointer IndexedDB the main-thread picker persists to. Poll it for a handle
-    // whose permission is already granted; the owning window may also postMessage a handle in
-    // mid-poll (checked each iteration). This has to come before the isNode branch: typesafecss's
-    // isNode() returns true in workers (window is undefined), so a worker would otherwise fall into
-    // the Node branch and try to use fs/path.
+    // A worker can't show the picker (no DOM / no user activation) and can't read localStorage, but it CAN open the pointer IndexedDB the main-thread picker persists to. Poll it for a handle whose permission is already granted; the owning window may also postMessage a handle in mid-poll (checked each iteration). This has to come before the isNode branch: typesafecss's isNode() returns true in workers (window is undefined), so a worker would otherwise fall into the Node branch and try to use fs/path.
     if ("WorkerGlobalScope" in globalThis) {
         while (true) {
             if (storageRootOverride) return storageRootOverride as unknown as DirectoryWrapper;
@@ -512,8 +481,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
             }
         };
         const onConnected = (config: RemoteConfig) => { saveRemoteConfig(config); resolveHandle(getRemoteHandle(config)); };
-        // The three options, rendered fresh each time. If a saved server just failed, pre-fill + expand
-        // the connect form so the user can retry or fix it.
+        // The three options, rendered fresh each time. If a saved server just failed, pre-fill + expand the connect form so the user can retry or fix it.
         const renderOptions = () => (
             <>
                 <button className={css.fontSize(40).pad2(80, 40)} onClick={pickLocal}>Pick Data Directory</button>
@@ -523,8 +491,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
             </>
         );
 
-        // A previously-picked local folder: try to restore it (may need a click). Skipped when a saved
-        // server failed — that user wants the server, so go straight to the (pre-filled) prompt.
+        // A previously-picked local folder: try to restore it (may need a click). Skipped when a saved server failed — that user wants the server, so go straight to the (pre-filled) prompt.
         const storedId = !savedRemote && localStorage.getItem(getFileAPIKey());
         if (storedId) {
             let doneLoad = false;
@@ -582,8 +549,7 @@ export const getFileStorageNested2 = cache(async function getFileStorage(pathStr
         base = new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
     } else {
         base = await getDirectoryHandle();
-        // Skip the "find data subdir" hack under OPFS — that's for picked directories where the user
-        // might have selected a folder with unrelated files; OPFS is a clean root we own end-to-end.
+        // Skip the "find data subdir" hack under OPFS — that's for picked directories where the user might have selected a folder with unrelated files; OPFS is a clean root we own end-to-end.
         if (!opfsEnabled) {
             let dirs: string[] = [];
             let alls: string[] = [];
@@ -614,8 +580,7 @@ export const getFileStorage = lazy(async function getFileStorage(): Promise<File
 });
 export function resetStorageLocation() {
     if (opfsEnabled) {
-        // Don't delete previous folder — listPrivateFolders / pickPrivateFolder still need it. Just point
-        // "current" at a fresh timestamp-named one so the next reload starts clean.
+        // Don't delete previous folder — listPrivateFolders / pickPrivateFolder still need it. Just point "current" at a fresh timestamp-named one so the next reload starts clean.
         setCurrentOpfsFolder(new Date().toISOString().replace(/[:.]/g, "-"));
         window.location.reload();
         return;
@@ -634,8 +599,7 @@ export type NestedFileStorage = {
 
 export type FileStorage = IStorageRaw & {
     folder: NestedFileStorage;
-    // Mirrors DirectoryWrapper.isRemote: true when this storage is served over the network. Lets callers
-    // (e.g. BulkDatabase2, which skips automatic compaction over the network by default) adapt.
+    // Mirrors DirectoryWrapper.isRemote: true when this storage is served over the network. Lets callers (e.g. BulkDatabase2, which skips automatic compaction over the network by default) adapt.
     isRemote?: boolean;
 };
 
@@ -671,8 +635,7 @@ async function fixedGetFileHandle(config: {
     return await config.handle.getFileHandle(config.key, { create: true });
 }
 
-// A file that genuinely does not exist. We must NOT retry these, otherwise reading many missing
-// files (a common pattern) gets catastrophically slow.
+// A file that genuinely does not exist. We must NOT retry these, otherwise reading many missing files (a common pattern) gets catastrophically slow.
 function isMissingError(error: unknown): boolean {
     let name = (error as { name?: string })?.name;
     let code = (error as { code?: string })?.code;
@@ -681,10 +644,7 @@ function isMissingError(error: unknown): boolean {
 
 const MAX_READ_RETRIES = 6;
 
-// The browser File System Access API can transiently fail reads under heavy load (it appears to
-// throttle when a page issues many reads at once). Those failures surface as errors OTHER than
-// "not found", so we retry them with backoff. A real missing file (NotFoundError / ENOENT) returns
-// undefined immediately with no retry.
+// The browser File System Access API can transiently fail reads under heavy load (it appears to throttle when a page issues many reads at once). Those failures surface as errors OTHER than "not found", so we retry them with backoff. A real missing file (NotFoundError / ENOENT) returns undefined immediately with no retry.
 async function readWithRetry<T>(label: string, key: string, read: () => Promise<T>): Promise<T | undefined> {
     let backoff = 25;
     for (let attempt = 0; ; attempt++) {
@@ -724,8 +684,7 @@ function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
                 const file = await handle.getFileHandle(key);
                 const fileContent = await file.getFile();
                 const arrayBuffer = await fileContent.arrayBuffer();
-                // Under load the FS Access API can resolve with a truncated buffer and no error.
-                //  Treat a short read as transient so readWithRetry retries it.
+                // Under load the FS Access API can resolve with a truncated buffer and no error. Treat a short read as transient so readWithRetry retries it.
                 if (arrayBuffer.byteLength !== fileContent.size) {
                     throw Object.assign(new Error(`Short read: got ${arrayBuffer.byteLength} of ${fileContent.size} bytes`), { name: "ShortReadError" });
                 }
@@ -749,8 +708,7 @@ function wrapHandleFiles(handle: DirectoryWrapper): IStorageRaw {
 
         async append(key: string, value: Buffer): Promise<void> {
             await appendQueue(key)(async () => {
-                // NOTE: Interesting point. Chrome doesn't optimize this to be an append, and instead
-                //  rewrites the entire file.
+                // NOTE: Interesting point. Chrome doesn't optimize this to be an append, and instead rewrites the entire file.
                 const file = await fixedGetFileHandle({ handle, key, create: true });
                 const writable = await file.createWritable({ keepExistingData: true });
                 let offset = (await file.getFile()).size;
@@ -837,10 +795,7 @@ export function wrapHandle(handle: DirectoryWrapper): FileStorage {
     };
 }
 
-// Returns a URL for a file's bytes, ready to drop into <video>/<img>/fetch. A native (local) file becomes
-// an in-memory blob: URL; a remote file becomes an https URL into the server's range-capable /media
-// endpoint (auth token in the query, since a media element can't send headers). Both support HTTP range /
-// seeking. ALWAYS hand the result to disposeFileURL when finished — for blob: URLs that frees memory.
+// Returns a URL for a file's bytes, ready to drop into <video>/<img>/fetch. A native (local) file becomes an in-memory blob: URL; a remote file becomes an https URL into the server's range-capable /media endpoint (auth token in the query, since a media element can't send headers). Both support HTTP range / seeking. ALWAYS hand the result to disposeFileURL when finished — for blob: URLs that frees memory.
 export async function getFileURL(file: FileWrapper): Promise<string> {
     if (file.getURL) return file.getURL();
     // Native FileSystemFileHandle (or any Blob-backed file): a blob: URL over the File itself.
@@ -848,16 +803,14 @@ export async function getFileURL(file: FileWrapper): Promise<string> {
     return URL.createObjectURL(f as unknown as Blob);
 }
 
-// Releases a URL from getFileURL. blob: URLs leak until the document is gone unless revoked; https/file:
-// URLs need no cleanup, so this is a no-op for them.
+// Releases a URL from getFileURL. blob: URLs leak until the document is gone unless revoked; https/file: URLs need no cleanup, so this is a no-op for them.
 export function disposeFileURL(url: string): void {
     if (url.startsWith("blob:")) {
         try { URL.revokeObjectURL(url); } catch { /* not in a browser, or already revoked */ }
     }
 }
 
-// A StorageFactory backed by a remote server (path -> FileStorage), for code that injects its own
-// storage into BulkDatabase2 rather than going through the directory prompt.
+// A StorageFactory backed by a remote server (path -> FileStorage), for code that injects its own storage into BulkDatabase2 rather than going through the directory prompt.
 export function getRemoteFileStorageFactory(url: string, password: string, options?: RemoteOptions): (pathStr: string) => Promise<FileStorage> {
     const root = getRemoteDirectoryHandle(url, password, options);
     return async (pathStr: string) => {

@@ -1,18 +1,11 @@
 // Deletion markers: how a merge retires the input files it consumed WITHOUT deleting them inline.
-//
-// The old approach deleted consumed inputs on a 15-min timer. If the tab closed before the timer fired
-// the inputs survived AND were still read — so the next merge re-merged the same duplicates, forever
-// (the "1739 files, 155GB, 99% duplicate" loop). Markers fix both halves: the consumed inputs are
-// EXCLUDED from reads the moment the marker exists (so they're never re-merged), and their physical
-// deletion is driven off the marker on a later read instead of an in-process timer.
-//
-// A marker names the input files it wants gone (`deleteFiles`) and the output files that supersede them
-// (`replacedBy`). On every read we:
+// 
+// The old approach deleted consumed inputs on a 15-min timer. If the tab closed before the timer fired the inputs survived AND were still read — so the next merge re-merged the same duplicates, forever (the "1739 files, 155GB, 99% duplicate" loop). Markers fix both halves: the consumed inputs are EXCLUDED from reads the moment the marker exists (so they're never re-merged), and their physical deletion is driven off the marker on a later read instead of an in-process timer.
+// 
+// A marker names the input files it wants gone (`deleteFiles`) and the output files that supersede them (`replacedBy`). On every read we:
 //   1) exclude every `deleteFiles` entry from the active file set (unconditionally — that's the loop fix);
-//   2) delete a marker's `deleteFiles` once its `replacedBy` outputs all exist OR the marker is older than
-//      the grace window (a crash-safety floor so a marker whose outputs never landed still gets cleaned);
-//   3) once a marker's `deleteFiles` are all gone, and the marker has aged past the grace window, delete
-//      the marker itself (kept around briefly so a concurrent reader still excludes the files consistently).
+//   2) delete a marker's `deleteFiles` once its `replacedBy` outputs all exist OR the marker is older than the grace window (a crash-safety floor so a marker whose outputs never landed still gets cleaned);
+//   3) once a marker's `deleteFiles` are all gone, and the marker has aged past the grace window, delete the marker itself (kept around briefly so a concurrent reader still excludes the files consistently).
 
 import type { FileStorage } from "../FileFolderAPI";
 import { blue, magenta } from "socket-function/src/formatting/logColors";
@@ -66,8 +59,7 @@ export function markerExclusions(markers: DeleteMarker[]): Set<string> {
     return excluded;
 }
 
-// Act on each marker (see file header). Idempotent and best-effort: every removal is guarded, so two
-// processes (or two reads) running this at once just race to the same already-correct end state.
+// Act on each marker (see file header). Idempotent and best-effort: every removal is guarded, so two processes (or two reads) running this at once just race to the same already-correct end state.
 export async function processDeleteMarkers(name: string, storage: FileStorage, markers: DeleteMarker[], allNames: string[]): Promise<void> {
     const present = new Set(allNames);
     const now = Date.now();

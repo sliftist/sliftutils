@@ -42,8 +42,7 @@ export type InputProps = (
         forceInputValueUpdatesWhenFocused?: boolean;
 
         // NOTE: We trigger onChange (and onChangeValue) whenever
-        //      e.ctrlKey && (e.code.startsWith("Key") || e.code === "Enter") || e.code === "Enter" && e.shiftKey
-        //  This is because ctrl usually means a hotkey, and hotkeys usually want committed values.
+        //      e.ctrlKey && (e.code.startsWith("Key") || e.code === "Enter") || e.code === "Enter" && e.shiftKey This is because ctrl usually means a hotkey, and hotkeys usually want committed values.
         onChangeValue?: (value: string) => void;
     }
 )
@@ -129,8 +128,7 @@ export class InputLabel extends preact.Component<InputLabelProps> {
             props.textarea = false;
             props.number = false;
             props.forceInputValueUpdatesWhenFocused = true;
-            // NOTE: When using forceInputValueUpdatesWhenFocused we need hot, otherwise the user's updates
-            //  won't be visible.
+            // NOTE: When using forceInputValueUpdatesWhenFocused we need hot, otherwise the user's updates won't be visible.
             props.hot = true;
             if (isJSNumber(value)) {
                 value = formatDateTimeForInput(+value);
@@ -254,8 +252,8 @@ export class InputLabel extends preact.Component<InputLabelProps> {
                     <span
                         className={
                             css.whiteSpace("pre-wrap")
-                            //.opacity(0)
-                            //.pointerEvents("none")
+                            // .opacity(0)
+                            // .pointerEvents("none")
                             + (props.editClass)
                             + " " + (props.class || props.className)
                         }

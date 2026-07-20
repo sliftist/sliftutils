@@ -10,13 +10,10 @@ import {
     TYPE_ABSENT_TAG,
 } from "./BulkDatabaseFormat";
 
-// Default total in-flight buffer budget for the executor: how much output value-data we hold in memory at
-// once. Multiple output files (≤ TARGET_FILE_BYTES each) are built together inside this budget so reading
-// inputs once amortizes their I/O across several outputs. Tighter budget → more passes, less memory.
+// Default total in-flight buffer budget for the executor: how much output value-data we hold in memory at once. Multiple output files (≤ TARGET_FILE_BYTES each) are built together inside this budget so reading inputs once amortizes their I/O across several outputs. Tighter budget → more passes, less memory.
 const DEFAULT_OUTPUT_BATCH_BYTES = 2 * 1024 * 1024 * 1024;
 
-// Per-value on-disk overhead (4-byte offset entry + 1-byte type tag). Used for the partition-cut size
-// estimate; the executor doesn't use it (offsets/types are sized exactly from the plan).
+// Per-value on-disk overhead (4-byte offset entry + 1-byte type tag). Used for the partition-cut size estimate; the executor doesn't use it (offsets/types are sized exactly from the plan).
 const PER_VALUE_OVERHEAD = 5;
 
 function fmtBytes(n: number): string {
@@ -26,9 +23,7 @@ function fmtBytes(n: number): string {
     return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
 }
 
-// A contiguous copy operation: take `sourceEndRow - sourceStartRow` consecutive rows of one source
-// column, splice the resulting bytes into the output column's data section at outputByteStart. Adjacent
-// per-row decisions get RLE'd into one copy op — one source-side read + memcpy instead of one per row.
+// A contiguous copy operation: take `sourceEndRow - sourceStartRow` consecutive rows of one source column, splice the resulting bytes into the output column's data section at outputByteStart. Adjacent per-row decisions get RLE'd into one copy op — one source-side read + memcpy instead of one per row.
 type CopyRun = {
     sourceIdx: number;
     sourceStartRow: number;
@@ -39,8 +34,7 @@ type CopyRun = {
 
 type PlannedOutputColumn = {
     name: string;
-    // offsets[i]..offsets[i+1] = row i's value byte range in the column's data section. Populated by the
-    // planner; the executor writes it verbatim into the output column blob.
+    // offsets[i]..offsets[i+1] = row i's value byte range in the column's data section. Populated by the planner; the executor writes it verbatim into the output column blob.
     offsets: Uint32Array;
     // Per-row type tag (TYPE_ABSENT for fall-through). Populated by the planner.
     types: Uint8Array;
@@ -71,17 +65,7 @@ export type PlannedMergeOutput = {
     sources: Map<string, number>;
 };
 
-// Plan a merge over `sources` and execute it, writing one or more output files via the caller's
-// `writeFile`. Two phases:
-//   • Planning: load only per-column INDEXES (offsets + types — ~5 B/row, small even on 20GB
-//     collections), determine the winning cell per (live key, column) by newest write-time + non-ABSENT
-//     fall-through, sort keys, partition into ~targetFileBytes output files, and pre-compute each output
-//     column's offsets/types arrays plus a run-length-encoded copy plan (no value data touched yet).
-//   • Execute: group outputs into ~targetBatchBytes batches; per batch, allocate column blobs with
-//     offsets/types already filled in, then iterate input sources copying contiguous byte runs straight
-//     into the output buffers. A source with no contribution to this batch is skipped entirely.
-// Returns the new output file descriptors plus any tombstones whose newest event is still a delete
-// (carried forward when older files outside the merge could still hold a now-stale set for that key).
+// Plan a merge over `sources` and execute it, writing one or more output files via the caller's `writeFile`. Two phases: • Planning: load only per-column INDEXES (offsets + types — ~5 B/row, small even on 20GB collections), determine the winning cell per (live key, column) by newest write-time + non-ABSENT fall-through, sort keys, partition into ~targetFileBytes output files, and pre-compute each output column's offsets/types arrays plus a run-length-encoded copy plan (no value data touched yet). • Execute: group outputs into ~targetBatchBytes batches; per batch, allocate column blobs with offsets/types already filled in, then iterate input sources copying contiguous byte runs straight into the output buffers. A source with no contribution to this batch is skipped entirely. Returns the new output file descriptors plus any tombstones whose newest event is still a delete (carried forward when older files outside the merge could still hold a now-stale set for that key).
 export async function runPlannedMerge(config: {
     sources: BaseBulkDatabaseReader[];
     sourceNames: string[];
@@ -97,11 +81,7 @@ export async function runPlannedMerge(config: {
     const targetBatchBytes = config.targetBatchBytes ?? DEFAULT_OUTPUT_BATCH_BYTES;
     const log = config.log ?? (line => console.log(`${blue(config.collectionName)} ${line}`));
 
-    // ─────────────────────────────────────────── Phase 1: plan ───────────────────────────────────────────
-    // Load per-source column indexes FIRST so a file that's gone (deleted between caller's listFiles and
-    // now) gets caught here and excluded from the merge entirely. Each source's load is wrapped in a
-    // try/catch; on failure we mark the source bad, log a "skipped" line, and the rest of planning +
-    // execute pretends the source doesn't exist. The caller only deletes inputs that were actually used.
+    // ─────────────────────────────────────────── Phase 1: plan ─────────────────────────────────────────── Load per-source column indexes FIRST so a file that's gone (deleted between caller's listFiles and now) gets caught here and excluded from the merge entirely. Each source's load is wrapped in a try/catch; on failure we mark the source bad, log a "skipped" line, and the rest of planning + execute pretends the source doesn't exist. The caller only deletes inputs that were actually used.
     const sourceOk = new Array<boolean>(config.sources.length).fill(true);
     const indexesPerSource: Map<string, ColumnIndex>[] = await Promise.all(config.sources.map(async (src, si) => {
         const map = new Map<string, ColumnIndex>();
@@ -112,8 +92,7 @@ export async function runPlannedMerge(config: {
         } catch (e) {
             sourceOk[si] = false;
             log(`${magenta("skipped")} ${config.sourceNames[si]}: ${(e as Error).message}`);
-            // Stack goes straight to console (not the buffered step log) so the merge summary stays
-            // readable but we can still trace where the failure came from.
+            // Stack goes straight to console (not the buffered step log) so the merge summary stays readable but we can still trace where the failure came from.
             console.log(`${config.collectionName} skipped ${config.sourceNames[si]}:`, (e as Error).stack || e);
         }
         return map;
@@ -123,9 +102,7 @@ export async function runPlannedMerge(config: {
         if (sourceOk[si]) usedSourceNames.add(config.sourceNames[si]);
     }
 
-    // Aggregate keyTimes + deleteTimes across GOOD sources only (max per key). A bad source's cached
-    // metadata might claim a key as newest, but we can't actually read its cells — letting it win the
-    // time resolution would just drop that key out of the output.
+    // Aggregate keyTimes + deleteTimes across GOOD sources only (max per key). A bad source's cached metadata might claim a key as newest, but we can't actually read its cells — letting it win the time resolution would just drop that key out of the output.
     const deleteTime = new Map<string, number>();
     const keyTime = new Map<string, number>();
     for (let si = 0; si < config.sources.length; si++) {
@@ -143,8 +120,7 @@ export async function runPlannedMerge(config: {
         }
     }
 
-    // Live keys (newest set strictly newer than newest delete) + tombstones to carry forward (newest
-    // event is a delete and the merge doesn't include the oldest data — that's the caller's call).
+    // Live keys (newest set strictly newer than newest delete) + tombstones to carry forward (newest event is a delete and the merge doesn't include the oldest data — that's the caller's call).
     const liveKeys: string[] = [];
     for (const [k, t] of keyTime) {
         const dT = deleteTime.get(k) ?? -Infinity;
@@ -156,8 +132,7 @@ export async function runPlannedMerge(config: {
         if (dT >= sT) carriedDeletes.set(k, dT);
     }
 
-    // All distinct value columns from GOOD sources (KEY_COLUMN excluded — it's added at file-assembly
-    // time). Order: first-seen, matching the existing builders.
+    // All distinct value columns from GOOD sources (KEY_COLUMN excluded — it's added at file-assembly time). Order: first-seen, matching the existing builders.
     const allColumns: string[] = [];
     const seenCols = new Set<string>();
     for (let si = 0; si < config.sources.length; si++) {
@@ -169,9 +144,7 @@ export async function runPlannedMerge(config: {
         }
     }
 
-    // For each live key, for each column, find the winning source: among sources that have this key, the
-    // one whose keyTime is largest AND whose column-index reports non-ABSENT. Record source + sourceRow +
-    // byteLen + type so the planner can size offsets and the executor can copy the bytes.
+    // For each live key, for each column, find the winning source: among sources that have this key, the one whose keyTime is largest AND whose column-index reports non-ABSENT. Record source + sourceRow + byteLen + type so the planner can size offsets and the executor can copy the bytes.
     type CellChoice = { sourceIdx: number; sourceRow: number; byteLen: number; type: number };
     const cellsPerKey = new Map<string, (CellChoice | undefined)[]>();
     for (const key of liveKeys) {
@@ -206,12 +179,10 @@ export async function runPlannedMerge(config: {
         cellsPerKey.set(key, cells);
     }
 
-    // Sort live keys lexicographically so each output file is key-contiguous (tight minKey/maxKey + fast
-    // single-key reads via header skip).
+    // Sort live keys lexicographically so each output file is key-contiguous (tight minKey/maxKey + fast single-key reads via header skip).
     liveKeys.sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
 
-    // Per-key estimated bytes for partition cutting: KEY_COLUMN cell + per value-column cell (bytes + 5B
-    // overhead) + TIME_COLUMN cell. Rough — only needs to keep each output near the target.
+    // Per-key estimated bytes for partition cutting: KEY_COLUMN cell + per value-column cell (bytes + 5B overhead) + TIME_COLUMN cell. Rough — only needs to keep each output near the target.
     function keyTotalBytes(key: string): number {
         const cells = cellsPerKey.get(key)!;
         let total = key.length * 2 + PER_VALUE_OVERHEAD;
@@ -220,8 +191,7 @@ export async function runPlannedMerge(config: {
         return total;
     }
 
-    // Walk sorted keys, cut each file when accumulated bytes would exceed targetFileBytes. A single key
-    // larger than the target still becomes its own (oversized) file — we never split within a key.
+    // Walk sorted keys, cut each file when accumulated bytes would exceed targetFileBytes. A single key larger than the target still becomes its own (oversized) file — we never split within a key.
     const fileKeyRanges: { start: number; end: number }[] = [];
     {
         let chunkStart = 0;
@@ -243,9 +213,7 @@ export async function runPlannedMerge(config: {
 
     log(`${magenta("plan")}: ${formatNumber(liveKeys.length)} live keys, ${plans.length} output file(s), ${formatNumber(carriedDeletes.size)} tombstones carried`);
 
-    // ───────────────────────────────────────── Phase 2: execute ──────────────────────────────────────────
-    // Group output files into batches that fit within targetBatchBytes so we read inputs once per batch
-    // (and skip inputs that contribute nothing to this batch).
+    // ───────────────────────────────────────── Phase 2: execute ────────────────────────────────────────── Group output files into batches that fit within targetBatchBytes so we read inputs once per batch (and skip inputs that contribute nothing to this batch).
     const batches: PlannedOutputFile[][] = [];
     {
         let start = 0;
@@ -305,9 +273,7 @@ function buildOutputPlan(
             }
             types[i] = cell.type;
             sourceCounts.set(cell.sourceIdx, (sourceCounts.get(cell.sourceIdx) ?? 0) + 1);
-            // RLE: extend the current run iff the next cell is the next row of the same source (its
-            // source-side bytes sit immediately after, so one read suffices) AND non-ABSENT (we never
-            // landed in the break-path above).
+            // RLE: extend the current run iff the next cell is the next row of the same source (its source-side bytes sit immediately after, so one read suffices) AND non-ABSENT (we never landed in the break-path above).
             if (currentRun && currentRun.sourceIdx === cell.sourceIdx && currentRun.sourceEndRow === cell.sourceRow) {
                 currentRun.sourceEndRow = cell.sourceRow + 1;
                 currentRun.byteLength += cell.byteLen;
@@ -329,8 +295,7 @@ function buildOutputPlan(
         return { name: colName, offsets, types, dataLength: outputByte, runs };
     });
 
-    // File size estimate: KEY_COLUMN blob + value column blobs + TIME_COLUMN blob + header guess. Used to
-    // batch output files; only needs to be close, not exact.
+    // File size estimate: KEY_COLUMN blob + value column blobs + TIME_COLUMN blob + header guess. Used to batch output files; only needs to be close, not exact.
     let estimatedFileBytes = 4 + 2048;
     let keyBytes = 0;
     for (const k of keys) keyBytes += k.length * 2;
@@ -357,8 +322,7 @@ async function executeBatch(
     writeFile: (data: Buffer) => Promise<{ name: string; size: number }>,
     log: (line: string) => void,
 ): Promise<PlannedMergeOutput[]> {
-    // Allocate one big buffer per (output file, column) — offsets + types are written immediately from
-    // the plan, the data section is filled below by the per-source copy loop.
+    // Allocate one big buffer per (output file, column) — offsets + types are written immediately from the plan, the data section is filled below by the per-source copy loop.
     type ColumnBuffer = { name: string; blob: Buffer; dataStart: number };
     const blobsPerFile: ColumnBuffer[][] = plans.map(plan => plan.columns.map(col => {
         const indexSize = columnIndexByteLength(col.offsets.length - 1);
@@ -368,9 +332,7 @@ async function executeBatch(
         return { name: col.name, blob, dataStart: indexSize };
     }));
 
-    // For each source, copy its byte runs into every output column whose plan references it. A source
-    // that's not referenced by any column in this batch is skipped entirely — that's the point of the
-    // batch shape: read 20GB of inputs only once for the whole pass, not once per output.
+    // For each source, copy its byte runs into every output column whose plan references it. A source that's not referenced by any column in this batch is skipped entirely — that's the point of the batch shape: read 20GB of inputs only once for the whole pass, not once per output.
     for (let si = 0; si < sources.length; si++) {
         let contributes = false;
         for (let fi = 0; fi < plans.length && !contributes; fi++) {

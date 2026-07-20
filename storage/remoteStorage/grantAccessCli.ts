@@ -3,9 +3,7 @@ import { RemoteStorageController } from "./storageController";
 import { authenticateStorage, parseStorageUrl } from "./ArchivesRemote";
 import { getArg } from "./cliArgs";
 
-// The grantAccess CLI. Invoked via the sibling grantAccess.js bootstrap (which loads typenode and
-// then requires this file). Grants a specific access request by its requestId; must be run on the
-// storage machine itself (its certs.ts identity is what the server trusts as admin).
+// The grantAccess CLI. Invoked via the sibling grantAccess.js bootstrap (which loads typenode and then requires this file). Grants a specific access request by its requestId; must be run on the storage machine itself (its certs.ts identity is what the server trusts as admin).
 
 async function main() {
     let url = getArg("url");

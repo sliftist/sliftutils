@@ -43,21 +43,16 @@ const MAX_INDEX_RELOAD_ATTEMPTS = 3;
 const FIRST_MERGE_BYTES = TARGET_FILE_BYTES / 2;
 const KEY_GROUP_BYTES = 800 * 1024 * 1024;
 const DUP_THRESHOLD = 0.4;
-// Whole-tier dedup short-circuit (after Pass 1): when the bulk tier is over this size AND the overall
-// key duplication fraction is over this threshold, fold every bulk file in one merge instead of the
-// per-key-group walk (which spaces merges 5 min apart — 16 h for 200 groups).
+// Whole-tier dedup short-circuit (after Pass 1): when the bulk tier is over this size AND the overall key duplication fraction is over this threshold, fold every bulk file in one merge instead of the per-key-group walk (which spaces merges 5 min apart — 16 h for 200 groups).
 const DEDUP_TRIGGER_BYTES = 512 * 1024 * 1024;
 const DEDUP_TRIGGER_FRACTION = 0.5;
 const WRITE_FLUSH_FIRST_STEP_MS = 250;
-// Skip logs are throttled per collection: the background write path retries merges about once a second,
-// so an unthrottled log would repeat for the whole duration of another tab's merge.
+// Skip logs are throttled per collection: the background write path retries merges about once a second, so an unthrottled log would repeat for the whole duration of another tab's merge.
 const MERGE_SKIP_LOG_INTERVAL_MS = 30 * 1000;
 
 export const bulkDatabase2Timing = {
     streamSealAgeMs: 10 * 60 * 60 * 1000,
-    // Wait this long after the tab becomes visible before the first merge check, then check this often
-    // afterwards. Tab being hidden cancels the timers (no merges while in background). Browser-only;
-    // Node compactors (e.g. remoteFileServer) drive their own polling.
+    // Wait this long after the tab becomes visible before the first merge check, then check this often afterwards. Tab being hidden cancels the timers (no merges while in background). Browser-only; Node compactors (e.g. remoteFileServer) drive their own polling.
     visibleMergeIntervalMs: 5 * 60 * 1000,
     mergeSpacingMs: 5 * 60 * 1000,
     firstMergeTriggerFiles: 20,
@@ -66,8 +61,7 @@ export const bulkDatabase2Timing = {
     streamFoldTriggerBytes: 64 * 1024 * 1024,
     streamFileMaxBytes: 50 * 1024 * 1024,
     streamFoldHardLimitBytes: 768 * 1024 * 1024,
-    // 0 = flush every write (Node — append is real and cheap); browser ramps to 15s to avoid rewriting
-    // the whole stream file per write.
+    // 0 = flush every write (Node — append is real and cheap); browser ramps to 15s to avoid rewriting the whole stream file per write.
     writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
     fileSetPollIntervalMs: 30 * 60 * 1000,
     memoryFlushHeapBytes: 5 * 1024 * 1024 * 1024,
@@ -82,14 +76,12 @@ function fmtBytes(n: number): string {
     return (n / 1024 / 1024 / 1024).toFixed(2) + "GB";
 }
 
-// Reactivity seam (no mobx dependency in this file). The mobx subclass supplies a ReactiveDeps that
-// maps signal strings to its own dependency tracking; non-reactive callers pass noopReactiveDeps.
+// Reactivity seam (no mobx dependency in this file). The mobx subclass supplies a ReactiveDeps that maps signal strings to its own dependency tracking; non-reactive callers pass noopReactiveDeps.
 export interface ReactiveDeps {
     observe(signal: string): void;
     invalidate(signal: string): void;
     batch(fn: () => void): void;
-    // Optional — lets writes skip per-key invalidation for rows nothing is watching. Undefined =
-    // "assume watched".
+    // Optional — lets writes skip per-key invalidation for rows nothing is watching. Undefined = "assume watched".
     isObserved?(signal: string): boolean;
 }
 
@@ -117,9 +109,7 @@ export type MergeSkipReason =
     // compact() only: the collection has no files on disk.
     | "nothingToMerge";
 
-// What a compact()/tryMergeNow() call did. skipReason is set when the pass never ran; for the lock
-// reasons, lockHolderId/lockExpiresInMs report who holds the lock and how long until it goes stale
-// (so a scheduler knows when retrying could succeed).
+// What a compact()/tryMergeNow() call did. skipReason is set when the pass never ran; for the lock reasons, lockHolderId/lockExpiresInMs report who holds the lock and how long until it goes stale (so a scheduler knows when retrying could succeed).
 export type MergeAttemptResult = {
     merged: boolean;
     skipReason?: MergeSkipReason;
@@ -173,11 +163,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         private config: BulkDatabase2Config = {},
     ) { }
 
-    // The reader (and the background machinery that rides along with it) must NOT be set up just
-    // because the collection was constructed. Many collections are constructed and never touched, and
-    // in Node a merge tick would poke the storage factory (e.g. indexedDB) and throw. We build it
-    // lazily on first access to `this.reader`: every read, write, and merge goes through the reader,
-    // while pure construction never touches it.
+    // The reader (and the background machinery that rides along with it) must NOT be set up just because the collection was constructed. Many collections are constructed and never touched, and in Node a merge tick would poke the storage factory (e.g. indexedDB) and throw. We build it lazily on first access to `this.reader`: every read, write, and merge goes through the reader, while pure construction never touches it.
     private _reader: BulkDatabaseReader<T> | undefined;
     private get reader(): BulkDatabaseReader<T> {
         if (this._reader) return this._reader;
@@ -213,11 +199,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         BulkDatabaseBase.startMemoryWatchdog();
     }
 
-    // Every `visibleMergeIntervalMs` of being-visible time, run a merge check. First check fires
-    // `visibleMergeIntervalMs` after the tab becomes visible (not on initial load — gives the user a
-    // moment of session commitment before we start churning the FS), then every interval after. Tab
-    // hiding cancels the timers; visible-again restarts. Node has no document — there we consider
-    // ourselves always-visible and just install the interval directly.
+    // Every `visibleMergeIntervalMs` of being-visible time, run a merge check. First check fires `visibleMergeIntervalMs` after the tab becomes visible (not on initial load — gives the user a moment of session commitment before we start churning the FS), then every interval after. Tab hiding cancels the timers; visible-again restarts. Node has no document — there we consider ourselves always-visible and just install the interval directly.
     private setupVisibilityMergeCheck(): void {
         let firstTimer: ReturnType<typeof setTimeout> | undefined;
         let intervalTimer: ReturnType<typeof setInterval> | undefined;
@@ -256,13 +238,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private streamFileName: string | undefined;
     private currentStreamFileName: string | undefined;
     private currentStreamFileBytes = 0;
-    // In-process re-entry guard: if a merge is running, additional triggers (visibility timer, writes,
-    // tryMergeNow calls) return immediately instead of queueing. Keeps the visibility-timer firings
-    // from stacking behind a long merge.
+    // In-process re-entry guard: if a merge is running, additional triggers (visibility timer, writes, tryMergeNow calls) return immediately instead of queueing. Keeps the visibility-timer firings from stacking behind a long merge.
     private mergeInFlight = false;
     private lastMergeSkipLogMs = 0;
-    // Running counters of stream-tier rows + bytes on disk. Seeded from each LoadedIndex build, then
-    // incremented per flush so the fold-trigger checks current data without an extra directory listing.
+    // Running counters of stream-tier rows + bytes on disk. Seeded from each LoadedIndex build, then incremented per flush so the fold-trigger checks current data without an extra directory listing.
     private streamRowsOnDisk = 0;
     private streamBytesOnDisk = 0;
 
@@ -343,8 +322,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return idx;
     }
 
-    // Coalescing rebuild loop: triggers during a build set rebuildDirty so the loop iterates once more
-    // when it finishes — N rapid triggers cause at most ONE extra rebuild after the current one ends.
+    // Coalescing rebuild loop: triggers during a build set rebuildDirty so the loop iterates once more when it finishes — N rapid triggers cause at most ONE extra rebuild after the current one ends.
     private triggerRebuild(opts: { dropStaleFallback?: boolean } = {}): Promise<void> {
         if (opts.dropStaleFallback) this.rebuildOptions.dropStaleFallback = true;
         if (this.rebuildPromise) {
@@ -449,8 +427,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const stamped = rows.map(row => ({ time: getTimeUnique(), row }));
         const framed = frameRows(stamped);
 
-        // Big batches skip the stream and become a bulk file directly — streaming thousands of rows
-        // one frame at a time would just churn.
+        // Big batches skip the stream and become a bulk file directly — streaming thousands of rows one frame at a time would just churn.
         if (entries.length >= ROLLOVER_ROWS || framed.length >= ROLLOVER_BYTES) {
             await this.writeBulkFile(rows);
             return;
@@ -480,9 +457,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         void this.maybeMerge({ onlyIfStreamHeavy: true });
     }
 
-    // Coalesce stream appends on a ramping per-collection schedule (the browser rewrites the whole
-    // file per append). The first write after a lull flushes immediately so a single edit-then-close
-    // is saved at once; sustained writes ramp toward writeFlushMaxDelayMs.
+    // Coalesce stream appends on a ramping per-collection schedule (the browser rewrites the whole file per append). The first write after a lull flushes immediately so a single edit-then-close is saved at once; sustained writes ramp toward writeFlushMaxDelayMs.
     private async streamAppend(framed: Buffer, rows: number): Promise<void> {
         this.pendingAppends.push({ framed, rows });
         const max = bulkDatabase2Timing.writeFlushMaxDelayMs;
@@ -524,8 +499,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
         // On failure the throw leaves pendingAppends intact so a later flush retries.
         await storage.append(fileName, combined);
-        // New entries appended during the await are after `batch` — removing the front is exactly the
-        // flushed set.
+        // New entries appended during the await are after `batch` — removing the front is exactly the flushed set.
         this.pendingAppends.splice(0, batch.length);
         this.streamBytesOnDisk += combined.length;
         for (const p of batch) this.streamRowsOnDisk += p.rows;
@@ -539,8 +513,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     private getStreamFileName(): string {
-        // Seal our current file once it ages past the seal threshold — no file is ever appended to past
-        // its seal age, which lets a consolidation safely fold it once aged.
+        // Seal our current file once it ages past the seal threshold — no file is ever appended to past its seal age, which lets a consolidation safely fold it once aged.
         if (this.streamFileName) {
             const info = parseStreamFileName(this.streamFileName);
             if (info && Date.now() - info.timestamp >= bulkDatabase2Timing.streamSealAgeMs) this.streamFileName = undefined;
@@ -586,9 +559,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private async listFiles(): Promise<{ bulkFiles: BulkFileInfo[]; streamFiles: StreamFileInfo[] }> {
         const storage = await this.storage();
         const names = await storage.getKeys();
-        // A consumed-merge input is hidden from reads the instant its deletion marker exists — that's
-        // what stops it from being re-read and re-merged. Physical deletion + marker cleanup runs on a
-        // throttle (not inline) so a read isn't slowed by it.
+        // A consumed-merge input is hidden from reads the instant its deletion marker exists — that's what stops it from being re-read and re-merged. Physical deletion + marker cleanup runs on a throttle (not inline) so a read isn't slowed by it.
         const markers = await readDeleteMarkers(storage, names);
         const excluded = markerExclusions(markers);
         if (markers.length) void this.processMarkers();
@@ -607,9 +578,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return { bulkFiles, streamFiles };
     }
 
-    // Throttled marker housekeeping: delete inputs whose replacement outputs have landed (or whose
-    // marker has aged out) and retire fulfilled markers. Triggered from listFiles, so it's gated to
-    // avoid a delete storm under heavy reads.
+    // Throttled marker housekeeping: delete inputs whose replacement outputs have landed (or whose marker has aged out) and retire fulfilled markers. Triggered from listFiles, so it's gated to avoid a delete storm under heavy reads.
     private processMarkers = throttleFunction(30 * 1000, async () => {
         const storage = await this.storage();
         const names = await storage.getKeys();
@@ -630,10 +599,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         void this.maybeMerge();
     }
 
-    // ── merge policy ─────────────────────────────────────────────────────────────────────────────────
-    // Called both periodically (visibility timer) and on writes (with the streamNeedsFold gate so a
-    // small write doesn't drag the merge through). The mergeInFlight check in tryMergeNow skips any
-    // call that arrives while a previous one is still running — so 5-min timer ticks don't pile up.
+    // ── merge policy ───────────────────────────────────────────────────────────────────────────────── Called both periodically (visibility timer) and on writes (with the streamNeedsFold gate so a small write doesn't drag the merge through). The mergeInFlight check in tryMergeNow skips any call that arrives while a previous one is still running — so 5-min timer ticks don't pile up.
     private async maybeMerge(opts: { onlyIfStreamHeavy?: boolean } = {}): Promise<void> {
         if (!await this.automaticCompactionAllowed()) return;
         if (opts.onlyIfStreamHeavy && !this.streamNeedsFold()) return;
@@ -644,8 +610,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
     }
 
-    // Build the "we didn't merge" result and log it (throttled — see MERGE_SKIP_LOG_INTERVAL_MS). For
-    // lock reasons the log and result include the holder and time until the lock goes stale.
+    // Build the "we didn't merge" result and log it (throttled — see MERGE_SKIP_LOG_INTERVAL_MS). For lock reasons the log and result include the holder and time until the lock goes stale.
     private async mergeSkip(reason: MergeSkipReason): Promise<MergeAttemptResult> {
         let lock: MergeLockInfo | undefined;
         if (reason === "tabLockHeld") {
@@ -661,8 +626,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return { merged: false, skipReason: reason, lockHolderId: lock?.holderId, lockExpiresInMs: lock?.expiresInMs };
     }
 
-    // Acquire both merge locks (same-tab mergeInFlight, cross-tab localStorage, cross-process file),
-    // run the pass, release. Skips (with the reason) instead of waiting when any of them is held.
+    // Acquire both merge locks (same-tab mergeInFlight, cross-tab localStorage, cross-process file), run the pass, release. Skips (with the reason) instead of waiting when any of them is held.
     private async runLockedMerge(run: () => Promise<MergeAttemptResult>): Promise<MergeAttemptResult> {
         if (this.mergeInFlight) return await this.mergeSkip("mergeInFlight");
         if (!tryAcquireMergeLock(this.name, writerId)) return await this.mergeSkip("tabLockHeld");
@@ -684,8 +648,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
     }
 
-    // The background path (maybeMerge) goes through this so write bursts coalesce; explicit callers use
-    // tryMergeNow directly and get the per-call result.
+    // The background path (maybeMerge) goes through this so write bursts coalesce; explicit callers use tryMergeNow directly and get the per-call result.
     private tryMergeThrottled = throttleFunction(1000, async () => {
         await this.tryMergeNow();
     });
@@ -704,8 +667,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             this.streamFileName = undefined;
             const { bulkFiles, streamFiles } = await this.listFiles();
             if (bulkFiles.length + streamFiles.length < 1) return await this.mergeSkip("nothingToMerge");
-            // compact() folds every file → no older data survives outside it → surviving tombstones
-            // can be dropped (nothing left to suppress).
+            // compact() folds every file → no older data survives outside it → surviving tombstones can be dropped (nothing left to suppress).
             const merged = await this.mergeFileSet(bulkFiles, streamFiles, true);
             return { merged };
         });
@@ -751,9 +713,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         }
     }
 
-    // A bulk file that won't load is either an in-progress write (recent) or a crashed partial write
-    // (stale). Warn while recent, delete once clearly abandoned — deleting is safe because the write
-    // protocol always lands the replacement before removing the file it supersedes.
+    // A bulk file that won't load is either an in-progress write (recent) or a crashed partial write (stale). Warn while recent, delete once clearly abandoned — deleting is safe because the write protocol always lands the replacement before removing the file it supersedes.
     private async handleUnreadableFile(file: BulkFileInfo, message: string): Promise<void> {
         const ageMs = Date.now() - file.timestamp;
         if (ageMs > STALE_DELETE_MS) {
@@ -769,14 +729,9 @@ export class BulkDatabaseBase<T extends { key: string }> {
         console.warn(`${this.name}: skipping unreadable bulk file ${file.fileName} (recent - may be in-progress): ${message}`);
     }
 
-    // The one merge primitive. Reads + plans + writes outputs before deleting any input, so a crash
-    // leaves duplicates (next merge dedupes) rather than a gap. After the file set changes on disk,
-    // we trigger an index rebuild + atomic swap; once swap completes, the consumed files' block-cache
-    // entries are evicted (no consumer can ask for them now).
-    //
-    // Serialized: foldOwnStream + merge(timeLo, timeHi) + testMerge's runMerge all hit this; the lock
-    // covers tryMergeNow/compact but those two paths bypass it. runInSerial queues so they never
-    // collide on the file set.
+    // The one merge primitive. Reads + plans + writes outputs before deleting any input, so a crash leaves duplicates (next merge dedupes) rather than a gap. After the file set changes on disk, we trigger an index rebuild + atomic swap; once swap completes, the consumed files' block-cache entries are evicted (no consumer can ask for them now).
+    // 
+    // Serialized: foldOwnStream + merge(timeLo, timeHi) + testMerge's runMerge all hit this; the lock covers tryMergeNow/compact but those two paths bypass it. runInSerial queues so they never collide on the file set.
     private mergeFileSet = runInSerial(async (bulkFiles: BulkFileInfo[], streamFiles: StreamFileInfo[], includesOldest = false, forceDeleteStreams = false): Promise<boolean> => {
         this.reader.beginCompaction();
         try {
@@ -790,11 +745,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const storage = await this.storage();
         const timestamp = nextFileTime();
 
-        // The caller's bulkFiles came from a `listFiles()` snapshot. Between then and now any file
-        // could be gone (another tab's deferred delete, manual cleanup). The subCaches reader for a
-        // deleted file is silently stale — its in-memory metadata still resolves, but the very next
-        // getRange against disk throws. Re-verify existence up-front and drop the cache entry for
-        // anything that vanished, so we don't even try to plan around a ghost file.
+        // The caller's bulkFiles came from a `listFiles()` snapshot. Between then and now any file could be gone (another tab's deferred delete, manual cleanup). The subCaches reader for a deleted file is silently stale — its in-memory metadata still resolves, but the very next getRange against disk throws. Re-verify existence up-front and drop the cache entry for anything that vanished, so we don't even try to plan around a ghost file.
         const verifiedBulkFiles = (await Promise.all(bulkFiles.map(async f => {
             try {
                 const info = await storage.getInfo(f.fileName);
@@ -835,8 +786,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // expanded console.group so a merge takes one collapsible block, not a
         // screenful (and never the per-file name dump it used to spew).
         const steps: string[] = [];
-        // Each step records the time spent since the previous step in blue at the front, so callers can
-        // just describe what they did and not bother measuring/formatting elapsed times themselves.
+        // Each step records the time spent since the previous step in blue at the front, so callers can just describe what they did and not bother measuring/formatting elapsed times themselves.
         let lastStepMs = mergeStartMs;
         const log = (line: string) => {
             const now = Date.now();
@@ -879,36 +829,25 @@ export class BulkDatabaseBase<T extends { key: string }> {
         for (const line of steps) console.log(line);
         console.groupEnd();
 
-        // Only the sources runPlannedMerge actually used can be retired — a source it dropped mid-plan
-        // (file gone, corruption) still holds data we couldn't merge in, so leave it on disk and let a
-        // future merge re-attempt it.
+        // Only the sources runPlannedMerge actually used can be retired — a source it dropped mid-plan (file gone, corruption) still holds data we couldn't merge in, so leave it on disk and let a future merge re-attempt it.
         const usedConsumedBulk = consumedBulk.filter(f => mergeResult.usedSourceNames.has(f.fileName));
         const usedStreamFiles = streamFiles.filter(f => mergeResult.usedSourceNames.has(f.fileName) || mergeResult.usedSourceNames.has("(streams)"));
-        // A stream may still be appended to after we read it (the writer hasn't sealed/moved on); only
-        // retire streams canDeleteStream clears — the rest stay live and a later merge re-folds them
-        // once sealed. Bulk files are immutable, so a used one is always safe to retire.
+        // A stream may still be appended to after we read it (the writer hasn't sealed/moved on); only retire streams canDeleteStream clears — the rest stay live and a later merge re-folds them once sealed. Bulk files are immutable, so a used one is always safe to retire.
         const deletableStreams: string[] = [];
         for (const f of usedStreamFiles) {
             if (await this.canDeleteStream(f, Date.now(), streamData.sizes, forceDeleteStreams)) deletableStreams.push(f.fileName);
         }
         const deleteFiles = [...usedConsumedBulk.map(f => f.fileName), ...deletableStreams];
 
-        // Write a deletion marker instead of deleting inline. From the next read on, listFiles hides
-        // these inputs (so they're never re-merged — the loop fix), and processMarkers removes them
-        // physically once the outputs have landed or the marker ages out. Marker BEFORE the rebuild so
-        // the freshly-swapped index already excludes the retired inputs.
+        // Write a deletion marker instead of deleting inline. From the next read on, listFiles hides these inputs (so they're never re-merged — the loop fix), and processMarkers removes them physically once the outputs have landed or the marker ages out. Marker BEFORE the rebuild so the freshly-swapped index already excludes the retired inputs.
         if (deleteFiles.length) await writeDeleteMarker(storage, { deleteFiles, replacedBy: outNames });
 
-        // Rebuild + swap so the index sees the new outputs and drops the retired inputs. Block-cache
-        // eviction for the dropped inputs happens here (they're no longer in the new index's fileSet).
+        // Rebuild + swap so the index sees the new outputs and drops the retired inputs. Block-cache eviction for the dropped inputs happens here (they're no longer in the new index's fileSet).
         await this.triggerRebuild();
         return newNames.length > 0 || carriedDeletes > 0;
     }
 
-    // A stream is safe to delete iff no writer will append to it again: it's aged past the seal age
-    // (writer has provably switched files) OR cross-tab sync is on AND its size didn't change while
-    // we read it. Else leave it — the data is also in the new bulk file; a later merge deletes it
-    // once aged.
+    // A stream is safe to delete iff no writer will append to it again: it's aged past the seal age (writer has provably switched files) OR cross-tab sync is on AND its size didn't change while we read it. Else leave it — the data is also in the new bulk file; a later merge deletes it once aged.
     private async canDeleteStream(f: StreamFileInfo, now: number, sizes: Map<string, number>, force = false): Promise<boolean> {
         if (now - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs) return true;
         if (!isSyncSupported() && !force) return false;
@@ -933,11 +872,8 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     // The merge policy (two passes, spaced by mergeSpacingMs):
-    //   1) Consolidate recent fragmentation: take newest files up to ~FIRST_MERGE_BYTES; merge them
-    //      into one when they fragment or span too wide a time range.
-    //   2) Key-stratify: walk all keys in ~KEY_GROUP_BYTES groups; rewrite groups whose duplicate-key
-    //      fraction passes DUP_THRESHOLD, highest first.
-    // Use tryMerge instead
+    //   1) Consolidate recent fragmentation: take newest files up to ~FIRST_MERGE_BYTES; merge them into one when they fragment or span too wide a time range.
+    //   2) Key-stratify: walk all keys in ~KEY_GROUP_BYTES groups; rewrite groups whose duplicate-key fraction passes DUP_THRESHOLD, highest first. Use tryMerge instead
     private async testMergeINTERNAL_DO_NOT_CALL(): Promise<boolean> {
         let merged = false;
         await this.flushPending();
@@ -947,8 +883,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             return true;
         };
 
-        // Hard stream limit: a stream this big makes every read pull a huge file → fold ALL of it now,
-        // force-delete (canDeleteStream still requires size-stable, so an active writer never loses data).
+        // Hard stream limit: a stream this big makes every read pull a huge file → fold ALL of it now, force-delete (canDeleteStream still requires size-stable, so an active writer never loses data).
         {
             const { streamFiles } = await this.listFiles();
             if (streamFiles.length) {
@@ -962,8 +897,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
         }
 
-        // Pass 1: consolidate recent. Only seal when cross-tab sync can fold recent streams — in Node
-        // canDeleteStream needs them aged anyway, so sealing would just fragment streams every pass.
+        // Pass 1: consolidate recent. Only seal when cross-tab sync can fold recent streams — in Node canDeleteStream needs them aged anyway, so sealing would just fragment streams every pass.
         const foldRecentStreams = isSyncSupported();
         if (foldRecentStreams) {
             syncBroadcastSeal(this.name);
@@ -1004,9 +938,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
         }
 
-        // Whole-tier dedup short-circuit (between Pass 1 and the per-group Pass 2): when the bulk tier
-        // is big enough AND mostly duplicates, fold every bulk file in one merge. Avoids the per-group
-        // walk's 5-min spacing × N-groups latency.
+        // Whole-tier dedup short-circuit (between Pass 1 and the per-group Pass 2): when the bulk tier is big enough AND mostly duplicates, fold every bulk file in one merge. Avoids the per-group walk's 5-min spacing × N-groups latency.
         {
             const { bulkFiles } = await this.listFiles();
             if (bulkFiles.length >= 2) {
@@ -1031,8 +963,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
         }
 
-        // Pass 2: key-stratified deduplication. Disjoint key ranges → one group's merge doesn't
-        // change another's duplication; re-select each group's files at merge time (set shifts).
+        // Pass 2: key-stratified deduplication. Disjoint key ranges → one group's merge doesn't change another's duplication; re-select each group's files at merge time (set shifts).
         const groups = await this.findDuplicateGroups();
         for (const g of groups) {
             const { bulkFiles } = await this.listFiles();
@@ -1131,9 +1062,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return this.reader.isColumnLoadedSync(column);
     }
 
-    // Reactive: true while a merge is rewriting this collection's files. Use this in UI to show a
-    // "compacting…" indicator. Counts both background merges (maybeMerge) and explicit compact/merge
-    // calls. Becomes false once the new index is swapped in (the deferred-delete window is NOT counted).
+    // Reactive: true while a merge is rewriting this collection's files. Use this in UI to show a "compacting…" indicator. Counts both background merges (maybeMerge) and explicit compact/merge calls. Becomes false once the new index is swapped in (the deferred-delete window is NOT counted).
     public isCompactingSync(): boolean {
         return this.reader.isCompactingSync();
     }
@@ -1228,8 +1157,7 @@ export type BulkFileEntry = {
     bytes: number;
     // Filesystem mtime (ms since epoch) — 0 if the storage layer didn't return one.
     lastModified: number;
-    // Lazy: pulled from the cached sub-reader for bulk (free if loaded), or from a parse of the stream
-    // file (small — tier-0 size-capped, also cached). Call only when you need the per-file detail.
+    // Lazy: pulled from the cached sub-reader for bulk (free if loaded), or from a parse of the stream file (small — tier-0 size-capped, also cached). Call only when you need the per-file detail.
     getDetails: () => Promise<BulkFileDetails>;
 };
 export type BulkFileInfoListing = { files: BulkFileEntry[]; count: number; totalBytes: number };

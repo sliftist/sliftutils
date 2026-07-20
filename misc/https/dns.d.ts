@@ -22,10 +22,7 @@ export declare function getRecordsRaw(type: string, key: string): Promise<{
     modified_on: string;
     comment?: string | undefined;
 }[]>;
-/** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database
- *   transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs
- *   aren't usable in our setup, and because it lets "remove others + assert target" happen
- *   without a window where the name resolves to nothing. */
+/** Cloudflare's batch endpoint applies deletes, then patches, then posts in a single database transaction. We route edits (patches) through here because the standalone PATCH/PUT verbs aren't usable in our setup, and because it lets "remove others + assert target" happen without a window where the name resolves to nothing. */
 export declare function batchRecords(zoneId: string, batch: {
     deletes?: {
         id: string;

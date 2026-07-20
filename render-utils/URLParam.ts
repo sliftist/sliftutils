@@ -84,9 +84,8 @@ export function getCurrentUrl() {
 let currentBatchedUrl: string | undefined;
 function throttledUrlPush(url: string) {
     history.pushState({}, "", url);
-    //currentBatchedUrl = url;
-    // NOTE: Stopped throttling, so when you click on links, it immediately updates the selected state. 
-    //void throttledUrlPushBase(url);
+    // currentBatchedUrl = url;
+    // NOTE: Stopped throttling, so when you click on links, it immediately updates the selected state. void throttledUrlPushBase(url);
 }
 const throttledUrlPushBase = throttleFunction(1000, (url: string) => {
     currentBatchedUrl = undefined;

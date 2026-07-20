@@ -10,27 +10,15 @@ import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, IMMUTABLE_CACHE_TIME } from "../IArchives";
 import { ROUTING_FILE } from "./remoteConfig";
-import { getTakeoverStamp } from "./deployTakeover";
 import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
     deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
-    getBucketConfig, listAccountBuckets, ServerBucketInfo,
+    getBucketConfig, listAccountBuckets, ServerBucketInfo, clearAccountWriteStats,
 } from "./storageServerState";
 import { StorageClientController } from "./storageClientController";
 
-// The remote storage server's API. Authentication uses certs.ts machine identities: a client
-// proves it owns its machine key by signing a timestamped token (bound to this server, so tokens
-// can't be replayed elsewhere), and the server then trusts that connection as that machineId.
-// Access to an account is granted to specific machineIds, via a command line command run on the
-// storage machine (see storageServer.ts).
-//
-// There is no bucket-creation API: a bucket exists iff its routing config (ROUTING_FILE) exists,
-// and writing that file creates or reconfigures the bucket (see storageServerState.ts). Reads of
-// nonexistent buckets return undefined / empty, same as reads of nonexistent files.
-
 export const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
-// Error markers, so clients can identify these failures inside error messages
 export const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
 export const STORAGE_ACCESS_DENIED = "REMOTE_STORAGE_ACCESS_DENIED_9d81a4c0";
 
@@ -41,8 +29,6 @@ const MAX_REQUESTS_PER_IP = 50;
 export type AuthTokenData = {
     purpose: string;
     time: number;
-    // The address the client dialed. The port varies freely (deploy takeovers serve on alternate
-    // ports); only the domain is security-relevant, as it is what the cert binds to.
     server: string;
 };
 export type AuthToken = {
@@ -67,18 +53,10 @@ export type AccessState = {
     machineId: string;
     ip: string;
     hasAccess: boolean;
-    // A single ssh command, runnable from anywhere, that runs the grantAccess CLI on the storage
-    // machine to grant the caller's own pending request. Only set when the caller has a pending
-    // request (so an already-trusted caller has no need for it).
     grantAccessCommand?: string;
-    // Only the machines that ALREADY have access. Pending requests are NEVER listed here — showing
-    // them would let a trusted user accidentally approve a random request. Callers see pending
-    // requests only by explicitly typing an IP into listRequestsForIP.
     trustedMachines?: TrustRecord[];
 };
 
-// callerNodeId -> authenticated machineId. Connections are long-lived websockets, so a session
-// lasts until the connection drops (clients re-authenticate on reconnect).
 const sessions = new Map<string, string>();
 
 const CONTENT_TYPES: { [ext: string]: string } = {
@@ -100,15 +78,11 @@ function assertValidPath(path: string) {
     if (!path || path.startsWith("/") || path.endsWith("/") || path.includes("//") || path.includes("\\") || path.includes("\x00")) {
         throw new Error(`Invalid path ${JSON.stringify(path.slice(0, 200))}, paths cannot be empty, start or end with /, or contain //, backslashes, or null characters`);
     }
-    // Paths are one-to-one with files on disk, so . and .. segments would escape the store folder
     if (path.split("/").some(part => part === "." || part === "..")) {
         throw new Error(`Invalid path ${JSON.stringify(path.slice(0, 200))}, paths cannot contain . or .. segments`);
     }
 }
 
-// Every client pings us (immediately on connect, then continuously), so pings tell us exactly who
-// our currently-connected clients are. Client nodeIds never reconnect (a reconnect is a NEW
-// nodeId), so the disconnect callback fully cleans an entry up.
 const connectedClients = new Set<string>();
 function trackCaller(): void {
     let nodeId = SocketFunction.getCaller().nodeId;
@@ -119,15 +93,10 @@ function trackCaller(): void {
     });
 }
 
-/** Called by storageServerState the moment any routing config is applied - clients must never
- *  have to wait for a poll to learn the topology changed. */
 export function broadcastRoutingChanged(): void {
     console.log(`Broadcasting routing config change to ${connectedClients.size} connected clients`);
     for (let nodeId of [...connectedClients]) {
-        void StorageClientController.nodes[nodeId].routingConfigChanged().catch(() => {
-            // The client is gone (or too old to know the controller); the disconnect callback
-            // cleans the registry, nothing to do here
-        });
+        void StorageClientController.nodes[nodeId].routingConfigChanged().catch(() => { });
     }
 }
 
@@ -165,8 +134,6 @@ async function requireAccess(account: string): Promise<string> {
     return machineId;
 }
 
-// A single command, runnable from anywhere, that sshes into the storage machine and runs the
-// grantAccess CLI there
 function getGrantAccessCommand(requestId: string): string {
     let { sshTarget, serverCommand } = getStorageServerConfig();
     return `ssh ${sshTarget} '${serverCommand} --requestId ${requestId}'`;
@@ -179,23 +146,14 @@ async function getBucket(account: string, bucketName: string): Promise<LoadedBuc
 }
 
 class RemoteStorageControllerBase {
-    // Latency measurement (see SourceWrapper's pinging); no auth, it measures the transport. The
-    // takeover stamp piggybacks on it so every connected client learns of a deploy takeover
-    // within one ping interval. Pings also tell us who our clients ARE - the trackCaller
-    // registry is what routing-change broadcasts push to.
-    async ping(): Promise<{ takeover?: string }> {
+    async ping(): Promise<{}> {
         trackCaller();
-        return { takeover: getTakeoverStamp() };
+        return {};
     }
 
-    // Proves the caller owns the machine key for the machineId in its certificate. The signature
-    // must be fresh and bound to this server, so it cannot be replayed to (or from) other servers.
     async authenticate(token: AuthToken): Promise<{ machineId: string; ip: string }> {
         let { domain, port } = getStorageServerConfig();
         let caller = SocketFunction.getCaller();
-        // First establish that the signature signs the data exactly as the client sent it, THEN
-        // validate the data's fields. The two steps must never be mixed - reconstructing the
-        // payload from expectations conflates "is this signed" with "is this acceptable".
         verify(token.certPem, token.signature, token.data);
         let { purpose, time, server } = token.data;
         if (purpose !== STORAGE_AUTH_PURPOSE) {
@@ -204,8 +162,6 @@ class RemoteStorageControllerBase {
         if (Math.abs(Date.now() - time) > AUTH_TIME_WINDOW) {
             throw new Error(`Auth token time is too far from the server time (token ${time}, server ${Date.now()}, allowed drift ${AUTH_TIME_WINDOW}ms)`);
         }
-        // Clients sign the address they dialed. The port varies freely (deploy takeovers serve on
-        // alternate ports); the domain is the replay boundary, so only it must match us.
         let tokenDomain = server.split(":")[0];
         if (tokenDomain !== domain) {
             throw new Error(`Auth token is for server ${JSON.stringify(server)}, but this server is ${JSON.stringify(`${domain}:${port}`)}`);
@@ -223,8 +179,6 @@ class RemoteStorageControllerBase {
         return { machineId, ip: getCallerIP() };
     }
 
-    // Records that the calling machine wants access to an account. Requests are kept per requesting
-    // IP, so the storage machine's admin can list them with --listAccess <ip> and grant one.
     async requestAccess(account: string): Promise<{ machineId: string; ip: string; requestId: string; grantAccessCommand: string }> {
         assertValidName(account, "account");
         let machineId = getCallerMachineId();
@@ -275,20 +229,12 @@ class RemoteStorageControllerBase {
         return result;
     }
 
-    // Callable by any machine that has access to `account`. Returns pending access requests for the
-    // account that come from EXACTLY `ip`. Callers must type in an IP explicitly — the server never
-    // volunteers a list of requesting IPs, so a trusted user can't accidentally approve a random
-    // request from a machine they didn't mean to trust.
     async listRequestsForIP(account: string, ip: string): Promise<AccessRequest[]> {
         let requests = await getRequests();
         return (await requests.get(ip) || []).filter(x => x.account === account);
     }
 
-    // Callable by any machine that has access to the request's account (or by the storage-machine
-    // admin). Grants the requested access; the caller must supply the specific requestId, which they
-    // only get by explicitly looking up requests for a specific IP.
     async grantAccess(requestId: string): Promise<TrustRecord> {
-        // Must capture in the synchronous phase — SocketFunction.getCaller() only works before any await.
         let callerMachineId = getCallerMachineId();
         let trust = await getTrust();
         let requests = await getRequests();
@@ -311,9 +257,6 @@ class RemoteStorageControllerBase {
         throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
-    // Admin (must be run from the storage machine itself, which shares the server's machineId).
-    // Only returns requests for the given IP, so you cannot accidentally grant a request from an
-    // IP you didn't explicitly type in.
     async adminListRequests(ip: string): Promise<AccessRequest[]> {
         let requests = await getRequests();
         return await requests.get(ip) || [];
@@ -350,8 +293,6 @@ class RemoteStorageControllerBase {
     async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number): Promise<void> {
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
-        // Handles bucket creation (writes of ROUTING_FILE), reconfiguration, fast mode, and
-        // immutability — see storageServerState.ts
         await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified });
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
@@ -370,7 +311,6 @@ class RemoteStorageControllerBase {
         if (!bucket) return [];
         return await bucket.store.findInfo(prefix, config);
     }
-    // Fast (served from the store's BulkDatabase2 index, not a scan) — see IArchives.getChangesAfter
     async getChangesAfter(account: string, bucketName: string, time: number): Promise<ArchiveFileInfo[]> {
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return [];
@@ -381,17 +321,17 @@ class RemoteStorageControllerBase {
     }
     async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
         let bucket = await getBucket(account, bucketName);
-        // Missing buckets say true, matching what they become once created (the default store type)
         if (!bucket) return { supportsChangesAfter: true };
         return getBucketConfig(bucket);
     }
-    /** Every bucket the account has on this host - active and inactive - with each bucket's
-     *  configuration. Inactive buckets stay inactive (their routing is read straight off disk). */
     async listBuckets(account: string): Promise<ServerBucketInfo[]> {
         return await listAccountBuckets(account);
     }
-    /** Walks the whole index for exact totals (overall and per holding source) - more expensive
-     *  than the maintained counters that getArchivesConfig returns, but immune to counter drift. */
+    /** Zeroes the write statistics listBuckets reports, for every bucket in the account. */
+    async clearWriteStats(account: string): Promise<{ clearedBuckets: number }> {
+        assertValidName(account, "account");
+        return { clearedBuckets: await clearAccountWriteStats(account) };
+    }
     async getIndexInfo(account: string, bucketName: string): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] } | undefined> {
         let bucket = await getBucket(account, bucketName);
         if (!bucket || !bucket.store.computeIndexTotals) return undefined;
@@ -408,7 +348,6 @@ class RemoteStorageControllerBase {
 
     async startLargeFile(account: string, bucketName: string, path: string): Promise<string> {
         assertWritesAllowed();
-        // Validates now, so the upload doesn't fail at the end
         assertValidPath(path);
         let bucket = await getBucket(account, bucketName);
         if (!bucket) {
@@ -445,11 +384,7 @@ class RemoteStorageControllerBase {
         await bucket.store.cancelLargeUpload(uploadId);
     }
 
-    // The server's single default HTTP route. /file/<account>/<bucketName>/<path> serves files from
-    // public buckets over plain GETs (see IArchives.getURL); every other path serves the access
-    // page (via RequireController.requireHTML — the path is the account name, see accessPage.tsx).
     async httpEntry(config?: { requireCalls?: string[]; cacheTime?: number }): Promise<Buffer> {
-        // Both are keyed by the current call and must be captured synchronously, before any await
         let caller = SocketFunction.getCaller();
         let request = getCurrentHTTPRequest();
         let pathname = new URL(request?.url || "/", "https://localhost").pathname;
@@ -476,8 +411,6 @@ class RemoteStorageControllerBase {
         if (!bucket.self?.public) {
             throw new Error(`Bucket ${account}/${bucketName} is not public, so its files cannot be read over plain URLs`);
         }
-        // The index answers existence + write time + size without touching any data, so
-        // If-Modified-Since and range validation cost nothing
         let info = await bucket.store.getInfo(filePath);
         if (!info || !info.size) {
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
@@ -494,7 +427,6 @@ class RemoteStorageControllerBase {
         let ifModifiedSince = request?.headers["if-modified-since"];
         if (typeof ifModifiedSince === "string") {
             let since = new Date(ifModifiedSince).getTime();
-            // Last-Modified is served at 1 second resolution, so compare at that resolution
             if (since && Math.floor(info.writeTime / 1000) * 1000 <= since) {
                 return setHTTPResultHeaders(Buffer.from(""), { ...headers, status: "304" });
             }
@@ -502,7 +434,6 @@ class RemoteStorageControllerBase {
         let range: { start: number; end: number } | undefined;
         let rangeHeader = request?.headers["range"];
         if (typeof rangeHeader === "string") {
-            // Single-range form only (bytes=start-end / start- / -suffix); anything else serves the full file
             let match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
             if (match && (match[1] || match[2])) {
                 let start: number;
@@ -534,14 +465,11 @@ class RemoteStorageControllerBase {
 
 const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string }>();
 
-// Access checks run as hooks on the register shape below, keyed off the call's arguments, so the
-// method bodies don't each repeat them
 const accountAccess: SocketFunctionHook = async (context) => {
     await requireAccess(String(context.call.args[0]));
 };
 const uploadAccess: SocketFunctionHook = async (context) => {
     let info = largeUploadInfo.get(String(context.call.args[0]));
-    // Unknown upload ids are handled by the methods themselves (throw / no-op)
     if (!info) return;
     await requireAccess(info.account);
 };
@@ -571,6 +499,7 @@ export const RemoteStorageController = SocketFunction.register(
         getArchivesConfig: { hooks: [accountAccess] },
         getIndexInfo: { hooks: [accountAccess] },
         listBuckets: { hooks: [accountAccess] },
+        clearWriteStats: { hooks: [accountAccess] },
         getSyncStatus: { hooks: [accountAccess] },
         startLargeFile: { hooks: [accountAccess] },
         uploadPart: { hooks: [uploadAccess] },

@@ -10,17 +10,12 @@ export type IvfConfig = {
     cellTargetSize: number;
 };
 
-// Tiered storage. Below FLAT_LIMIT embeddings the whole set lives in one flat transaction set (no IVF);
-// once it grows past that we build the IVF (centroids + per-cell sets) and stay there forever. `count` is
-// the live embedding count (re-derived exactly on a rebuild). `steps` records one-time upgrades that must
-// never re-run even if the set later shrinks and regrows.
+// Tiered storage. Below FLAT_LIMIT embeddings the whole set lives in one flat transaction set (no IVF); once it grows past that we build the IVF (centroids + per-cell sets) and stay there forever. `count` is the live embedding count (re-derived exactly on a rebuild). `steps` records one-time upgrades that must never re-run even if the set later shrinks and regrows.
 export type IvfEmbeddingRoot = {
     config: IvfConfig;
     count: number;
     flat: TransactionSetStore<StoredEmbedding>;
-    // Direct ref -> embedding index. Each entry is one CBOR blob at its own key, so a lookup or delete is a
-    // single key-value op (no transaction-set replay) and deleteData can drop it (it's a primitive leaf). Refs
-    // and their embeddings never move, so a rebuild leaves this untouched.
+    // Direct ref -> embedding index. Each entry is one CBOR blob at its own key, so a lookup or delete is a single key-value op (no transaction-set replay) and deleteData can drop it (it's a primitive leaf). Refs and their embeddings never move, so a rebuild leaves this untouched.
     byRef: { [ref: string]: Uint8Array };
     steps: { [step: string]: boolean };
     centroids: TransactionSetStore<StoredEmbedding>;
@@ -67,8 +62,7 @@ function rankCellsByCloseness(embedding: StoredEmbedding, centroids: Map<string,
     return ranked.map(entry => entry.cellId);
 }
 
-// Per-write chance of a full rebuild. Zero at/under the target size, then rises (cubically) past it so cells
-// stay roughly between target and ~2x target.
+// Per-write chance of a full rebuild. Zero at/under the target size, then rises (cubically) past it so cells stay roughly between target and ~2x target.
 function rebalanceProbability(fillRatio: number): number {
     if (fillRatio <= 1) {
         return 0;
@@ -77,9 +71,7 @@ function rebalanceProbability(fillRatio: number): number {
     return Math.min(1, over * over * over * 0.25);
 }
 
-// k-means. Decodes every member to a pooled float32 buffer ONCE, then assigns with a plain internal float
-// dot (no getCloseness call — comparing two float vectors is trivial) and keeps centroids as float means,
-// encoding them to StoredEmbedding only at the end. Releases the borrowed buffers when done.
+// k-means. Decodes every member to a pooled float32 buffer ONCE, then assigns with a plain internal float dot (no getCloseness call — comparing two float vectors is trivial) and keeps centroids as float means, encoding them to StoredEmbedding only at the end. Releases the borrowed buffers when done.
 function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfConfig): { centroid: StoredEmbedding; members: CellEntry[] }[] {
     const memberFloats: Float32Array[] = [];
     for (const member of members) {
@@ -156,10 +148,7 @@ function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfC
     return result;
 }
 
-// Re-cluster EVERY embedding (flat tier + all cells) into a fresh IVF, clear the flat tier, and mark IVF
-// mode. This is the rearranger: run probabilistically as the set grows, once at each regenerate threshold,
-// and once to upgrade from flat. Reads everything it uses, so it bails (does nothing) if anything isn't
-// synced and the caller's retry re-runs it; no caller cares about its result.
+// Re-cluster EVERY embedding (flat tier + all cells) into a fresh IVF, clear the flat tier, and mark IVF mode. This is the rearranger: run probabilistically as the set grows, once at each regenerate threshold, and once to upgrade from flat. Reads everything it uses, so it bails (does nothing) if anything isn't synced and the caller's retry re-runs it; no caller cares about its result.
 export function rebuildStructure(database: Database<IvfEmbeddingRoot>): void {
     const config = database.readData(root => root.config);
     if (!config) return;
@@ -167,9 +156,7 @@ export function rebuildStructure(database: Database<IvfEmbeddingRoot>): void {
     if (!steps) return;
 
     const allMembers: CellEntry[] = [];
-    // Only the one-time flat->IVF upgrade pulls from the flat tier. Once STEP_IVF is set the flat data has
-    // already been folded into cells, so later rebuilds ignore it. It's left in place, never deleted: deleteData
-    // only removes primitive leaves, not a whole store, and the flat tier is small enough not to matter.
+    // Only the one-time flat->IVF upgrade pulls from the flat tier. Once STEP_IVF is set the flat data has already been folded into cells, so later rebuilds ignore it. It's left in place, never deleted: deleteData only removes primitive leaves, not a whole store, and the flat tier is small enough not to matter.
     if (!steps[STEP_IVF]) {
         const flat = transactionRead(flatStore(database));
         if (!flat) return;
@@ -252,8 +239,7 @@ export function searchEmbeddings(
     return hits.slice(0, options.resultCount);
 }
 
-// Direct ref -> stored embedding lookup through the byRef index: one key-value read per ref, no cell scan. A
-// search returns refs; this fetches the data behind them. Skips refs that aren't present; undefined if not synced.
+// Direct ref -> stored embedding lookup through the byRef index: one key-value read per ref, no cell scan. A search returns refs; this fetches the data behind them. Skips refs that aren't present; undefined if not synced.
 export function lookupEmbeddings(
     database: Database<IvfEmbeddingRoot>,
     refs: string[],
@@ -364,8 +350,7 @@ export function removeEmbeddings(
     if (!centroids) return;
     if (!centroids.size) return;
 
-    // Look up each ref's embedding through byRef, then rank its cells the way an insert would, so we delete from
-    // the cell it actually landed in (plus a few neighbours, in case a rebuild nudged it across a boundary).
+    // Look up each ref's embedding through byRef, then rank its cells the way an insert would, so we delete from the cell it actually landed in (plus a few neighbours, in case a rebuild nudged it across a boundary).
     const refValues = database.readData(root => refs.map(ref => root.byRef[ref]));
     if (!refValues) return;
     const candidatesByItem: { ref: string; cellIds: string[] }[] = [];

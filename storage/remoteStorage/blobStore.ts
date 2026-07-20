@@ -13,18 +13,11 @@ import { ROUTING_FILE, getRoute, routeContains } from "./remoteConfig";
 import { BulkDatabaseBase, noopReactiveDeps } from "../BulkDatabase2/BulkDatabaseBase";
 import { wrapHandle, NodeJSDirectoryHandleWrapper, DirectoryWrapper } from "../FileFolderAPI";
 
-// The storage engine of the remote storage server. Data lives in synchronization sources (at
-// minimum an ArchivesDisk, the local disk); BlobStore keeps an index of every file (path, last
-// modified time, size, and which source currently holds the data) in a BulkDatabase2, and
-// synchronizes the index from all sources (see ArchivesSource in IArchives.ts).
-// Every startup fully rescans each source's metadata, so the index self-heals; the file with the
-// highest write time wins across all sources, so multiple sources need no stacking order.
+// The storage engine of the remote storage server. Data lives in synchronization sources (at minimum an ArchivesDisk, the local disk); BlobStore keeps an index of every file (path, last modified time, size, and which source currently holds the data) in a BulkDatabase2, and synchronizes the index from all sources (see ArchivesSource in IArchives.ts). Every startup fully rescans each source's metadata, so the index self-heals; the file with the highest write time wins across all sources, so multiple sources need no stacking order.
 
 export const DEFAULT_FAST_WRITE_DELAY = timeInMinute * 5;
 const FAST_FLUSH_POLL = 1000 * 15;
-// Fast writes are never delayed past our own valid window, and within this margin of the window's
-// end they write through immediately - so when the next window's source takes over, the writes are
-// already on disk
+// Fast writes are never delayed past our own valid window, and within this margin of the window's end they write through immediately - so when the next window's source takes over, the writes are already on disk
 export const WINDOW_END_FLUSH_MARGIN = timeInMinute * 5;
 // Index changes are buffered in memory and written to the BulkDatabase2 in batches
 const INDEX_FLUSH_INTERVAL = 1000 * 30;
@@ -32,38 +25,31 @@ const INDEX_FLUSH_INTERVAL = 1000 * 30;
 const CHANGES_POLL_INTERVAL = 1000 * 60;
 // Sources that don't support getChangesAfter get a full metadata rescan this often
 const FULL_RESCAN_INTERVAL = 1000 * 60 * 60;
-// On a request for a file the index doesn't know, changes-after sources are re-polled, at most
-// this often
+// On a request for a file the index doesn't know, changes-after sources are re-polled, at most this often
 const MISS_CHECK_INTERVAL = 1000 * 5;
 // Change polls re-request this much overlap, so clock skew between us and a source can't drop changes
 const CHANGES_POLL_OVERLAP = timeInMinute;
 const SCAN_RETRY_DELAY = 1000 * 30;
-// Deletes are tombstones (an empty file IS a missing file): the size-0 index entry is what lets a
-// deletion propagate/reconcile like any other write, and it expires after this long
+// Deletes are tombstones (an empty file IS a missing file): the size-0 index entry is what lets a deletion propagate/reconcile like any other write, and it expires after this long
 const TOMBSTONE_EXPIRY = 1000 * 60 * 60 * 24 * 7;
 const TOMBSTONE_CLEANUP_INTERVAL = 1000 * 60 * 60;
 // While a metadata scan or full sync is running, its progress is logged this often
 const SYNC_PROGRESS_LOG_INTERVAL = 1000 * 60;
 const DISK_LIMIT_CHECK_INTERVAL = 1000 * 60;
-// Full syncs download this many files concurrently (high-latency sources like backblaze would
-// otherwise crawl one round-trip at a time)
+// Full syncs download this many files concurrently (high-latency sources like backblaze would otherwise crawl one round-trip at a time)
 const FULL_SYNC_PARALLEL = 8;
-// A full sync running longer than this is console.errored (and again every interval after), so a
-// sync that will take days is loud instead of a quiet console.log every minute
+// A full sync running longer than this is console.errored (and again every interval after), so a sync that will take days is loud instead of a quiet console.log every minute
 const FULL_SYNC_SLOW_ERROR_INTERVAL = 1000 * 60 * 60;
 
 export type WriteConfig = {
-    // Resolve once the write is in memory; flush to the sources after writeDelay, coalescing
-    // writes to the same key (only the latest is written). Data is lost if the process crashes first.
+    // Resolve once the write is in memory; flush to the sources after writeDelay, coalescing writes to the same key (only the latest is written). Data is lost if the process crashes first.
     fast?: boolean;
     writeDelay?: number;
-    // Stamps the write with this last-write time instead of now. Older than the current file's
-    // time no-ops; more than 15 minutes in the future throws. See IArchives.set.
+    // Stamps the write with this last-write time instead of now. Older than the current file's time no-ops; more than 15 minutes in the future throws. See IArchives.set.
     lastModified?: number;
 };
 
-// What the storage server needs from a bucket's store. BlobStore implements it fully; ArchivesDisk
-// also satisfies it (used directly for rawDisk buckets), minus the optional index-backed methods.
+// What the storage server needs from a bucket's store. BlobStore implements it fully; ArchivesDisk also satisfies it (used directly for rawDisk buckets), minus the optional index-backed methods.
 export type IBucketStore = {
     get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined>;
     get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
@@ -105,11 +91,9 @@ type IndexEntry = {
     writeTime: number;
     size: number;
     source: number;
-    // When WE last changed this entry (not the file's write time) — what getChangesAfter filters
-    // on, so late-arriving files with old write times are still reported as changes
+    // When WE last changed this entry (not the file's write time) — what getChangesAfter filters on, so late-arriving files with old write times are still reported as changes
     changedAt: number;
-    // In-memory only (not persisted): when the file was last served, for readerDiskLimit's LRU
-    // eviction. Starts as changedAt on load.
+    // In-memory only (not persisted): when the file was last served, for readerDiskLimit's LRU eviction. Starts as changedAt on load.
     lastAccess: number;
 };
 
@@ -124,15 +108,13 @@ type SourceState = {
     lastMissCheck: number;
     // Per-slot stop token: a removed source's loops stop without touching the rest of the store
     stopped: { stop: boolean };
-    // Source slots are stable forever (index entries reference sources by slot number), so a
-    // removed source's slot stays in the arrays, marked dead - never scanned, written, or read
+    // Source slots are stable forever (index entries reference sources by slot number), so a removed source's slot stays in the arrays, marked dead - never scanned, written, or read
     dead?: boolean;
 };
 
 // One source of a live source-list update; see BlobStore.updateSources
 export type BlobSourceSpec = {
-    // Matched against ArchivesSource.identity ("disk" for the base slot); equal identities pair
-    // off in order
+    // Matched against ArchivesSource.identity ("disk" for the base slot); equal identities pair off in order
     identity: string;
     validWindow: [number, number];
     route?: [number, number];
@@ -169,11 +151,12 @@ export class BlobStore implements IBucketStore {
         private folder: string,
         private sources: ArchivesSource[],
         private config?: {
-            // Called whenever a key's index entry changes (our own writes AND files pulled in via
-            // synchronization) — how the storage server notices routing config updates.
+            // Called whenever a key's index entry changes (our own writes AND files pulled in via synchronization) — how the storage server notices routing config updates.
             onIndexChanged?: (key: string) => void;
             // LRU-bound the disk (base source) to this many bytes; see CommonConfig.readerDiskLimit
             readerDiskLimit?: number;
+            // Every accepted write ("original") and every write that actually reached the sources ("flushed"). Fast writes coalesce, so the two counts differ.
+            onWriteCounted?: (kind: "original" | "flushed", bytes: number) => void;
         }
     ) { }
 
@@ -187,18 +170,15 @@ export class BlobStore implements IBucketStore {
         }
         return wrapHandle(base);
     });
-    // The in-memory copy of the index. All reads are served from it; changes are buffered in
-    // dirty and flushed to the BulkDatabase2 in batches (undefined = delete).
+    // The in-memory copy of the index. All reads are served from it; changes are buffered in dirty and flushed to the BulkDatabase2 in batches (undefined = delete).
     private mem = new Map<string, IndexEntry>();
-    // Live totals over mem (tombstones excluded), adjusted on every mutation and recomputed on
-    // load - so any drift heals on restart. computeIndexTotals gives the walk-the-index truth.
+    // Live totals over mem (tombstones excluded), adjusted on every mutation and recomputed on load - so any drift heals on restart. computeIndexTotals gives the walk-the-index truth.
     private indexFileCount = 0;
     private indexByteCount = 0;
     // The same totals per holding source (index 0 = our disk, which readerDiskLimit bounds)
     private sourceFileCounts = this.sources.map(() => 0);
     private sourceByteCounts = this.sources.map(() => 0);
-    // Background scans / full syncs currently in progress (a Set - one source can have a change
-    // poll's full sync and a rescan overlapping)
+    // Background scans / full syncs currently in progress (a Set - one source can have a change poll's full sync and a rescan overlapping)
     private syncActivities = new Set<SyncActivity>();
     private dirty = new Map<string, IndexEntry | undefined>();
     private overlay = new Map<string, OverlayEntry>();
@@ -224,9 +204,7 @@ export class BlobStore implements IBucketStore {
         }
     });
 
-    // Stops all synchronization scans/polls and flushes pending writes. Only used when the store
-    // genuinely cannot continue (rawDisk flip, process shutdown) - routine config changes go
-    // through updateSources instead, which the store survives.
+    // Stops all synchronization scans/polls and flushes pending writes. Only used when the store genuinely cannot continue (rawDisk flip, process shutdown) - routine config changes go through updateSources instead, which the store survives.
     public async dispose(): Promise<void> {
         this.stopped.stop = true;
         for (let state of this.sourceStates) {
@@ -249,8 +227,7 @@ export class BlobStore implements IBucketStore {
             let source = sourceMap.get(entry.key);
             // Explicit checks, as 0 is a valid size and a valid source number
             if (size === undefined || source === undefined) continue;
-            // The routing config is only ever read off our own disk (see applyScanned), and a
-            // loaded bucket always has it there - a persisted entry pointing elsewhere is stale
+            // The routing config is only ever read off our own disk (see applyScanned), and a loaded bucket always has it there - a persisted entry pointing elsewhere is stale
             if (entry.key === ROUTING_FILE) {
                 source = 0;
             }
@@ -287,12 +264,7 @@ export class BlobStore implements IBucketStore {
         this.dirty.set(key, undefined);
     }
 
-    /** Applies a config change to the RUNNING store: windows/routes update in place, new sources
-     *  are added (their sync starts immediately), and removed sources' slots go dead (their scans
-     *  stop, their index entries drop). The store survives every routine config evolution - it is
-     *  never destroyed for a source-list change, only for structural flips it cannot express
-     *  (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing
-     *  immediately when it has already passed). */
+    /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
     public updateSources(specs: BlobSourceSpec[]): void {
         if (!specs.length || specs[0].identity !== "disk") {
             throw new Error(`updateSources expects the disk source first (identity "disk"), got ${JSON.stringify(specs.map(x => x.identity))} (store ${this.folder})`);
@@ -304,8 +276,7 @@ export class BlobStore implements IBucketStore {
             this.sources[i].validWindow = window;
         };
         setWindow(0, specs[0].validWindow);
-        // Live slots pair with specs by identity, in order (the same endpoint can appear several
-        // times, e.g. one entry per window)
+        // Live slots pair with specs by identity, in order (the same endpoint can appear several times, e.g. one entry per window)
         let liveByIdentity = new Map<string, number[]>();
         let originalLength = this.sources.length;
         for (let i = 1; i < originalLength; i++) {
@@ -362,9 +333,7 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    // The slot stays in the arrays forever (index entries reference sources by slot number); it
-    // just goes dead - loops stop, and its index entries drop (other sources' scans re-find any
-    // copy that's still reachable through the new config)
+    // The slot stays in the arrays forever (index entries reference sources by slot number); it just goes dead - loops stop, and its index entries drop (other sources' scans re-find any copy that's still reachable through the new config)
     private removeSource(sourceIndex: number): void {
         let state = this.sourceStates[sourceIndex];
         let source = this.sources[sourceIndex].source;
@@ -381,16 +350,13 @@ export class BlobStore implements IBucketStore {
         console.log(`Removed sync source ${source.getDebugName()} (store ${this.folder}): its scans are stopped and ${dropped} index entries it held were dropped`);
     }
 
-    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
-     *  another process wrote files to the shared folder that our index hasn't seen. */
+    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
     public async rescanBase(): Promise<void> {
         await this.init();
         await this.scanSource(0);
     }
 
-    /** A boundary scan of the node that owned (part of) our route in the valid window before ours,
-     *  when that node is different storage (a disk rescan can't see its writes): just its changes
-     *  since the boundary neighborhood, with matching values pulled onto our own disk. */
+    /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
     public async boundaryScanRemote(source: IArchives, config: { since: number; route?: [number, number] }): Promise<void> {
         await this.init();
         let scanStart = Date.now();
@@ -457,8 +423,7 @@ export class BlobStore implements IBucketStore {
         };
     }
 
-    /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to
-     *  any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
+    /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
     public async computeIndexTotals(): Promise<{
         fileCount: number;
         byteCount: number;
@@ -535,8 +500,7 @@ export class BlobStore implements IBucketStore {
                 await this.pollChanges(sourceIndex);
                 if (!noFullSync()) await this.copySourceFiles(sourceIndex);
             }, state.stopped);
-            // Change polls only show what the source HAS, never what it's missing, so pushes run on
-            // the full-rescan cadence (findInfo on an index-backed source is cheap)
+            // Change polls only show what the source HAS, never what it's missing, so pushes run on the full-rescan cadence (findInfo on an index-backed source is cheap)
             runInfinitePoll(FULL_RESCAN_INTERVAL, async () => {
                 let files = await source.findInfo("");
                 await this.reconcileSource(sourceIndex, new Map(files.map(x => [x.path, x.createTime])));
@@ -550,8 +514,7 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    // Full metadata scan (size, writeTime, path) of one source, applied to the index. Returns the
-    // source's listing (path -> write time), which reconcileSource uses for the push direction.
+    // Full metadata scan (size, writeTime, path) of one source, applied to the index. Returns the source's listing (path -> write time), which reconcileSource uses for the push direction.
     private async scanSource(sourceIndex: number): Promise<Map<string, number>> {
         let { source, validWindow, route } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
@@ -584,10 +547,7 @@ export class BlobStore implements IBucketStore {
             tally[this.applyScanned(sourceIndex, file)]++;
         }
         state.scannedCount = files.length;
-        // Index entries this source was the holder of, but that vanished from it (e.g. deleted
-        // while we were offline), come out of the index. Entries changed after the scan started
-        // are kept — the scan listing may simply predate them. Tombstones have no physical file
-        // for a listing to vouch for, so they're exempt (cleanupTombstones expires them instead).
+        // Index entries this source was the holder of, but that vanished from it (e.g. deleted while we were offline), come out of the index. Entries changed after the scan started are kept — the scan listing may simply predate them. Tombstones have no physical file for a listing to vouch for, so they're exempt (cleanupTombstones expires them instead).
         let removedFromIndex = 0;
         let missingOnSource = 0;
         for (let [key, entry] of this.mem) {
@@ -597,15 +557,13 @@ export class BlobStore implements IBucketStore {
                 removedFromIndex++;
                 continue;
             }
-            // Counted only when the source SHOULD hold the entry (its window/route match) - these
-            // are what the reconcile pass pushes to it
+            // Counted only when the source SHOULD hold the entry (its window/route match) - these are what the reconcile pass pushes to it
             if (entry.size === 0 || key === ROUTING_FILE) continue;
             if (entry.writeTime < validWindow[0] || entry.writeTime > validWindow[1]) continue;
             if (!routeContains(route, getRoute(key))) continue;
             missingOnSource++;
         }
-        // Percentages are of the union of both sides (our index + their listing), so every count
-        // has a stable denominator
+        // Percentages are of the union of both sides (our index + their listing), so every count has a stable denominator
         let union = indexSizeBefore + newPaths;
         let pct = (n: number) => `${Math.round(n / Math.max(union, 1) * 1000) / 10}%`;
         console.log(`Metadata scan of ${source.getDebugName()} finished in ${Math.round((Date.now() - scanStart) / 1000)}s (store ${this.folder}): ${files.length} listed vs ${indexSizeBefore} indexed (union ${union}): ${formatScanTally(tally, union)}, ${missingOnSource} in index but missing on source (${pct(missingOnSource)}), ${removedFromIndex} removed from index (${pct(removedFromIndex)})`);
@@ -613,10 +571,7 @@ export class BlobStore implements IBucketStore {
         return seen;
     }
 
-    // The push direction of synchronization: everything we know that the source is missing (or
-    // holds an older copy of) is written to it — including deletions, as tombstone writes. This is
-    // what heals a source whose background writes failed (e.g. it was down): the next scan sees
-    // what's missing and re-sends it.
+    // The push direction of synchronization: everything we know that the source is missing (or holds an older copy of) is written to it — including deletions, as tombstone writes. This is what heals a source whose background writes failed (e.g. it was down): the next scan sees what's missing and re-sends it.
     private async reconcileSource(sourceIndex: number, listing: Map<string, number>): Promise<void> {
         let { source, validWindow, route } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
@@ -625,8 +580,7 @@ export class BlobStore implements IBucketStore {
             for (let [key, entry] of this.mem) {
                 if (this.stopped.stop || state.stopped.stop) return;
                 if (entry.source === sourceIndex) continue;
-                // The routing file is NEVER synchronized between storage nodes - it is only ever
-                // written directly to each node, and only ever read off our own disk
+                // The routing file is NEVER synchronized between storage nodes - it is only ever written directly to each node, and only ever read off our own disk
                 if (key === ROUTING_FILE) continue;
                 if (!acceptsWrites) continue;
                 if (!routeContains(route, getRoute(key))) continue;
@@ -652,11 +606,7 @@ export class BlobStore implements IBucketStore {
         // An in-flight scan can outlive its source's removal; its results are dead
         if (!this.isLive(sourceIndex)) return "filtered";
         if (file.path === ROUTING_FILE) {
-            // The routing config is NEVER pulled from other sources - it only ever arrives as an
-            // explicit, version-validated write, and is only ever read off our own disk. Route and
-            // valid-window filters can't possibly apply to it either: it is the file DEFINING
-            // them, so filtering it would mean certain sources could never have their routing
-            // config updated, ever.
+            // The routing config is NEVER pulled from other sources - it only ever arrives as an explicit, version-validated write, and is only ever read off our own disk. Route and valid-window filters can't possibly apply to it either: it is the file DEFINING them, so filtering it would mean certain sources could never have their routing config updated, ever.
             if (sourceIndex !== 0) return "filtered";
         } else {
             let { validWindow, route } = this.sources[sourceIndex];
@@ -692,9 +642,7 @@ export class BlobStore implements IBucketStore {
         state.changesAfterTime = pollStart - CHANGES_POLL_OVERLAP;
     }
 
-    // Downloads the files a source currently holds onto our own base source (the local disk),
-    // preserving their modified times — so a newer local write always wins. Skipped for noFullSync
-    // sources (fronting a large database without copying it); reads still down-cache lazily.
+    // Downloads the files a source currently holds onto our own base source (the local disk), preserving their modified times — so a newer local write always wins. Skipped for noFullSync sources (fronting a large database without copying it); reads still down-cache lazily.
     private async copySourceFiles(sourceIndex: number): Promise<void> {
         if (sourceIndex === 0) return;
         let { source } = this.sources[sourceIndex];
@@ -779,16 +727,12 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    // findInfo and getChangesAfter list from the index, so they must wait for our own base
-    // source's initial scan (which might lag minutes) before the listing is trustworthy. The base
-    // (local disk) is implicitly required - remote sources are not, they come and go.
+    // findInfo and getChangesAfter list from the index, so they must wait for our own base source's initial scan (which might lag minutes) before the listing is trustworthy. The base (local disk) is implicitly required - remote sources are not, they come and go.
     private async waitForRequiredScans(): Promise<void> {
         await this.sourceStates[0].initialScan.promise;
     }
 
-    // A requested file isn't in the index: our own base source (implicitly required) is checked
-    // directly if its initial scan hasn't finished, and changes-after sources are re-polled (at
-    // most every 5 seconds)
+    // A requested file isn't in the index: our own base source (implicitly required) is checked directly if its initial scan hasn't finished, and changes-after sources are re-polled (at most every 5 seconds)
     private async checkMissingKey(key: string): Promise<void> {
         for (let i = 0; i < this.sources.length; i++) {
             if (!this.isLive(i)) continue;
@@ -859,14 +803,12 @@ export class BlobStore implements IBucketStore {
             }
             return result;
         }
-        // The routing file is only ever read off our own disk - falling back to another source's
-        // copy would synchronize it between nodes through the read path, which it never is
+        // The routing file is only ever read off our own disk - falling back to another source's copy would synchronize it between nodes through the read path, which it never is
         if (key === ROUTING_FILE) {
             if (holderError) throw holderError;
             return undefined;
         }
-        // The holder is down or lost the file. ANY other source's copy beats no value - even an
-        // OLDER one - and it's copied onto our disk so the next read doesn't depend on luck.
+        // The holder is down or lost the file. ANY other source's copy beats no value - even an OLDER one - and it's copied onto our disk so the next read doesn't depend on luck.
         for (let i = 0; i < this.sources.length; i++) {
             if (i === holder || !this.isLive(i)) continue;
             let fallback: { data: Buffer; writeTime: number; size: number } | undefined;
@@ -889,8 +831,7 @@ export class BlobStore implements IBucketStore {
         return undefined;
     }
 
-    // The read's bytes came from a remote source, so write them onto our own base source (the
-    // local disk), which becomes the entry's new holder - reads only pay the remote fetch once
+    // The read's bytes came from a remote source, so write them onto our own base source (the local disk), which becomes the entry's new holder - reads only pay the remote fetch once
     private async cacheRead(key: string, result: { data: Buffer; writeTime: number }): Promise<void> {
         await this.sources[0].source.set(key, result.data, { lastModified: result.writeTime });
         this.setIndexEntry(key, { writeTime: result.writeTime, size: result.data.length, source: 0 });
@@ -898,6 +839,7 @@ export class BlobStore implements IBucketStore {
 
     public async set(key: string, data: Buffer, config?: WriteConfig): Promise<string> {
         await this.init();
+        this.config?.onWriteCounted?.("original", data.length);
         let lastModified = config?.lastModified;
         if (lastModified) {
             assertValidLastModified(lastModified);
@@ -909,16 +851,12 @@ export class BlobStore implements IBucketStore {
         }
         let writeTime = lastModified || Date.now();
         if (config?.fast) {
-            // A writeDelay of zero is a real choice (no delay at all), so only an omitted delay
-            // gets the default
+            // A writeDelay of zero is a real choice (no delay at all), so only an omitted delay gets the default
             let writeDelay = config.writeDelay;
             if (writeDelay === undefined) {
                 writeDelay = DEFAULT_FAST_WRITE_DELAY;
             }
-            // The delay never extends past our own valid window's end (minus the margin, so the
-            // writes are on disk before the next window's source takes over - a deploy switchover
-            // is just this too, since its remap ends our window). Past that point fast writes
-            // write through immediately.
+            // The delay never extends past our own valid window's end (minus the margin, so the writes are on disk before the next window's source takes over - a deploy switchover is just this too, since its remap ends our window). Past that point fast writes write through immediately.
             let deadline = this.sources[0].validWindow[1] - WINDOW_END_FLUSH_MARGIN;
             if (writeDelay > 0 && Date.now() < deadline) {
                 let flushAt = Math.min(Date.now() + writeDelay, deadline);
@@ -935,9 +873,7 @@ export class BlobStore implements IBucketStore {
     }
 
     public async del(key: string, config?: WriteConfig): Promise<void> {
-        // Deletes are tombstone writes (an empty file IS a missing file): the size-0 index entry is
-        // ordered by write time like any other write, propagates through synchronization, and
-        // expires after TOMBSTONE_EXPIRY
+        // Deletes are tombstone writes (an empty file IS a missing file): the size-0 index entry is ordered by write time like any other write, propagates through synchronization, and expires after TOMBSTONE_EXPIRY
         await this.set(key, Buffer.alloc(0), config);
     }
 
@@ -952,19 +888,15 @@ export class BlobStore implements IBucketStore {
     }
 
     private async writeToSources(key: string, data: Buffer, writeTime: number): Promise<void> {
-        // The routing file is NEVER synchronized between storage nodes: the writer writes it
-        // directly to each node, so we store it on our own disk only (no valid-window filter -
-        // routing/valid windows can't possibly apply to the file defining them) and never forward
-        // it to other sources.
+        // The routing file is NEVER synchronized between storage nodes: the writer writes it directly to each node, so we store it on our own disk only (no valid-window filter - routing/valid windows can't possibly apply to the file defining them) and never forward it to other sources.
+        this.config?.onWriteCounted?.("flushed", data.length);
         let isRouting = key === ROUTING_FILE;
         let writable = this.getWritableSources({ ignoreWindow: isRouting });
         let first = writable.shift();
         if (first === undefined) {
             throw new Error(`No source accepts writes (every source's valid window is in the past), so writes cannot be stored (store ${this.folder})`);
         }
-        // Only our own (first) source blocks the write. Downstream sources are written in the
-        // background: a down downstream source must not fail or stall writes, and reconcileSource
-        // re-sends anything they missed once they come back.
+        // Only our own (first) source blocks the write. Downstream sources are written in the background: a down downstream source must not fail or stall writes, and reconcileSource re-sends anything they missed once they come back.
         if (data.length === 0) {
             // A tombstone stores nothing on our own source - the index entry alone records it
             await this.sources[first].source.del(key);
@@ -976,8 +908,7 @@ export class BlobStore implements IBucketStore {
         let route = getRoute(key);
         for (let i of writable) {
             if (!routeContains(this.sources[i].route, route)) continue;
-            // Downstream sources receive tombstones as actual empty writes, so their listings show
-            // the deletion (size 0) and other stores scan it in as a tombstone
+            // Downstream sources receive tombstones as actual empty writes, so their listings show the deletion (size 0) and other stores scan it in as a tombstone
             void this.sources[i].source.set(key, data, { lastModified: writeTime }).catch((e: Error) => {
                 console.error(`Background write of ${key} to sync source ${this.sources[i].source.getDebugName()} failed: ${e.stack ?? e}`);
             });
@@ -1018,10 +949,7 @@ export class BlobStore implements IBucketStore {
         return files;
     }
 
-    // All files changed after the given time — fast, straight from the in-memory index. Filters on
-    // when WE learned of the change (changedAt), so files synchronized late (with old write times)
-    // are still reported. Deletions ARE reported, as size-0 tombstone entries — that's how they
-    // propagate to stores syncing from us.
+    // All files changed after the given time — fast, straight from the in-memory index. Filters on when WE learned of the change (changedAt), so files synchronized late (with old write times) are still reported. Deletions ARE reported, as size-0 tombstone entries — that's how they propagate to stores syncing from us.
     public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
         await this.init();
         await this.waitForRequiredScans();
@@ -1098,10 +1026,7 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    // readerDiskLimit: the disk is only a bounded read cache, so once it exceeds the limit, the
-    // least recently used files are deleted from it - but ONLY when another source verifiably
-    // holds a same-or-newer copy (the only copy of a file is never deleted), and the index entry
-    // repoints to that source so reads keep working (re-caching on the next read).
+    // readerDiskLimit: the disk is only a bounded read cache, so once it exceeds the limit, the least recently used files are deleted from it - but ONLY when another source verifiably holds a same-or-newer copy (the only copy of a file is never deleted), and the index entry repoints to that source so reads keep working (re-caching on the next read).
     private evicting = false;
     private async enforceDiskLimit(): Promise<void> {
         let limit = this.config?.readerDiskLimit;
@@ -1148,10 +1073,7 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    // Tombstones only need to exist long enough for every store to learn of the deletion; expired
-    // ones come out of the index. The physical empty file is removed only on backblaze sources:
-    // remote stores expire their own tombstones (a del there would just mint a fresh one), and our
-    // own disk never stored anything for it.
+    // Tombstones only need to exist long enough for every store to learn of the deletion; expired ones come out of the index. The physical empty file is removed only on backblaze sources: remote stores expire their own tombstones (a del there would just mint a fresh one), and our own disk never stored anything for it.
     private async cleanupTombstones(): Promise<void> {
         let cutoff = Date.now() - TOMBSTONE_EXPIRY;
         for (let [key, entry] of this.mem) {

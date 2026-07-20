@@ -94,11 +94,7 @@ let formatters: { [formatter in StringFormatters]: (value: unknown) => preact.Co
     },
     guess: (value) => {
         if (typeof value === "number") {
-            // NOTE: These special values don't represent real values, and if they are shown
-            //  to the user, it is a mistake anyways. So instead of showing a large number
-            //  that is not meaningful to the user, we show a string, so they the issue
-            //  is not the system having a large number, but the system not changing
-            //  the default value.
+            // NOTE: These special values don't represent real values, and if they are shown to the user, it is a mistake anyways. So instead of showing a large number that is not meaningful to the user, we show a string, so they the issue is not the system having a large number, but the system not changing the default value.
             if (value === Number.MAX_SAFE_INTEGER) {
                 return "Number.MAX_SAFE_INTEGER";
             }
@@ -111,9 +107,7 @@ let formatters: { [formatter in StringFormatters]: (value: unknown) => preact.Co
             if (value === Number.MIN_VALUE) {
                 return "Number.MIN_VALUE";
             }
-            // Infinity should be somewhat understood by the user, if they are even a little
-            //  bit literate. Of course, the value is likely a bug, but at least the consequences
-            //  may be inferrable (the threshold is +Infinity, so it will never be reached, etc).
+            // Infinity should be somewhat understood by the user, if they are even a little bit literate. Of course, the value is likely a bug, but at least the consequences may be inferrable (the threshold is +Infinity, so it will never be reached, etc).
             if (value === Number.POSITIVE_INFINITY) {
                 return "+Infinity";
             }

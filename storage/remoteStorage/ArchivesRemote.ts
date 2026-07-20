@@ -11,10 +11,7 @@ import {
     STORAGE_NOT_AUTHENTICATED, STORAGE_ACCESS_DENIED,
 } from "./storageController";
 
-// A bucket on our remote storage server (storageServer.ts), used like ArchivesBackblaze. Works in
-// Node.js and the browser. Authenticates with this machine's certs.ts identity; if the account
-// hasn't trusted this machine yet it requests access, and by default waits, logging instructions
-// every minute (calls block until access is granted).
+// A bucket on our remote storage server (storageServer.ts), used like ArchivesBackblaze. Works in Node.js and the browser. Authenticates with this machine's certs.ts identity; if the account hasn't trusted this machine yet it requests access, and by default waits, logging instructions every minute (calls block until access is granted).
 
 const ACCESS_RETRY_DELAY = 1000 * 30;
 const LARGE_FILE_PART_SIZE = 8 * 1024 * 1024;
@@ -23,10 +20,7 @@ export type ArchivesRemoteConfig = {
     // The bucket's routing URL, which addresses the server, account, and bucket in one:
     //  https://storage.example.com:4444/file/<account>/<bucketName>/storage/storagerouting.json
     url: string;
-    // Access is checked against this account (defaults to the account in the url)
-    accountName?: string;
-    // false: access-denied calls throw immediately (the error includes the access page link)
-    // instead of requesting access and blocking until it is granted (the default).
+    // false: access-denied calls throw immediately (the error includes the access page link) instead of requesting access and blocking until it is granted (the default).
     waitForAccess?: boolean;
 };
 
@@ -40,8 +34,7 @@ export function parseStorageUrl(url: string): { address: string; port: number } 
 
 // Authenticates a connection to a storage server with this machine's certs.ts identity
 export async function authenticateStorage(config: { address: string; port: number; nodeId: string }): Promise<{ machineId: string; ip: string }> {
-    // hostServer nodeIds are machine-specific, so connections by domain must target "any server
-    // at this address" (which is how browsers always connect)
+    // hostServer nodeIds are machine-specific, so connections by domain must target "any server at this address" (which is how browsers always connect)
     SocketFunction.ENABLE_CLIENT_MODE = true;
     let rootDomain = config.address.split(".").slice(-2).join(".");
     await loadIdentityCA(rootDomain);
@@ -57,13 +50,12 @@ export async function authenticateStorage(config: { address: string; port: numbe
 
 export class ArchivesRemote implements IArchives {
     constructor(private config: ArchivesRemoteConfig) {
-        // hostServer nodeIds are machine-specific, so connections by domain must target "any
-        // server at this address" (which is how browsers always connect)
+        // hostServer nodeIds are machine-specific, so connections by domain must target "any server at this address" (which is how browsers always connect)
         SocketFunction.ENABLE_CLIENT_MODE = true;
     }
 
     private parsed = parseHostedUrl(this.config.url);
-    private account = this.config.accountName || this.parsed.account;
+    private account = this.parsed.account;
     private bucketName = this.parsed.bucketName;
     private nodeId = SocketFunction.connect({ address: this.parsed.address, port: this.parsed.port });
     private controller = RemoteStorageController.nodes[this.nodeId];
@@ -77,7 +69,7 @@ export class ArchivesRemote implements IArchives {
         return SocketFunction.isNodeConnected(this.nodeId);
     }
 
-    public async ping(): Promise<{ takeover?: string }> {
+    public async ping(): Promise<{}> {
         return await this.controller.ping();
     }
 
@@ -85,8 +77,7 @@ export class ArchivesRemote implements IArchives {
         await authenticateStorage({ address: this.parsed.address, port: this.parsed.port, nodeId: this.nodeId });
     }
 
-    // Runs a call, authenticating (and re-authenticating after reconnects) as needed. Unlike
-    // call(), does NOT wait for account access.
+    // Runs a call, authenticating (and re-authenticating after reconnects) as needed. Unlike call(), does NOT wait for account access.
     private async callAuthed<T>(fnc: () => Promise<T>): Promise<T> {
         try {
             return await fnc();
@@ -97,9 +88,7 @@ export class ArchivesRemote implements IArchives {
         }
     }
 
-    // Returns undefined if this machine has access to the account. Otherwise puts in an access
-    // request and returns our machineId + ip (so the caller can display them alongside the link,
-    // for the approver to match the incoming request) and the link to the grant page.
+    // Returns undefined if this machine has access to the account. Otherwise puts in an access request and returns our machineId + ip (so the caller can display them alongside the link, for the approver to match the incoming request) and the link to the grant page.
     public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
         let state = await this.callAuthed(() => this.controller.getAccessState(this.account));
         if (state.hasAccess) return undefined;
@@ -116,8 +105,7 @@ export class ArchivesRemote implements IArchives {
         return !!state.hasAccess;
     }
 
-    // Registers our access request server-side (so an admin has a requestId to grant) and logs the
-    // grant instructions, at most once a minute
+    // Registers our access request server-side (so an admin has a requestId to grant) and logs the grant instructions, at most once a minute
     private async registerAccessRequest(): Promise<void> {
         let requested = await this.callAuthed(() => this.controller.requestAccess(this.account));
         if (Date.now() - this.lastDeniedLog > timeInMinute) {
@@ -126,9 +114,7 @@ export class ArchivesRemote implements IArchives {
         }
     }
 
-    // Runs a call, authenticating (and re-authenticating after reconnects) and waiting for account
-    // access as needed. With waitForAccess false, denied calls throw immediately instead - but the
-    // access request is still registered (in the background), so the denial is grantable.
+    // Runs a call, authenticating (and re-authenticating after reconnects) and waiting for account access as needed. With waitForAccess false, denied calls throw immediately instead - but the access request is still registered (in the background), so the denial is grantable.
     private async call<T>(fnc: () => Promise<T>): Promise<T> {
         while (true) {
             try {
@@ -188,8 +174,7 @@ export class ArchivesRemote implements IArchives {
     }
 
     public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
-        // Ensure we're authenticated with access BEFORE consuming any data (the stream cannot be
-        // rewound, so we can't use the retry loop around the actual upload)
+        // Ensure we're authenticated with access BEFORE consuming any data (the stream cannot be rewound, so we can't use the retry loop around the actual upload)
         await this.call(() => this.controller.getInfo(this.account, this.bucketName, config.path));
         let uploadId = await this.controller.startLargeFile(this.account, this.bucketName, config.path);
         try {
