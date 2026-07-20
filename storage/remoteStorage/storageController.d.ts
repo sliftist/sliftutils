@@ -36,6 +36,9 @@ export type AccessState = {
     grantAccessCommand?: string;
     trustedMachines?: TrustRecord[];
 };
+/** Called by storageServerState the moment any routing config is applied - clients must never
+ *  have to wait for a poll to learn the topology changed. */
+export declare function broadcastRoutingChanged(): void;
 export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
     ping: () => Promise<{
         takeover?: string;

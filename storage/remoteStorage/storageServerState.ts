@@ -14,6 +14,7 @@ import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfig
 import { applyDeployRemap, getTakeoverAltPort, getOwnWindowEndClip, onTakeoverEvent } from "./deployTakeover";
 import { createApiArchives } from "./createArchives";
 import type { IStorage } from "../IStorage";
+import { broadcastRoutingChanged } from "./storageController";
 import type { AccessRequest, TrustRecord } from "./storageController";
 import { getArg } from "./cliArgs";
 
@@ -563,17 +564,6 @@ export function getLoadedBucket(account: string, bucketName: string): Promise<Lo
     return loaded;
 }
 
-// Called whenever any bucket's routing config is applied (created, updated in place, or rebuilt).
-// storageController wires this to its connected-client broadcast, so every client is pushed the
-// change immediately - never waiting for a poll. (A callback, not an import - storageController
-// imports us, so importing it back would be a cycle.)
-let routingChangedBroadcaster: (() => void) | undefined;
-export function setRoutingChangedBroadcaster(broadcaster: () => void): void {
-    routingChangedBroadcaster = broadcaster;
-}
-function notifyRoutingChanged(): void {
-    routingChangedBroadcaster?.();
-}
 
 // Routing reloads are serialized per bucket, so concurrent writes/syncs can't rebuild the same
 // store twice in parallel
@@ -622,7 +612,7 @@ async function checkRoutingChanged(account: string, bucketName: string, config?:
         buckets.set(key, Promise.resolve(updated));
         scheduleWindowBoundaryRebuild(updated);
         scheduleBoundaryScans(updated);
-        notifyRoutingChanged();
+        broadcastRoutingChanged();
         return;
     }
     console.log(`Rebuilding the store for bucket ${key} (${reason})`);
@@ -630,7 +620,7 @@ async function checkRoutingChanged(account: string, bucketName: string, config?:
         await loaded.store.dispose();
     }
     buckets.set(key, Promise.resolve(buildBucket(account, bucketName, routing, plan)));
-    notifyRoutingChanged();
+    broadcastRoutingChanged();
 }
 
 // Per-write options are evaluated at the WRITE's time (and the key's route), not the current
@@ -671,7 +661,7 @@ async function writeRoutingConfig(account: string, bucketName: string, data: Buf
     if (!loaded) {
         await new ArchivesDisk(getBucketFolder(account, bucketName)).set(ROUTING_FILE, data, { lastModified: config?.lastModified });
         buckets.set(key, Promise.resolve(buildBucket(account, bucketName, incoming)));
-        notifyRoutingChanged();
+        broadcastRoutingChanged();
         console.log(`Created bucket ${key}`);
         return;
     }

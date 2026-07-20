@@ -37,7 +37,6 @@ export type LoadedBucket = {
 };
 export declare function addExtraListenPort(port: number): void;
 export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
-export declare function setRoutingChangedBroadcaster(broadcaster: () => void): void;
 export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
 export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
     lastModified?: number;

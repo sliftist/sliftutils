@@ -3487,6 +3487,9 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         grantAccessCommand?: string;
         trustedMachines?: TrustRecord[];
     };
+    /** Called by storageServerState the moment any routing config is applied - clients must never
+     *  have to wait for a poll to learn the topology changed. */
+    export declare function broadcastRoutingChanged(): void;
     export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
         ping: () => Promise<{
             takeover?: string;
@@ -3609,7 +3612,6 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     };
     export declare function addExtraListenPort(port: number): void;
     export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
-    export declare function setRoutingChangedBroadcaster(broadcaster: () => void): void;
     export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
     export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
         lastModified?: number;

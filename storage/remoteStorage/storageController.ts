@@ -14,7 +14,7 @@ import { getTakeoverStamp } from "./deployTakeover";
 import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
     deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
-    getBucketConfig, listAccountBuckets, ServerBucketInfo, setRoutingChangedBroadcaster,
+    getBucketConfig, listAccountBuckets, ServerBucketInfo,
 } from "./storageServerState";
 import { StorageClientController } from "./storageClientController";
 
@@ -119,9 +119,9 @@ function trackCaller(): void {
     });
 }
 
-// The moment any routing config changes on this server, every connected client is told - clients
-// must never have to wait for a poll to learn the topology changed
-setRoutingChangedBroadcaster(() => {
+/** Called by storageServerState the moment any routing config is applied - clients must never
+ *  have to wait for a poll to learn the topology changed. */
+export function broadcastRoutingChanged(): void {
     console.log(`Broadcasting routing config change to ${connectedClients.size} connected clients`);
     for (let nodeId of [...connectedClients]) {
         void StorageClientController.nodes[nodeId].routingConfigChanged().catch(() => {
@@ -129,7 +129,7 @@ setRoutingChangedBroadcaster(() => {
             // cleans the registry, nothing to do here
         });
     }
-});
+}
 
 function getCallerMachineId(): string {
     let caller = SocketFunction.getCaller();
