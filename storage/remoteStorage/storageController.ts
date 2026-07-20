@@ -14,8 +14,9 @@ import { getTakeoverStamp } from "./deployTakeover";
 import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
     deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
-    getBucketConfig, listAccountBuckets, ServerBucketInfo,
+    getBucketConfig, listAccountBuckets, ServerBucketInfo, setRoutingChangedBroadcaster,
 } from "./storageServerState";
+import { StorageClientController } from "./storageClientController";
 
 // The remote storage server's API. Authentication uses certs.ts machine identities: a client
 // proves it owns its machine key by signing a timestamped token (bound to this server, so tokens
@@ -105,6 +106,31 @@ function assertValidPath(path: string) {
     }
 }
 
+// Every client pings us (immediately on connect, then continuously), so pings tell us exactly who
+// our currently-connected clients are. Client nodeIds never reconnect (a reconnect is a NEW
+// nodeId), so the disconnect callback fully cleans an entry up.
+const connectedClients = new Set<string>();
+function trackCaller(): void {
+    let nodeId = SocketFunction.getCaller().nodeId;
+    if (connectedClients.has(nodeId)) return;
+    connectedClients.add(nodeId);
+    SocketFunction.onNextDisconnect(nodeId, () => {
+        connectedClients.delete(nodeId);
+    });
+}
+
+// The moment any routing config changes on this server, every connected client is told - clients
+// must never have to wait for a poll to learn the topology changed
+setRoutingChangedBroadcaster(() => {
+    console.log(`Broadcasting routing config change to ${connectedClients.size} connected clients`);
+    for (let nodeId of [...connectedClients]) {
+        void StorageClientController.nodes[nodeId].routingConfigChanged().catch(() => {
+            // The client is gone (or too old to know the controller); the disconnect callback
+            // cleans the registry, nothing to do here
+        });
+    }
+});
+
 function getCallerMachineId(): string {
     let caller = SocketFunction.getCaller();
     let machineId = sessions.get(caller.nodeId);
@@ -155,8 +181,10 @@ async function getBucket(account: string, bucketName: string): Promise<LoadedBuc
 class RemoteStorageControllerBase {
     // Latency measurement (see SourceWrapper's pinging); no auth, it measures the transport. The
     // takeover stamp piggybacks on it so every connected client learns of a deploy takeover
-    // within one ping interval.
+    // within one ping interval. Pings also tell us who our clients ARE - the trackCaller
+    // registry is what routing-change broadcasts push to.
     async ping(): Promise<{ takeover?: string }> {
+        trackCaller();
         return { takeover: getTakeoverStamp() };
     }
 

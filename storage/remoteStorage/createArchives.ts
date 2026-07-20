@@ -14,6 +14,7 @@ import {
 } from "./remoteConfig";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { ArchivesRemote, parseStorageUrl, authenticateStorage } from "./ArchivesRemote";
+import { onServerRoutingChanged } from "./storageClientController";
 import { ArchivesBackblaze } from "../backblaze";
 import { getStorageServerConfigOptional, getLocalArchives, ServerBucketInfo } from "./storageServerState";
 import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageController";
@@ -87,10 +88,17 @@ export class ArchivesChain implements IArchives {
     private initRetryTimer: ReturnType<typeof setTimeout> | undefined;
     private pollTimer: ReturnType<typeof setInterval> | undefined;
     private disposed = false;
+    private unsubscribeRoutingPush: (() => void) | undefined;
 
     constructor(config: RemoteConfig | RemoteConfigBase) {
         this.configured = normalizeRemoteConfig(config);
         this.activeConfig = this.configured;
+        // Servers broadcast to their connected clients the moment a routing config changes; the
+        // push runs the exact same refresh the poll does, just immediately
+        this.unsubscribeRoutingPush = onServerRoutingChanged(() => {
+            console.log(`A storage server broadcast a routing config change; refreshing config for ${this.getDebugName()}`);
+            void this.refreshActiveConfig().catch((e: Error) => console.error(`Config refresh failed for ${this.getDebugName()}: ${e.stack ?? e}`));
+        });
     }
 
     public getDebugName() {
@@ -226,7 +234,14 @@ export class ArchivesChain implements IArchives {
                         for (let source of sources) {
                             if (writtenUrls.has(source.config.url)) continue;
                             writtenUrls.add(source.config.url);
+                        }
+                        console.log(`Storage routing config for ${this.getDebugName()} is out of date (stored version ${existing && getConfigVersion(existing) || "none"}, ours ${getConfigVersion(this.configured)}): writing ours to all ${writtenUrls.size} nodes (write time ${new Date(routingWriteTime).toISOString()}): ${[...writtenUrls].join(", ")}`);
+                        writtenUrls.clear();
+                        for (let source of sources) {
+                            if (writtenUrls.has(source.config.url)) continue;
+                            writtenUrls.add(source.config.url);
                             await source.write(archives => archives.set(ROUTING_FILE, routingData, { lastModified: routingWriteTime }));
+                            console.log(`Wrote storage routing config version ${getConfigVersion(this.configured)} to ${source.config.url}`);
                         }
                     } catch (e) {
                         for (let source of sources) {
@@ -701,11 +716,46 @@ export class ArchivesChain implements IArchives {
      *  are automatically materialized (a shard value is picked and embedded, see setVariableShard)
      *  and the caller needs the returned key to ever read the value back. */
     public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
+        if (fileName === ROUTING_FILE) {
+            return await this.setRoutingConfig(data, config);
+        }
         if (fileName.includes(VARIABLE_SHARD) && parseVariableRoute(fileName) === undefined) {
             return await this.setVariableShard(fileName, data, config);
         }
         await this.request({ write: true, route: getRoute(fileName) }, archives => archives.set(fileName, data, config));
         return fileName;
+    }
+
+    // The routing config is NEVER synchronized between nodes, so a chain-level write of it goes
+    // directly to EVERY node - first-valid-source routing would leave every other node on the old
+    // config forever. One shared write time, so each node resolves latest-write-time-wins
+    // identically. Afterwards we immediately run the same refresh the config poll uses: the
+    // update must apply to us now, not whenever the poll would have noticed.
+    private async setRoutingConfig(data: Buffer, config?: { lastModified?: number }): Promise<string> {
+        let state = await this.getState();
+        // Parse first, so a malformed config fails before any node stores it
+        let incoming = parseRoutingData(data);
+        let writeTime = config?.lastModified || Date.now();
+        let written: string[] = [];
+        let errors: string[] = [];
+        let seen = new Set<string>();
+        console.log(`Writing storage routing config version ${getConfigVersion(incoming)} for ${this.getDebugName()} to every node (write time ${new Date(writeTime).toISOString()})`);
+        for (let source of state.sources) {
+            if (seen.has(source.config.url)) continue;
+            seen.add(source.config.url);
+            try {
+                await source.write(archives => archives.set(ROUTING_FILE, data, { lastModified: writeTime }));
+                written.push(source.config.url);
+                console.log(`Wrote storage routing config version ${getConfigVersion(incoming)} to ${source.config.url}`);
+            } catch (e) {
+                errors.push(`${source.config.url}: ${(e as Error).stack ?? e}`);
+            }
+        }
+        await this.refreshActiveConfig();
+        if (errors.length) {
+            throw new Error(`Storage routing config write for ${this.getDebugName()} failed on ${errors.length} of ${seen.size} nodes (succeeded on: ${written.join(", ") || "none"}): ${errors.join(" | ")}`);
+        }
+        return ROUTING_FILE;
     }
     public async del(fileName: string): Promise<void> {
         await this.request({ write: true, route: getRoute(fileName) }, archives => archives.del(fileName));
@@ -802,6 +852,7 @@ export class ArchivesChain implements IArchives {
 
     public dispose(): void {
         this.disposed = true;
+        this.unsubscribeRoutingPush?.();
         if (this.pollTimer) {
             clearInterval(this.pollTimer);
         }
