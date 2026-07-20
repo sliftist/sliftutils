@@ -76,6 +76,19 @@ export type ServerBucketInfo = {
     config?: ArchivesConfig;
     error?: string;
 };
+export type ActiveBucketInfo = {
+    folder: string;
+    /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
+    routing: RemoteConfig;
+    /** Our own entries in that config, and the one currently valid */
+    selfEntries: HostedConfig[];
+    self?: HostedConfig;
+    config: ArchivesConfig;
+};
+/** The live in-memory state of ONE bucket, answered without touching the disk (no routing file read, no statfs, no stored write stats). Returns an error string when the bucket is not loaded here, which is the normal state for a bucket nothing has accessed since startup. */
+export declare function getActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
+/** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
+export declare function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
 export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
 export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
 export declare function getLocalArchives(account: string, bucketName: string): IArchives;

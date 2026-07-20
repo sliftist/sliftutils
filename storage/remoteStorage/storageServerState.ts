@@ -818,48 +818,123 @@ async function getDiskInfo(folder: string): Promise<BucketDiskInfo> {
     };
 }
 
+export type ActiveBucketInfo = {
+    folder: string;
+    /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
+    routing: RemoteConfig;
+    /** Our own entries in that config, and the one currently valid */
+    selfEntries: HostedConfig[];
+    self?: HostedConfig;
+    config: ArchivesConfig;
+};
+
+/** The live in-memory state of ONE bucket, answered without touching the disk (no routing file read, no statfs, no stored write stats). Returns an error string when the bucket is not loaded here, which is the normal state for a bucket nothing has accessed since startup. */
+export async function getActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
+    let key = `${account}/${bucketName}`;
+    let loadedPromise = buckets.get(key);
+    if (!loadedPromise) {
+        return `Bucket ${key} is not loaded on this server, so it has no live state (it loads on first access)`;
+    }
+    let loaded: LoadedBucket | undefined;
+    try {
+        loaded = await loadedPromise;
+    } catch (e) {
+        return `Bucket ${key} failed to load on this server: ${String((e as Error).stack ?? e).slice(0, 500)}`;
+    }
+    if (!loaded) {
+        return `Bucket ${key} does not exist on this server`;
+    }
+    return toActiveBucketInfo(loaded);
+}
+
+function toActiveBucketInfo(loaded: LoadedBucket): ActiveBucketInfo {
+    return {
+        folder: getBucketFolder(loaded.account, loaded.bucketName),
+        routing: loaded.routing,
+        selfEntries: loaded.selfEntries,
+        self: loaded.self,
+        config: getBucketConfig(loaded),
+    };
+}
+
+/** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
+export async function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
+    let key = `${account}/${bucketName}`;
+    let wasLoaded = buckets.has(key);
+    let loaded: LoadedBucket | undefined;
+    try {
+        loaded = await getLoadedBucket(account, bucketName);
+    } catch (e) {
+        return `Bucket ${key} failed to load on this server: ${String((e as Error).stack ?? e).slice(0, 500)}`;
+    }
+    if (!loaded) {
+        return `Bucket ${key} does not exist on this server (no routing file in ${getBucketFolder(account, bucketName)})`;
+    }
+    if (!wasLoaded) {
+        console.log(`Activated bucket ${key} on request: it is now loaded and synchronizing`);
+    }
+    return toActiveBucketInfo(loaded);
+}
+
 export async function listAccountBuckets(account: string): Promise<ServerBucketInfo[]> {
+    let start = Date.now();
+    let timings = new Map<string, number>();
+    async function timed<T>(name: string, run: () => Promise<T>): Promise<T> {
+        let began = Date.now();
+        try {
+            return await run();
+        } finally {
+            timings.set(name, (timings.get(name) || 0) + (Date.now() - began));
+        }
+    }
     let accountFolder = path.join(getStorageServerConfig().folder, "buckets2", account);
     let names: string[];
     try {
-        names = await fs.promises.readdir(accountFolder);
+        names = await timed("readdir", () => fs.promises.readdir(accountFolder));
     } catch {
         return [];
     }
-    return await Promise.all(names.map(async bucketName => {
-        let key = `${account}/${bucketName}`;
-        let folder = getBucketFolder(account, bucketName);
-        let base: ServerBucketInfo = { bucketName, active: false, folder };
-        let [disk, writeStats] = await Promise.all([
-            getDiskInfo(folder).catch((e: Error) => {
-                base.diskError = String(e.stack ?? e).slice(0, 500);
-                return undefined;
-            }),
-            getBucketWriteStats(key),
-        ]);
-        base.disk = disk;
-        base.writeStats = writeStats;
-        let loadedPromise = buckets.get(key);
-        if (loadedPromise) {
-            try {
-                let loaded = await loadedPromise;
-                if (loaded) {
-                    return { ...base, active: true, config: getBucketConfig(loaded) };
+    try {
+        return await Promise.all(names.map(async bucketName => {
+            let key = `${account}/${bucketName}`;
+            let folder = getBucketFolder(account, bucketName);
+            let base: ServerBucketInfo = { bucketName, active: false, folder };
+            let [disk, writeStats] = await Promise.all([
+                timed("statfs", () => getDiskInfo(folder)).catch((e: Error) => {
+                    base.diskError = String(e.stack ?? e).slice(0, 500);
+                    return undefined;
+                }),
+                timed("writeStats", () => getBucketWriteStats(key)),
+            ]);
+            base.disk = disk;
+            base.writeStats = writeStats;
+            const loadedPromise = buckets.get(key);
+            if (loadedPromise) {
+                try {
+                    let loaded = await timed("awaitLoaded", () => loadedPromise);
+                    if (loaded) {
+                        return { ...base, active: true, config: getBucketConfig(loaded) };
+                    }
+                } catch (e) {
+                    return { ...base, active: true, error: String((e as Error).stack ?? e).slice(0, 500) };
                 }
+            }
+            try {
+                const data = await timed("readRoutingFile", () => readRoutingFile(folder));
+                if (!data) {
+                    return { ...base, error: `No routing file (${ROUTING_FILE})` };
+                }
+                let parsed = await timed("parseRouting", async () => parseRoutingData(data));
+                return { ...base, config: { remoteConfig: parsed } };
             } catch (e) {
-                return { ...base, active: true, error: String((e as Error).stack ?? e).slice(0, 500) };
+                return { ...base, error: String((e as Error).stack ?? e).slice(0, 500) };
             }
-        }
-        try {
-            let data = await readRoutingFile(folder);
-            if (!data) {
-                return { ...base, error: `No routing file (${ROUTING_FILE})` };
-            }
-            return { ...base, config: { remoteConfig: parseRoutingData(data) } };
-        } catch (e) {
-            return { ...base, error: String((e as Error).stack ?? e).slice(0, 500) };
-        }
-    }));
+        }));
+    } finally {
+        // The parts run concurrently, so these are summed wall times per part, not a breakdown of the total
+        let parts = [...timings].map(([name, ms]) => `${name} ${ms}ms`).join(", ");
+        console.log(`listAccountBuckets(${account}) took ${Date.now() - start}ms for ${names.length} buckets: ${parts}`);
+    }
 }
 
 export async function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void> {

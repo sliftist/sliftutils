@@ -17,7 +17,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { ArchivesRemote, parseStorageUrl, authenticateStorage } from "./ArchivesRemote";
 import { onServerRoutingChanged } from "./storageClientController";
 import { ArchivesBackblaze } from "../backblaze";
-import { getStorageServerConfigOptional, getLocalArchives, ServerBucketInfo } from "./storageServerState";
+import { getStorageServerConfigOptional, getLocalArchives, ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageController";
 import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
 
@@ -747,6 +747,16 @@ async function callServer<T>(url: string, run: (controller: typeof RemoteStorage
 
 export async function listServerBuckets(config: { url: string; account: string }): Promise<ServerBucketInfo[]> {
     return await callServer(config.url, controller => controller.listBuckets(config.account));
+}
+
+/** The live, in-memory state of one bucket on a server (routing config included), or a string saying why it is unavailable. Cheap - it never touches the server's disk - but only works while that bucket is loaded there. */
+export async function getServerActiveBucket(config: { url: string; account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
+    return await callServer(config.url, controller => controller.getActiveBucket(config.account, config.bucketName));
+}
+
+/** Tells a server to load one of its buckets into memory (starting its synchronization) and returns its live state, or a string saying why it could not be loaded. Only touches that server - nothing is written and no other source is contacted. */
+export async function activateServerBucket(config: { url: string; account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
+    return await callServer(config.url, controller => controller.activateBucket(config.account, config.bucketName));
 }
 
 /** Zeroes the write statistics listServerBuckets reports, for every bucket in the account. */

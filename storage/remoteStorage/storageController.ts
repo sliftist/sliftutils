@@ -14,6 +14,7 @@ import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
     deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
     getBucketConfig, listAccountBuckets, ServerBucketInfo, clearAccountWriteStats,
+    getActiveBucket, activateBucket, ActiveBucketInfo,
 } from "./storageServerState";
 import { StorageClientController } from "./storageClientController";
 
@@ -23,6 +24,7 @@ export const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7
 export const STORAGE_ACCESS_DENIED = "REMOTE_STORAGE_ACCESS_DENIED_9d81a4c0";
 
 const AUTH_TIME_WINDOW = timeInMinute * 10;
+const ACCESS_CHECK_SLOW_TIME = 50;
 const MAX_SESSIONS = 100 * 1000;
 const MAX_REQUESTS_PER_IP = 50;
 
@@ -325,7 +327,23 @@ class RemoteStorageControllerBase {
         return getBucketConfig(bucket);
     }
     async listBuckets(account: string): Promise<ServerBucketInfo[]> {
-        return await listAccountBuckets(account);
+        let start = Date.now();
+        try {
+            return await listAccountBuckets(account);
+        } finally {
+            // The access hook (and the storage it initializes) runs before this, so a large gap between this and the caller's timing is the hook
+            console.log(`listBuckets(${account}) call body took ${Date.now() - start}ms`);
+        }
+    }
+    /** The live, in-memory state of one bucket, or a string saying why it is unavailable. Answered without touching the disk, so it is cheap - but only works while the bucket is loaded here. */
+    async getActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
+        assertValidName(bucketName, "bucket name");
+        return await getActiveBucket(account, bucketName);
+    }
+    /** Loads a bucket that exists on this server into memory (starting its synchronization) and returns its live state, or a string saying why it could not be loaded. */
+    async activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
+        assertValidName(bucketName, "bucket name");
+        return await activateBucket(account, bucketName);
     }
     /** Zeroes the write statistics listBuckets reports, for every bucket in the account. */
     async clearWriteStats(account: string): Promise<{ clearedBuckets: number }> {
@@ -466,7 +484,12 @@ class RemoteStorageControllerBase {
 const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string }>();
 
 const accountAccess: SocketFunctionHook = async (context) => {
+    let start = Date.now();
     await requireAccess(String(context.call.args[0]));
+    let duration = Date.now() - start;
+    if (duration > ACCESS_CHECK_SLOW_TIME) {
+        console.log(`Access check for ${context.call.functionName} took ${duration}ms`);
+    }
 };
 const uploadAccess: SocketFunctionHook = async (context) => {
     let info = largeUploadInfo.get(String(context.call.args[0]));
@@ -499,6 +522,8 @@ export const RemoteStorageController = SocketFunction.register(
         getArchivesConfig: { hooks: [accountAccess] },
         getIndexInfo: { hooks: [accountAccess] },
         listBuckets: { hooks: [accountAccess] },
+        getActiveBucket: { hooks: [accountAccess] },
+        activateBucket: { hooks: [accountAccess] },
         clearWriteStats: { hooks: [accountAccess] },
         getSyncStatus: { hooks: [accountAccess] },
         startLargeFile: { hooks: [accountAccess] },
