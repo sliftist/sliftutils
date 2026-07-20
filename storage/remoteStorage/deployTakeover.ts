@@ -416,6 +416,18 @@ export function getTakeoverAltPort(): number | undefined {
     return current.remap?.altPort;
 }
 
+/** For the dying process of a takeover: our own process's data ends at the write handoff - fast
+ *  writes must be on disk by then. Undefined for the successor and in normal operation. Both
+ *  processes share the config identity (all self windows look like "ours" to both), so this is
+ *  the only way the dying side knows the post-handoff windows belong to the other process. */
+export function getOwnWindowEndClip(): number | undefined {
+    let dying = current.dying;
+    if (!dying) return undefined;
+    let remap = current.remap;
+    if (remap) return remap.boundaryA;
+    return dying.successorStart;
+}
+
 /** How long to wait between main-port acquisition attempts: tight around the predecessor's
  *  scheduled death (when the port actually frees), relaxed otherwise. */
 export function getMainPortAcquireDelay(): number {

@@ -11,7 +11,7 @@ import {
     WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
-import { applyDeployRemap, getTakeoverAltPort, onTakeoverEvent } from "./deployTakeover";
+import { applyDeployRemap, getTakeoverAltPort, getOwnWindowEndClip, onTakeoverEvent } from "./deployTakeover";
 import { createApiArchives } from "./createArchives";
 import type { IStorage } from "../IStorage";
 import type { AccessRequest, TrustRecord } from "./storageController";
@@ -445,9 +445,36 @@ function computeStorePlan(account: string, bucketName: string, routing: RemoteCo
     // Being removed from the config entirely is a valid window of NOTHING ([0, 0]): fast
     // writes flush immediately (nothing may sit in memory on a node that's been cut out),
     // while the disk data and index stay served.
+    // Internally every self entry is the SAME store - one process listening on one or more ports
+    // (a takeover's alternate-port middle window included). So the disk window merges all
+    // contiguous own windows: an options boundary or the port split must never force a pointless
+    // internal flush between two windows that are both us. Only the DYING process of a takeover
+    // clips its end - from the write handoff on, the data belongs to the successor process.
+    let diskWindow: [number, number] = [0, 0];
+    if (self) {
+        let [start, end] = self.validWindow;
+        let merged = true;
+        while (merged) {
+            merged = false;
+            for (let entry of selfEntries) {
+                let [entryStart, entryEnd] = entry.validWindow;
+                if (entryStart > end || entryEnd < start) continue;
+                if (entryStart < start || entryEnd > end) {
+                    start = Math.min(start, entryStart);
+                    end = Math.max(end, entryEnd);
+                    merged = true;
+                }
+            }
+        }
+        let clip = getOwnWindowEndClip();
+        if (clip !== undefined && clip < end) {
+            end = clip;
+        }
+        diskWindow = [start, end];
+    }
     let ownIndexes = new Set(selfIndexes);
     let sourceSpecs: StorePlan["sourceSpecs"] = [{
-        validWindow: self && self.validWindow || [0, 0],
+        validWindow: diskWindow,
     }];
     if (selfIndex !== -1) {
         for (let i = selfIndex + 1; i < effective.sources.length; i++) {
