@@ -42,7 +42,6 @@ export declare function writeBucketFile(account: string, bucketName: string, fil
 }): Promise<void>;
 export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
 export declare function rebuildAllLoadedBuckets(): Promise<void>;
-export declare function rescanAllLoadedBucketDisks(): Promise<void>;
 export type ServerBucketInfo = {
     bucketName: string;
     active: boolean;

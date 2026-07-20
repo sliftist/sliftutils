@@ -13,7 +13,7 @@ export class ArchivesUrl implements IArchives {
     constructor(private base: string) { }
 
     public getDebugName() {
-        return `url/${this.base}`;
+        return `url ${this.base}`;
     }
 
     private readOnlyError(operation: string): Error {

@@ -70,7 +70,7 @@ export class ArchivesRemote implements IArchives {
     private lastDeniedLog = 0;
 
     public getDebugName() {
-        return `remoteStorage/${this.parsed.address}:${this.parsed.port}/${this.account}/${this.bucketName}`;
+        return `remoteStorage ${this.parsed.address}:${this.parsed.port} account ${this.account} bucket ${this.bucketName}`;
     }
 
     public isConnected(): boolean {

@@ -125,7 +125,7 @@ export class ArchivesDisk implements IArchives {
     });
 
     public getDebugName() {
-        return `disk/${this.folder}`;
+        return `disk ${this.folder}`;
     }
 
     public async getConfig(): Promise<ArchivesConfig> {

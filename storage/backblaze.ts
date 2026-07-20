@@ -398,7 +398,7 @@ export class ArchivesBackblaze implements IArchives {
     }
 
     public getDebugName() {
-        return "backblaze/" + this.config.bucketName;
+        return "backblaze " + this.config.bucketName;
     }
 
     private getBucketAPI = lazy(async () => {

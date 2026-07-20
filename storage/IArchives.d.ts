@@ -44,6 +44,7 @@ export type BackblazeConfig = CommonConfig & {
     url: string;
     public?: boolean;
     immutable?: boolean;
+    allowedOrigins?: string[];
 };
 export declare const FULL_VALID_WINDOW: [number, number];
 export type ArchiveFileInfo = {

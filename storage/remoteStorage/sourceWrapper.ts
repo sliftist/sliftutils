@@ -53,7 +53,7 @@ export class SourceWrapper {
         let wrapper = new SourceWrapper(config, options?.background !== false);
         if (config.type === "backblaze") {
             if (await hasBackblazeCreds()) {
-                wrapper.api = new ArchivesBackblaze({ bucketName: parseBackblazeUrl(config.url).bucketName, public: config.public, immutable: config.immutable });
+                wrapper.api = new ArchivesBackblaze({ bucketName: parseBackblazeUrl(config.url).bucketName, public: config.public, immutable: config.immutable, allowedOrigins: config.allowedOrigins });
             } else if (isNode()) {
                 wrapper.writeBlocked = `No backblaze credentials for ${config.url}. Provide backblaze.json.applicationKeyId and backblaze.json.applicationKey via getSecret to enable API access.`;
             } else {
@@ -93,7 +93,7 @@ export class SourceWrapper {
             let endText = end === Number.MAX_SAFE_INTEGER && "forever" || new Date(end).toISOString();
             parts.push(`validWindow [${startText}, ${endText}]`);
         }
-        return `source/${this.config.url}${parts.length && ` (${parts.join(", ")})` || ""}`;
+        return `source ${this.config.url}${parts.length && ` (${parts.join(", ")})` || ""}`;
     }
 
     public isConnected(): boolean {

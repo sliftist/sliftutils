@@ -10,9 +10,11 @@ A client adopts a routing config once, during initialization, and then runs on i
 
 Every store fully rescans its sources' metadata (on startup and periodically), and every write — including deletions — is ordered by last-write time. Deletions are tombstones: an empty file IS a missing file, kept as a size-0 index entry (for a week) so the deletion itself propagates and reconciles like any other write. Because everything is a timestamped write and scans are bidirectional (pull what they have, push what they're missing), any two sources can be merged in any order and converge to the same state: newest write time wins, per file. There is no operation whose loss corrupts the system — a failed background write, a missed delete, a source that was down for a day — the next scan reconciles it.
 
-## The full source list is duplicated into every source
+## storage/storagerouting.json Has the routing config and is duplicated on every node. 
 
 Each bucket stores its complete routing config (the full redundancy list) inside itself, at storage/storagerouting.json, on every source. Discovery is therefore trivial: as long as ONE node is up, a client reading it gets the full overview of the intended sources. And because clients re-discover on every startup (and re-read every 5 minutes), a developer can change the configuration in one place and clients rapidly accept it — no redeploy, no coordinated restart of the fleet.
+
+If the client tries to do a write where the valid state is far enough away or the sharding is wrong, it will re-download the routing config throttled, so it only does this at most once every 30 seconds, and retry the request.
 
 ## BulkDatabase2 index + our own disk as just another source
 
@@ -29,3 +31,19 @@ Clients always write to the same node — the first source whose valid window is
 ## Trust instead of API keys
 
 Machines authenticate with their certs.ts identity (proving ownership of their machine key with a signed, server-bound token), and access is granted per account to specific machineIds. No API keys are minted, copied into configs, or passed around — granting a machine access is one command on the storage machine, and revoking it is removing the trust record. The only API keys left in the system are the ones third parties force on us: backblaze and cloudflare, both resolved through getSecret.
+
+## storage/storagerouting.json is a special file
+
+    This is our special file that stores the routing information. We write it directly to each node. The client side tries to keep an updated version of these (that's mentioned earlier And is how the client can keep up to date even if the client's code isn't up to date, As long as at least one of the sources is still alive).
+
+    IMPORTANTLY! This special file is never synchronized between different storage nodes. It's only directly written to, and it's only read off of our disk. It can be written to on any node. We don't take into account the valid state window or the shard. We still do take into account the write time, though, the latest write time wins. We only allow writes if version >= the previous version.
+
+## fast writes
+
+    We support a flag that does fast writes, which will cause us to batch all the writes in memory, Returning from the set call immediately. This allows you to do many writes to the same file with very little disk I/O. This uses a configurable delay amount. You could set it to zero and then we just won't delay it at all, and we'll flush everything to the disk immediately away. 
+
+    The deploy system will tell us if it's intending to switch over a source, which we use to create a virtual valid state window in the middle that uses a different port. 
+
+    We look at the valid state windows and we make sure we never delay past the valid state window. In fact, if we are within five minutes of being invalid due to the valid state window, we flush the writes immediately. That way, when the next valid window starts running, the writes will be already on disk. 
+
+    We also do scans when we are coming up to the valid state window. If we are going to be the new valid state window, both before, a little bit after, and farther after. This helps the switch over be smoother so we get all of the trailing writes. These scans use our ability to ask for the changes since a certain time. We do the scan on the right write node. The write node is always the first node in order (with a valid state window and matching the route hash). Which might result in us having to scan multiple nodes if we require multiple nodes to fill the full route hash window. 

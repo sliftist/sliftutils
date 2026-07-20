@@ -5,7 +5,7 @@ import { timeInMinute, sort, promiseObj } from "socket-function/src/misc";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import {
     IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, assertValidLastModified,
-    windowAcceptsWrites, SyncActivity,
+    windowAcceptsWrites, SyncActivity, FULL_ROUTE,
 } from "../IArchives";
 import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
 import { ArchivesBackblaze } from "../backblaze";
@@ -22,6 +22,10 @@ import { wrapHandle, NodeJSDirectoryHandleWrapper, DirectoryWrapper } from "../F
 
 export const DEFAULT_FAST_WRITE_DELAY = timeInMinute * 5;
 const FAST_FLUSH_POLL = 1000 * 15;
+// Fast writes are never delayed past our own valid window, and within this margin of the window's
+// end they write through immediately - so when the next window's source takes over, the writes are
+// already on disk
+export const WINDOW_END_FLUSH_MARGIN = timeInMinute * 5;
 // Index changes are buffered in memory and written to the BulkDatabase2 in batches
 const INDEX_FLUSH_INTERVAL = 1000 * 30;
 // Sources that support getChangesAfter are polled this often
@@ -120,6 +124,17 @@ type SourceState = {
     lastMissCheck: number;
 };
 
+// What a scanned listing entry meant when compared against our index
+type ScanOutcome = "filtered" | "new" | "updated" | "tombstone" | "unchanged";
+type ScanTally = Record<ScanOutcome, number>;
+function newScanTally(): ScanTally {
+    return { filtered: 0, new: 0, updated: 0, tombstone: 0, unchanged: 0 };
+}
+function formatScanTally(tally: ScanTally, total: number): string {
+    let pct = (n: number) => `${Math.round(n / Math.max(total, 1) * 1000) / 10}%`;
+    return `${tally.new} new paths (${pct(tally.new)}), ${tally.updated} newer writes (${pct(tally.updated)}), ${tally.tombstone} deletions (${pct(tally.tombstone)}), ${tally.unchanged} unchanged (${pct(tally.unchanged)}), ${tally.filtered} outside window/route (${pct(tally.filtered)})`;
+}
+
 export class BlobStore implements IBucketStore {
     constructor(
         private folder: string,
@@ -130,10 +145,6 @@ export class BlobStore implements IBucketStore {
             onIndexChanged?: (key: string) => void;
             // LRU-bound the disk (base source) to this many bytes; see CommonConfig.readerDiskLimit
             readerDiskLimit?: number;
-            // Deploy takeover: fast-write flush delays never extend past this time, and after it
-            // fast writes flush immediately (nothing may sit in memory when the write window
-            // transfers to the successor process)
-            getFlushDeadline?: () => number | undefined;
         }
     ) { }
 
@@ -205,6 +216,11 @@ export class BlobStore implements IBucketStore {
             let source = sourceMap.get(entry.key);
             // Explicit checks, as 0 is a valid size and a valid source number
             if (size === undefined || source === undefined) continue;
+            // The routing config is only ever read off our own disk (see applyScanned), and a
+            // loaded bucket always has it there - a persisted entry pointing elsewhere is stale
+            if (entry.key === ROUTING_FILE) {
+                source = 0;
+            }
             let full: IndexEntry = { writeTime: entry.value, size, source, changedAt: entry.time, lastAccess: entry.time };
             this.mem.set(entry.key, full);
             this.countEntry(full, 1);
@@ -238,11 +254,61 @@ export class BlobStore implements IBucketStore {
         this.dirty.set(key, undefined);
     }
 
-    /** Rescans our own disk's metadata into the index - used around deploy switchovers, where the
-     *  other process wrote files to the shared folder that our index hasn't seen. */
+    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
+     *  another process wrote files to the shared folder that our index hasn't seen. */
     public async rescanBase(): Promise<void> {
         await this.init();
         await this.scanSource(0);
+    }
+
+    /** A boundary scan of the node that owned (part of) our route in the valid window before ours,
+     *  when that node is different storage (a disk rescan can't see its writes): just its changes
+     *  since the boundary neighborhood, with matching values pulled onto our own disk. */
+    public async boundaryScanRemote(source: IArchives, config: { since: number; route?: [number, number] }): Promise<void> {
+        await this.init();
+        let scanStart = Date.now();
+        console.log(`Boundary scan of ${source.getDebugName()} starting: changes since ${new Date(config.since).toISOString()}, route ${JSON.stringify(config.route || FULL_ROUTE)} (store ${this.folder})`);
+        let changes: ArchiveFileInfo[];
+        if (source.getChangesAfter) {
+            changes = await source.getChangesAfter(config.since);
+        } else {
+            changes = (await source.findInfo("")).filter(x => x.createTime > config.since);
+        }
+        let tally = newScanTally();
+        for (let file of changes) {
+            if (file.path === ROUTING_FILE || !routeContains(config.route, getRoute(file.path))) {
+                tally.filtered++;
+                continue;
+            }
+            let overlayEntry = this.overlay.get(file.path);
+            let entry = this.mem.get(file.path);
+            let currentTime = overlayEntry && overlayEntry.t || entry && entry.writeTime || 0;
+            if (file.createTime <= currentTime) {
+                tally.unchanged++;
+                continue;
+            }
+            if (file.size === 0) {
+                // A tombstone stores nothing on our own source - the index entry alone records it
+                this.setIndexEntry(file.path, { writeTime: file.createTime, size: 0, source: 0 });
+                tally.tombstone++;
+                continue;
+            }
+            let result = await source.get2(file.path);
+            if (!result) continue;
+            if (result.data.length === 0) {
+                this.setIndexEntry(file.path, { writeTime: result.writeTime, size: 0, source: 0 });
+                tally.tombstone++;
+                continue;
+            }
+            await this.sources[0].source.set(file.path, result.data, { lastModified: result.writeTime });
+            this.setIndexEntry(file.path, { writeTime: result.writeTime, size: result.data.length, source: 0 });
+            if (entry || overlayEntry) {
+                tally.updated++;
+            } else {
+                tally.new++;
+            }
+        }
+        console.log(`Boundary scan of ${source.getDebugName()} finished in ${Math.round((Date.now() - scanStart) / 1000)}s (store ${this.folder}): ${changes.length} changes: ${formatScanTally(tally, changes.length)}`);
     }
 
     /** The cheap always-current totals plus any in-progress background synchronization. */
@@ -358,7 +424,7 @@ export class BlobStore implements IBucketStore {
     // Full metadata scan (size, writeTime, path) of one source, applied to the index. Returns the
     // source's listing (path -> write time), which reconcileSource uses for the push direction.
     private async scanSource(sourceIndex: number): Promise<Map<string, number>> {
-        let { source } = this.sources[sourceIndex];
+        let { source, validWindow, route } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
         let scanStart = Date.now();
         let activity: SyncActivity = { type: "metadataScan", sourceDebugName: source.getDebugName(), startTime: scanStart };
@@ -375,24 +441,43 @@ export class BlobStore implements IBucketStore {
             clearInterval(progressTimer);
             this.syncActivities.delete(activity);
         }
-        console.log(`Metadata scan of ${source.getDebugName()} finished: ${files.length} files in ${Math.round((Date.now() - scanStart) / 1000)}s (store ${this.folder})`);
+        let indexSizeBefore = this.mem.size;
         let seen = new Map<string, number>();
+        let tally = newScanTally();
+        let newPaths = 0;
         for (let file of files) {
             seen.set(file.path, file.createTime);
-            this.applyScanned(sourceIndex, file);
+            if (!this.mem.has(file.path)) {
+                newPaths++;
+            }
+            tally[this.applyScanned(sourceIndex, file)]++;
         }
         state.scannedCount = files.length;
         // Index entries this source was the holder of, but that vanished from it (e.g. deleted
         // while we were offline), come out of the index. Entries changed after the scan started
         // are kept — the scan listing may simply predate them. Tombstones have no physical file
         // for a listing to vouch for, so they're exempt (cleanupTombstones expires them instead).
+        let removedFromIndex = 0;
+        let missingOnSource = 0;
         for (let [key, entry] of this.mem) {
-            if (entry.source !== sourceIndex) continue;
-            if (entry.size === 0) continue;
             if (seen.has(key)) continue;
-            if (entry.changedAt >= scanStart) continue;
-            this.deleteIndexEntry(key);
+            if (entry.source === sourceIndex && entry.size !== 0 && entry.changedAt < scanStart) {
+                this.deleteIndexEntry(key);
+                removedFromIndex++;
+                continue;
+            }
+            // Counted only when the source SHOULD hold the entry (its window/route match) - these
+            // are what the reconcile pass pushes to it
+            if (entry.size === 0 || key === ROUTING_FILE) continue;
+            if (entry.writeTime < validWindow[0] || entry.writeTime > validWindow[1]) continue;
+            if (!routeContains(route, getRoute(key))) continue;
+            missingOnSource++;
         }
+        // Percentages are of the union of both sides (our index + their listing), so every count
+        // has a stable denominator
+        let union = indexSizeBefore + newPaths;
+        let pct = (n: number) => `${Math.round(n / Math.max(union, 1) * 1000) / 10}%`;
+        console.log(`Metadata scan of ${source.getDebugName()} finished in ${Math.round((Date.now() - scanStart) / 1000)}s (store ${this.folder}): ${files.length} listed vs ${indexSizeBefore} indexed (union ${union}): ${formatScanTally(tally, union)}, ${missingOnSource} in index but missing on source (${pct(missingOnSource)}), ${removedFromIndex} removed from index (${pct(removedFromIndex)})`);
         state.changesAfterTime = Math.max(state.changesAfterTime, scanStart - CHANGES_POLL_OVERLAP);
         return seen;
     }
@@ -408,12 +493,11 @@ export class BlobStore implements IBucketStore {
             for (let [key, entry] of this.mem) {
                 if (this.stopped.stop) return;
                 if (entry.source === sourceIndex) continue;
-                // Past-window sources only receive the routing file (see writeToSources), and
-                // sharded sources only the keys routing into them
-                if (key !== ROUTING_FILE) {
-                    if (!acceptsWrites) continue;
-                    if (!routeContains(route, getRoute(key))) continue;
-                }
+                // The routing file is NEVER synchronized between storage nodes - it is only ever
+                // written directly to each node, and only ever read off our own disk
+                if (key === ROUTING_FILE) continue;
+                if (!acceptsWrites) continue;
+                if (!routeContains(route, getRoute(key))) continue;
                 let theirTime = listing.get(key);
                 if (theirTime !== undefined && theirTime >= entry.writeTime) continue;
                 if (entry.size === 0) {
@@ -432,16 +516,28 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    private applyScanned(sourceIndex: number, file: ArchiveFileInfo): void {
-        let { validWindow, route } = this.sources[sourceIndex];
-        let [windowStart, windowEnd] = validWindow;
-        if (file.createTime < windowStart || file.createTime > windowEnd) return;
-        // A partially-overlapping shard's listing includes keys outside our route; ignore them
-        if (file.path !== ROUTING_FILE && !routeContains(route, getRoute(file.path))) return;
+    private applyScanned(sourceIndex: number, file: ArchiveFileInfo): ScanOutcome {
+        if (file.path === ROUTING_FILE) {
+            // The routing config is NEVER pulled from other sources - it only ever arrives as an
+            // explicit, version-validated write, and is only ever read off our own disk. Route and
+            // valid-window filters can't possibly apply to it either: it is the file DEFINING
+            // them, so filtering it would mean certain sources could never have their routing
+            // config updated, ever.
+            if (sourceIndex !== 0) return "filtered";
+        } else {
+            let { validWindow, route } = this.sources[sourceIndex];
+            let [windowStart, windowEnd] = validWindow;
+            if (file.createTime < windowStart || file.createTime > windowEnd) return "filtered";
+            // A partially-overlapping shard's listing includes keys outside our route; ignore them
+            if (!routeContains(route, getRoute(file.path))) return "filtered";
+        }
         let existing = this.mem.get(file.path);
         // The highest write time wins across all sources (ties keep the existing entry)
-        if (existing && file.createTime <= existing.writeTime) return;
+        if (existing && file.createTime <= existing.writeTime) return "unchanged";
         this.setIndexEntry(file.path, { writeTime: file.createTime, size: file.size, source: sourceIndex });
+        if (file.size === 0) return "tombstone";
+        if (existing) return "updated";
+        return "new";
     }
 
     private async pollChanges(sourceIndex: number): Promise<void> {
@@ -450,8 +546,13 @@ export class BlobStore implements IBucketStore {
         let state = this.sourceStates[sourceIndex];
         let pollStart = Date.now();
         let changes = await source.getChangesAfter(state.changesAfterTime);
+        let tally = newScanTally();
         for (let file of changes) {
-            this.applyScanned(sourceIndex, file);
+            tally[this.applyScanned(sourceIndex, file)]++;
+        }
+        // Polls run constantly, so only the ones that actually changed the index get a line
+        if (tally.new || tally.updated || tally.tombstone) {
+            console.log(`Changes poll of ${source.getDebugName()} (store ${this.folder}): ${changes.length} changes: ${formatScanTally(tally, changes.length)}`);
         }
         state.scannedCount += changes.length;
         state.changesAfterTime = pollStart - CHANGES_POLL_OVERLAP;
@@ -622,6 +723,12 @@ export class BlobStore implements IBucketStore {
             }
             return result;
         }
+        // The routing file is only ever read off our own disk - falling back to another source's
+        // copy would synchronize it between nodes through the read path, which it never is
+        if (key === ROUTING_FILE) {
+            if (holderError) throw holderError;
+            return undefined;
+        }
         // The holder is down or lost the file. ANY other source's copy beats no value - even an
         // OLDER one - and it's copied onto our disk so the next read doesn't depend on luck.
         for (let i = 0; i < this.sources.length; i++) {
@@ -666,20 +773,24 @@ export class BlobStore implements IBucketStore {
         }
         let writeTime = lastModified || Date.now();
         if (config?.fast) {
-            let writeDelay = config.writeDelay || DEFAULT_FAST_WRITE_DELAY;
-            let flushAt = Date.now() + writeDelay;
-            let deadline = this.config?.getFlushDeadline?.();
-            if (deadline !== undefined) {
-                // Past the deadline fast writes write through (deployTakeover logs the transition
-                // once, with the times - a per-store log here would repeat on every store rebuild)
-                if (Date.now() >= deadline) {
-                    this.overlay.delete(key);
-                    await this.writeToSources(key, data, writeTime);
-                    return key;
-                }
-                flushAt = Math.min(flushAt, deadline);
+            // A writeDelay of zero is a real choice (no delay at all), so only an omitted delay
+            // gets the default
+            let writeDelay = config.writeDelay;
+            if (writeDelay === undefined) {
+                writeDelay = DEFAULT_FAST_WRITE_DELAY;
             }
-            this.overlay.set(key, { data, t: writeTime, flushAt });
+            // The delay never extends past our own valid window's end (minus the margin, so the
+            // writes are on disk before the next window's source takes over - a deploy switchover
+            // is just this too, since its remap ends our window). Past that point fast writes
+            // write through immediately.
+            let deadline = this.sources[0].validWindow[1] - WINDOW_END_FLUSH_MARGIN;
+            if (writeDelay > 0 && Date.now() < deadline) {
+                let flushAt = Math.min(Date.now() + writeDelay, deadline);
+                this.overlay.set(key, { data, t: writeTime, flushAt });
+                return key;
+            }
+            this.overlay.delete(key);
+            await this.writeToSources(key, data, writeTime);
             return key;
         }
         this.overlay.delete(key);
@@ -704,9 +815,10 @@ export class BlobStore implements IBucketStore {
     }
 
     private async writeToSources(key: string, data: Buffer, writeTime: number): Promise<void> {
-        // The routing file is exempt from the valid-window and route write filters: the CONFIG
-        // must keep flowing to every source, or a client probing one of them first would adopt a
-        // stale config. Only data writes stop.
+        // The routing file is NEVER synchronized between storage nodes: the writer writes it
+        // directly to each node, so we store it on our own disk only (no valid-window filter -
+        // routing/valid windows can't possibly apply to the file defining them) and never forward
+        // it to other sources.
         let isRouting = key === ROUTING_FILE;
         let writable = this.getWritableSources({ ignoreWindow: isRouting });
         let first = writable.shift();
@@ -723,9 +835,10 @@ export class BlobStore implements IBucketStore {
             await this.sources[first].source.set(key, data, { lastModified: writeTime });
         }
         this.setIndexEntry(key, { writeTime, size: data.length, source: first });
-        let route = !isRouting && getRoute(key) || 0;
+        if (isRouting) return;
+        let route = getRoute(key);
         for (let i of writable) {
-            if (!isRouting && !routeContains(this.sources[i].route, route)) continue;
+            if (!routeContains(this.sources[i].route, route)) continue;
             // Downstream sources receive tombstones as actual empty writes, so their listings show
             // the deletion (size 0) and other stores scan it in as a tombstone
             void this.sources[i].source.set(key, data, { lastModified: writeTime }).catch((e: Error) => {

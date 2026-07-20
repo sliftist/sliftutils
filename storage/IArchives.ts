@@ -81,6 +81,10 @@ export type BackblazeConfig = CommonConfig & {
     // NOTE: This isn't enforced on the backblaze level, so this is just a client-side guarantee. This can change how we cache files.
     //  - Backblaze does support immutability. However, apparently, once we enable it on a bucket, we can't disable it, which is really bad, as it means if our code could ever enable it and we accidentally enable it on an important bucket, we essentially just bricked that bucket. So we should never write any code that ever tries to use backblaze to make things immutable. 
     immutable?: boolean;
+    // CORS origins allowed to consume the bucket's files in a browser. Not a security boundary
+    // (access is gated by the API key / signed URLs, neither of which rides in cookies) - it only
+    // controls which sites' in-page JavaScript can read responses. Defaults to any HTTPS origin.
+    allowedOrigins?: string[];
 
     // NOTE: We will access the api key from getSecret, see backblaze.ts for the specific keys.
 };

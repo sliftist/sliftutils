@@ -29,12 +29,6 @@ const PORT_REGISTRY_FOLDER_NAME = "storagePortRegistry";
 const ACQUIRE_SLOW_DELAY = 30 * 1000;
 const ACQUIRE_FAST_DELAY = 5 * 1000;
 const ACQUIRE_FAST_WINDOW = 60 * 1000;
-// Disk rescans fire this far before and after the write handoff, catching files the other process
-// wrote (the BulkDatabase2 index is atomic but its entries land at write time, not file time)
-const SWITCH_SCAN_LEAD = 10 * 1000;
-// The dying process must have flushed everything before the handoff: fast-write delays never
-// extend past S + overlap * this fraction, and after that point fast writes flush immediately
-const FLUSH_DEADLINE_FRACTION = 0.25;
 const BOUNDARY_A_FRACTION = 0.5;
 const BOUNDARY_B_FRACTION = 1.5;
 const REMAP_EXPIRE_FRACTION = 2;
@@ -58,7 +52,7 @@ type TakeoverComputed = {
     predecessorEnd?: number;
 };
 
-export type TakeoverEvent = "remapChanged" | "diskScan";
+export type TakeoverEvent = "remapChanged";
 
 let initialized: { domain: string; mainPort: number; storageFolder: string } | undefined;
 let ancestorPids = new Set<number>();
@@ -205,26 +199,9 @@ function scheduleEvents(): void {
     const remap = current.remap;
     if (remap) {
         let altPort = remap.altPort;
-        schedule(remap.boundaryA - SWITCH_SCAN_LEAD, () => emit("diskScan"));
         schedule(remap.boundaryA, () => console.log(`${logPrefix()} Deploy switchover write handoff boundary ${iso(remap.boundaryA)} passed: fresh writes now belong to the alternate-port side (port ${altPort})`));
-        schedule(remap.boundaryA + SWITCH_SCAN_LEAD, () => emit("diskScan"));
         schedule(remap.boundaryB, () => console.log(`${logPrefix()} Deploy switchover second boundary ${iso(remap.boundaryB)} passed: fresh writes return to the main port`));
         schedule(remap.expire, () => void recompute().catch((e: Error) => console.error(`Deploy takeover recompute failed: ${e.stack ?? e}`)));
-    }
-    let dying = current.dying;
-    if (dying) {
-        let deadline = dying.successorStart + dying.overlap * FLUSH_DEADLINE_FRACTION;
-        let killTime = dying.successorStart + dying.overlap;
-        let logDeadline = () => {
-            if (loggedFlushDeadlineFor === deadline) return;
-            loggedFlushDeadlineFor = deadline;
-            console.log(`${logPrefix()} Deploy switchover flush deadline ${iso(deadline)} reached (now ${iso(Date.now())}): fast writes write through immediately until we are killed at ${iso(killTime)}`);
-        };
-        if (deadline <= now) {
-            logDeadline();
-        } else {
-            schedule(deadline, logDeadline);
-        }
     }
 }
 
@@ -233,7 +210,6 @@ function scheduleEvents(): void {
 function logPrefix(): string {
     return `[pid ${process.pid}]`;
 }
-let loggedFlushDeadlineFor: number | undefined;
 
 // Recompute is invoked from init, registerAltPort, the poll, and the expiry timer - possibly
 // concurrently. Runs are serialized, or two in-flight runs would both pass the changed-state check
@@ -286,9 +262,10 @@ async function recomputeNow(): Promise<void> {
         if (next) {
             let successorStart = next.release;
             let overlap = next.entry.parameters.overlapTime || us.parameters.overlapTime || 0;
-            // Even a ZERO-overlap deploy needs the dying behaviors - draining fast-write flushes
-            // by the release and writing through after it, or acknowledged data dies with us.
-            // Only the remap (the alternate-port middle window) needs an actual overlap.
+            // Tracked even for a ZERO-overlap deploy (the scheduled-switchover log must still
+            // fire); only the remap (the alternate-port middle window) needs an actual overlap.
+            // Flushing before the handoff needs nothing special here: the remap ends our valid
+            // window, and fast writes always flush ahead of their window's end.
             computed.dying = { successorStart, overlap };
             if (overlap > 0 && now < successorStart + overlap * REMAP_EXPIRE_FRACTION) {
                 const successorPid = next.entry.pid;
@@ -326,7 +303,7 @@ function iso(time: number): string {
 function logTransitions(prev: TakeoverComputed, next: TakeoverComputed): void {
     if (!prev.dying && next.dying) {
         let { successorStart, overlap } = next.dying;
-        console.log(`${logPrefix()} Deploy switchover scheduled: our successor starts at ${iso(successorStart)}; fast-write flushes drain by ${iso(successorStart + overlap * FLUSH_DEADLINE_FRACTION)}, fresh writes hand off at ${iso(successorStart + overlap * BOUNDARY_A_FRACTION)}, and we are killed at ${iso(successorStart + overlap)}`);
+        console.log(`${logPrefix()} Deploy switchover scheduled: our successor starts at ${iso(successorStart)}; fresh writes hand off at ${iso(successorStart + overlap * BOUNDARY_A_FRACTION)}, and we are killed at ${iso(successorStart + overlap)}`);
     }
     if (!prev.predecessorEnd && next.predecessorEnd) {
         console.log(`${logPrefix()} We are a deploy successor: our predecessor holds the main port until ${iso(next.predecessorEnd)}`);
@@ -341,7 +318,7 @@ function logTransitions(prev: TakeoverComputed, next: TakeoverComputed): void {
 
 /** Starts the takeover machinery. Port fallback (alternate port + registry + acquisition polling)
  *  works regardless; without a deploy timeline folder the switchover-specific parts (the remap,
- *  the flush deadline, the tighter acquisition pacing) simply stay inert. */
+ *  the tighter acquisition pacing) simply stay inert. */
 export async function initDeployTakeover(config: { domain: string; mainPort: number; storageFolder: string }): Promise<void> {
     initialized = config;
     ancestorPids = await getAncestorPids();
@@ -437,14 +414,6 @@ export function getTakeoverStamp(): string | undefined {
  *  this port on OUR machine (same disk!), so sources pointing at it are self, never sync targets. */
 export function getTakeoverAltPort(): number | undefined {
     return current.remap?.altPort;
-}
-
-/** For the dying process: fast-write flush delays must never extend past this time, and after it
- *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
-export function getFlushDeadline(): number | undefined {
-    let dying = current.dying;
-    if (!dying) return undefined;
-    return dying.successorStart + dying.overlap * FLUSH_DEADLINE_FRACTION;
 }
 
 /** How long to wait between main-port acquisition attempts: tight around the predecessor's

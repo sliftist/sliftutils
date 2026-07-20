@@ -1,7 +1,8 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, SyncActivity } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, SyncActivity } from "../IArchives";
 export declare const DEFAULT_FAST_WRITE_DELAY: number;
+export declare const WINDOW_END_FLUSH_MARGIN: number;
 export type WriteConfig = {
     fast?: boolean;
     writeDelay?: number;
@@ -70,7 +71,6 @@ export declare class BlobStore implements IBucketStore {
     constructor(folder: string, sources: ArchivesSource[], config?: {
         onIndexChanged?: ((key: string) => void) | undefined;
         readerDiskLimit?: number | undefined;
-        getFlushDeadline?: (() => number | undefined) | undefined;
     } | undefined);
     private stopped;
     private index;
@@ -93,9 +93,16 @@ export declare class BlobStore implements IBucketStore {
     private countEntry;
     private setIndexEntry;
     private deleteIndexEntry;
-    /** Rescans our own disk's metadata into the index - used around deploy switchovers, where the
-     *  other process wrote files to the shared folder that our index hasn't seen. */
+    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
+     *  another process wrote files to the shared folder that our index hasn't seen. */
     rescanBase(): Promise<void>;
+    /** A boundary scan of the node that owned (part of) our route in the valid window before ours,
+     *  when that node is different storage (a disk rescan can't see its writes): just its changes
+     *  since the boundary neighborhood, with matching values pulled onto our own disk. */
+    boundaryScanRemote(source: IArchives, config: {
+        since: number;
+        route?: [number, number];
+    }): Promise<void>;
     /** The cheap always-current totals plus any in-progress background synchronization. */
     getSyncProgress(): {
         index: {

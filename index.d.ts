@@ -2147,6 +2147,7 @@ declare module "sliftutils/storage/IArchives" {
         url: string;
         public?: boolean;
         immutable?: boolean;
+        allowedOrigins?: string[];
     };
     export declare const FULL_VALID_WINDOW: [number, number];
     export type ArchiveFileInfo = {
@@ -2988,8 +2989,9 @@ declare module "sliftutils/storage/remoteStorage/accessPage" {
 declare module "sliftutils/storage/remoteStorage/blobStore" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, SyncActivity } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, SyncActivity } from "../IArchives";
     export declare const DEFAULT_FAST_WRITE_DELAY: number;
+    export declare const WINDOW_END_FLUSH_MARGIN: number;
     export type WriteConfig = {
         fast?: boolean;
         writeDelay?: number;
@@ -3058,7 +3060,6 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         constructor(folder: string, sources: ArchivesSource[], config?: {
             onIndexChanged?: ((key: string) => void) | undefined;
             readerDiskLimit?: number | undefined;
-            getFlushDeadline?: (() => number | undefined) | undefined;
         } | undefined);
         private stopped;
         private index;
@@ -3081,9 +3082,16 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private countEntry;
         private setIndexEntry;
         private deleteIndexEntry;
-        /** Rescans our own disk's metadata into the index - used around deploy switchovers, where the
-         *  other process wrote files to the shared folder that our index hasn't seen. */
+        /** Rescans our own disk's metadata into the index - used around valid window handoffs, where
+         *  another process wrote files to the shared folder that our index hasn't seen. */
         rescanBase(): Promise<void>;
+        /** A boundary scan of the node that owned (part of) our route in the valid window before ours,
+         *  when that node is different storage (a disk rescan can't see its writes): just its changes
+         *  since the boundary neighborhood, with matching values pulled onto our own disk. */
+        boundaryScanRemote(source: IArchives, config: {
+            since: number;
+            route?: [number, number];
+        }): Promise<void>;
         /** The cheap always-current totals plus any in-progress background synchronization. */
         getSyncProgress(): {
             index: {
@@ -3280,10 +3288,10 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
 
 declare module "sliftutils/storage/remoteStorage/deployTakeover" {
     import { RemoteConfig } from "../IArchives";
-    export type TakeoverEvent = "remapChanged" | "diskScan";
+    export type TakeoverEvent = "remapChanged";
     /** Starts the takeover machinery. Port fallback (alternate port + registry + acquisition polling)
      *  works regardless; without a deploy timeline folder the switchover-specific parts (the remap,
-     *  the flush deadline, the tighter acquisition pacing) simply stay inert. */
+     *  the tighter acquisition pacing) simply stay inert. */
     export declare function initDeployTakeover(config: {
         domain: string;
         mainPort: number;
@@ -3304,9 +3312,6 @@ declare module "sliftutils/storage/remoteStorage/deployTakeover" {
     /** The middle-window alternate port of an active remap. The OTHER process of the takeover lives on
      *  this port on OUR machine (same disk!), so sources pointing at it are self, never sync targets. */
     export declare function getTakeoverAltPort(): number | undefined;
-    /** For the dying process: fast-write flush delays must never extend past this time, and after it
-     *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
-    export declare function getFlushDeadline(): number | undefined;
     /** How long to wait between main-port acquisition attempts: tight around the predecessor's
      *  scheduled death (when the port actually frees), relaxed otherwise. */
     export declare function getMainPortAcquireDelay(): number;
@@ -3572,7 +3577,6 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     }): Promise<void>;
     export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
     export declare function rebuildAllLoadedBuckets(): Promise<void>;
-    export declare function rescanAllLoadedBucketDisks(): Promise<void>;
     export type ServerBucketInfo = {
         bucketName: string;
         active: boolean;

@@ -46,7 +46,7 @@ const AVAILABILITY_RECHECK_THROTTLE = 5 * 1000;
 // explicit writes surface the denial (with grant instructions) to the caller instead of hanging.
 export function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives {
     if (source.type === "backblaze") {
-        return new ArchivesBackblaze({ bucketName: parseBackblazeUrl(source.url).bucketName, public: source.public, immutable: source.immutable });
+        return new ArchivesBackblaze({ bucketName: parseBackblazeUrl(source.url).bucketName, public: source.public, immutable: source.immutable, allowedOrigins: source.allowedOrigins });
     }
     let parsed = parseHostedUrl(source.url);
     let server = isNode() && getStorageServerConfigOptional() || undefined;
@@ -92,7 +92,7 @@ export class ArchivesChain implements IArchives {
 
     public getDebugName() {
         let urls = this.activeConfig.sources.map(x => typeof x === "string" && x || (x as HostedConfig | BackblazeConfig).url);
-        return `chain/${urls.join(",")}`;
+        return `chain ${urls.join(", ")}`;
     }
 
     // Lazy init that rethrows its error to every caller, while a background timer resets and
@@ -214,7 +214,17 @@ export class ArchivesChain implements IArchives {
                         // A rejected write fails init, which retries from scratch - re-reading the
                         // routing, so losing a create race to another client just adopts their
                         // config on the next attempt.
-                        await found.probe.write(archives => archives.set(ROUTING_FILE, serializeRemoteConfig(this.configured)));
+                        // The routing file is NEVER synchronized between storage nodes, so it is
+                        // written directly to EVERY node, with one shared write time (the latest
+                        // write time wins on each node independently)
+                        let routingData = serializeRemoteConfig(this.configured);
+                        let routingWriteTime = Date.now();
+                        let writtenUrls = new Set<string>();
+                        for (let source of sources) {
+                            if (writtenUrls.has(source.config.url)) continue;
+                            writtenUrls.add(source.config.url);
+                            await source.write(archives => archives.set(ROUTING_FILE, routingData, { lastModified: routingWriteTime }));
+                        }
                     } catch (e) {
                         for (let source of sources) {
                             source.dispose();

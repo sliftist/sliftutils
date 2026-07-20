@@ -4,14 +4,14 @@ import { getFileStorageNested2 } from "../FileFolderAPI";
 import { TransactionStorage } from "../TransactionStorage";
 import { JSONStorage } from "../JSONStorage";
 import { ArchivesDisk } from "../ArchivesDisk";
-import { BlobStore, IBucketStore } from "./blobStore";
+import { BlobStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MARGIN } from "./blobStore";
 import {
     RemoteConfig, HostedConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
     ArchivesSyncStatus, FULL_VALID_WINDOW,
     WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
-import { applyDeployRemap, getFlushDeadline, getTakeoverAltPort, onTakeoverEvent } from "./deployTakeover";
+import { applyDeployRemap, getTakeoverAltPort, onTakeoverEvent } from "./deployTakeover";
 import { createApiArchives } from "./createArchives";
 import type { IStorage } from "../IStorage";
 import type { AccessRequest, TrustRecord } from "./storageController";
@@ -233,6 +233,150 @@ function scheduleWindowBoundaryRebuild(loaded: LoadedBucket): void {
     (timer as { unref?: () => void }).unref?.();
 }
 
+// Extra scans around each of OUR valid-window starts (a deploy switchover is just this too - its
+// remap adds valid windows), catching last-moment writes the previous window's owner accepted near
+// the boundary. By the final scan the previous owner has flushed everything (fast writes never
+// delay past a window's end), so nothing is missed.
+const BOUNDARY_SCAN_OFFSETS = [-30 * 1000, 2 * 1000, 30 * 1000];
+// How far back a boundary scan asks the previous owner for changes: anything older has already
+// arrived through normal synchronization, and this covers the longest a write can sit unflushed
+const BOUNDARY_SCAN_LOOKBACK = DEFAULT_FAST_WRITE_DELAY + WINDOW_END_FLUSH_MARGIN;
+
+// Each (bucket, boundary, offset) is scheduled exactly once, surviving store rebuilds - the timer
+// re-resolves the bucket (and recomputes owners from the then-current routing) when it fires
+const scheduledBoundaryScans = new Set<string>();
+const boundaryScansRunning = new Set<string>();
+
+function scheduleBoundaryScans(loaded: LoadedBucket): void {
+    let key = `${loaded.account}/${loaded.bucketName}`;
+    let now = Date.now();
+    let starts = new Set<number>();
+    for (let self of loaded.selfEntries) {
+        let start = self.validWindow[0];
+        if (start > now && start < Number.MAX_SAFE_INTEGER) {
+            starts.add(start);
+        }
+    }
+    for (let start of starts) {
+        for (let offset of BOUNDARY_SCAN_OFFSETS) {
+            let at = start + offset;
+            if (at <= now) continue;
+            let scheduleKey = `${key}|${start}|${offset}`;
+            if (scheduledBoundaryScans.has(scheduleKey)) continue;
+            scheduledBoundaryScans.add(scheduleKey);
+            let arm = () => {
+                let timer = setTimeout(() => {
+                    // Timer length is capped (far-future boundaries), so re-arm until the time
+                    // actually arrives
+                    if (Date.now() < at) {
+                        arm();
+                        return;
+                    }
+                    void runBoundaryScan(key, start, offset).catch((e: Error) => console.error(`Boundary scan for bucket ${key} failed: ${e.stack ?? e}`));
+                }, Math.min(at - Date.now(), MAX_REBUILD_TIMER_DELAY));
+                (timer as { unref?: () => void }).unref?.();
+            };
+            arm();
+        }
+    }
+}
+
+async function runBoundaryScan(bucketKey: string, windowStart: number, offset: number): Promise<void> {
+    let label = `bucket ${bucketKey}, window starting ${new Date(windowStart).toISOString()}, offset ${offset / 1000}s`;
+    if (boundaryScansRunning.has(bucketKey)) {
+        // Boundary scans never run in parallel; a slow one simply swallows later scheduled points
+        console.log(`Skipping boundary scan (${label}): the previous boundary scan is still running`);
+        return;
+    }
+    boundaryScansRunning.add(bucketKey);
+    try {
+        let loaded = await buckets.get(bucketKey);
+        if (!loaded) return;
+        let store = loaded.store;
+        if (!(store instanceof BlobStore)) return;
+        // Owners are recomputed at fire time - the routing (or the takeover remap) may have
+        // changed since this scan was scheduled
+        let effective = applyDeployRemap(loaded.routing);
+        let selfIndexes = findSelfIndexes(effective, loaded.account, loaded.bucketName);
+        let selfIndexSet = new Set(selfIndexes);
+        let selves = selfIndexes.map(i => effective.sources[i] as HostedConfig).filter(x => x.validWindow[0] === windowStart);
+        if (!selves.length) return;
+        let prevTime = windowStart - 1;
+        let needDiskScan = false;
+        // sourceIndex -> the slice of our route that source owned in the previous window
+        let remoteOwners = new Map<number, [number, number]>();
+        for (let self of selves) {
+            let selfRoute = self.route || FULL_ROUTE;
+            let idx = effective.sources.indexOf(self);
+            // These scans only run on the write node - the first source valid at the new window's
+            // start for our route. An earlier entry fully covering our route means writes go there,
+            // and IT does the boundary scans.
+            let shadowed = false;
+            for (let j = 0; j < idx; j++) {
+                let other = effective.sources[j];
+                if (typeof other === "string") continue;
+                let [ws, we] = other.validWindow;
+                if (!(ws <= windowStart && windowStart < we)) continue;
+                let r = other.route || FULL_ROUTE;
+                if (r[0] <= selfRoute[0] && selfRoute[1] <= r[1]) {
+                    shadowed = true;
+                    break;
+                }
+            }
+            if (shadowed) continue;
+            // The previous window's owners: walking the config in order (write-target order),
+            // each source claims whatever slice of our route no earlier source already owns
+            let uncovered: [number, number][] = [[selfRoute[0], selfRoute[1]]];
+            for (let j = 0; j < effective.sources.length && uncovered.length; j++) {
+                let other = effective.sources[j];
+                if (typeof other === "string") continue;
+                let [ws, we] = other.validWindow;
+                if (!(ws <= prevTime && prevTime < we)) continue;
+                let r = other.route || FULL_ROUTE;
+                let remaining: [number, number][] = [];
+                let claimed: [number, number] | undefined;
+                for (let u of uncovered) {
+                    let inter = routeIntersection(u, r);
+                    if (!inter) {
+                        remaining.push(u);
+                        continue;
+                    }
+                    claimed = claimed && [Math.min(claimed[0], inter[0]), Math.max(claimed[1], inter[1])] as [number, number] || inter;
+                    if (u[0] < inter[0]) remaining.push([u[0], inter[0]]);
+                    if (inter[1] < u[1]) remaining.push([inter[1], u[1]]);
+                }
+                uncovered = remaining;
+                if (!claimed) continue;
+                if (selfIndexSet.has(j)) {
+                    // The previous owner shares our storage (same machine + bucket, e.g. the other
+                    // process of a deploy switchover), so a disk rescan sees its writes
+                    needDiskScan = true;
+                } else {
+                    let existing = remoteOwners.get(j);
+                    remoteOwners.set(j, existing && [Math.min(existing[0], claimed[0]), Math.max(existing[1], claimed[1])] as [number, number] || claimed);
+                }
+            }
+        }
+        if (!needDiskScan && !remoteOwners.size) return;
+        console.log(`Boundary scan (${label}): diskScan=${needDiskScan}, remote previous-window owners: ${remoteOwners.size}`);
+        if (needDiskScan) {
+            await store.rescanBase();
+        }
+        let since = windowStart - BOUNDARY_SCAN_LOOKBACK;
+        for (let [sourceIndex, route] of remoteOwners) {
+            let ownerSource = effective.sources[sourceIndex];
+            if (typeof ownerSource === "string") continue;
+            try {
+                await store.boundaryScanRemote(createApiArchives(ownerSource), { since, route });
+            } catch (e) {
+                console.error(`Boundary scan (${label}) of previous-window owner (source index ${sourceIndex}) failed: ${(e as Error).stack ?? e}`);
+            }
+        }
+    } finally {
+        boundaryScansRunning.delete(bucketKey);
+    }
+}
+
 function buildBucket(account: string, bucketName: string, routing: RemoteConfig): LoadedBucket {
     let folder = getBucketFolder(account, bucketName);
     // The deploy-takeover remap is an INTERPRETATION overlay: everything behavioral (self entries,
@@ -288,11 +432,11 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig)
                 void scheduleRoutingReload(account, bucketName);
             },
             readerDiskLimit: self?.readerDiskLimit,
-            getFlushDeadline,
         });
     }
     let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store };
     scheduleWindowBoundaryRebuild(loaded);
+    scheduleBoundaryScans(loaded);
     return loaded;
 }
 
@@ -339,9 +483,9 @@ async function checkRoutingChanged(account: string, bucketName: string, config?:
     let key = `${account}/${bucketName}`;
     let loaded = await buckets.get(key);
     if (!loaded) return;
-    // get() cache-reads the file onto our disk when a remote source holds it, so the bucket still
-    // exists after a restart
-    let data = await loaded.store.get(ROUTING_FILE);
+    // The routing config is only ever read off our own disk - it is never pulled from another
+    // source (it reaches us exclusively as a version-validated write, which lands on disk first)
+    let data = await new ArchivesDisk(getBucketFolder(account, bucketName)).get(ROUTING_FILE);
     if (!data) return;
     let routing = parseRoutingData(data);
     if (!config?.force && JSON.stringify(routing) === loaded.routingJSON) return;
@@ -468,27 +612,11 @@ export async function rebuildAllLoadedBuckets(): Promise<void> {
     }
 }
 
-export async function rescanAllLoadedBucketDisks(): Promise<void> {
-    console.log(`Deploy switchover disk rescan starting (${buckets.size} loaded buckets) - catching files the other process wrote`);
-    for (let loadedPromise of [...buckets.values()]) {
-        let loaded = await loadedPromise.catch(() => undefined);
-        if (!loaded) continue;
-        let store = loaded.store;
-        if (!(store instanceof BlobStore)) continue;
-        try {
-            await store.rescanBase();
-        } catch (e) {
-            console.error(`Deploy switchover disk rescan failed for bucket ${loaded.account}/${loaded.bucketName}: ${(e as Error).stack ?? e}`);
-        }
-    }
-}
-
 onTakeoverEvent(event => {
     if (event === "remapChanged") {
+        // The rebuild applies the remapped windows, and scheduleBoundaryScans (part of the
+        // rebuild) schedules the handoff scans around the new windows' starts
         void rebuildAllLoadedBuckets();
-    }
-    if (event === "diskScan") {
-        void rescanAllLoadedBucketDisks();
     }
 });
 
@@ -564,7 +692,7 @@ class ArchivesLocalBucket implements IArchives {
     }
 
     public getDebugName() {
-        return `localBucket/${this.account}/${this.bucketName}`;
+        return `localBucket account ${this.account} bucket ${this.bucketName}`;
     }
     public async get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined> {
         let result = await this.get2(fileName, config);
