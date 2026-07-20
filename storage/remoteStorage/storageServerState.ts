@@ -11,7 +11,7 @@ import {
     WRITE_PAST_WINDOW_GRACE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, parseHostedUrl, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
-import { applyDeployRemap, getFlushDeadline, onTakeoverEvent } from "./deployTakeover";
+import { applyDeployRemap, getFlushDeadline, getTakeoverAltPort, onTakeoverEvent } from "./deployTakeover";
 import { createApiArchives } from "./createArchives";
 import type { IStorage } from "../IStorage";
 import type { AccessRequest, TrustRecord } from "./storageController";
@@ -164,15 +164,19 @@ const extraListenPorts = new Set<number>();
 export function addExtraListenPort(port: number): void {
     extraListenPorts.add(port);
 }
-
 function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[] {
     let { domain, port } = getStorageServerConfig();
     let indexes: number[] = [];
+    // The takeover's alternate port is the OTHER process of the switchover, on OUR machine with
+    // OUR disk - self for sync purposes on both sides (the old node must not scan/push its own
+    // successor; the shared folder plus the switchover disk scans reconcile them)
+    let takeoverAltPort = getTakeoverAltPort();
     for (let i = 0; i < routing.sources.length; i++) {
         let source = routing.sources[i];
         if (typeof source === "string" || source.type !== "remote") continue;
         let parsed = parseHostedUrl(source.url);
-        if (parsed.address === domain && (parsed.port === port || extraListenPorts.has(parsed.port)) && parsed.account === account && parsed.bucketName === bucketName) {
+        if (parsed.address !== domain || parsed.account !== account || parsed.bucketName !== bucketName) continue;
+        if (parsed.port === port || extraListenPorts.has(parsed.port) || parsed.port === takeoverAltPort) {
             indexes.push(i);
         }
     }
@@ -431,11 +435,11 @@ export async function writeBucketFile(account: string, bucketName: string, fileP
     if (!config?.lastModified && loaded.selfEntries.length) {
         let timeValid = loaded.selfEntries.filter(x => writeTime >= x.validWindow[0] - WRITE_PAST_WINDOW_GRACE && writeTime <= x.validWindow[1] + WRITE_PAST_WINDOW_GRACE);
         if (!timeValid.length) {
-            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: outside our valid windows (a switchover moved the write target)`);
+            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) is outside all our valid windows ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))} even with the ${WRITE_PAST_WINDOW_GRACE}ms grace (a switchover moved the write target)`);
             throw new Error(`${STORAGE_WRONG_VALID_WINDOW} This server is not a valid write target at ${writeTime} for bucket ${account}/${bucketName} (our valid windows: ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))}). Re-resolve the currently valid source and retry.`);
         }
         if (!timeValid.some(x => routeContains(x.route, route))) {
-            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: route ${route} is not ours (the client's shard config is stale)`);
+            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: route ${route} is outside our routes ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))} at writeTime ${writeTime} (the client's shard config is stale)`);
             throw new Error(`${STORAGE_WRONG_ROUTE} This server does not handle route ${route} (key ${JSON.stringify(filePath)}) for bucket ${account}/${bucketName} (our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}). Re-resolve the source for this key and retry.`);
         }
     }

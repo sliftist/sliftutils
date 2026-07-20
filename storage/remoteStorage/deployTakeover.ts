@@ -202,18 +202,50 @@ function scheduleEvents(): void {
         (timer as { unref?: () => void }).unref?.();
         eventTimers.push(timer);
     };
-    let remap = current.remap;
+    const remap = current.remap;
     if (remap) {
         let altPort = remap.altPort;
         schedule(remap.boundaryA - SWITCH_SCAN_LEAD, () => emit("diskScan"));
-        schedule(remap.boundaryA, () => console.log(`Deploy switchover write handoff boundary passed: fresh writes now belong to the alternate-port side (port ${altPort})`));
+        schedule(remap.boundaryA, () => console.log(`${logPrefix()} Deploy switchover write handoff boundary ${iso(remap.boundaryA)} passed: fresh writes now belong to the alternate-port side (port ${altPort})`));
         schedule(remap.boundaryA + SWITCH_SCAN_LEAD, () => emit("diskScan"));
-        schedule(remap.boundaryB, () => console.log(`Deploy switchover second boundary passed: fresh writes return to the main port`));
+        schedule(remap.boundaryB, () => console.log(`${logPrefix()} Deploy switchover second boundary ${iso(remap.boundaryB)} passed: fresh writes return to the main port`));
         schedule(remap.expire, () => void recompute().catch((e: Error) => console.error(`Deploy takeover recompute failed: ${e.stack ?? e}`)));
+    }
+    let dying = current.dying;
+    if (dying) {
+        let deadline = dying.successorStart + dying.overlap * FLUSH_DEADLINE_FRACTION;
+        let killTime = dying.successorStart + dying.overlap;
+        let logDeadline = () => {
+            if (loggedFlushDeadlineFor === deadline) return;
+            loggedFlushDeadlineFor = deadline;
+            console.log(`${logPrefix()} Deploy switchover flush deadline ${iso(deadline)} reached (now ${iso(Date.now())}): fast writes write through immediately until we are killed at ${iso(killTime)}`);
+        };
+        if (deadline <= now) {
+            logDeadline();
+        } else {
+            schedule(deadline, logDeadline);
+        }
     }
 }
 
-async function recompute(): Promise<void> {
+// Multiple processes (predecessor + successor) often share one journal during a switchover, so
+// every lifecycle line identifies its process
+function logPrefix(): string {
+    return `[pid ${process.pid}]`;
+}
+let loggedFlushDeadlineFor: number | undefined;
+
+// Recompute is invoked from init, registerAltPort, the poll, and the expiry timer - possibly
+// concurrently. Runs are serialized, or two in-flight runs would both pass the changed-state check
+// and double-fire every transition (logs, rebuild events, timers).
+let recomputeChain = Promise.resolve();
+function recompute(): Promise<void> {
+    let next = recomputeChain.then(() => recomputeNow());
+    recomputeChain = next.then(() => { }, () => { });
+    return next;
+}
+
+async function recomputeNow(): Promise<void> {
     if (!initialized || !timelineFolder) return;
     let now = Date.now();
     let entries = await readTimelineEntries();
@@ -227,11 +259,11 @@ async function recompute(): Promise<void> {
     // Matching failures must be loud, or takeover detection fails silently forever
     if (!us && entries.length && !loggedNoMatch) {
         loggedNoMatch = true;
-        console.warn(`No deploy timeline entry matches our pid chain (${[...ancestorPids].join(", ")}) - takeover detection cannot work. Entries: ${entries.map(x => `pid=${x.pid ?? "none"} releaseTime=${x.parameters.releaseTime}`).join(" | ")}`);
+        console.warn(`${logPrefix()} No deploy timeline entry matches our pid chain (${[...ancestorPids].join(", ")}) - takeover detection cannot work. Entries: ${entries.map(x => `pid=${x.pid ?? "none"} releaseTime=${x.parameters.releaseTime}`).join(" | ")}`);
     }
     if (us && !loggedIdentity) {
         loggedIdentity = true;
-        console.log(`Deploy timeline entry matched: we are pid=${us.pid}, releaseTime=${us.parameters.releaseTime !== undefined && iso(us.parameters.releaseTime) || "unknown"}, ${entries.length} entries total`);
+        console.log(`${logPrefix()} Deploy timeline entry matched: we are pid=${us.pid}, releaseTime=${us.parameters.releaseTime !== undefined && iso(us.parameters.releaseTime) || "unknown"}, ${entries.length} entries total`);
     }
     let computed: TakeoverComputed = {};
     let usRelease = us?.parameters.releaseTime;
@@ -294,16 +326,16 @@ function iso(time: number): string {
 function logTransitions(prev: TakeoverComputed, next: TakeoverComputed): void {
     if (!prev.dying && next.dying) {
         let { successorStart, overlap } = next.dying;
-        console.log(`Deploy switchover scheduled: our successor starts at ${iso(successorStart)}; fast-write flushes drain by ${iso(successorStart + overlap * FLUSH_DEADLINE_FRACTION)}, fresh writes hand off at ${iso(successorStart + overlap * BOUNDARY_A_FRACTION)}, and we are killed at ${iso(successorStart + overlap)}`);
+        console.log(`${logPrefix()} Deploy switchover scheduled: our successor starts at ${iso(successorStart)}; fast-write flushes drain by ${iso(successorStart + overlap * FLUSH_DEADLINE_FRACTION)}, fresh writes hand off at ${iso(successorStart + overlap * BOUNDARY_A_FRACTION)}, and we are killed at ${iso(successorStart + overlap)}`);
     }
     if (!prev.predecessorEnd && next.predecessorEnd) {
-        console.log(`We are a deploy successor: our predecessor holds the main port until ${iso(next.predecessorEnd)}`);
+        console.log(`${logPrefix()} We are a deploy successor: our predecessor holds the main port until ${iso(next.predecessorEnd)}`);
     }
     if (!prev.remap && next.remap) {
-        console.log(`Deploy switchover remap active: sources pointing at us are split so [${iso(next.remap.boundaryA)} .. ${iso(next.remap.boundaryB)}] routes to alternate port ${next.remap.altPort} (remap expires at ${iso(next.remap.expire)})`);
+        console.log(`${logPrefix()} Deploy switchover remap active: sources pointing at us are split so [${iso(next.remap.boundaryA)} .. ${iso(next.remap.boundaryB)}] routes to alternate port ${next.remap.altPort} (remap expires at ${iso(next.remap.expire)})`);
     }
     if (prev.remap && !next.remap) {
-        console.log(`Deploy switchover remap ended; running on the plain stored routing config`);
+        console.log(`${logPrefix()} Deploy switchover remap ended; running on the plain stored routing config`);
     }
 }
 
@@ -316,9 +348,9 @@ export async function initDeployTakeover(config: { domain: string; mainPort: num
     timelineFolder = getTimelineFolder();
     let entries = await readTimelineEntries();
     if (!entries.length) {
-        console.log(`No deploy timeline entries in ${timelineFolder}; deploy takeover inactive until they appear (port fallback still works)`);
+        console.log(`${logPrefix()} No deploy timeline entries in ${timelineFolder}; deploy takeover inactive until they appear (port fallback still works)`);
     } else {
-        console.log(`Deploy timeline found at ${timelineFolder} (${entries.length} entries); our pid chain: ${[...ancestorPids].join(" -> ")}`);
+        console.log(`${logPrefix()} Deploy timeline found at ${timelineFolder} (${entries.length} entries); our pid chain: ${[...ancestorPids].join(" -> ")}`);
     }
     await recompute();
     let poll = setInterval(() => {
@@ -399,6 +431,12 @@ export function getTakeoverStamp(): string | undefined {
     let remap = current.remap;
     if (!remap) return undefined;
     return JSON.stringify(remap);
+}
+
+/** The middle-window alternate port of an active remap. The OTHER process of the takeover lives on
+ *  this port on OUR machine (same disk!), so sources pointing at it are self, never sync targets. */
+export function getTakeoverAltPort(): number | undefined {
+    return current.remap?.altPort;
 }
 
 /** For the dying process: fast-write flush delays must never extend past this time, and after it

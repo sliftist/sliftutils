@@ -3157,7 +3157,6 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         cancelLargeUpload(id: string): Promise<void>;
         private flushOverlay;
         private evicting;
-        private loggedFlushDeadline;
         private enforceDiskLimit;
         private cleanupTombstones;
     }
@@ -3302,6 +3301,9 @@ declare module "sliftutils/storage/remoteStorage/deployTakeover" {
      *  client learns of a takeover within one ping interval, instead of waiting for its config poll
      *  or a write rejection. */
     export declare function getTakeoverStamp(): string | undefined;
+    /** The middle-window alternate port of an active remap. The OTHER process of the takeover lives on
+     *  this port on OUR machine (same disk!), so sources pointing at it are self, never sync targets. */
+    export declare function getTakeoverAltPort(): number | undefined;
     /** For the dying process: fast-write flush delays must never extend past this time, and after it
      *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
     export declare function getFlushDeadline(): number | undefined;
@@ -3413,10 +3415,15 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
     export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
     export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
     export declare const STORAGE_ACCESS_DENIED = "REMOTE_STORAGE_ACCESS_DENIED_9d81a4c0";
+    export type AuthTokenData = {
+        purpose: string;
+        time: number;
+        server: string;
+    };
     export type AuthToken = {
         certPem: string;
-        time: number;
         signature: string;
+        data: AuthTokenData;
     };
     export type AccessRequest = {
         requestId: string;

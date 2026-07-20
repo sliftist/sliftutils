@@ -46,13 +46,13 @@ export async function authenticateStorage(config: { address: string; port: numbe
     let rootDomain = config.address.split(".").slice(-2).join(".");
     await loadIdentityCA(rootDomain);
     let ca = getIdentityCA(rootDomain);
-    let time = Date.now();
-    let signature = sign({ key: ca.key }, {
+    let data = {
         purpose: STORAGE_AUTH_PURPOSE,
-        time,
+        time: Date.now(),
         server: `${config.address}:${config.port}`,
-    });
-    return await RemoteStorageController.nodes[config.nodeId].authenticate({ certPem: ca.cert.toString(), time, signature });
+    };
+    let signature = sign({ key: ca.key }, data);
+    return await RemoteStorageController.nodes[config.nodeId].authenticate({ certPem: ca.cert.toString(), signature, data });
 }
 
 export class ArchivesRemote implements IArchives {

@@ -361,11 +361,10 @@ export class BlobStore implements IBucketStore {
         let { source } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
         let scanStart = Date.now();
-        let scanLogged = false;
         let activity: SyncActivity = { type: "metadataScan", sourceDebugName: source.getDebugName(), startTime: scanStart };
         this.syncActivities.add(activity);
+        console.log(`Metadata scan of ${source.getDebugName()} starting (store ${this.folder})`);
         let progressTimer = setInterval(() => {
-            scanLogged = true;
             console.log(`Metadata scan of ${source.getDebugName()} still running (${Math.round((Date.now() - scanStart) / 1000)}s, store ${this.folder})`);
         }, SYNC_PROGRESS_LOG_INTERVAL);
         (progressTimer as { unref?: () => void }).unref?.();
@@ -376,9 +375,7 @@ export class BlobStore implements IBucketStore {
             clearInterval(progressTimer);
             this.syncActivities.delete(activity);
         }
-        if (scanLogged) {
-            console.log(`Metadata scan of ${source.getDebugName()} finished: ${files.length} files in ${Math.round((Date.now() - scanStart) / 1000)}s (store ${this.folder})`);
-        }
+        console.log(`Metadata scan of ${source.getDebugName()} finished: ${files.length} files in ${Math.round((Date.now() - scanStart) / 1000)}s (store ${this.folder})`);
         let seen = new Map<string, number>();
         for (let file of files) {
             seen.set(file.path, file.createTime);
@@ -673,11 +670,9 @@ export class BlobStore implements IBucketStore {
             let flushAt = Date.now() + writeDelay;
             let deadline = this.config?.getFlushDeadline?.();
             if (deadline !== undefined) {
+                // Past the deadline fast writes write through (deployTakeover logs the transition
+                // once, with the times - a per-store log here would repeat on every store rebuild)
                 if (Date.now() >= deadline) {
-                    if (!this.loggedFlushDeadline) {
-                        this.loggedFlushDeadline = true;
-                        console.log(`Deploy switchover flush deadline passed (store ${this.folder}): fast writes now write through immediately`);
-                    }
                     this.overlay.delete(key);
                     await this.writeToSources(key, data, writeTime);
                     return key;
@@ -858,7 +853,6 @@ export class BlobStore implements IBucketStore {
     // holds a same-or-newer copy (the only copy of a file is never deleted), and the index entry
     // repoints to that source so reads keep working (re-caching on the next read).
     private evicting = false;
-    private loggedFlushDeadline = false;
     private async enforceDiskLimit(): Promise<void> {
         let limit = this.config?.readerDiskLimit;
         if (!limit || this.evicting) return;

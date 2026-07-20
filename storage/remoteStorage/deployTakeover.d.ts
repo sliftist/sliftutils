@@ -20,6 +20,9 @@ export declare function applyDeployRemap(routing: RemoteConfig): RemoteConfig;
  *  client learns of a takeover within one ping interval, instead of waiting for its config poll
  *  or a write rejection. */
 export declare function getTakeoverStamp(): string | undefined;
+/** The middle-window alternate port of an active remap. The OTHER process of the takeover lives on
+ *  this port on OUR machine (same disk!), so sources pointing at it are self, never sync targets. */
+export declare function getTakeoverAltPort(): number | undefined;
 /** For the dying process: fast-write flush delays must never extend past this time, and after it
  *  fast writes flush immediately - so nothing is left in memory when the write window transfers. */
 export declare function getFlushDeadline(): number | undefined;

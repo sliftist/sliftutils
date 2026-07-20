@@ -20,7 +20,7 @@ Each bucket's store keeps a BulkDatabase2 index of every file (path, write time,
 
 ## Metadata first, data second
 
-Synchronization starts with metadata: every source's full listing (path, write time, size) is scanned into the index up front. This is fast and small, so a server very quickly knows exactly what exists everywhere — and can act as a consistent authority on the bucket (serving correct reads, listings, and existence checks by fetching bytes from whichever source holds them) long before it has downloaded the actual data. The data then follows: eagerly by default (the full sync), or — when there is simply too much data to copy — in noFullSync mode, where the disk is only a lazy read cache. Either way consistency is unchanged: the index is complete, writes still go to all the servers, and only where the bytes rest differs.
+We have an index that says where our data is, which we load immediately. Therefore, we can start acting as the authority immediately. And then we do a fast sync based on all of our sources, one of them being a disk source, in order to update this. This means that almost all the time we are immediately ready, and if anything is out of sync, we'll find it as quickly as possible. The index and our syncs just synchronize which files exist, their write times, and their sizes, which is almost always sufficient to characterize a unique state, while being very fast, and supported for all sources (backblaze, etc).
 
 ## Client writes are consistent; client reads are redundant
 

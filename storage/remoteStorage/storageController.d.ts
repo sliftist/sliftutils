@@ -6,10 +6,15 @@ export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a
 export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
 export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
 export declare const STORAGE_ACCESS_DENIED = "REMOTE_STORAGE_ACCESS_DENIED_9d81a4c0";
+export type AuthTokenData = {
+    purpose: string;
+    time: number;
+    server: string;
+};
 export type AuthToken = {
     certPem: string;
-    time: number;
     signature: string;
+    data: AuthTokenData;
 };
 export type AccessRequest = {
     requestId: string;

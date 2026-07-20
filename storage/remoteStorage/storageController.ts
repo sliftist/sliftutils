@@ -37,10 +37,17 @@ const AUTH_TIME_WINDOW = timeInMinute * 10;
 const MAX_SESSIONS = 100 * 1000;
 const MAX_REQUESTS_PER_IP = 50;
 
+export type AuthTokenData = {
+    purpose: string;
+    time: number;
+    // The address the client dialed. The port varies freely (deploy takeovers serve on alternate
+    // ports); only the domain is security-relevant, as it is what the cert binds to.
+    server: string;
+};
 export type AuthToken = {
     certPem: string;
-    time: number;
     signature: string;
+    data: AuthTokenData;
 };
 export type AccessRequest = {
     requestId: string;
@@ -158,14 +165,23 @@ class RemoteStorageControllerBase {
     async authenticate(token: AuthToken): Promise<{ machineId: string; ip: string }> {
         let { domain, port } = getStorageServerConfig();
         let caller = SocketFunction.getCaller();
-        if (Math.abs(Date.now() - token.time) > AUTH_TIME_WINDOW) {
-            throw new Error(`Auth token time is too far from the server time (token ${token.time}, server ${Date.now()}, allowed drift ${AUTH_TIME_WINDOW}ms)`);
+        // First establish that the signature signs the data exactly as the client sent it, THEN
+        // validate the data's fields. The two steps must never be mixed - reconstructing the
+        // payload from expectations conflates "is this signed" with "is this acceptable".
+        verify(token.certPem, token.signature, token.data);
+        let { purpose, time, server } = token.data;
+        if (purpose !== STORAGE_AUTH_PURPOSE) {
+            throw new Error(`Auth token purpose is ${JSON.stringify(purpose)}, expected ${JSON.stringify(STORAGE_AUTH_PURPOSE)}`);
         }
-        verify(token.certPem, token.signature, {
-            purpose: STORAGE_AUTH_PURPOSE,
-            time: token.time,
-            server: `${domain}:${port}`,
-        });
+        if (Math.abs(Date.now() - time) > AUTH_TIME_WINDOW) {
+            throw new Error(`Auth token time is too far from the server time (token ${time}, server ${Date.now()}, allowed drift ${AUTH_TIME_WINDOW}ms)`);
+        }
+        // Clients sign the address they dialed. The port varies freely (deploy takeovers serve on
+        // alternate ports); the domain is the replay boundary, so only it must match us.
+        let tokenDomain = server.split(":")[0];
+        if (tokenDomain !== domain) {
+            throw new Error(`Auth token is for server ${JSON.stringify(server)}, but this server is ${JSON.stringify(`${domain}:${port}`)}`);
+        }
         let machineId = getCommonName(token.certPem).split(".")[0];
         if (!verifyMachineIdForPublicKey({ machineId, publicKey: getPublicIdentifier(token.certPem) })) {
             throw new Error(`Certificate common name ${JSON.stringify(getCommonName(token.certPem))} does not match its public key`);
