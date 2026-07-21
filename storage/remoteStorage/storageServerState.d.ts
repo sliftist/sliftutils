@@ -52,6 +52,11 @@ export declare function writeBucketFile(account: string, bucketName: string, fil
     lastModified?: number;
 }): Promise<void>;
 export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
+/** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
+export declare function getActiveBucketKeys(): {
+    account: string;
+    bucketName: string;
+}[];
 export declare function rebuildAllLoadedBuckets(): Promise<void>;
 /** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
 export declare const startIntermediateMaintenance: {

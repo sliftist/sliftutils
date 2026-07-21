@@ -12,7 +12,7 @@ import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
     deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
     getBucketConfig, listAccountBuckets, ServerBucketInfo, clearAccountWriteStats,
-    getActiveBucket, activateBucket, ActiveBucketInfo,
+    getActiveBucket, activateBucket, ActiveBucketInfo, getActiveBucketKeys,
 } from "./storageServerState";
 import { StorageClientController } from "./storageClientController";
 
@@ -257,6 +257,10 @@ class RemoteStorageControllerBase {
         throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
+    /** Admin (so only this machine's own processes can call it): the buckets this process has loaded. A deploy successor asks its predecessor for this, so it activates exactly the buckets that are in use instead of every bucket on disk. */
+    async adminListActiveBuckets(): Promise<{ account: string; bucketName: string }[]> {
+        return getActiveBucketKeys();
+    }
     async adminListRequests(ip: string): Promise<AccessRequest[]> {
         let requests = await getRequests();
         return await requests.get(ip) || [];
@@ -511,6 +515,7 @@ export const RemoteStorageController = SocketFunction.register(
         listRequestsForIP: { hooks: [accountAccess] },
         grantAccess: {},
         adminListRequests: { hooks: [adminAccess] },
+        adminListActiveBuckets: { hooks: [adminAccess] },
         adminGrantAccess: { hooks: [adminAccess] },
         get: { hooks: [accountAccess] },
         get2: { hooks: [accountAccess] },

@@ -3281,6 +3281,13 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         account: string;
         bucketName: string;
     }): Promise<ActiveBucketInfo | string>;
+    /** The buckets a server currently has loaded. Admin only, so in practice this is our own machine's other process - a deploy successor asking its predecessor what is actually in use. */
+    export declare function listServerActiveBucketKeys(config: {
+        url: string;
+    }): Promise<{
+        account: string;
+        bucketName: string;
+    }[]>;
     /** Tells a server to load one of its buckets into memory (starting its synchronization) and returns its live state, or a string saying why it could not be loaded. Only touches that server - nothing is written and no other source is contacted. */
     export declare function activateServerBucket(config: {
         url: string;
@@ -3504,6 +3511,10 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         getAccessState: (account: string) => Promise<AccessState>;
         listRequestsForIP: (account: string, ip: string) => Promise<AccessRequest[]>;
         grantAccess: (requestId: string) => Promise<TrustRecord>;
+        adminListActiveBuckets: () => Promise<{
+            account: string;
+            bucketName: string;
+        }[]>;
         adminListRequests: (ip: string) => Promise<AccessRequest[]>;
         adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
         get: (account: string, bucketName: string, path: string, range?: {
@@ -3629,6 +3640,11 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         lastModified?: number;
     }): Promise<void>;
     export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
+    /** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
+    export declare function getActiveBucketKeys(): {
+        account: string;
+        bucketName: string;
+    }[];
     export declare function rebuildAllLoadedBuckets(): Promise<void>;
     /** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
     export declare const startIntermediateMaintenance: {

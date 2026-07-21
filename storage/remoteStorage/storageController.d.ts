@@ -52,6 +52,10 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     getAccessState: (account: string) => Promise<AccessState>;
     listRequestsForIP: (account: string, ip: string) => Promise<AccessRequest[]>;
     grantAccess: (requestId: string) => Promise<TrustRecord>;
+    adminListActiveBuckets: () => Promise<{
+        account: string;
+        bucketName: string;
+    }[]>;
     adminListRequests: (ip: string) => Promise<AccessRequest[]>;
     adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
     get: (account: string, bucketName: string, path: string, range?: {

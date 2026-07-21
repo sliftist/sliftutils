@@ -102,7 +102,7 @@ export function setAltPort(port: number): void {
         throw new Error(`An alternate port (${port}) was taken without a detected deploy takeover - detectDeployTakeover must run first`);
     }
     takeover.altPort = port;
-    console.warn(`${logPrefix()} Listening on alternate port ${port}: writes route here until ${iso(getIntermediateEnd())}, and we keep listening until ${iso(getAltPortListenEnd())}. Writing the switchover windows into every bucket now.`);
+    console.warn(`${logPrefix()} Listening on alternate port ${port}: writes route here until ${iso(getIntermediateEnd())}, and we keep listening until ${iso(getAltPortListenEnd())}`);
     startIntermediateMaintenance();
 }
 

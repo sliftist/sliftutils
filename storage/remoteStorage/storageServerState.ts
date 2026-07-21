@@ -15,7 +15,7 @@ import {
 import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
 import { injectIntermediateSource, expireIntermediateSources, getIntermediateSources, findSplitUrl, nextIntermediateVersion, INTERMEDIATE_EXPIRE_GRACE } from "./intermediateSources";
 import { getTakeoverIntermediate } from "./deployTakeover";
-import { createApiArchives } from "./createArchives";
+import { createApiArchives, listServerActiveBucketKeys } from "./createArchives";
 import type { IStorage } from "../IStorage";
 import { broadcastRoutingChanged } from "./storageController";
 import type { AccessRequest, TrustRecord } from "./storageController";
@@ -707,6 +707,14 @@ export function getBucketConfig(bucket: LoadedBucket): ArchivesConfig {
     };
 }
 
+/** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
+export function getActiveBucketKeys(): { account: string; bucketName: string }[] {
+    return [...buckets.keys()].map(key => {
+        let slash = key.indexOf("/");
+        return { account: key.slice(0, slash), bucketName: key.slice(slash + 1) };
+    });
+}
+
 export async function rebuildAllLoadedBuckets(): Promise<void> {
     for (let key of [...buckets.keys()]) {
         let slash = key.indexOf("/");
@@ -729,7 +737,7 @@ async function writeOwnRoutingConfig(loaded: LoadedBucket, updated: RemoteConfig
     lastOwnConfigWrite.set(key, Date.now());
     let version = nextIntermediateVersion(getConfigVersion(loaded.routing));
     let next: RemoteConfig = { ...updated, version };
-    console.log(`Writing our own routing config update for bucket ${key} (${reason}), version ${getConfigVersion(loaded.routing)} -> ${version}: ${JSON.stringify(next)}`);
+    console.log(`Writing ${ROUTING_FILE} for bucket ${key} (${reason}), version ${getConfigVersion(loaded.routing)} -> ${version}: ${JSON.stringify(next)}`);
     let data = Buffer.from(serializeRemoteConfig(next));
     await writeBucketFile(loaded.account, loaded.bucketName, ROUTING_FILE, data);
     await propagateRoutingConfig(loaded, next, data);
@@ -749,7 +757,7 @@ async function propagateRoutingConfig(loaded: LoadedBucket, next: RemoteConfig, 
     for (let [url, source] of targets) {
         try {
             await createApiArchives(source).set(ROUTING_FILE, data);
-            console.log(`Propagated our routing config update to ${url}`);
+            console.log(`Wrote ${ROUTING_FILE} for bucket ${loaded.account}/${loaded.bucketName} to ${url}`);
         } catch (e) {
             console.error(`Propagating our routing config update to ${url} failed: ${(e as Error).stack ?? e}`);
         }
@@ -759,8 +767,12 @@ async function propagateRoutingConfig(loaded: LoadedBucket, next: RemoteConfig, 
 async function maintainIntermediates(): Promise<void> {
     let { domain, port } = getStorageServerConfig();
     let takeover = getTakeoverIntermediate();
+    let written: string[] = [];
+    let alreadyCorrect: string[] = [];
+    let notOurs: string[] = [];
     // ONLY buckets already in memory. A switchover must never load a bucket: loading starts its synchronization, and buckets nothing has touched (legacy ones especially) have no writes to hand off in the first place. One that does get used mid-switchover loads on that access, and the next pass gives it its window.
-    for (let key of [...buckets.keys()]) {
+    let keys = [...buckets.keys()];
+    for (let key of keys) {
         let loadedPromise = buckets.get(key);
         if (!loadedPromise) continue;
         let loaded = await loadedPromise.catch(() => undefined);
@@ -768,6 +780,7 @@ async function maintainIntermediates(): Promise<void> {
         let expired = expireIntermediateSources(loaded.routing, Date.now());
         if (JSON.stringify(expired) !== JSON.stringify(loaded.routing)) {
             await writeOwnRoutingConfig(loaded, expired, `switchover windows expired more than ${INTERMEDIATE_EXPIRE_GRACE / 1000}s ago`);
+            written.push(key);
             continue;
         }
         if (!takeover) continue;
@@ -776,21 +789,64 @@ async function maintainIntermediates(): Promise<void> {
             let parsed = parseHostedUrl(x.url);
             return parsed.address === domain && parsed.port === port;
         }) as HostedConfig | undefined;
-        if (!mainUrl) continue;
+        if (!mainUrl) {
+            notOurs.push(key);
+            continue;
+        }
         let injected = injectIntermediateSource(loaded.routing, {
             splitUrl: mainUrl.url,
             intermediateUrl: replaceHostedUrlPort(mainUrl.url, takeover.altPort),
             start: takeover.start,
             end: takeover.end,
         });
-        if (JSON.stringify(injected) === JSON.stringify(loaded.routing)) continue;
+        if (JSON.stringify(injected) === JSON.stringify(loaded.routing)) {
+            alreadyCorrect.push(key);
+            continue;
+        }
         await writeOwnRoutingConfig(loaded, injected, `we are a deploy successor: writes route to our alternate port ${takeover.altPort} from ${new Date(takeover.start).toISOString()} until our predecessor is killed at ${new Date(takeover.end).toISOString()}`);
+        written.push(key);
+    }
+    if (!takeover) return;
+    if (!keys.length) {
+        console.log(`No active buckets, so no config files to write the intermediate into (a bucket is only active once something uses it)`);
+        return;
+    }
+    if (!written.length) {
+        console.log(`Wrote no config files: of ${keys.length} active buckets, ${alreadyCorrect.length} already contain the intermediate and ${notOurs.length} are not hosted by us`);
+    }
+}
+
+/** Our predecessor still holds the main port and has been serving all along, so it - not us - knows which buckets are in use. We activate exactly those, which is what makes their config files get the intermediate; nothing else on disk is touched. */
+async function activatePredecessorBuckets(): Promise<void> {
+    let { domain, port } = getStorageServerConfig();
+    let url = `https://${domain}:${port}`;
+    let keys: { account: string; bucketName: string }[];
+    try {
+        keys = await listServerActiveBucketKeys({ url });
+    } catch (e) {
+        console.error(`Could not ask our predecessor on ${url} which buckets are active, so only buckets used on this process get the intermediate: ${(e as Error).stack ?? e}`);
+        return;
+    }
+    if (!keys.length) {
+        console.log(`Our predecessor on ${url} has no active buckets, so there are no config files to write the intermediate into`);
+        return;
+    }
+    console.log(`Our predecessor on ${url} has ${keys.length} active buckets, activating them here so their config files get the intermediate: ${keys.map(x => `${x.account}/${x.bucketName}`).join(", ")}`);
+    for (let { account, bucketName } of keys) {
+        try {
+            await getLoadedBucket(account, bucketName);
+        } catch (e) {
+            console.error(`Activating bucket ${account}/${bucketName} (active on our predecessor) failed: ${(e as Error).stack ?? e}`);
+        }
     }
 }
 
 /** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
 export const startIntermediateMaintenance = lazy(() => {
-    void maintainIntermediates().catch((e: Error) => console.error(`Maintaining switchover routing windows failed: ${e.stack ?? e}`));
+    void (async () => {
+        await activatePredecessorBuckets();
+        await maintainIntermediates();
+    })().catch((e: Error) => console.error(`Writing the intermediate into the config files failed: ${e.stack ?? e}`));
     runInfinitePoll(INTERMEDIATE_MAINTAIN_INTERVAL, maintainIntermediates);
 });
 

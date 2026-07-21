@@ -752,6 +752,11 @@ export async function getServerActiveBucket(config: { url: string; account: stri
     return await callServer(config.url, controller => controller.getActiveBucket(config.account, config.bucketName));
 }
 
+/** The buckets a server currently has loaded. Admin only, so in practice this is our own machine's other process - a deploy successor asking its predecessor what is actually in use. */
+export async function listServerActiveBucketKeys(config: { url: string }): Promise<{ account: string; bucketName: string }[]> {
+    return await callServer(config.url, controller => controller.adminListActiveBuckets());
+}
+
 /** Tells a server to load one of its buckets into memory (starting its synchronization) and returns its live state, or a string saying why it could not be loaded. Only touches that server - nothing is written and no other source is contacted. */
 export async function activateServerBucket(config: { url: string; account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
     return await callServer(config.url, controller => controller.activateBucket(config.account, config.bucketName));
