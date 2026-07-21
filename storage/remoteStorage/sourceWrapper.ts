@@ -101,11 +101,19 @@ export class SourceWrapper {
         return this.remote.isConnected();
     }
 
+    /** A source whose window has passed is never read from or written to (see the window checks in ArchivesChain), and an intermediate only exists for the minutes of a deploy switchover - on either, being unreachable is expected, not a problem to report. */
+    private isConnectionProblemWorthReporting(): boolean {
+        if (this.config.intermediate) return false;
+        return this.config.validWindow[1] > Date.now();
+    }
+
     /** Call after a request failed while isConnected() was false: starts (if not already running) the background reconnect loop. Never blocks - the failed request still throws. */
     public noteFailure(): void {
         if (!this.background || this.disposed || this.reconnectRunning) return;
         if (this.isConnected()) return;
-        console.error(`Cannot connect to storage ${this.getDebugName()}`);
+        if (this.isConnectionProblemWorthReporting()) {
+            console.error(`Cannot connect to storage ${this.getDebugName()}`);
+        }
         this.reconnectRunning = true;
         void this.reconnectLoop();
     }
@@ -126,7 +134,9 @@ export class SourceWrapper {
             } catch (e) {
                 // Even a failing call (e.g. access denied) proves the connection is back
                 if (this.isConnected()) break;
-                console.warn(`Cannot connect to storage ${this.getDebugName()}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).stack ?? e}`);
+                if (this.isConnectionProblemWorthReporting()) {
+                    console.warn(`Cannot connect to storage ${this.getDebugName()}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).stack ?? e}`);
+                }
             }
             retryDelay = Math.min(RETRY_MAX_DELAY, retryDelay * RETRY_GROWTH);
         }
@@ -182,6 +192,8 @@ export class SourceWrapper {
     public startPinging(): void {
         const remote = this.remote;
         if (!remote || this.pingTimer || this.disposed) return;
+        // Latency only decides which shard a variable-shard write materializes into, and a source whose window has passed never receives writes - so measuring it is pointless traffic
+        if (this.config.validWindow[1] <= Date.now()) return;
         let measure = async () => {
             let start = Date.now();
             try {

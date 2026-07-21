@@ -21,6 +21,8 @@ export declare class SourceWrapper {
     }): Promise<SourceWrapper>;
     getDebugName(): string;
     isConnected(): boolean;
+    /** A source whose window has passed is never read from or written to (see the window checks in ArchivesChain), and an intermediate only exists for the minutes of a deploy switchover - on either, being unreachable is expected, not a problem to report. */
+    private isConnectionProblemWorthReporting;
     /** Call after a request failed while isConnected() was false: starts (if not already running) the background reconnect loop. Never blocks - the failed request still throws. */
     noteFailure(): void;
     private reconnectLoop;
