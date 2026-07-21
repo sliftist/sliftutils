@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
 import { IArchives, ArchiveFileInfo, ArchivesConfig } from "../IArchives";
 import { buildFileUrl } from "./remoteConfig";

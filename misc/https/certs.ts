@@ -1,7 +1,5 @@
 /// <reference path="./node-forge-ed25519.d.ts" />
 
-module.allowclient = true;
-
 // NOTE: We can't use crypto.subtle (non-extractable CryptoKeys) for our keys, because subtle is asynchronous, and everything here (key generation, cert creation, signing) must be available synchronously. The only real benefit of subtle is that a cross-site scripting attack can't exfiltrate the key. Which, while nice, is of minor benefit, as the cross-site script can already do quite a bit of damage anyway with access. And if that happens, the first thing the user is probably going to do is reset all their credentials, which solves the case of the key being exfiltrated anyway (by telling the server to stop trusting all identities).
 // NOTE: We are just not going to support HTTPS browser certs. Our code is purely for identification, and so it only supports ED25519.
 

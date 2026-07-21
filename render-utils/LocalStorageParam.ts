@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import { isNode } from "typesafecss";
 import { observable } from "mobx";
 

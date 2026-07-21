@@ -1,4 +1,3 @@
-process.env.NODE_ENV = "production";
 import { hostStorageServer } from "./storageServer";
 import { getArg } from "./cliArgs";
 

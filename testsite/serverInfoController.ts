@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import os from "os";
 import { SocketFunction } from "socket-function/SocketFunction";
 

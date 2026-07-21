@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import preact from "preact";
 import { showModal } from "./modal";
 import { observable } from "mobx";

@@ -3353,6 +3353,10 @@ declare module "sliftutils/storage/remoteStorage/intermediateSources" {
 
 }
 
+declare module "sliftutils/storage/remoteStorage/productionEnv" {
+
+}
+
 declare module "sliftutils/storage/remoteStorage/remoteConfig" {
     /// <reference types="node" />
     /// <reference types="node" />

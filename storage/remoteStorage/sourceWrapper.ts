@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import { isNode, sort } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getSecret } from "../../misc/getSecret";

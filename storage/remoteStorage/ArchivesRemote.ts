@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";

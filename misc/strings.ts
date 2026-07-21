@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 export function ellipsize(text: string, maxLength: number): string {
     if (text.length <= maxLength) {
         return text;

@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import { observable } from "mobx";
 import { list } from "socket-function/src/misc";
 import { css } from "typesafecss";

@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import preact from "preact";
 import { css } from "typesafecss";
 import { formatValue, JSXFormatter, toSpaceCase } from "./GenericFormat";

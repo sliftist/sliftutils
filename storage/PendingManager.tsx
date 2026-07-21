@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import { throttleFunction } from "socket-function/src/misc";
 import { observable } from "mobx";
 import preact from "preact";

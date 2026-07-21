@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import { SocketFunction } from "socket-function/SocketFunction";
 import { SocketRegistered } from "socket-function/SocketFunctionTypes";
 import { onHotReload } from "socket-function/hot/HotReloadController";

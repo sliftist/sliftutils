@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import preact from "preact";
 import { css } from "typesafecss";
 import { observer } from "./observer";

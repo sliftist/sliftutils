@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import * as mobx from "mobx";
 import { batchFunction } from "socket-function/src/batching";
 

@@ -1,4 +1,4 @@
-module.allowclient = true;
+process.env.NODE_ENV = "production";
 
 import preact from "preact";
 import { observable } from "mobx";

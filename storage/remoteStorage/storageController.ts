@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import { SocketFunction } from "socket-function/SocketFunction";
 import { SocketFunctionHook } from "socket-function/SocketFunctionTypes";
 import { getNodeIdIP } from "socket-function/src/nodeCache";
@@ -62,8 +60,8 @@ export type AccessState = {
 const sessions = new Map<string, string>();
 
 const CONTENT_TYPES: { [ext: string]: string } = {
-    html: "text/html", js: "text/javascript", css: "text/css", json: "application/json",
-    txt: "text/plain", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+    html: "text/html; charset=utf-8", js: "text/javascript; charset=utf-8", css: "text/css; charset=utf-8", json: "application/json; charset=utf-8",
+    txt: "text/plain; charset=utf-8", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
     svg: "image/svg+xml", webp: "image/webp", mp4: "video/mp4", webm: "video/webm",
     mp3: "audio/mpeg", wav: "audio/wav", pdf: "application/pdf",
 };
@@ -407,10 +405,12 @@ class RemoteStorageControllerBase {
         let request = getCurrentHTTPRequest();
         let pathname = new URL(request?.url || "/", "https://localhost").pathname;
         if (!pathname.startsWith("/file/")) {
-            return await performLocalCall({
+            let html = await performLocalCall({
                 caller,
                 call: { nodeId: caller.nodeId, classGuid: RequireController._classGuid, functionName: "requireHTML", args: [config] },
             }) as Buffer;
+            // Without this the access page is served with no content type, and a browser that is told not to sniff simply will not render it
+            return setHTTPResultHeaders(html, { "Content-Type": "text/html; charset=utf-8" });
         }
         let parts = pathname.split("/").filter(x => x).map(decodeURIComponent);
         let account = parts[1];

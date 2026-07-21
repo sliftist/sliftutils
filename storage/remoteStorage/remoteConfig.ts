@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import { sort, sha256HashBuffer } from "socket-function/src/misc";
 import { getBufferInt } from "socket-function/src/bits";
 import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, FULL_VALID_WINDOW, FULL_ROUTE, VARIABLE_SHARD } from "../IArchives";

@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 import { isNode } from "socket-function/src/misc";
 import fs from "fs";
 import os from "os";

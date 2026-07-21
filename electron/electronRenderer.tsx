@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import * as preact from "preact";
 import { observable } from "mobx";
 import { observer } from "../render-utils/observer";

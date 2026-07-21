@@ -1,5 +1,3 @@
-module.allowclient = true;
-
 // The important operations of an archive bucket (extracted from ArchivesBackblaze), so other backends (e.g. our own remote storage server) can be used interchangeably.
 
 // A write may not be stamped more than this far in the future, or clock skew between machines would let a bad timestamp block writes for a long time.

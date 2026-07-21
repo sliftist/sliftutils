@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import os from "os";
 import path from "path";
 import fsp from "fs/promises";
@@ -89,8 +91,10 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     SocketFunction.expose(RequireController);
     SocketFunction.expose(RemoteStorageController);
     // Every HTTP path goes through httpEntry: /file/<account>/<bucketName>/... serves public bucket files, everything else serves the access page (the path is the account name, see accessPage.tsx). A full URL, so the page resolves modules from the origin root even when served at /accountName (a relative require would resolve inside the account path).
+    // The module path is resolved server-side against its working directory, which is the HOST application's folder - so it is computed from where this file actually is, instead of assuming the storage server runs from inside sliftutils (in a host app it lives under node_modules/sliftutils).
+    let accessPagePath = "./" + path.relative(process.cwd(), path.join(__dirname, "accessPage.tsx")).replaceAll("\\", "/");
     SocketFunction.setDefaultHTTPCall(RemoteStorageController, "httpEntry", {
-        requireCalls: [`https://${domain}:${port}/./storage/remoteStorage/accessPage.tsx`],
+        requireCalls: [`https://${domain}:${port}/${accessPagePath}`],
     });
 
     // Initial check so a server starting under-limit immediately rejects writes; then keep checking every 15 minutes so recovery (freed disk space) is picked up automatically.

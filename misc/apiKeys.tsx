@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "production";
+
 import preact from "preact";
 import { cache, lazy } from "socket-function/src/caching";
 import { css, isNode } from "typesafecss";
