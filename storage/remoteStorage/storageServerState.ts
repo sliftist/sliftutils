@@ -508,6 +508,10 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig,
     let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store, structureKey: plan.structureKey };
     scheduleWindowBoundaryRebuild(loaded);
     scheduleBoundaryScans(loaded);
+    // A loaded bucket must actually be running: the store's init loads its index and starts its source synchronization, and it is lazy, so without this a bucket nothing has read from or written to sits inert - reporting no data and no syncing while its disk is full of files.
+    if (store instanceof BlobStore) {
+        void store.init().catch((e: Error) => console.error(`Initializing the store for bucket ${account}/${bucketName} failed: ${e.stack ?? e}`));
+    }
     return loaded;
 }
 
@@ -869,6 +873,10 @@ export async function activateBucket(account: string, bucketName: string): Promi
     }
     if (!loaded) {
         return `Bucket ${key} does not exist on this server (no routing file in ${getBucketFolder(account, bucketName)})`;
+    }
+    // Wait for the index to load, so the totals we return are the real ones rather than zeroes from a store that has not read its index yet. The source scans keep running in the background.
+    if (loaded.store instanceof BlobStore) {
+        await loaded.store.init();
     }
     if (!wasLoaded) {
         console.log(`Activated bucket ${key} on request: it is now loaded and synchronizing`);
