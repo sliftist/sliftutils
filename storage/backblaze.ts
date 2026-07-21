@@ -415,7 +415,8 @@ export class ArchivesBackblaze implements IArchives {
             allowedOperations: ["b2_download_file_by_id", "b2_download_file_by_name"],
             allowedHeaders: ["range"],
             exposeHeaders: ["x-bz-content-sha1"],
-            maxAgeSeconds: cacheTime / 1000,
+            // 60 is the absolute minimum. If we try to set a value lower than this, it'll be updated to be 60. 
+            maxAgeSeconds: Math.max(60, cacheTime / 1000),
         }];
         let bucketInfo: Record<string, unknown> = {};
         if (cacheTime) {
