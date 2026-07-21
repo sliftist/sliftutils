@@ -4,7 +4,8 @@ import { startIntermediateMaintenance } from "./storageServerState";
 
 const PARAMETERS_TIMELINE_FILE_REGEX = /^(\d+)-parameters\.json$/;
 const DEPLOY_DETECT_RETRY_DELAY = 5 * 1000;
-const DEPLOY_DETECT_ATTEMPTS = 6;
+const DEPLOY_DETECT_TIMEOUT = 30 * 1000;
+const EXIT_LOG_FLUSH_DELAY = 5 * 1000;
 const DEPLOY_RELEASE_MATCH_WINDOW = 5 * 60 * 1000;
 const ALT_PORT_LINGER = 30 * 60 * 1000;
 const ACQUIRE_SLOW_DELAY = 30 * 1000;
@@ -72,20 +73,28 @@ function findOurRelease(entries: TimelineEntry[], now: number): DeployTakeover |
 
 /** Called when the main port is already in use, which on a healthy machine only happens while our predecessor is still running a deploy overlap. Confirms that against the deploy timeline; if no deploy is in progress we are in a bad state (someone else holds our port) and the process must not keep running. */
 export async function detectDeployTakeover(): Promise<DeployTakeover> {
-    for (let attempt = 1; attempt <= DEPLOY_DETECT_ATTEMPTS; attempt++) {
+    console.warn(`${logPrefix()} Our main port is in use, which should only happen while a deploy overlap is running - checking the deploy timeline in ${getTimelineFolder()} for the release we are part of`);
+    let start = Date.now();
+    let attempt = 0;
+    while (true) {
+        attempt++;
         let entries = await readTimelineEntries();
         let found = findOurRelease(entries, Date.now());
         if (found) {
             takeover = found;
-            console.log(`${logPrefix()} Our main port is in use and the deploy timeline confirms a release at ${iso(found.releaseTime)} with an overlap of ${found.overlapTime}ms: we are the successor. Our predecessor is killed at ${iso(found.releaseTime + found.overlapTime)}.`);
+            console.warn(`${logPrefix()} Deploy takeover confirmed on attempt ${attempt}: release at ${iso(found.releaseTime)}, overlap ${found.overlapTime}ms, so our predecessor holds the main port until ${iso(found.releaseTime + found.overlapTime)}. We are the successor.`);
             return found;
         }
-        console.log(`${logPrefix()} Our main port is in use but the deploy timeline in ${getTimelineFolder()} shows no release in progress (attempt ${attempt} of ${DEPLOY_DETECT_ATTEMPTS}); retrying in ${DEPLOY_DETECT_RETRY_DELAY}ms`);
-        if (attempt < DEPLOY_DETECT_ATTEMPTS) {
-            await new Promise(resolve => setTimeout(resolve, DEPLOY_DETECT_RETRY_DELAY));
+        let elapsed = Date.now() - start;
+        if (elapsed >= DEPLOY_DETECT_TIMEOUT) {
+            // Not a deploy, so something else holds our port and nothing we do from here is correct. Exit, giving the log time to reach the disk first - the message is the only thing that explains the exit.
+            console.error(`${logPrefix()} Our main port is in use, but the deploy timeline in ${getTimelineFolder()} showed no release in progress across ${attempt} checks over ${elapsed}ms. Something else is holding our port, so this process is in a bad state. Exiting in ${EXIT_LOG_FLUSH_DELAY}ms.`);
+            await new Promise(resolve => setTimeout(resolve, EXIT_LOG_FLUSH_DELAY));
+            process.exit(1);
         }
+        console.warn(`${logPrefix()} No release in progress in the deploy timeline yet (attempt ${attempt}, ${elapsed}ms of ${DEPLOY_DETECT_TIMEOUT}ms); retrying in ${DEPLOY_DETECT_RETRY_DELAY}ms`);
+        await new Promise(resolve => setTimeout(resolve, DEPLOY_DETECT_RETRY_DELAY));
     }
-    throw new Error(`Our main port is in use, but no deploy is in progress after ${DEPLOY_DETECT_ATTEMPTS * DEPLOY_DETECT_RETRY_DELAY}ms of checking the deploy timeline in ${getTimelineFolder()}. Something else is holding our port, so this process is in a bad state and is exiting.`);
 }
 
 export function setAltPort(port: number): void {
@@ -93,7 +102,7 @@ export function setAltPort(port: number): void {
         throw new Error(`An alternate port (${port}) was taken without a detected deploy takeover - detectDeployTakeover must run first`);
     }
     takeover.altPort = port;
-    console.log(`${logPrefix()} Listening on alternate port ${port}: writes route here until ${iso(getIntermediateEnd())}, and we keep listening until ${iso(getAltPortListenEnd())}`);
+    console.warn(`${logPrefix()} Listening on alternate port ${port}: writes route here until ${iso(getIntermediateEnd())}, and we keep listening until ${iso(getAltPortListenEnd())}. Writing the switchover windows into every bucket now.`);
     startIntermediateMaintenance();
 }
 

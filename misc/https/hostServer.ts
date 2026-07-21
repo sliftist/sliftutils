@@ -91,7 +91,7 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
     let servingPort = getNodeIdLocation(nodeId)?.port || port;
     let fallback = config.portFallback;
     if (fallback && servingPort !== port) {
-        console.log(magenta(`Port ${port} is in use (presumably by our predecessor); serving on alternate port ${servingPort} until it frees`));
+        console.warn(`Port ${port} is in use (presumably by our predecessor); serving on alternate port ${servingPort} until it frees`);
         await fallback.onPortInUse?.();
         void runMainPortAcquireLoop(domain, port, servingPort, fallback);
     }

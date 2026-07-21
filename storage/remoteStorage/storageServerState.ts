@@ -716,16 +716,17 @@ export async function rebuildAllLoadedBuckets(): Promise<void> {
 
 const OWN_CONFIG_WRITE_THROTTLE = 30 * 1000;
 const INTERMEDIATE_MAINTAIN_INTERVAL = 60 * 1000;
-let lastOwnConfigWrite = 0;
+// Per bucket, not global: a switchover has to write every bucket's windows at once, and a shared throttle would let only one bucket through per interval
+const lastOwnConfigWrite = new Map<string, number>();
 
 async function writeOwnRoutingConfig(loaded: LoadedBucket, updated: RemoteConfig, reason: string): Promise<void> {
     let key = `${loaded.account}/${loaded.bucketName}`;
-    let sinceLast = Date.now() - lastOwnConfigWrite;
+    let sinceLast = Date.now() - (lastOwnConfigWrite.get(key) || 0);
     if (sinceLast < OWN_CONFIG_WRITE_THROTTLE) {
         console.log(`Not writing our own routing config update for bucket ${key} (${reason}): the last one was ${sinceLast}ms ago, under the ${OWN_CONFIG_WRITE_THROTTLE}ms throttle. Retrying on the next maintenance pass. Wanted: ${JSON.stringify(updated)}`);
         return;
     }
-    lastOwnConfigWrite = Date.now();
+    lastOwnConfigWrite.set(key, Date.now());
     let version = nextIntermediateVersion(getConfigVersion(loaded.routing));
     let next: RemoteConfig = { ...updated, version };
     console.log(`Writing our own routing config update for bucket ${key} (${reason}), version ${getConfigVersion(loaded.routing)} -> ${version}: ${JSON.stringify(next)}`);
@@ -758,6 +759,7 @@ async function propagateRoutingConfig(loaded: LoadedBucket, next: RemoteConfig, 
 async function maintainIntermediates(): Promise<void> {
     let { domain, port } = getStorageServerConfig();
     let takeover = getTakeoverIntermediate();
+    // ONLY buckets already in memory. A switchover must never load a bucket: loading starts its synchronization, and buckets nothing has touched (legacy ones especially) have no writes to hand off in the first place. One that does get used mid-switchover loads on that access, and the next pass gives it its window.
     for (let key of [...buckets.keys()]) {
         let loadedPromise = buckets.get(key);
         if (!loadedPromise) continue;
