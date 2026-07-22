@@ -402,6 +402,7 @@ class RemoteStorageControllerBase {
         await bucket.store.cancelLargeUpload(uploadId);
     }
 
+    // IMPORTANT: We can never expose enumeration (listing, prefix search, changes feeds) over this public HTTP endpoint - only exact-key reads. Enumeration would be a massive security risk (public buckets rely on unguessable keys staying unguessable), and could also crash the client by sending them too much data. Listings exist only on the authenticated API (findInfo etc, behind accountAccess).
     async httpEntry(config?: { requireCalls?: string[]; cacheTime?: number }): Promise<Buffer> {
         let caller = SocketFunction.getCaller();
         let request = getCurrentHTTPRequest();

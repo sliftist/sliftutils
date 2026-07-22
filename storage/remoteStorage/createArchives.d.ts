@@ -14,6 +14,7 @@ export declare class ArchivesChain implements IArchives {
     private configured;
     private activeConfig;
     private statePromise;
+    private latestState;
     private initRetryDelay;
     private initRetryTimer;
     private pollTimer;
@@ -86,8 +87,10 @@ export declare class ArchivesChain implements IArchives {
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
     getURL(path: string): Promise<string>;
-    /** Every URL that could serve this path, in source order: public sources matching both the path's route and the current valid window. Empty when none qualify. */
+    /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runWrite - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
     getURLs(path: string): Promise<string[]>;
+    /** getURLs, but after the one await (initialization) the returned function is synchronous: everything underneath - route hashing, window checks, latencies, URL building - is synchronous, and the closure always reads the newest adopted config, so it stays correct across config refreshes. */
+    getGetURLs(): Promise<(path: string) => string[]>;
     dispose(): void;
 }
 export declare function createArchives(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions): ArchivesChain;

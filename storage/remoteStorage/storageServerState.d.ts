@@ -40,7 +40,7 @@ export type LoadedBucket = {
     routing: RemoteConfig;
     routingJSON: string;
     selfEntries: HostedConfig[];
-    self: HostedConfig | undefined;
+    self: SelfSummary | undefined;
     store: IBucketStore;
     structureKey: string;
 };
@@ -48,6 +48,16 @@ export declare function addExtraListenPort(port: number): void;
 export declare function removeExtraListenPort(port: number): void;
 /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
 export declare function resolveSourceArchives(url: string): IArchives;
+/** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
+export type SelfSummary = {
+    /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
+    routes: [number, number][];
+    public: boolean;
+    immutable: boolean;
+    noFullSync: boolean;
+    rawDisk: boolean;
+    readerDiskLimit?: number;
+};
 export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
 export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
 export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
@@ -88,9 +98,9 @@ export type ActiveBucketInfo = {
     folder: string;
     /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
     routing: RemoteConfig;
-    /** Our own entries in that config, and the one currently valid */
+    /** Our own entries in that config, and their summarized current role (routes union + flags) */
     selfEntries: HostedConfig[];
-    self?: HostedConfig;
+    self?: SelfSummary;
     config: ArchivesConfig;
 };
 /** The live in-memory state of ONE bucket, answered without touching the disk (no routing file read, no statfs, no stored write stats). Returns an error string when the bucket is not loaded here, which is the normal state for a bucket nothing has accessed since startup. */

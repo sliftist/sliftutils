@@ -8,7 +8,7 @@ import {
 import {
     ROUTING_FILE, getConfigVersion, parseHostedUrl, parseBackblazeUrl,
     normalizeRemoteConfig, normalizeSource, serializeRemoteConfig,
-    getRoute, routeContains, parseVariableRoute, getBucketBaseUrl,
+    getRoute, routeContains, parseVariableRoute, getBucketBaseUrl, buildFileUrl,
 } from "./remoteConfig";
 import { ArchivesUrl } from "./ArchivesUrl";
 import { resolveIntermediateSources } from "./intermediateSources";
@@ -100,6 +100,8 @@ export class ArchivesChain implements IArchives {
     private configured: RemoteConfig;
     private activeConfig: RemoteConfig;
     private statePromise: Promise<ChainState> | undefined;
+    // The resolved state, for synchronous access (getGetURLs) - always the newest adopted config, where statePromise may briefly lag during a rebuild
+    private latestState: ChainState | undefined;
     private initRetryDelay = RETRY_START_DELAY;
     private initRetryTimer: ReturnType<typeof setTimeout> | undefined;
     private pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -249,7 +251,9 @@ export class ArchivesChain implements IArchives {
             }
             this.activeConfig = active;
             this.startConfigPoll();
-            return { config: active, sources };
+            let state: ChainState = { config: active, sources };
+            this.latestState = state;
+            return state;
         } finally {
             for (let fetch of fetches) {
                 fetch.probe.dispose();
@@ -366,7 +370,9 @@ export class ArchivesChain implements IArchives {
             }
         }
         this.activeConfig = latest;
-        this.statePromise = Promise.resolve({ config: latest, sources });
+        let newState: ChainState = { config: latest, sources };
+        this.latestState = newState;
+        this.statePromise = Promise.resolve(newState);
     }
 
     private lastAvailabilityRecheck = 0;
@@ -804,21 +810,27 @@ export class ArchivesChain implements IArchives {
 
     /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runWrite - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
     public async getURLs(path: string): Promise<string[]> {
-        let state = await this.getState();
-        let route = getRoute(path);
-        let candidates: { source: SourceWrapper; provider: IArchives }[] = [];
-        for (let source of state.sources) {
-            if (!(source.config.public ?? true)) continue;
-            if (!routeContains(source.config.route, route)) continue;
-            if (!configWindowCurrent(source.config)) continue;
-            let provider = source.url || source.api;
-            if (!provider) continue;
-            candidates.push({ source, provider });
-        }
-        let rest = candidates.slice(1);
-        sort(rest, x => x.source.getLatency());
-        let urls = await Promise.all([...candidates.slice(0, 1), ...rest].map(x => x.provider.getURL(path)));
-        return [...new Set(urls)];
+        return (await this.getGetURLs())(path);
+    }
+
+    /** getURLs, but after the one await (initialization) the returned function is synchronous: everything underneath - route hashing, window checks, latencies, URL building - is synchronous, and the closure always reads the newest adopted config, so it stays correct across config refreshes. */
+    public async getGetURLs(): Promise<(path: string) => string[]> {
+        let initialState = await this.getState();
+        return (path: string) => {
+            let state = this.latestState || initialState;
+            let route = getRoute(path);
+            let sources: SourceWrapper[] = [];
+            for (let source of state.sources) {
+                if (!(source.config.public ?? true)) continue;
+                if (!routeContains(source.config.route, route)) continue;
+                if (!configWindowCurrent(source.config)) continue;
+                sources.push(source);
+            }
+            let rest = sources.slice(1);
+            sort(rest, x => x.getLatency());
+            let urls = [...sources.slice(0, 1), ...rest].map(x => buildFileUrl(getBucketBaseUrl(x.config.url), path));
+            return [...new Set(urls)];
+        };
     }
 
     public dispose(): void {

@@ -1,6 +1,7 @@
 import path from "path";
 import fs from "fs";
 import { lazy } from "socket-function/src/caching";
+import { sort } from "socket-function/src/misc";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { getFileStorageNested2 } from "../FileFolderAPI";
 import { TransactionStorage } from "../TransactionStorage";
@@ -201,7 +202,7 @@ export type LoadedBucket = {
     routing: RemoteConfig;
     routingJSON: string;
     selfEntries: HostedConfig[];
-    self: HostedConfig | undefined;
+    self: SelfSummary | undefined;
     store: IBucketStore;
     structureKey: string;
 };
@@ -417,7 +418,7 @@ async function runBoundaryScan(bucketKey: string, windowStart: number, offset: n
 
 type StorePlan = {
     selfEntries: HostedConfig[];
-    self: HostedConfig | undefined;
+    self: SelfSummary | undefined;
     rawDisk: boolean;
     sourceSpecs: { sourceConfig?: HostedConfig | BackblazeConfig; validWindow: [number, number]; route?: [number, number]; noFullSync?: boolean }[];
     readerDiskLimit?: number;
@@ -444,17 +445,64 @@ function sourceIdentity(sourceConfig: HostedConfig | BackblazeConfig | undefined
     return JSON.stringify({ ...sourceConfig, validWindow: undefined, route: undefined });
 }
 
+/** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
+export type SelfSummary = {
+    /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
+    routes: [number, number][];
+    public: boolean;
+    immutable: boolean;
+    noFullSync: boolean;
+    rawDisk: boolean;
+    readerDiskLimit?: number;
+};
+
+function mergeRoutes(routes: ([number, number] | undefined)[]): [number, number][] {
+    let list = routes.map(x => x || FULL_ROUTE).map(x => [x[0], x[1]] as [number, number]);
+    sort(list, x => x[0]);
+    let merged: [number, number][] = [];
+    for (let route of list) {
+        let last = merged[merged.length - 1];
+        if (last && route[0] <= last[1]) {
+            last[1] = Math.max(last[1], route[1]);
+            continue;
+        }
+        merged.push(route);
+    }
+    return merged;
+}
+
+/** anchor is the first currently-valid entry (nearest-window when none contains now, matching selectEntryAt) - the deterministic representative used only for positional things: the sync-topology cut (selfIndex) and the diskWindow seed. Everything behavioral comes from the summary, which spans every entry the anchor's group represents. */
+function summarizeSelf(selfEntries: HostedConfig[], now: number): { summary: SelfSummary | undefined; anchor: HostedConfig | undefined } {
+    let current = selfEntries.filter(x => x.validWindow[0] <= now && now < x.validWindow[1]);
+    if (!current.length) {
+        let nearest = selectEntryAt(selfEntries, now);
+        current = nearest && [nearest] || [];
+    }
+    if (!current.length) {
+        return { summary: undefined, anchor: undefined };
+    }
+    let summary: SelfSummary = {
+        routes: mergeRoutes(current.map(x => x.route)),
+        public: current.some(x => x.public),
+        immutable: current.some(x => x.immutable),
+        noFullSync: current.some(x => x.noFullSync),
+        rawDisk: current.some(x => x.rawDisk),
+        readerDiskLimit: current.find(x => x.readerDiskLimit !== undefined)?.readerDiskLimit,
+    };
+    return { summary, anchor: current[0] };
+}
+
 function computeStorePlan(account: string, bucketName: string, routing: RemoteConfig): StorePlan {
     let selfIndexes = findSelfIndexes(routing, account, bucketName);
     let selfEntries = selfIndexes.map(i => routing.sources[i] as HostedConfig);
-    let self = selectEntryAt(selfEntries, Date.now());
+    let { summary: self, anchor } = summarizeSelf(selfEntries, Date.now());
     let selfIndex = -1;
-    if (self) {
-        selfIndex = routing.sources.indexOf(self);
+    if (anchor) {
+        selfIndex = routing.sources.indexOf(anchor);
     }
     let diskWindow: [number, number] = [0, 0];
-    if (self) {
-        let [start, end] = self.validWindow;
+    if (anchor) {
+        let [start, end] = anchor.validWindow;
         let merged = true;
         while (merged) {
             merged = false;
@@ -474,13 +522,16 @@ function computeStorePlan(account: string, bucketName: string, routing: RemoteCo
     let sourceSpecs: StorePlan["sourceSpecs"] = [{
         validWindow: diskWindow,
     }];
-    if (selfIndex !== -1) {
+    if (self && selfIndex !== -1) {
         for (let i = selfIndex + 1; i < routing.sources.length; i++) {
             let source = routing.sources[i];
             if (typeof source === "string" || ownIndexes.has(i)) continue;
-            let sharedRoute = routeIntersection(self?.route, source.route);
-            if (!sharedRoute) continue;
-            sourceSpecs.push({ sourceConfig: source, validWindow: source.validWindow, route: sharedRoute, noFullSync: source.noFullSync || self?.noFullSync });
+            // One spec per intersection segment: a peer's route can overlap several of our (disjoint) route slices, and each slice becomes its own sync-source slot (same-URL multi-slot is already the supported shape)
+            for (let selfRoute of self.routes) {
+                let sharedRoute = routeIntersection(selfRoute, source.route);
+                if (!sharedRoute) continue;
+                sourceSpecs.push({ sourceConfig: source, validWindow: source.validWindow, route: sharedRoute, noFullSync: source.noFullSync || self.noFullSync });
+            }
         }
     }
     let rawDisk = !!self?.rawDisk;
@@ -914,9 +965,9 @@ export type ActiveBucketInfo = {
     folder: string;
     /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
     routing: RemoteConfig;
-    /** Our own entries in that config, and the one currently valid */
+    /** Our own entries in that config, and their summarized current role (routes union + flags) */
     selfEntries: HostedConfig[];
-    self?: HostedConfig;
+    self?: SelfSummary;
     config: ArchivesConfig;
 };
 

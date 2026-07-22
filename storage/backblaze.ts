@@ -25,6 +25,9 @@ let backblazeCreds = lazy(async (): Promise<BackblazeCreds> => {
         applicationKey: key,
     };
 });
+// B2's minimum maxAgeSeconds is 60 - anything lower gets bumped to 60 server-side, so a smaller default would never match what the bucket actually stores and we would rewrite its settings on every startup
+const MIN_BUCKET_CACHE_TIME = 60 * 1000;
+
 // A B2 download/HEAD response's headers carry the file's metadata. content-range's total wins over content-length for ranged responses (which only report the slice's length).
 function parseFileMetadataHeaders(response: HttpsResponseInfo): { size: number; uploadTimestamp: number } {
     let size = Number(response.headers["content-length"] || 0);
@@ -439,7 +442,7 @@ export class ArchivesBackblaze implements IArchives {
     private getBucketAPI = lazy(async () => {
         let api = await getAPI();
 
-        let cacheTime = this.config.cacheTime ?? 0;
+        let cacheTime = Math.max(this.config.cacheTime ?? 0, MIN_BUCKET_CACHE_TIME);
         if (this.config.immutable) {
             cacheTime = IMMUTABLE_CACHE_TIME;
         }
@@ -451,8 +454,7 @@ export class ArchivesBackblaze implements IArchives {
             allowedOperations: ["b2_download_file_by_id", "b2_download_file_by_name"],
             allowedHeaders: ["range"],
             exposeHeaders: ["x-bz-content-sha1"],
-            // 60 is the absolute minimum. If we try to set a value lower than this, it'll be updated to be 60. 
-            maxAgeSeconds: Math.max(60, cacheTime / 1000),
+            maxAgeSeconds: cacheTime / 1000,
         }];
         let bucketInfo: Record<string, unknown> = {};
         if (cacheTime) {

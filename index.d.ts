@@ -3185,6 +3185,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         private configured;
         private activeConfig;
         private statePromise;
+        private latestState;
         private initRetryDelay;
         private initRetryTimer;
         private pollTimer;
@@ -3257,8 +3258,10 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
             getNextData(): Promise<Buffer | undefined>;
         }): Promise<void>;
         getURL(path: string): Promise<string>;
-        /** Every URL that could serve this path, in source order: public sources matching both the path's route and the current valid window. Empty when none qualify. */
+        /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runWrite - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
         getURLs(path: string): Promise<string[]>;
+        /** getURLs, but after the one await (initialization) the returned function is synchronous: everything underneath - route hashing, window checks, latencies, URL building - is synchronous, and the closure always reads the newest adopted config, so it stays correct across config refreshes. */
+        getGetURLs(): Promise<(path: string) => string[]>;
         dispose(): void;
     }
     export declare function createArchives(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions): ArchivesChain;
@@ -3645,7 +3648,7 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         routing: RemoteConfig;
         routingJSON: string;
         selfEntries: HostedConfig[];
-        self: HostedConfig | undefined;
+        self: SelfSummary | undefined;
         store: IBucketStore;
         structureKey: string;
     };
@@ -3653,6 +3656,16 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     export declare function removeExtraListenPort(port: number): void;
     /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
     export declare function resolveSourceArchives(url: string): IArchives;
+    /** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
+    export type SelfSummary = {
+        /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
+        routes: [number, number][];
+        public: boolean;
+        immutable: boolean;
+        noFullSync: boolean;
+        rawDisk: boolean;
+        readerDiskLimit?: number;
+    };
     export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
     export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
     export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
@@ -3693,9 +3706,9 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         folder: string;
         /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
         routing: RemoteConfig;
-        /** Our own entries in that config, and the one currently valid */
+        /** Our own entries in that config, and their summarized current role (routes union + flags) */
         selfEntries: HostedConfig[];
-        self?: HostedConfig;
+        self?: SelfSummary;
         config: ArchivesConfig;
     };
     /** The live in-memory state of ONE bucket, answered without touching the disk (no routing file read, no statfs, no stored write stats). Returns an error string when the bucket is not loaded here, which is the normal state for a bucket nothing has accessed since startup. */
