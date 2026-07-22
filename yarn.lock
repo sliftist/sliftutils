@@ -1944,10 +1944,10 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^1.2.26:
-  version "1.2.26"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.2.26.tgz#f674419614e4a1cbac3f162246d55c64ffa48a54"
-  integrity sha512-khUT1tHH3WiqNyGWmicglkv9uZ/4q7smy884XzyDUViStJNb6cYaPVnTL01k5ysotf8yz6bdnbUc5r/Jo+FfpQ==
+socket-function@^1.2.27:
+  version "1.2.27"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.2.27.tgz#7340b3a8c68fd467080e2158c94b87e6ef793c77"
+  integrity sha512-tOitwcUWz23JLzq7mBNFIRyPZtBPkA/+/a+DHoxWP30lMkZ5so5HTlF7vspOMpAPQFPpufgVJnWuOi87F/cxzg==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"
