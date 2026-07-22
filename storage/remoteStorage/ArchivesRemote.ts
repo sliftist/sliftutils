@@ -2,7 +2,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig } from "../IArchives";
 import { parseHostedUrl, getBucketBaseUrl, buildFileUrl } from "./remoteConfig";
 import {
     RemoteStorageController, STORAGE_AUTH_PURPOSE,
@@ -137,16 +137,16 @@ export class ArchivesRemote implements IArchives {
         }
     }
 
-    public async get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined> {
+    public async get(fileName: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         let result = await this.call(() => this.controller.get2(this.account, this.bucketName, fileName, config?.range));
         return result && { data: Buffer.from(result.data), writeTime: result.writeTime, size: result.size } || undefined;
     }
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
-        await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified));
+    public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified, config?.forceSetImmutable));
         return fileName;
     }
     public async del(fileName: string): Promise<void> {
@@ -161,8 +161,8 @@ export class ArchivesRemote implements IArchives {
     public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
         return (await this.findInfo(prefix, config)).map(x => x.path);
     }
-    public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
-        return await this.call(() => this.controller.getChangesAfter(this.account, this.bucketName, time));
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
+        return await this.call(() => this.controller.getChangesAfter2(this.account, this.bucketName, config));
     }
     public async getConfig(): Promise<ArchivesConfig> {
         return await this.call(() => this.controller.getArchivesConfig(this.account, this.bucketName));
@@ -171,10 +171,10 @@ export class ArchivesRemote implements IArchives {
         return await this.call(() => this.controller.getSyncStatus(this.account, this.bucketName));
     }
 
-    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         // Ensure we're authenticated with access BEFORE consuming any data (the stream cannot be rewound, so we can't use the retry loop around the actual upload)
         await this.call(() => this.controller.getInfo(this.account, this.bucketName, config.path));
-        let uploadId = await this.controller.startLargeFile(this.account, this.bucketName, config.path);
+        let uploadId = await this.controller.startLargeFile(this.account, this.bucketName, config.path, config.lastModified);
         try {
             while (true) {
                 let data = await config.getNextData();

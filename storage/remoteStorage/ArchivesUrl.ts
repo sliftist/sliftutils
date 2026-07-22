@@ -1,5 +1,5 @@
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchiveFileInfo, ArchivesConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig } from "../IArchives";
 import { buildFileUrl } from "./remoteConfig";
 
 // Read-only IArchives over a public bucket's plain-URL form (our storage server's
@@ -17,11 +17,11 @@ export class ArchivesUrl implements IArchives {
         return new Error(`${operation} is not supported over URL-form access (no API access to this source, only public URL reads). Source: ${this.base}`);
     }
 
-    public async get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined> {
+    public async get(fileName: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         let url = buildFileUrl(this.base, fileName);
         let headers: Record<string, string> = {};
         let range = config?.range;
@@ -53,8 +53,15 @@ export class ArchivesUrl implements IArchives {
         return { data, writeTime, size };
     }
     public async getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined> {
-        let result = await this.get2(fileName);
-        return result && { writeTime: result.writeTime, size: result.size } || undefined;
+        // A 1-byte ranged read: Content-Range carries the full size and Last-Modified the write time, so metadata never downloads the file
+        try {
+            let result = await this.get2(fileName, { range: { start: 0, end: 1 } });
+            return result && { writeTime: result.writeTime, size: result.size } || undefined;
+        } catch {
+            // Some servers reject ranged reads of empty files (416 instead of an empty 206); a full read is the fallback, and for an empty file it is free anyway
+            let result = await this.get2(fileName);
+            return result && { writeTime: result.writeTime, size: result.size } || undefined;
+        }
     }
 
     public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
@@ -71,6 +78,9 @@ export class ArchivesUrl implements IArchives {
     }
     public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         throw this.readOnlyError("findInfo (listing)");
+    }
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
+        throw this.readOnlyError("getChangesAfter2 (listing)");
     }
 
     public async getURL(path: string): Promise<string> {

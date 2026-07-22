@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, SyncActivity } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SyncActivity } from "../IArchives";
 export declare const DEFAULT_FAST_WRITE_DELAY: number;
 export declare const WINDOW_END_FLUSH_MARGIN: number;
 export type WriteConfig = {
@@ -9,18 +9,8 @@ export type WriteConfig = {
     lastModified?: number;
 };
 export type IBucketStore = {
-    get(fileName: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<Buffer | undefined>;
-    get2(fileName: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<{
+    get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
+    get2(fileName: string, config?: GetConfig): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
@@ -35,7 +25,7 @@ export type IBucketStore = {
         shallow?: boolean;
         type?: "files" | "folders";
     }): Promise<ArchiveFileInfo[]>;
-    getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getSyncStatus?(): Promise<ArchivesSyncStatus>;
     getSyncProgress?(): {
         index: {
@@ -61,14 +51,16 @@ export type IBucketStore = {
     }>;
     startLargeUpload(): Promise<string>;
     appendLargeUpload(id: string, data: Buffer): Promise<void>;
-    finishLargeUpload(id: string, key: string): Promise<void>;
+    finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
     cancelLargeUpload(id: string): Promise<void>;
 };
 export type BlobSourceSpec = {
     identity: string;
+    url: string;
     validWindow: [number, number];
     route?: [number, number];
     noFullSync?: boolean;
+    intermediate?: boolean;
     create: () => IArchives;
 };
 export declare class BlobStore implements IBucketStore {
@@ -79,6 +71,7 @@ export declare class BlobStore implements IBucketStore {
         onIndexChanged?: ((key: string) => void) | undefined;
         readerDiskLimit?: number | undefined;
         onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
+        resolveSourceUrl?: ((url: string) => IArchives) | undefined;
     } | undefined);
     private stopped;
     private index;
@@ -92,7 +85,14 @@ export declare class BlobStore implements IBucketStore {
     private overlay;
     private sourceStates;
     private syncStarted;
+    private sourcesList;
+    private slotSourcesListIndexes;
+    private slotRegistrations;
     private isLive;
+    private registerSlot;
+    private sourcesListIndexOfSlot;
+    private slotForSourcesListIndex;
+    private getEntryHolder;
     init: {
         (): Promise<void>;
         reset(): void;
@@ -139,26 +139,17 @@ export declare class BlobStore implements IBucketStore {
     }>;
     private flushIndex;
     private runSourceSync;
+    private isDeadIntermediate;
     private scanSource;
     private reconcileSource;
-    private applyScanned;
+    private updateScanIndex;
     private pollChanges;
     private copySourceFiles;
     private waitForRequiredScans;
     private checkMissingKey;
     private getIndexEntry;
-    get(key: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<Buffer | undefined>;
-    get2(key: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<{
+    get(key: string, config?: GetConfig): Promise<Buffer | undefined>;
+    get2(key: string, config?: GetConfig): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
@@ -176,12 +167,12 @@ export declare class BlobStore implements IBucketStore {
         shallow?: boolean;
         type?: "files" | "folders";
     }): Promise<ArchiveFileInfo[]>;
-    getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getSyncStatus(): Promise<ArchivesSyncStatus>;
     private getDiskSource;
     startLargeUpload(): Promise<string>;
     appendLargeUpload(id: string, data: Buffer): Promise<void>;
-    finishLargeUpload(id: string, key: string): Promise<void>;
+    finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
     cancelLargeUpload(id: string): Promise<void>;
     private flushOverlay;
     private evicting;

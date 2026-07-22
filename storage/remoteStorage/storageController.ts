@@ -6,7 +6,7 @@ import { performLocalCall } from "socket-function/src/callManager";
 import { RequireController } from "socket-function/require/RequireController";
 import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
-import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, IMMUTABLE_CACHE_TIME } from "../IArchives";
+import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, IMMUTABLE_CACHE_TIME } from "../IArchives";
 import { ROUTING_FILE } from "./remoteConfig";
 import {
     getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
@@ -59,10 +59,11 @@ export type AccessState = {
 
 const sessions = new Map<string, string>();
 
+// We must never serve anything that can be evaluated as code (html, js - and svg, which can embed <script> and runs it when visited as a document). Otherwise a user could host a file and, by visiting it, run it on our domain - giving them access to all of our keys and cookies. PDF stays: browser PDF viewers run any embedded PDF scripting in a sandbox with no access to the serving origin's cookies or DOM.
 const CONTENT_TYPES: { [ext: string]: string } = {
-    html: "text/html; charset=utf-8", js: "text/javascript; charset=utf-8", css: "text/css; charset=utf-8", json: "application/json; charset=utf-8",
+    css: "text/css; charset=utf-8", json: "application/json; charset=utf-8",
     txt: "text/plain; charset=utf-8", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
-    svg: "image/svg+xml", webp: "image/webp", mp4: "video/mp4", webm: "video/webm",
+    webp: "image/webp", mp4: "video/mp4", webm: "video/webm",
     mp3: "audio/mpeg", wav: "audio/wav", pdf: "application/pdf",
 };
 
@@ -294,10 +295,10 @@ class RemoteStorageControllerBase {
         if (!bucket) return undefined;
         return await bucket.store.get2(path, { range });
     }
-    async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number): Promise<void> {
+    async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean): Promise<void> {
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
-        await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified });
+        await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified, forceSetImmutable });
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
         assertValidName(bucketName, "bucket name");
@@ -315,13 +316,10 @@ class RemoteStorageControllerBase {
         if (!bucket) return [];
         return await bucket.store.findInfo(prefix, config);
     }
-    async getChangesAfter(account: string, bucketName: string, time: number): Promise<ArchiveFileInfo[]> {
+    async getChangesAfter2(account: string, bucketName: string, config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return [];
-        if (!bucket.store.getChangesAfter) {
-            throw new Error(`Bucket ${account}/${bucketName} does not support getChangesAfter (rawDisk buckets have no index)`);
-        }
-        return await bucket.store.getChangesAfter(time);
+        return await bucket.store.getChangesAfter2(config);
     }
     async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
         let bucket = await getBucket(account, bucketName);
@@ -366,16 +364,16 @@ class RemoteStorageControllerBase {
         return await bucket.store.getSyncStatus();
     }
 
-    async startLargeFile(account: string, bucketName: string, path: string): Promise<string> {
+    async startLargeFile(account: string, bucketName: string, path: string, lastModified?: number): Promise<string> {
         assertWritesAllowed();
         assertValidPath(path);
         let bucket = await getBucket(account, bucketName);
         if (!bucket) {
             throw new Error(`Bucket ${account}/${bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
         }
-        await assertMutable(bucket, path, Date.now());
+        await assertMutable(bucket, path, lastModified || Date.now());
         let id = await bucket.store.startLargeUpload();
-        largeUploadInfo.set(id, { account, bucketName, path });
+        largeUploadInfo.set(id, { account, bucketName, path, lastModified });
         return id;
     }
     async uploadPart(uploadId: string, data: Buffer): Promise<void> {
@@ -393,7 +391,7 @@ class RemoteStorageControllerBase {
         largeUploadInfo.delete(uploadId);
         let bucket = await getBucket(info.account, info.bucketName);
         if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
-        await bucket.store.finishLargeUpload(uploadId, info.path);
+        await bucket.store.finishLargeUpload(uploadId, info.path, info.lastModified);
     }
     async cancelLargeFile(uploadId: string): Promise<void> {
         let info = largeUploadInfo.get(uploadId);
@@ -485,7 +483,7 @@ class RemoteStorageControllerBase {
     }
 }
 
-const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string }>();
+const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string; lastModified?: number }>();
 
 const accountAccess: SocketFunctionHook = async (context) => {
     let start = Date.now();
@@ -523,7 +521,7 @@ export const RemoteStorageController = SocketFunction.register(
         del: { hooks: [accountAccess] },
         getInfo: { hooks: [accountAccess] },
         findInfo: { hooks: [accountAccess] },
-        getChangesAfter: { hooks: [accountAccess] },
+        getChangesAfter2: { hooks: [accountAccess] },
         getArchivesConfig: { hooks: [accountAccess] },
         getIndexInfo: { hooks: [accountAccess] },
         listBuckets: { hooks: [accountAccess] },

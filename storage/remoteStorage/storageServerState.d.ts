@@ -46,10 +46,13 @@ export type LoadedBucket = {
 };
 export declare function addExtraListenPort(port: number): void;
 export declare function removeExtraListenPort(port: number): void;
+/** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
+export declare function resolveSourceArchives(url: string): IArchives;
 export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
 export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
 export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
     lastModified?: number;
+    forceSetImmutable?: boolean;
 }): Promise<void>;
 export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
 /** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */

@@ -12,6 +12,7 @@ export const RETRY_START_DELAY = 2 * 1000;
 export const RETRY_MAX_DELAY = 5 * 60 * 1000;
 export const RETRY_GROWTH = 1.5;
 const ACCESS_RECHECK_INTERVAL = 60 * 1000;
+const SOURCE_FAILURE_COOLDOWN = 30 * 60 * 1000;
 const PING_INTERVAL = 60 * 1000;
 const PING_HISTORY = 10;
 
@@ -50,8 +51,14 @@ export class SourceWrapper {
         this.config.validWindow = validWindow;
     }
 
-    public static async create(config: HostedConfig | BackblazeConfig, options?: { background?: boolean }): Promise<SourceWrapper> {
+    public static async create(config: HostedConfig | BackblazeConfig, options?: { background?: boolean; readOnly?: boolean }): Promise<SourceWrapper> {
         let wrapper = new SourceWrapper(config, options?.background !== false);
+        // A public bucket serves everything we can read over plain HTTPS GETs, so there is no reason to open an API connection (which costs a WebSocket, and an access grant we likely don't have) just to read it
+        if (options?.readOnly && config.public !== false) {
+            wrapper.url = new ArchivesUrl(getBucketBaseUrl(config.url));
+            wrapper.writeBlocked = `${config.url} is being read in read-only mode (public bucket, and we are not in node), so it is downloaded over plain URLs and cannot be written. Pass directConnect to createArchives to use the API instead.`;
+            return wrapper;
+        }
         if (config.type === "backblaze") {
             if (await hasBackblazeCreds()) {
                 wrapper.api = new ArchivesBackblaze({ bucketName: parseBackblazeUrl(config.url).bucketName, public: config.public, immutable: config.immutable, allowedOrigins: config.allowedOrigins });
@@ -107,13 +114,21 @@ export class SourceWrapper {
         return this.config.validWindow[1] > Date.now();
     }
 
-    /** Call after a request failed while isConnected() was false: starts (if not already running) the background reconnect loop. Never blocks - the failed request still throws. */
+    private cooldownUntil = 0;
+    /** A source that failed while disconnected is skipped by callers for SOURCE_FAILURE_COOLDOWN - but only while some other source can serve the request. When nothing else is usable, callers ignore this and try it anyway, so a total outage still retries every time. */
+    public isOnCooldown(): boolean {
+        return Date.now() < this.cooldownUntil;
+    }
+
+    /** Call after a request failed while isConnected() was false: puts the source on cooldown and starts (if not already running) the background reconnect loop. Never blocks - the failed request still throws. */
     public noteFailure(): void {
-        if (!this.background || this.disposed || this.reconnectRunning) return;
-        if (this.isConnected()) return;
-        if (this.isConnectionProblemWorthReporting()) {
-            console.error(`Cannot connect to storage ${this.getDebugName()}`);
+        if (this.disposed || this.isConnected()) return;
+        let now = Date.now();
+        if (now >= this.cooldownUntil && this.isConnectionProblemWorthReporting()) {
+            console.error(`Cannot connect to storage ${this.getDebugName()}; skipping it until ${new Date(now + SOURCE_FAILURE_COOLDOWN).toISOString()} (now ${new Date(now).toISOString()}) unless no other source can serve the request`);
         }
+        this.cooldownUntil = now + SOURCE_FAILURE_COOLDOWN;
+        if (!this.background || this.reconnectRunning) return;
         this.reconnectRunning = true;
         void this.reconnectLoop();
     }
@@ -135,13 +150,14 @@ export class SourceWrapper {
                 // Even a failing call (e.g. access denied) proves the connection is back
                 if (this.isConnected()) break;
                 if (this.isConnectionProblemWorthReporting()) {
-                    console.warn(`Cannot connect to storage ${this.getDebugName()}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).stack ?? e}`);
+                    console.error(`Cannot connect to storage ${this.getDebugName()}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).stack ?? e}`);
                 }
             }
             retryDelay = Math.min(RETRY_MAX_DELAY, retryDelay * RETRY_GROWTH);
         }
         this.reconnectRunning = false;
-        console.log(`Reconnected to storage ${this.getDebugName()}`);
+        this.cooldownUntil = 0;
+        console.log(`Reconnected to storage ${this.getDebugName()}, clearing its cooldown`);
     }
 
     // For hosted sources: cached access check, so reads know whether to use the API or the public URL form. Access, once seen, is assumed to stick; no-access is re-checked periodically (the check also registers our access request server-side, which logs the grant link).
@@ -188,16 +204,30 @@ export class SourceWrapper {
     private pingTimer: ReturnType<typeof setInterval> | undefined;
     private loggedConnected = false;
 
-    /** Starts measuring this source's latency (for variable-shard target preference). Only hosted remotes are pinged; our own local server counts as 0, everything else as Infinity. */
+    /** Starts measuring this source's latency, which decides which hosts reads and variable-shard writes prefer. Hosted remotes ping over their API connection; URL-only sources (read-only mode, backblaze without credentials) probe over plain HTTPS instead - the client NEEDS their latency too, or it cannot rank the hosts it reads from. Our own local server counts as 0; only sources with neither form stay Infinity. */
     public startPinging(): void {
-        const remote = this.remote;
-        if (!remote || this.pingTimer || this.disposed) return;
-        // Latency only decides which shard a variable-shard write materializes into, and a source whose window has passed never receives writes - so measuring it is pointless traffic
+        if (this.pingTimer || this.disposed) return;
+        // A source whose window has passed never receives reads or writes - measuring it is pointless traffic
         if (this.config.validWindow[1] <= Date.now()) return;
+        const remote = this.remote;
+        const url = this.url;
+        let probe: () => Promise<void>;
+        if (remote) {
+            probe = async () => {
+                await remote.ping();
+            };
+        } else if (url) {
+            // A 1-byte ranged read of the routing file transfers essentially nothing, and unlike an explicit OPTIONS request it needs no CORS preflight (backblaze's CORS rules only allow download operations) - so it works from the browser, which is exactly where URL-only mode runs
+            probe = async () => {
+                await url.getInfo(ROUTING_FILE);
+            };
+        } else {
+            return;
+        }
         let measure = async () => {
             let start = Date.now();
             try {
-                await remote.ping();
+                await probe();
             } catch {
                 // A failed ping is also our earliest down-detection
                 this.noteFailure();
@@ -225,12 +255,10 @@ export class SourceWrapper {
         this.pings.push(ms);
     }
 
-    /** Median of the recent pings. Sources that can't be pinged sort last (Infinity), except our own in-process server, which is the best possible target (0). */
+    /** Median of the recent pings (API or URL-form, whichever this source measures). Sources with no measurements yet sort last (Infinity), except our own in-process server, which is the best possible target (0). */
     public getLatency(): number {
-        if (!this.remote) {
-            if (this.config.type === "remote" && this.api) return 0;
-            return Infinity;
-        }
+        // Our own in-process server: hosted (type remote), api present, but no remote connection - it IS us
+        if (!this.remote && this.config.type === "remote" && this.api) return 0;
         if (!this.pings.length) return Infinity;
         let sorted = [...this.pings];
         sort(sorted, x => x);

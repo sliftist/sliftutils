@@ -2,14 +2,15 @@ import { isNode, sort } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig,
-    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, STORAGE_WRONG_VALID_WINDOW,
+    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
     STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD,
 } from "../IArchives";
 import {
     ROUTING_FILE, getConfigVersion, parseHostedUrl, parseBackblazeUrl,
     normalizeRemoteConfig, normalizeSource, serializeRemoteConfig,
-    getRoute, routeContains, parseVariableRoute,
+    getRoute, routeContains, parseVariableRoute, getBucketBaseUrl,
 } from "./remoteConfig";
+import { ArchivesUrl } from "./ArchivesUrl";
 import { resolveIntermediateSources } from "./intermediateSources";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { ArchivesRemote, parseStorageUrl, authenticateStorage } from "./ArchivesRemote";
@@ -24,6 +25,8 @@ const WRONG_TARGET_BOUNDARY_WINDOW = 30 * 1000;
 const WRONG_TARGET_BOUNDARY_RETRY_DELAY = 15 * 1000;
 const CONFIG_REFRESH_THROTTLE = 30 * 1000;
 const AVAILABILITY_RECHECK_THROTTLE = 5 * 1000;
+const NO_FALLBACKS_RETRY_TIMEOUT = 30 * 1000;
+const NO_FALLBACKS_RETRY_DELAY = 2 * 1000;
 
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
@@ -45,6 +48,11 @@ type ChainState = {
     sources: SourceWrapper[];
 };
 
+export type ArchivesChainOptions = {
+    /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
+    directConnect?: boolean;
+};
+
 function configWindowCurrent(config: HostedConfig | BackblazeConfig): boolean {
     let now = Date.now();
     let [start, end] = config.validWindow;
@@ -53,6 +61,39 @@ function configWindowCurrent(config: HostedConfig | BackblazeConfig): boolean {
 
 function configAcceptsWrites(config: HostedConfig | BackblazeConfig): boolean {
     return configWindowCurrent(config);
+}
+
+function materializeShardKey(key: string, target: SourceWrapper): string {
+    let [start, end] = target.config.route || FULL_ROUTE;
+    return key.replace(VARIABLE_SHARD, VARIABLE_SHARD + "_" + (start + Math.random() * (end - start)));
+}
+
+/** The fewest sources whose routes span the whole key space, or undefined when they leave a gap. */
+function coverRoutes(candidates: SourceWrapper[]): SourceWrapper[] | undefined {
+    let chosen: SourceWrapper[] = [];
+    let covered = 0;
+    while (covered < 1) {
+        let best: SourceWrapper | undefined;
+        let bestEnd = covered;
+        for (let source of candidates) {
+            let [start, end] = source.config.route || FULL_ROUTE;
+            if (start > covered) continue;
+            if (end > bestEnd) {
+                bestEnd = end;
+                best = source;
+            }
+        }
+        if (!best) return undefined;
+        chosen.push(best);
+        covered = bestEnd;
+    }
+    return chosen;
+}
+
+/** READS ONLY. Drops sources that recently failed while disconnected - unless that would leave nothing, in which case a down source is still better than no source, and we retry it immediately. Never applies to writes (or noFallbacks reads of the write target): the write node is strictly the FIRST source matching the route and valid window, regardless of connectivity - a client's flaky view of the network must never scatter writes across the chain (spec: client writes are consistent, client reads are redundant). */
+function preferUsable(sources: SourceWrapper[]): SourceWrapper[] {
+    let usable = sources.filter(x => !x.isOnCooldown());
+    return usable.length && usable || sources;
 }
 
 export class ArchivesChain implements IArchives {
@@ -65,7 +106,7 @@ export class ArchivesChain implements IArchives {
     private disposed = false;
     private unsubscribeRoutingPush: (() => void) | undefined;
 
-    constructor(config: RemoteConfig | RemoteConfigBase) {
+    constructor(config: RemoteConfig | RemoteConfigBase, private options?: ArchivesChainOptions) {
         this.configured = normalizeRemoteConfig(config);
         this.activeConfig = this.configured;
         this.unsubscribeRoutingPush = onServerRoutingChanged(() => {
@@ -107,8 +148,9 @@ export class ArchivesChain implements IArchives {
 
     private async init(): Promise<ChainState> {
         let configs = this.configured.sources.map(normalizeSource);
+        let readOnly = this.isReadOnly(this.configured);
         let fetches = await Promise.all(configs.map(async sourceConfig => {
-            let probe = await SourceWrapper.create(sourceConfig, { background: false });
+            let probe = await SourceWrapper.create(sourceConfig, { background: false, readOnly });
             let start = Date.now();
             try {
                 let existing = await probe.readRoutingConfig();
@@ -215,16 +257,23 @@ export class ArchivesChain implements IArchives {
         }
     }
 
-    private async createChainSource(sourceConfig: HostedConfig | BackblazeConfig): Promise<SourceWrapper> {
-        let source = await SourceWrapper.create(sourceConfig);
+    /** Clientside, a config with public sources is served entirely over plain URL downloads - no API connection, no access grant, and no writing. directConnect opts out of that. */
+    private isReadOnly(config: RemoteConfig): boolean {
+        if (this.options?.directConnect || isNode()) return false;
+        return config.sources.map(normalizeSource).some(x => x.public);
+    }
+
+    private async createChainSource(sourceConfig: HostedConfig | BackblazeConfig, readOnly: boolean): Promise<SourceWrapper> {
+        let source = await SourceWrapper.create(sourceConfig, { readOnly });
         source.startPinging();
         return source;
     }
 
     private async buildSources(config: RemoteConfig): Promise<SourceWrapper[]> {
+        let readOnly = this.isReadOnly(config);
         let sources: SourceWrapper[] = [];
         for (let sourceConfig of config.sources.map(normalizeSource)) {
-            sources.push(await this.createChainSource(sourceConfig));
+            sources.push(await this.createChainSource(sourceConfig, readOnly));
         }
         return sources;
     }
@@ -300,6 +349,7 @@ export class ArchivesChain implements IArchives {
             }
             list.push(source);
         }
+        let readOnly = this.isReadOnly(latest);
         let sources: SourceWrapper[] = [];
         for (let sourceConfig of latest.sources.map(normalizeSource)) {
             let old = oldByConfig.get(strippedKey(sourceConfig))?.shift();
@@ -307,7 +357,7 @@ export class ArchivesChain implements IArchives {
                 old.updateValidWindow(sourceConfig.validWindow);
                 sources.push(old);
             } else {
-                sources.push(await this.createChainSource(sourceConfig));
+                sources.push(await this.createChainSource(sourceConfig, readOnly));
             }
         }
         for (let leftovers of oldByConfig.values()) {
@@ -351,16 +401,51 @@ export class ArchivesChain implements IArchives {
         await this.adoptNewConfig(state, latest);
     }
 
-    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number }, run: (archives: IArchives) => Promise<T>): Promise<T> {
+    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         if (config.write) {
             return await this.runWrite(config.route, run);
+        }
+        if (config.noFallbacks) {
+            // Only the primary (the source writes would target) is guaranteed current, so the caller asked to never degrade to a possibly-lagging copy. A slow call is almost always better than throwing, so a failing primary is retried until the timeout - re-resolved each attempt, as a config refresh can change which source is primary
+            let deadline = Date.now() + NO_FALLBACKS_RETRY_TIMEOUT;
+            let attempt = 0;
+            while (true) {
+                attempt++;
+                let attemptStart = Date.now();
+                // The primary is strictly the first source matching the route and valid window - identical to the write target's selection, connectivity ignored
+                let target = state.sources.find(x => configAcceptsWrites(x.config) && (config.route === undefined || routeContains(x.config.route, config.route)));
+                try {
+                    if (!target) {
+                        throw new Error(`No primary source to read from for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""} (noFallbacks: every source is outside its valid window or outside the key's route)`);
+                    }
+                    const primary = target;
+                    return await primary.read(archives => run(archives, primary.config.url));
+                } catch (e) {
+                    if (target && !target.isConnected()) target.noteFailure();
+                    if (target && (attempt === 1 || attempt % 3 === 0)) {
+                        // The reason we try the HTTP request: httpsRequest has better DNS retrying capabilities than our WebSocket server (we have more control over it), so just using it can fix some DNS issues, which can propagate to fix the WebSocket connection. It is still the primary source's own data, so noFallbacks semantics hold - and ArchivesUrl has no setup cost, so making one on the spot is fine.
+                        try {
+                            return await run(target.url || new ArchivesUrl(getBucketBaseUrl(target.config.url)), target.config.url);
+                        } catch {
+                            // Best-effort: the primary's error (thrown at the deadline) is the real one
+                        }
+                    }
+                    if (Date.now() >= deadline) throw e;
+                }
+                // At most one attempt per interval, in case the failure is fast
+                await delay(Math.max(0, attemptStart + NO_FALLBACKS_RETRY_DELAY - Date.now()));
+                await this.recheckAvailability();
+                state = await this.getState();
+            }
         }
         let recheckedAvailability = false;
         while (true) {
             let errors: string[] = [];
-            for (let source of state.sources) {
-                if (config.route !== undefined && !routeContains(source.config.route, config.route)) continue;
-                if (!configWindowCurrent(source.config)) continue;
+            let candidates = state.sources.filter(source =>
+                (config.route === undefined || routeContains(source.config.route, config.route))
+                && configWindowCurrent(source.config)
+            );
+            for (let source of preferUsable(candidates)) {
                 try {
                     if (config.apiOnly) {
                         let api = source.api;
@@ -368,9 +453,9 @@ export class ArchivesChain implements IArchives {
                             errors.push(`${source.config.url} has URL-only access, which cannot serve this operation`);
                             continue;
                         }
-                        return await run(api);
+                        return await run(api, source.config.url);
                     }
-                    return await source.read(run);
+                    return await source.read(archives => run(archives, source.config.url));
                 } catch (e) {
                     if (source.isConnected()) throw e;
                     source.noteFailure();
@@ -387,7 +472,8 @@ export class ArchivesChain implements IArchives {
         }
     }
 
-    private async runWrite<T>(route: number | undefined, run: (archives: IArchives) => Promise<T>): Promise<T> {
+    // It's important that writing always accesses the same node everywhere, even if that node is down - otherwise we're just writing into the void, and who knows if the writes will even be accepted, or clobbered, or what.
+    private async runWrite<T>(route: number | undefined, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let retriedWrongWindow = false;
         let retriedWrongRoute = false;
         let recheckedAvailability = false;
@@ -403,7 +489,8 @@ export class ArchivesChain implements IArchives {
                 throw new Error(`No source accepts writes for ${this.getDebugName()}${route !== undefined && ` (route ${route})` || ""} (every source is outside its valid window or outside the key's route)`);
             }
             try {
-                return await target.write(run);
+                const writeTarget = target;
+                return await writeTarget.write(archives => run(archives, writeTarget.config.url));
             } catch (e) {
                 let message = String((e as Error).stack ?? e);
                 if (message.includes(STORAGE_WRONG_VALID_WINDOW) && !retriedWrongWindow) {
@@ -446,7 +533,7 @@ export class ArchivesChain implements IArchives {
         await this.refreshActiveConfig();
     }
 
-    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number }, run: (archives: IArchives) => Promise<T>): Promise<T> {
+    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let state = await this.getState();
         return await this.run(state, config, run);
     }
@@ -454,6 +541,8 @@ export class ArchivesChain implements IArchives {
     public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
         let state = await this.getState();
         for (let source of state.sources) {
+            // A source whose window has passed is never read or written again, so its access state is irrelevant - and asking a dead intermediate would just hang or throw. Future windows DO matter: access should be granted before their window starts.
+            if (source.config.validWindow[1] <= Date.now()) continue;
             if (source.api instanceof ArchivesRemote) {
                 let waiting = await source.api.waitingForAccess();
                 if (waiting) return waiting;
@@ -462,37 +551,29 @@ export class ArchivesChain implements IArchives {
         return undefined;
     }
 
-    public async get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined> {
+    public async get(fileName: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        return await this.request({ route: getRoute(fileName) }, archives => archives.get2(fileName, config));
+    public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | undefined> {
+        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks }, async (archives, url) => {
+            let result = await archives.get2(fileName, config);
+            return result && { ...result, url } || undefined;
+        });
     }
-    public async getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined> {
-        return await this.request({ route: getRoute(fileName) }, archives => archives.getInfo(fileName));
+    public async getInfo(fileName: string): Promise<{ writeTime: number; size: number; url: string } | undefined> {
+        return await this.request({ route: getRoute(fileName) }, async (archives, url) => {
+            let result = await archives.getInfo(fileName);
+            return result && { ...result, url } || undefined;
+        });
     }
 
     private selectCoveringSources(state: ChainState, excluded: Set<SourceWrapper>): SourceWrapper[] {
         let candidates = state.sources.filter(x => configWindowCurrent(x.config) && x.api && !excluded.has(x));
-        let chosen: SourceWrapper[] = [];
-        let covered = 0;
-        while (covered < 1) {
-            let best: SourceWrapper | undefined;
-            let bestEnd = covered;
-            for (let source of candidates) {
-                let [start, end] = source.config.route || FULL_ROUTE;
-                if (start > covered) continue;
-                if (end > bestEnd) {
-                    bestEnd = end;
-                    best = source;
-                }
-            }
-            if (!best) {
-                throw new Error(`Cannot cover the full route space for ${this.getDebugName()}: the available sources only cover up to ${covered} (some shards are down or URL-only)`);
-            }
-            chosen.push(best);
-            covered = bestEnd;
+        // Unlike the single-source paths, dropping a cooled-down source can leave a route gap - so the cooled-down set only comes back as a whole, when the healthy sources cannot cover everything on their own
+        let chosen = coverRoutes(candidates.filter(x => !x.isOnCooldown())) || coverRoutes(candidates);
+        if (!chosen) {
+            throw new Error(`Cannot cover the full route space for ${this.getDebugName()}: the available sources leave a gap (some shards are down or URL-only)`);
         }
         return chosen;
     }
@@ -540,13 +621,8 @@ export class ArchivesChain implements IArchives {
         sort(merged, x => x.path);
         return merged;
     }
-    public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
-        let results = await this.runOnCovering(async archives => {
-            if (!archives.getChangesAfter) {
-                throw new Error(`${archives.getDebugName()} does not support getChangesAfter`);
-            }
-            return await archives.getChangesAfter(time);
-        });
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
+        let results = await this.runOnCovering(archives => archives.getChangesAfter2(config));
         let byPath = new Map<string, ArchiveFileInfo>();
         for (let list of results) {
             for (let file of list) {
@@ -588,7 +664,7 @@ export class ArchivesChain implements IArchives {
         return true;
     }
 
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
+    public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
         if (fileName === ROUTING_FILE) {
             return await this.setRoutingConfig(data, config);
         }
@@ -627,24 +703,48 @@ export class ArchivesChain implements IArchives {
         await this.request({ write: true, route: getRoute(fileName) }, archives => archives.del(fileName));
     }
 
-    private async setVariableShard(key: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
+    // One write target per route range, lowest latency first. Within a shard the target is ALWAYS the first source in config order (see runWrite - writes must stay on the same node): connectivity only decides which SHARD we pick, never which node within it, so a shard whose node is disconnected is dropped entirely when connectedOnly is set.
+    private getVariableShardTargets(state: ChainState, config: { connectedOnly: boolean }): SourceWrapper[] {
+        let targetsByRoute = new Map<string, SourceWrapper>();
+        for (let source of state.sources) {
+            if (!configAcceptsWrites(source.config)) continue;
+            let routeKey = JSON.stringify(source.config.route || FULL_ROUTE);
+            if (!targetsByRoute.has(routeKey)) {
+                targetsByRoute.set(routeKey, source);
+            }
+        }
+        let targets = [...targetsByRoute.values()];
+        if (config.connectedOnly) {
+            targets = targets.filter(x => x.isConnected());
+        }
+        sort(targets, x => x.getLatency());
+        return targets;
+    }
+
+    /** The key setVariableShard would materialize for this VARIABLE_SHARD key (a value in the preferred shard's route range), without writing anything. */
+    public async getShardKey(key: string): Promise<string> {
+        if (!key.includes(VARIABLE_SHARD) || parseVariableRoute(key) !== undefined) {
+            throw new Error(`getShardKey requires a key containing an unmaterialized ${JSON.stringify(VARIABLE_SHARD)}, got ${JSON.stringify(key)}`);
+        }
+        let state = await this.getState();
+        let target = this.getVariableShardTargets(state, { connectedOnly: true })[0]
+            || this.getVariableShardTargets(state, { connectedOnly: false })[0];
+        if (!target) {
+            throw new Error(`No source accepts writes for ${this.getDebugName()}, so there is no shard to materialize ${JSON.stringify(key)} into`);
+        }
+        return materializeShardKey(key, target);
+    }
+
+    private async setVariableShard(key: string, data: Buffer, config?: SetConfig): Promise<string> {
         let recheckedAvailability = false;
+        // There's no point talking to a shard whose node was fast but is now disconnected - only when no connected shard works do we recheck availability and try every shard
+        let connectedOnly = true;
         while (true) {
             let state = await this.getState();
-            let targetsByRoute = new Map<string, SourceWrapper>();
-            for (let source of state.sources) {
-                if (!configAcceptsWrites(source.config)) continue;
-                let routeKey = JSON.stringify(source.config.route || FULL_ROUTE);
-                if (!targetsByRoute.has(routeKey)) {
-                    targetsByRoute.set(routeKey, source);
-                }
-            }
-            let targets = [...targetsByRoute.values()];
-            sort(targets, x => x.getLatency());
+            let targets = this.getVariableShardTargets(state, { connectedOnly });
             let errors: string[] = [];
             for (let target of targets) {
-                let [start, end] = target.config.route || FULL_ROUTE;
-                let fullKey = key.replace(VARIABLE_SHARD, VARIABLE_SHARD + "_" + (start + Math.random() * (end - start)));
+                let fullKey = materializeShardKey(key, target);
                 try {
                     await target.write(archives => archives.set(fullKey, data, config));
                     return fullKey;
@@ -657,6 +757,7 @@ export class ArchivesChain implements IArchives {
             }
             if (!recheckedAvailability) {
                 recheckedAvailability = true;
+                connectedOnly = false;
                 await this.recheckAvailability();
                 continue;
             }
@@ -664,7 +765,7 @@ export class ArchivesChain implements IArchives {
         }
     }
 
-    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         if (config.path.includes(VARIABLE_SHARD) && parseVariableRoute(config.path) === undefined) {
             throw new Error(`setLargeFile does not support VARIABLE_SHARD keys (there is no way to return the materialized key); write the file with set, or materialize the key yourself. Key: ${JSON.stringify(config.path)}`);
         }
@@ -694,15 +795,30 @@ export class ArchivesChain implements IArchives {
     }
 
     public async getURL(path: string): Promise<string> {
+        let urls = await this.getURLs(path);
+        if (!urls.length) {
+            throw new Error(`No public source covering route ${getRoute(path)} to build a URL from for ${this.getDebugName()}`);
+        }
+        return urls[0];
+    }
+
+    /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runWrite - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
+    public async getURLs(path: string): Promise<string[]> {
         let state = await this.getState();
         let route = getRoute(path);
+        let candidates: { source: SourceWrapper; provider: IArchives }[] = [];
         for (let source of state.sources) {
-            if (source.config.public === false) continue;
+            if (!(source.config.public ?? true)) continue;
             if (!routeContains(source.config.route, route)) continue;
-            if (source.url) return await source.url.getURL(path);
-            if (source.api) return await source.api.getURL(path);
+            if (!configWindowCurrent(source.config)) continue;
+            let provider = source.url || source.api;
+            if (!provider) continue;
+            candidates.push({ source, provider });
         }
-        throw new Error(`No public source covering route ${route} to build a URL from for ${this.getDebugName()}`);
+        let rest = candidates.slice(1);
+        sort(rest, x => x.source.getLatency());
+        let urls = await Promise.all([...candidates.slice(0, 1), ...rest].map(x => x.provider.getURL(path)));
+        return [...new Set(urls)];
     }
 
     public dispose(): void {
@@ -725,8 +841,8 @@ export class ArchivesChain implements IArchives {
     }
 }
 
-export function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain {
-    return new ArchivesChain(config);
+export function createArchives(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions): ArchivesChain {
+    return new ArchivesChain(config, options);
 }
 
 async function callServer<T>(url: string, run: (controller: typeof RemoteStorageController.nodes[string]) => Promise<T>): Promise<T> {

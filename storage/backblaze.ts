@@ -8,8 +8,9 @@ import { blue, green, magenta } from "socket-function/src/formatting/logColors";
 import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
-import { httpsRequest } from "socket-function/src/https";
-import { IArchives, ArchivesConfig, assertValidLastModified, IMMUTABLE_CACHE_TIME } from "./IArchives";
+import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, SetConfig, assertValidLastModified, IMMUTABLE_CACHE_TIME } from "./IArchives";
+import { filterChanges } from "./remoteStorage/remoteConfig";
 
 type BackblazeCreds = {
     applicationKeyId: string;
@@ -24,6 +25,17 @@ let backblazeCreds = lazy(async (): Promise<BackblazeCreds> => {
         applicationKey: key,
     };
 });
+// A B2 download/HEAD response's headers carry the file's metadata. content-range's total wins over content-length for ranged responses (which only report the slice's length).
+function parseFileMetadataHeaders(response: HttpsResponseInfo): { size: number; uploadTimestamp: number } {
+    let size = Number(response.headers["content-length"] || 0);
+    let contentRange = response.headers["content-range"];
+    let total = contentRange && Number(contentRange.split("/")[1]);
+    if (total && Number.isFinite(total)) {
+        size = total;
+    }
+    return { size, uploadTimestamp: Number(response.headers["x-bz-upload-timestamp"] || 0) };
+}
+
 const getAPI = lazy(async () => {
     let creds = await backblazeCreds();
 
@@ -148,6 +160,8 @@ const getAPI = lazy(async () => {
         bucketName: string;
         fileName: string;
         range?: { start: number; end: number; };
+        // Captures the response headers, which carry the file's metadata (x-bz-upload-timestamp, content-length / content-range) - so callers that need it don't pay a second API call
+        outResponse?: HttpsResponseInfo;
     }) {
         let fileName = encodePath(config.fileName);
 
@@ -160,8 +174,29 @@ const getAPI = lazy(async () => {
                 "Content-Type": "application/json",
                 Range: config.range ? `bytes=${config.range.start}-${config.range.end - 1}` : undefined,
             }).filter(x => x[1] !== undefined)),
+            outResponse: config.outResponse,
         });
         return result;
+    }
+
+    /** A file's metadata by name, without the body: HEAD on the download URL, which is a class B (download-priced) transaction - b2_list_file_names is class C at 10x the price, and b2_get_file_info needs a fileId we don't have. Returns undefined for missing (or hidden) files. */
+    async function headFileByName(config: { bucketName: string; fileName: string }): Promise<{ size: number; uploadTimestamp: number } | undefined> {
+        let fileName = encodePath(config.fileName);
+        let response: HttpsResponseInfo = { headers: {} };
+        try {
+            await httpsRequest(auth.apiUrl + "/file/" + config.bucketName + "/" + fileName, undefined, "HEAD", undefined, {
+                headers: { Authorization: auth.authorizationToken },
+                outResponse: response,
+            });
+        } catch (e) {
+            if (response.statusCode === 404) return undefined;
+            // HEAD responses have no body, so the expired_auth_token marker apiRetryLogic matches on never appears - re-add it so an expired token still refreshes and retries
+            if (response.statusCode === 401) {
+                throw new Error(`"expired_auth_token" HEAD ${config.bucketName}/${config.fileName} got a 401: ${(e as Error).stack ?? e}`);
+            }
+            throw e;
+        }
+        return parseFileMetadataHeaders(response);
     }
 
     // Oh... apparently, we can't reuse these? Huh...
@@ -353,6 +388,7 @@ const getAPI = lazy(async () => {
         updateBucket,
         listBuckets,
         downloadFileByName,
+        headFileByName,
         uploadFile,
         hideFile,
         getFileInfo,
@@ -480,11 +516,10 @@ export class ArchivesBackblaze implements IArchives {
                 }
                 return true;
             }
-            if (
-                !orderIndependentEqualArray(bucket.corsRules, desiredCorsRules)
-                || !orderIndependentEqual(bucket.bucketInfo, bucketInfo)
-            ) {
-                console.log(magenta(`Updating CORS rules for ${this.bucketName}`), bucket.corsRules, desiredCorsRules);
+            let corsChanged = !orderIndependentEqualArray(bucket.corsRules, desiredCorsRules);
+            let infoChanged = !orderIndependentEqual(bucket.bucketInfo, bucketInfo);
+            if (corsChanged || infoChanged) {
+                console.log(magenta(`Updating bucket settings for ${this.bucketName} (corsRules ${corsChanged && "changed" || "unchanged"}, bucketInfo ${infoChanged && "changed" || "unchanged"}): corsRules ${JSON.stringify(bucket.corsRules)} -> ${JSON.stringify(desiredCorsRules)}, bucketInfo ${JSON.stringify(bucket.bucketInfo)} -> ${JSON.stringify(bucketInfo)}`));
                 await api.updateBucket({
                     accountId: bucket.accountId,
                     bucketId: bucket.bucketId,
@@ -586,7 +621,11 @@ export class ArchivesBackblaze implements IArchives {
         }
     }
 
-    public async get(fileName: string, config?: { range?: { start: number; end: number; }; retryCount?: number }): Promise<Buffer | undefined> {
+    public async get(fileName: string, config?: GetConfig): Promise<Buffer | undefined> {
+        let result = await this.get2(fileName, config);
+        return result && result.data || undefined;
+    }
+    public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         let downloading = true;
         try {
             let time = Date.now();
@@ -596,46 +635,51 @@ export class ArchivesBackblaze implements IArchives {
                 setTimeout(downloadPoll, 5000);
             };
             setTimeout(downloadPoll, 5000);
-            let result = await this.apiRetryLogic(`get ${fileName}`, async (api) => {
+            let result = await this.apiRetryLogic(`get ${fileName}`, async (api): Promise<{ data: Buffer; writeTime: number; size: number }> => {
                 let range = config?.range;
                 if (range) {
+                    // The clamp needs the file's size (and gives us its metadata for free)
                     let fileInfo = await this.getInfo(fileName);
                     if (!fileInfo) throw new Error(`File ${fileName} not found`);
                     let rangeStart = range.start;
                     let rangeEnd = Math.min(range.end, fileInfo.size);
                     // NOTE: I think if we request nothing, it confuses Backblaze and ends up giving us the entire file.
-                    if (rangeEnd <= rangeStart) return Buffer.alloc(0);
-                    let result = await api.downloadFileByName({
+                    if (rangeEnd <= rangeStart) return { data: Buffer.alloc(0), writeTime: fileInfo.writeTime, size: fileInfo.size };
+                    let data = await api.downloadFileByName({
                         bucketName: this.bucketName,
                         fileName,
                         range: { start: rangeStart, end: rangeEnd },
                     });
-                    if (result.length !== rangeEnd - rangeStart) {
-                        console.error(`Backblaze range download returned the wrong number of bytes. Tried to get ${rangeStart}-${rangeEnd}, but received ${rangeStart}-${rangeStart + result.length}. For file: ${fileName}`);
+                    if (data.length !== rangeEnd - rangeStart) {
+                        console.error(`Backblaze range download returned the wrong number of bytes. Tried to get ${rangeStart}-${rangeEnd}, but received ${rangeStart}-${rangeStart + data.length}. For file: ${fileName}`);
                     }
-                    return result;
+                    return { data, writeTime: fileInfo.writeTime, size: fileInfo.size };
                 }
-                return await api.downloadFileByName({
+                // The download's own response headers carry the metadata, so a full read is a single API call
+                let response: HttpsResponseInfo = { headers: {} };
+                let data = await api.downloadFileByName({
                     bucketName: this.bucketName,
                     fileName,
+                    outResponse: response,
                 });
+                let meta = parseFileMetadataHeaders(response);
+                return { data, writeTime: meta.uploadTimestamp, size: data.length };
             });
             let timeStr = formatTime(Date.now() - time);
-            let rateStr = formatNumber(result.length / (Date.now() - time) * 1000) + "B/s";
-            this.log(`backblaze download (${formatNumber(result.length)}B${config?.range && `, ${formatNumber(config.range.start)} - ${formatNumber(config.range.end)}` || ""}) in ${timeStr} (${rateStr}, ${fileName})`);
+            let rateStr = formatNumber(result.data.length / (Date.now() - time) * 1000) + "B/s";
+            this.log(`backblaze download (${formatNumber(result.data.length)}B${config?.range && `, ${formatNumber(config.range.start)} - ${formatNumber(config.range.end)}` || ""}) in ${timeStr} (${rateStr}, ${fileName})`);
             return result;
         } catch (e) {
-            this.log(`backblaze file does not exist ${fileName}`);
-            return undefined;
+            // Only genuine absence may become undefined: callers treat undefined as authoritative "the bucket does not hold this file" (BlobStore even deletes index entries over it), so a transient failure (503, auth, timeout) must throw instead of masquerading as a missing file
+            let message = String((e as Error).stack ?? e);
+            if (message.includes(`"not_found"`) || message.includes(`file_not_found`) || message.includes(`not found`)) {
+                this.log(`backblaze file does not exist ${fileName}`);
+                return undefined;
+            }
+            throw e;
         } finally {
             downloading = false;
         }
-    }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number; } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        // B2 downloads don't return the upload time, so this takes a second API call
-        let [data, info] = await Promise.all([this.get(fileName, config), this.getInfo(fileName)]);
-        if (!data || !info) return undefined;
-        return { data, writeTime: info.writeTime, size: info.size };
     }
     public async getConfig(): Promise<ArchivesConfig> {
         return {};
@@ -656,28 +700,37 @@ export class ArchivesBackblaze implements IArchives {
             return false;
         }
     }
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
+    public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        if (config?.forceSetImmutable && !config.lastModified) {
+            throw new Error(`forceSetImmutable requires lastModified (synchronization writes are ordered by their write time), writing ${fileName} to ${this.getDebugName()}`);
+        }
         if (config?.lastModified) {
             assertValidLastModified(config.lastModified);
-            let existing = await this.getInfo(fileName);
-            // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
-            if (existing && config.lastModified < existing.writeTime) return fileName;
+            if (!config.noChecks) {
+                let existing = await this.getInfo(fileName);
+                // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
+                if (existing && config.lastModified < existing.writeTime) return fileName;
+                // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
+                if (existing && config.forceSetImmutable && this.config.immutable) return fileName;
+            }
         }
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
         let f = fileName;
         await this.apiRetryLogic(`uploadFile ${fileName}`, async (api) => {
             await api.uploadFile({ bucketId: this.bucketId, fileName, data: data, });
         });
-        let existsChecks = 30;
-        while (existsChecks > 0) {
-            let exists = await this.getInfo(fileName);
-            if (exists) break;
-            await delay(1000);
-            existsChecks--;
-        }
-        if (existsChecks === 0) {
-            let exists = await this.getInfo(fileName);
-            console.warn(`File ${fileName}/${f} was uploaded, but could not be found afterwards. Hopefully it was just deleted, very quickly? If backblaze is taking too long for files to propagate, then we might run into issues with the database atomicity.`);
+        if (!config?.noChecks) {
+            let existsChecks = 30;
+            while (existsChecks > 0) {
+                let exists = await this.getInfo(fileName);
+                if (exists) break;
+                await delay(1000);
+                existsChecks--;
+            }
+            if (existsChecks === 0) {
+                let exists = await this.getInfo(fileName);
+                console.warn(`File ${fileName}/${f} was uploaded, but could not be found afterwards. Hopefully it was just deleted, very quickly? If backblaze is taking too long for files to propagate, then we might run into issues with the database atomicity.`);
+            }
         }
         return fileName;
     }
@@ -694,7 +747,8 @@ export class ArchivesBackblaze implements IArchives {
         // NOTE: Deletion SEEMS to work. This DOES break if we delete a file which keeps being recreated, ex, the heartbeat. let existsChecks = 10; while (existsChecks > 0) { let exists = await this.getInfo(fileName); if (!exists) break; await delay(1000); existsChecks--; } if (existsChecks === 0) { let exists = await this.getInfo(fileName); devDebugbreak(); console.warn(`File ${fileName} was deleted, but was still found afterwards`); exists = await this.getInfo(fileName); }
     }
 
-    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined>; }): Promise<void> {
+    // lastModified is accepted but cannot be honored - b2 stamps its own uploadTimestamp, which is what our getInfo/findInfo report as the write time
+    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined>; }): Promise<void> {
 
         let onError: (() => Promise<void>)[] = [];
         let time = Date.now();
@@ -829,9 +883,7 @@ export class ArchivesBackblaze implements IArchives {
     public async getInfo(fileName: string): Promise<{ writeTime: number; size: number; } | undefined> {
         return await this.apiRetryLogic(`getInfo ${fileName}`, async (api) => {
             try {
-                // NOTE: Apparently, there's no other way to do this, as the file name does not equal the file ID, and get file info requires the file ID.
-                let info = await api.listFileNames({ bucketId: this.bucketId, prefix: fileName, maxFileCount: 10 });
-                let file = info.files.find(x => x.fileName === fileName && x.action === "upload");
+                let file = await api.headFileByName({ bucketName: this.bucketName, fileName });
                 if (!file) {
                     this.log(`Backblaze file not exists ${fileName}`);
                     return undefined;
@@ -839,7 +891,7 @@ export class ArchivesBackblaze implements IArchives {
                 this.log(`Backblaze file exists ${fileName}`);
                 return {
                     writeTime: file.uploadTimestamp,
-                    size: file.contentLength,
+                    size: file.size,
                 };
             } catch (e: any) {
                 if (e.stack.includes(`file_not_found`)) {
@@ -856,6 +908,11 @@ export class ArchivesBackblaze implements IArchives {
         let result = await this.findInfo(prefix, config);
         return result.map(x => x.path);
     }
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
+        // No native change feed (b2 supports neither time nor route filtering) - a full listing filtered in memory
+        return filterChanges(await this.findInfo(""), config);
+    }
+
     public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<{ path: string; createTime: number; size: number; }[]> {
         return await this.apiRetryLogic(`findInfo ${prefix}`, async (api) => {
             if (!config?.shallow && config?.type === "folders") {

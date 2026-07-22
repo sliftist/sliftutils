@@ -6,8 +6,9 @@ const PARAMETERS_TIMELINE_FILE_REGEX = /^(\d+)-parameters\.json$/;
 const DEPLOY_DETECT_RETRY_DELAY = 5 * 1000;
 const DEPLOY_DETECT_TIMEOUT = 30 * 1000;
 const EXIT_LOG_FLUSH_DELAY = 5 * 1000;
-const DEPLOY_RELEASE_MATCH_WINDOW = 5 * 60 * 1000;
 const ALT_PORT_LINGER = 30 * 60 * 1000;
+// The end time needs to be enough after the kill time that we are certain we will have the main port by then. Scaled up with the overlap, so unusually long overlaps get an equally generous buffer.
+const INTERMEDIATE_END_MIN_BUFFER = 5 * 60 * 1000;
 const ACQUIRE_SLOW_DELAY = 30 * 1000;
 const ACQUIRE_FAST_DELAY = 1000;
 const ACQUIRE_FAST_WINDOW = 60 * 1000;
@@ -20,6 +21,8 @@ type DeployTakeover = {
     releaseTime: number;
     overlapTime: number;
     altPort?: number;
+    // Frozen when the alt port is taken (a moving start would make every maintenance pass write a new config)
+    intermediateStart?: number;
 };
 
 let takeover: DeployTakeover | undefined;
@@ -57,14 +60,13 @@ async function readTimelineEntries(): Promise<TimelineEntry[]> {
     return entries;
 }
 
-function findOurRelease(entries: TimelineEntry[], now: number): DeployTakeover | undefined {
+// The newest release in the timeline is the one we are part of - the timeline is append-only history, so whatever process starts up during a takeover belongs to its latest entry
+function findOurRelease(entries: TimelineEntry[]): DeployTakeover | undefined {
     let best: DeployTakeover | undefined;
     for (let entry of entries) {
         let releaseTime = entry.parameters.releaseTime;
         if (releaseTime === undefined) continue;
         let overlapTime = entry.parameters.overlapTime || 0;
-        if (releaseTime > now + DEPLOY_RELEASE_MATCH_WINDOW) continue;
-        if (now > releaseTime + overlapTime + DEPLOY_RELEASE_MATCH_WINDOW) continue;
         if (best && best.releaseTime >= releaseTime) continue;
         best = { releaseTime, overlapTime };
     }
@@ -79,7 +81,7 @@ export async function detectDeployTakeover(): Promise<DeployTakeover> {
     while (true) {
         attempt++;
         let entries = await readTimelineEntries();
-        let found = findOurRelease(entries, Date.now());
+        let found = findOurRelease(entries);
         if (found) {
             takeover = found;
             console.warn(`${logPrefix()} Deploy takeover confirmed on attempt ${attempt}: release at ${iso(found.releaseTime)}, overlap ${found.overlapTime}ms, so our predecessor holds the main port until ${iso(found.releaseTime + found.overlapTime)}. We are the successor.`);
@@ -102,19 +104,27 @@ export function setAltPort(port: number): void {
         throw new Error(`An alternate port (${port}) was taken without a detected deploy takeover - detectDeployTakeover must run first`);
     }
     takeover.altPort = port;
-    console.warn(`${logPrefix()} Listening on alternate port ${port}: writes route here until ${iso(getIntermediateEnd())}, and we keep listening until ${iso(getAltPortListenEnd())}`);
+    // Needs to be enough after our startup time that the previous node has time to see it's going to be shut down and flush (and so we have time to start up), and enough before the kill time that nodes have time to notice we exist and prepare to connect to us - halfway between now and the kill time satisfies both
+    takeover.intermediateStart = Math.round((Date.now() + getKillTime()) / 2);
+    console.warn(`${logPrefix()} Listening on alternate port ${port}: writes route here from ${iso(takeover.intermediateStart)} until ${iso(getIntermediateEnd())}, and we keep listening until ${iso(getAltPortListenEnd())}`);
     startIntermediateMaintenance();
 }
 
-/** The window in which writes belong to our alternate port: from the release until our predecessor is killed and we take the main port. */
+/** The window in which writes belong to our alternate port: from partway through the overlap (giving the predecessor notice to flush) until safely past its kill (giving us time to actually take the main port). */
 export function getTakeoverIntermediate(): { start: number; end: number; altPort: number } | undefined {
-    if (!takeover?.altPort) return undefined;
-    return { start: takeover.releaseTime, end: getIntermediateEnd(), altPort: takeover.altPort };
+    if (!takeover?.altPort || takeover.intermediateStart === undefined) return undefined;
+    return { start: takeover.intermediateStart, end: getIntermediateEnd(), altPort: takeover.altPort };
+}
+
+/** When our predecessor is killed and the main port frees. Port acquisition polls against this on its own - it is entirely independent of the intermediate window. */
+function getKillTime(): number {
+    if (!takeover) return 0;
+    return takeover.releaseTime + takeover.overlapTime;
 }
 
 function getIntermediateEnd(): number {
     if (!takeover) return 0;
-    return takeover.releaseTime + takeover.overlapTime;
+    return getKillTime() + Math.max(INTERMEDIATE_END_MIN_BUFFER, takeover.overlapTime);
 }
 
 /** We never stop listening on the alternate port while its window is still valid, and hold it well past that for clients that have not caught up yet. */
@@ -126,8 +136,7 @@ export function getAltPortListenEnd(): number {
 /** How long to wait between main-port acquisition attempts: tight around our predecessor's scheduled death (when the port actually frees), relaxed otherwise. */
 export function getMainPortAcquireDelay(): number {
     if (!takeover) return ACQUIRE_SLOW_DELAY;
-    let predecessorEnd = takeover.releaseTime + takeover.overlapTime;
-    if (Date.now() >= predecessorEnd - ACQUIRE_FAST_WINDOW) {
+    if (Date.now() >= getKillTime() - ACQUIRE_FAST_WINDOW) {
         return ACQUIRE_FAST_DELAY;
     }
     return ACQUIRE_SLOW_DELAY;

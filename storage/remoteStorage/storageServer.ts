@@ -104,6 +104,7 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
             .catch(e => console.error(`Disk space check failed for ${folder}:`, e));
     }, DISK_SPACE_CHECK_INTERVAL_MS);
     (interval as { unref?: () => void }).unref?.();
+    SocketFunction.MAX_MESSAGE_SIZE = 1024 * 1024 * 384;
 
     await hostServer({
         domain,

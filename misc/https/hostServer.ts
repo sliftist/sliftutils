@@ -107,6 +107,9 @@ async function runMainPortAcquireLoop(domain: string, mainPort: number, servingP
         let acquired = await new Promise<boolean>(resolve => {
             let relay = net.createServer(client => {
                 let upstream = net.connect({ host: "127.0.0.1", port: servingPort });
+                // Without this every relayed request pays the ~40ms delayed-ACK timer: a call is a small write (often a header then a body), Nagle holds the second write until the first is acknowledged, and the peer has nothing to piggyback the ACK on. Measured as 43ms per call through the relay versus 1ms direct.
+                client.setNoDelay(true);
+                upstream.setNoDelay(true);
                 client.pipe(upstream);
                 upstream.pipe(client);
                 let cleanup = () => {

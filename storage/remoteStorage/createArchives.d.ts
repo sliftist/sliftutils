@@ -1,11 +1,16 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig } from "../IArchives";
 import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
 export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
+export type ArchivesChainOptions = {
+    /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
+    directConnect?: boolean;
+};
 export declare class ArchivesChain implements IArchives {
+    private options?;
     private configured;
     private activeConfig;
     private statePromise;
@@ -14,10 +19,12 @@ export declare class ArchivesChain implements IArchives {
     private pollTimer;
     private disposed;
     private unsubscribeRoutingPush;
-    constructor(config: RemoteConfig | RemoteConfigBase);
+    constructor(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions | undefined);
     getDebugName(): string;
     private getState;
     private init;
+    /** Clientside, a config with public sources is served entirely over plain URL downloads - no API connection, no access grant, and no writing. directConnect opts out of that. */
+    private isReadOnly;
     private createChainSource;
     private buildSources;
     private startConfigPoll;
@@ -40,25 +47,17 @@ export declare class ArchivesChain implements IArchives {
         machineId: string;
         ip: string;
     } | undefined>;
-    get(fileName: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<Buffer | undefined>;
-    get2(fileName: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<{
+    get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
+    get2(fileName: string, config?: GetConfig): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
+        url: string;
     } | undefined>;
     getInfo(fileName: string): Promise<{
         writeTime: number;
         size: number;
+        url: string;
     } | undefined>;
     private selectCoveringSources;
     private runOnCovering;
@@ -70,24 +69,28 @@ export declare class ArchivesChain implements IArchives {
         shallow?: boolean;
         type: "files" | "folders";
     }): Promise<ArchiveFileInfo[]>;
-    getChangesAfter(time: number): Promise<ArchiveFileInfo[]>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getSyncStatus(): Promise<ArchivesSyncStatus>;
     getConfig(): Promise<ArchivesConfig>;
     hasWriteAccess(): Promise<boolean>;
-    set(fileName: string, data: Buffer, config?: {
-        lastModified?: number;
-    }): Promise<string>;
+    set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     private setRoutingConfig;
     del(fileName: string): Promise<void>;
+    private getVariableShardTargets;
+    /** The key setVariableShard would materialize for this VARIABLE_SHARD key (a value in the preferred shard's route range), without writing anything. */
+    getShardKey(key: string): Promise<string>;
     private setVariableShard;
     setLargeFile(config: {
         path: string;
+        lastModified?: number;
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
     getURL(path: string): Promise<string>;
+    /** Every URL that could serve this path, in source order: public sources matching both the path's route and the current valid window. Empty when none qualify. */
+    getURLs(path: string): Promise<string[]>;
     dispose(): void;
 }
-export declare function createArchives(config: RemoteConfig | RemoteConfigBase): ArchivesChain;
+export declare function createArchives(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions): ArchivesChain;
 export declare function listServerBuckets(config: {
     url: string;
     account: string;

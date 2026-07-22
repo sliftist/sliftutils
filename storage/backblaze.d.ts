@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchivesConfig } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, SetConfig } from "./IArchives";
 export declare class ArchivesBackblaze implements IArchives {
     private config;
     constructor(config: {
@@ -20,31 +20,19 @@ export declare class ArchivesBackblaze implements IArchives {
     private currentReset;
     private last503Reset;
     private apiRetryLogic;
-    get(fileName: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-        retryCount?: number;
-    }): Promise<Buffer | undefined>;
-    get2(fileName: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<{
+    get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
+    get2(fileName: string, config?: GetConfig): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
     } | undefined>;
     getConfig(): Promise<ArchivesConfig>;
     hasWriteAccess(): Promise<boolean>;
-    set(fileName: string, data: Buffer, config?: {
-        lastModified?: number;
-    }): Promise<string>;
+    set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     del(fileName: string): Promise<void>;
     setLargeFile(config: {
         path: string;
+        lastModified?: number;
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
     getInfo(fileName: string): Promise<{
@@ -55,6 +43,7 @@ export declare class ArchivesBackblaze implements IArchives {
         shallow?: boolean;
         type: "files" | "folders";
     }): Promise<string[]>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     findInfo(prefix: string, config?: {
         shallow?: boolean;
         type: "files" | "folders";

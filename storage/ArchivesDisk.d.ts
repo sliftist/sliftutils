@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, SetConfig } from "./IArchives";
 export declare class ArchivesDisk implements IArchives {
     private folder;
     constructor(folder: string);
@@ -16,24 +16,13 @@ export declare class ArchivesDisk implements IArchives {
     };
     getDebugName(): string;
     getConfig(): Promise<ArchivesConfig>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     hasWriteAccess(): Promise<boolean>;
     private filePath;
-    set(key: string, data: Buffer, config?: {
-        lastModified?: number;
-    }): Promise<string>;
+    set(key: string, data: Buffer, config?: SetConfig): Promise<string>;
     del(key: string): Promise<void>;
-    get(key: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<Buffer | undefined>;
-    get2(key: string, config?: {
-        range?: {
-            start: number;
-            end: number;
-        };
-    }): Promise<{
+    get(key: string, config?: GetConfig): Promise<Buffer | undefined>;
+    get2(key: string, config?: GetConfig): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
@@ -53,11 +42,12 @@ export declare class ArchivesDisk implements IArchives {
     private collectFiles;
     setLargeFile(config: {
         path: string;
+        lastModified?: number;
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
     startLargeUpload(): Promise<string>;
     appendLargeUpload(id: string, data: Buffer): Promise<void>;
-    finishLargeUpload(id: string, key: string): Promise<void>;
+    finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
     cancelLargeUpload(id: string): Promise<void>;
     getURL(path: string): Promise<string>;
 }

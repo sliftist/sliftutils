@@ -9,10 +9,10 @@ import { ArchivesDisk } from "../ArchivesDisk";
 import { BlobStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MARGIN } from "./blobStore";
 import {
     RemoteConfig, HostedConfig, BackblazeConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
-    ArchivesSyncStatus,
+    ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig,
     STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
-import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection } from "./remoteConfig";
+import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection, normalizeSource } from "./remoteConfig";
 import { injectIntermediateSource, expireIntermediateSources, getIntermediateSources, findSplitUrl, nextIntermediateVersion, INTERMEDIATE_EXPIRE_GRACE } from "./intermediateSources";
 import { getTakeoverIntermediate } from "./deployTakeover";
 import { createApiArchives, listServerActiveBucketKeys } from "./createArchives";
@@ -424,6 +424,21 @@ type StorePlan = {
     structureKey: string;
 };
 
+const resolvedSourceArchives = new Map<string, IArchives>();
+/** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
+export function resolveSourceArchives(url: string): IArchives {
+    let existing = resolvedSourceArchives.get(url);
+    if (existing) return existing;
+    let archives: IArchives;
+    if (url.startsWith("https://")) {
+        archives = createApiArchives(normalizeSource(url));
+    } else {
+        archives = new ArchivesDisk(url);
+    }
+    resolvedSourceArchives.set(url, archives);
+    return archives;
+}
+
 function sourceIdentity(sourceConfig: HostedConfig | BackblazeConfig | undefined): string {
     if (!sourceConfig) return "disk";
     return JSON.stringify({ ...sourceConfig, validWindow: undefined, route: undefined });
@@ -491,9 +506,11 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig,
         }
         let sources: ArchivesSource[] = plan.sourceSpecs.map(spec => ({
             source: spec.sourceConfig && createApiArchives(spec.sourceConfig) || new ArchivesDisk(folder),
+            url: spec.sourceConfig?.url || folder,
             validWindow: spec.validWindow,
             route: spec.route,
             noFullSync: spec.noFullSync,
+            intermediate: spec.sourceConfig?.intermediate,
             identity: sourceIdentity(spec.sourceConfig),
         }));
         store = new BlobStore(folder, sources, {
@@ -503,6 +520,7 @@ function buildBucket(account: string, bucketName: string, routing: RemoteConfig,
             },
             readerDiskLimit: plan.readerDiskLimit,
             onWriteCounted: (kind, bytes) => countBucketWrite(`${account}/${bucketName}`, kind, bytes),
+            resolveSourceUrl: resolveSourceArchives,
         });
     }
     let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store, structureKey: plan.structureKey };
@@ -584,13 +602,15 @@ async function checkRoutingChanged(account: string, bucketName: string, config?:
         loaded.store.updateSources(plan.sourceSpecs.map(spec => {
             const sourceConfig = spec.sourceConfig;
             if (!sourceConfig) {
-                return { identity: sourceIdentity(undefined), validWindow: spec.validWindow, create: (): IArchives => new ArchivesDisk(getBucketFolder(account, bucketName)) };
+                return { identity: sourceIdentity(undefined), url: getBucketFolder(account, bucketName), validWindow: spec.validWindow, create: (): IArchives => new ArchivesDisk(getBucketFolder(account, bucketName)) };
             }
             return {
                 identity: sourceIdentity(sourceConfig),
+                url: sourceConfig.url,
                 validWindow: spec.validWindow,
                 route: spec.route,
                 noFullSync: spec.noFullSync,
+                intermediate: sourceConfig.intermediate,
                 create: () => createApiArchives(sourceConfig),
             };
         }));
@@ -666,7 +686,7 @@ async function writeRoutingConfig(account: string, bucketName: string, data: Buf
     await scheduleRoutingReload(account, bucketName);
 }
 
-export async function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+export async function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: { lastModified?: number; forceSetImmutable?: boolean }): Promise<void> {
     assertWritesAllowed();
     if (filePath === ROUTING_FILE) {
         let key = `${account}/${bucketName}`;
@@ -691,14 +711,24 @@ export async function writeBucketFile(account: string, bucketName: string, fileP
             throw new Error(`${STORAGE_WRONG_ROUTE} This server does not handle route ${route} (key ${JSON.stringify(filePath)}) for bucket ${account}/${bucketName} (our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}). Re-resolve the source for this key and retry.`);
         }
     }
-    await assertMutable(loaded, filePath, writeTime);
+    if (config?.forceSetImmutable) {
+        if (!config.lastModified) {
+            throw new Error(`forceSetImmutable requires lastModified (synchronization writes are ordered by their write time), writing ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}`);
+        }
+        // Immutability wins: an existing path is kept instead of the push throwing (see SetConfig.forceSetImmutable)
+        let self = selectEntryAt(loaded.selfEntries, writeTime, route);
+        if (self?.immutable && await loaded.store.getInfo(filePath)) return;
+    } else {
+        await assertMutable(loaded, filePath, writeTime);
+    }
     await loaded.store.set(filePath, data, { ...getWriteConfig(loaded, writeTime, route), lastModified: writeTime });
 }
 
 export function getBucketConfig(bucket: LoadedBucket): ArchivesConfig {
     let progress = bucket.store.getSyncProgress?.();
     return {
-        supportsChangesAfter: !!bucket.store.getChangesAfter,
+        // Native change-feed support = the store keeps an index (rawDisk buckets emulate getChangesAfter2 with a full listing) - clients use this to pick their scan cadence
+        supportsChangesAfter: bucket.store instanceof BlobStore,
         remoteConfig: bucket.routing,
         index: progress?.index,
         indexSources: progress?.sources,
@@ -1024,29 +1054,29 @@ class ArchivesLocalBucket implements IArchives {
     public getDebugName() {
         return `localBucket account ${this.account} bucket ${this.bucketName}`;
     }
-    public async get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined> {
+    public async get(fileName: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         let bucket = await this.getBucket();
         if (!bucket) return undefined;
         return await bucket.store.get2(fileName, config);
     }
-    public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
+    public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
         await writeBucketFile(this.account, this.bucketName, fileName, data, config);
         return fileName;
     }
     public async del(fileName: string): Promise<void> {
         await deleteBucketFile(this.account, this.bucketName, fileName);
     }
-    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         assertWritesAllowed();
         let bucket = await this.getBucket();
         if (!bucket) {
             throw new Error(`Bucket ${this.account}/${this.bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
         }
-        await assertMutable(bucket, config.path, Date.now());
+        await assertMutable(bucket, config.path, config.lastModified || Date.now());
         let id = await bucket.store.startLargeUpload();
         try {
             while (true) {
@@ -1056,7 +1086,7 @@ class ArchivesLocalBucket implements IArchives {
                     await bucket.store.appendLargeUpload(id, data.subarray(offset, offset + LARGE_FILE_PART_SIZE));
                 }
             }
-            await bucket.store.finishLargeUpload(id, config.path);
+            await bucket.store.finishLargeUpload(id, config.path, config.lastModified);
         } catch (e) {
             await bucket.store.cancelLargeUpload(id);
             throw e;
@@ -1087,13 +1117,10 @@ class ArchivesLocalBucket implements IArchives {
     public async hasWriteAccess(): Promise<boolean> {
         return true;
     }
-    public async getChangesAfter(time: number): Promise<ArchiveFileInfo[]> {
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
         let bucket = await this.getBucket();
         if (!bucket) return [];
-        if (!bucket.store.getChangesAfter) {
-            throw new Error(`Bucket ${this.account}/${this.bucketName} does not support getChangesAfter (rawDisk buckets have no index)`);
-        }
-        return await bucket.store.getChangesAfter(time);
+        return await bucket.store.getChangesAfter2(config);
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
         let bucket = await this.getBucket();

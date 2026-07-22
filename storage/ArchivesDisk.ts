@@ -3,7 +3,8 @@ import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { sort, binarySearchBasic } from "socket-function/src/misc";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, assertValidLastModified } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, SetConfig, assertValidLastModified } from "./IArchives";
+import { filterChanges } from "./remoteStorage/remoteConfig";
 
 // The base file-system IArchives: storage is one-to-one with the file system, every key is exactly one real file under <folder>/files, so the file system itself is the index. File handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a file run in serial, so they can't collide with each other or with handle closing. Used as the disk synchronization source of BlobStore (see remoteStorage/blobStore.ts).
 
@@ -124,6 +125,11 @@ export class ArchivesDisk implements IArchives {
         return {};
     }
 
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
+        // No native change feed - a full listing filtered in memory (see the scanning note in BlobStore.scanSource for why the listing itself takes no filters)
+        return filterChanges(await this.findInfo(""), config);
+    }
+
     public async hasWriteAccess(): Promise<boolean> {
         return true;
     }
@@ -136,7 +142,8 @@ export class ArchivesDisk implements IArchives {
         return result;
     }
 
-    public async set(key: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {
+    // forceSetImmutable is accepted and needs no handling: disk sources are never immutable, and the older-write no-op below already gives synchronization its only-take-the-latest semantics
+    public async set(key: string, data: Buffer, config?: SetConfig): Promise<string> {
         await this.init();
         let lastModified = config?.lastModified;
         if (lastModified) {
@@ -173,12 +180,12 @@ export class ArchivesDisk implements IArchives {
         });
     }
 
-    public async get(key: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined> {
+    public async get(key: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(key, config);
         return result && result.data || undefined;
     }
 
-    public async get2(key: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    public async get2(key: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         await this.init();
         let range = config?.range;
         let filePath = this.filePath(key);
@@ -255,7 +262,7 @@ export class ArchivesDisk implements IArchives {
         }
     }
 
-    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         let id = await this.startLargeUpload();
         try {
             while (true) {
@@ -263,7 +270,7 @@ export class ArchivesDisk implements IArchives {
                 if (!data) break;
                 await this.appendLargeUpload(id, data);
             }
-            await this.finishLargeUpload(id, config.path);
+            await this.finishLargeUpload(id, config.path, config.lastModified);
         } catch (e) {
             await this.cancelLargeUpload(id);
             throw e;
@@ -286,9 +293,12 @@ export class ArchivesDisk implements IArchives {
             await handle.write(data, 0, data.length);
         });
     }
-    public async finishLargeUpload(id: string, key: string): Promise<void> {
+    public async finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void> {
         let upload = this.largeUploads.get(id);
         if (!upload) throw new Error(`Unknown large upload ${id}`);
+        if (lastModified) {
+            assertValidLastModified(lastModified);
+        }
         const tmpPath = upload.tmpPath;
         this.largeUploads.delete(id);
         let filePath = this.filePath(key);
@@ -303,6 +313,10 @@ export class ArchivesDisk implements IArchives {
                 if (e.code !== "ENOENT") throw e;
                 // Nothing was ever appended, so the upload file was never created
                 await fs.promises.writeFile(filePath, Buffer.alloc(0));
+            }
+            // The rename preserves the temp file's mtime, which is just when the last append happened - the logical write time has to be stamped explicitly (it is the metadata scans order everything by)
+            if (lastModified) {
+                await fs.promises.utimes(filePath, new Date(lastModified), new Date(lastModified));
             }
         });
     }

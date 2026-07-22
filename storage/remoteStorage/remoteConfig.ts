@@ -1,6 +1,10 @@
-import { sort, sha256HashBuffer } from "socket-function/src/misc";
+import { sort } from "socket-function/src/misc";
 import { getBufferInt } from "socket-function/src/bits";
-import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, FULL_VALID_WINDOW, FULL_ROUTE, VARIABLE_SHARD } from "../IArchives";
+import { setFlag } from "socket-function/require/compileFlags";
+import jsSha256 from "js-sha256";
+import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ChangesAfterConfig, FULL_VALID_WINDOW, FULL_ROUTE, VARIABLE_SHARD } from "../IArchives";
+
+setFlag(require, "js-sha256", "allowclient", true);
 
 // Parsing / normalization of RemoteConfig (see IArchives.ts). Every bucket stores its own configuration (a RemoteConfig) inside itself, at ROUTING_FILE. Writing that file creates the bucket / reconfigures it (see storageServerState.ts); clients reconcile it by version (see createArchives.ts).
 
@@ -22,8 +26,19 @@ export function parseVariableRoute(key: string): number | undefined {
 export function getRoute(key: string): number {
     let override = parseVariableRoute(key);
     if (override !== undefined) return override;
-    let hash = getBufferInt(sha256HashBuffer(key));
+    // Pure JS, so routing works clientside too (node's crypto hashing is unavailable there)
+    let hash = getBufferInt(Buffer.from(jsSha256.sha256.array(key)));
     return hash % ROUTE_PRECISION / ROUTE_PRECISION;
+}
+
+/** The in-memory getChangesAfter2 emulation, for backends without a native change feed: a full listing filtered down to files written after config.time whose keys route into config.routes. */
+export function filterChanges(files: ArchiveFileInfo[], config: ChangesAfterConfig): ArchiveFileInfo[] {
+    return files.filter(file => {
+        if (file.createTime <= config.time) return false;
+        let routes = config.routes;
+        if (routes && !routes.some(route => routeContains(route, getRoute(file.path)))) return false;
+        return true;
+    });
 }
 
 // Route ranges are [start, end) - inclusive start, exclusive end
@@ -122,10 +137,10 @@ export function normalizeSource(source: RemoteConfigBase): HostedConfig | Backbl
     if (hostname.endsWith(".backblazeb2.com")) {
         // Validates the URL (throws on malformed) before it's stored; the bucket name is read back out of the URL at use sites, never stored on the config.
         parseBackblazeUrl(source);
-        return { type: "backblaze", url: source, validWindow: FULL_VALID_WINDOW };
+        return { type: "backblaze", url: source, validWindow: FULL_VALID_WINDOW, public: true };
     }
     parseHostedUrl(source);
-    return { type: "remote", url: source, validWindow: FULL_VALID_WINDOW };
+    return { type: "remote", url: source, validWindow: FULL_VALID_WINDOW, public: true };
 }
 
 /** How far up from 0 the sources' routes reach without a gap (1 means the whole key space). */

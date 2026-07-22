@@ -58,7 +58,7 @@ export type HostedConfig = CommonConfig & {
     // Fast mode: the server acknowledges writes once they are in memory, flushing to disk after writeDelay (default 5 minutes) and coalescing writes to the same file. A server crash loses writes that haven't flushed yet.
     fast?: boolean;
     writeDelay?: number;
-    // The bucket is served straight from the server's disk, with no index — so no fast writes and no getChangesAfter/getSyncStatus.
+    // The bucket is served straight from the server's disk, with no index — so no fast writes, no getSyncStatus, and getChangesAfter2 falls back to a full listing.
     rawDisk?: boolean;
     // Writes to paths that already exist are disallowed (deletes still work).
     immutable?: boolean;
@@ -86,6 +86,26 @@ export const FULL_VALID_WINDOW: [number, number] = [0, Number.MAX_SAFE_INTEGER];
 
 
 
+export type GetConfig = {
+    range?: { start: number; end: number };
+    /** Read ONLY from the primary source - the one writes would target - instead of falling back across the redundant sources. Use this when you want your reads and writes to be somewhat atomic: there will still be issues with the round trip, but without it you could talk to a completely different node and get a much older value. Most reads aren't followed by a write though, so for most cases it's better to get a value than to have to wait (or even throw) when the primary node is not available. */
+    noFallbacks?: boolean;
+};
+
+export type ChangesAfterConfig = {
+    time: number;
+    /** Only keys routing into one of these [start, end) ranges. Only scanning passes this - it lets a store syncing a partial shard ask for just its slice. */
+    routes?: [number, number][];
+};
+
+export type SetConfig = {
+    lastModified?: number;
+    /** Makes the write acceptable on immutable targets: an existing path is simply kept (immutability wins - nothing is overwritten) instead of the write throwing. Requires lastModified. Synchronization MUST pass this on every push - a plain set throws on immutable targets, which would abort reconciliation whenever one source in a chain is immutable. */
+    forceSetImmutable?: boolean;
+    /** Skips the target-side safety reads around the write (backblaze: the pre-write getInfo comparison and the post-upload existence poll). For writers whose own bookkeeping already decides what to write and orders it by write time (BlobStore's index-driven writes and synchronization), those reads are pure extra API calls - but the default stays checked, because other users of the raw backends rely on the checks. */
+    noChecks?: boolean;
+};
+
 // createTime is a misnomer kept for compatibility — it is really the LAST-WRITE time, same as getInfo's writeTime. Neither Backblaze nor our remote storage tracks a distinct creation date: each write stamps a fresh timestamp on the current version, so both fields are just "when the bytes served by get() were most recently written".
 export type ArchiveFileInfo = { path: string; createTime: number; size: number };
 
@@ -102,7 +122,7 @@ export type SyncActivity = {
 };
 
 export type ArchivesConfig = {
-    // Whether getChangesAfter is implemented (fast change polling, instead of full rescans)
+    // Whether getChangesAfter2 is natively index-backed (fast change polling; every backend still serves it, but the others emulate it with a full listing)
     supportsChangesAfter?: boolean;
     // The bucket's full routing config (ROUTING_FILE). Absent for sources that don't have one (a bare disk source, or a bucket that doesn't exist yet).
     remoteConfig?: RemoteConfig;
@@ -119,12 +139,16 @@ export type ArchivesConfig = {
 // A synchronization source of a BlobStore (which synchronizes an index + local cache from them)
 export type ArchivesSource = {
     source: IArchives;
-    // From the source's CommonConfig. Values with write times outside the window are ignored when scanning, and once its end is past (see windowAcceptsWrites) the source stops receiving writes entirely - still scanned (it holds the authoritative data for its window), it just stops growing.
+    /** The persistent identity of the endpoint: its routing URL (hosted/backblaze), or the disk folder path for the base disk source. The store persists this (via its append-only sources list) as IndexEntry.sourcesListIndex, so it must mean the same endpoint forever. */
+    url: string;
+    // From the source's CommonConfig. The window routes WRITES: once its end is past (see windowAcceptsWrites) the source stops receiving writes entirely - it just stops growing. It does NOT filter scanning: a scan is us asking the source what it already holds, and existing values synchronize regardless of their write times (the same reasoning that lets synchronization ignore the immutable flag).
     validWindow: [number, number];
     // From the source's CommonConfig (intersected with the owning store's own route): only keys routing into [start, end) are accepted from this source's scans and sent to it in writes/reconciliation. The routing file is exempt - config flows everywhere. Absent = all keys.
     route?: [number, number];
     // From the source's CommonConfig; see there.
     noFullSync?: boolean;
+    // From the source's CommonConfig: a deploy switchover's temporary alternate-port entry. Once its window is past, the port it points at is gone for good - so it is never scanned then, and scan failures are never retried.
+    intermediate?: boolean;
     // Stable identity of the underlying endpoint (its config with windows/routes stripped) - how BlobStore.updateSources recognizes a source across config changes so it can update it in place instead of removing and re-adding it
     identity?: string;
 };
@@ -140,9 +164,59 @@ export const FULL_ROUTE: [number, number] = [0, 1];
 // A key containing this sentinel doesn't have a fixed shard: setVariableShard picks the (lowest latency, up) write shard, appends "_<value in the shard's route>" directly after the sentinel, and returns the materialized key. getRoute treats that suffix as a complete route override.
 export const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
 // No grace past the end: a window boundary is a hard handoff (clients retry a rejected write against the newly-valid source, so leniency here would only desynchronize the handoff)
+//  - Writing to older valid state windows is fine, though. We need this to ingest the old data when we're synchronizing nodes to get them up to date anyway. 
 export function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean {
     if (!validWindow) return true;
     return validWindow[1] > Date.now();
+}
+
+const LARGE_COPY_THRESHOLD = 64 * 1024 * 1024;
+const LARGE_COPY_CHUNK = 32 * 1024 * 1024;
+
+/** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. size/writeTime usually come from the caller's metadata scan; when either is omitted, getInfo fills them in. Returns the copied file's info, or undefined when the source doesn't have the file. */
+export async function copyArchiveFile(config: {
+    from: IArchives;
+    to: IArchives;
+    path: string;
+    size?: number;
+    writeTime?: number;
+    forceSetImmutable?: boolean;
+    noChecks?: boolean;
+}): Promise<{ writeTime: number; size: number } | undefined> {
+    let { from, to, path } = config;
+    let size = config.size;
+    let writeTime = config.writeTime;
+    if (size === undefined || writeTime === undefined) {
+        let info = await from.getInfo(path);
+        if (!info) return undefined;
+        size = info.size;
+        writeTime = info.writeTime;
+    }
+    if (size <= LARGE_COPY_THRESHOLD) {
+        let result = await from.get2(path);
+        if (!result) return undefined;
+        await to.set(path, result.data, { lastModified: result.writeTime, forceSetImmutable: config.forceSetImmutable, noChecks: config.noChecks });
+        return { writeTime: result.writeTime, size: result.data.length };
+    }
+    // Consts so the closure keeps the narrowed types
+    const totalSize = size;
+    const finalWriteTime = writeTime;
+    let offset = 0;
+    await to.setLargeFile({
+        path,
+        lastModified: finalWriteTime,
+        getNextData: async () => {
+            if (offset >= totalSize) return undefined;
+            let end = Math.min(offset + LARGE_COPY_CHUNK, totalSize);
+            let data = await from.get(path, { range: { start: offset, end } });
+            if (!data || !data.length) {
+                throw new Error(`Ranged read of ${JSON.stringify(path)} from ${from.getDebugName()} returned ${data && data.length || "nothing"} at ${offset}-${end} (expected ${end - offset} bytes of a ${totalSize} byte file - it changed or vanished mid-copy)`);
+            }
+            offset += data.length;
+            return data;
+        },
+    });
+    return { writeTime: finalWriteTime, size: totalSize };
 }
 
 export type ArchivesSyncSourceStatus = {
@@ -166,8 +240,16 @@ export interface IArchives {
     getDebugName(): string;
     /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc). Checked without writing anything. */
     hasWriteAccess(): Promise<boolean>;
-    get(fileName: string, config?: { range?: { start: number; end: number } }): Promise<Buffer | undefined>;
-    get2(fileName: string, config?: { range?: { start: number; end: number } }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
+    /**
+     * Reads automatically fall back across the redundant sources unless config.noFallbacks is set.
+     * A fallback copy can lag the write target, so a caller reading state in order to mutate it
+     * (e.g. x++), where acting on previous state would cause big issues, should pass noFallbacks -
+     * and try/catch the read, handling the catch case (a down primary is retried for a while, then
+     * throws instead of degrading to a stale copy).
+     */
+    get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
+    /** See get for the fallback semantics (and when to pass noFallbacks). url is the config URL of the source that served the value - set by multi-source implementations (ArchivesChain), absent from single-source backends. */
+    get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url?: string } | undefined>;
     /**
      * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
      * the file's current last-write time the write no-ops (so delayed / synchronized writes can
@@ -177,12 +259,12 @@ export interface IArchives {
      * VARIABLE_SHARD, where the shard value is materialized into the key (picked by shard latency,
      * see ArchivesChain) and the caller needs the returned key to ever read the value back.
      */
-    set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string>;
+    set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     del(fileName: string): Promise<void>;
-    /** Streams a file too large to hold in memory. getNextData returns undefined when done. */
-    setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void>;
-    /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. */
-    getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined>;
+    /** Streams a file too large to hold in memory. getNextData returns undefined when done. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. */
+    setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void>;
+    /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. */
+    getInfo(fileName: string): Promise<{ writeTime: number; size: number; url?: string } | undefined>;
     find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]>;
     findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]>;
     /** Only works for public buckets (private buckets are API-access only). */
@@ -190,10 +272,13 @@ export interface IArchives {
     /** The bucket's configuration, which tells whether the optional functions are supported. */
     getConfig(): Promise<ArchivesConfig>;
     /**
-     * All files changed after the given time. Only exists when getConfig().supportsChangesAfter;
-     * backed by an index, so it is fast (unlike a full findInfo scan). Deletions are not reported.
+     * All files changed after config.time, optionally restricted to keys routing into one of
+     * config.routes (used by scanning, so partially-overlapping shards only receive their slice).
+     * When getConfig().supportsChangesAfter, this is backed by an index (fast, and deletions ARE
+     * reported, as size-0 tombstone entries). Every other backend emulates it: a full findInfo
+     * listing filtered in memory - correct, but no cheaper than the listing itself.
      */
-    getChangesAfter?(time: number): Promise<ArchiveFileInfo[]>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     /** Synchronization introspection, for backends that synchronize from sources (see BlobStore). */
     getSyncStatus?(): Promise<ArchivesSyncStatus>;
 }
