@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig } from "../IArchives";
+import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
 import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
@@ -39,7 +39,9 @@ export declare class ArchivesChain implements IArchives {
     private recheckAvailability;
     private recheckAvailabilityNow;
     private run;
-    private runWrite;
+    private runPrimary;
+    /** Races call against a size-based deadline. Uploads know their size upfront; gets are given SMART_TIMEOUT_PROBE to produce anything, and only then is the file's info fetched (from the same source, itself time-limited) to size the deadline - measured from the call's start, so a source that was slow before the probe doesn't get the full allowance again. Timed-out calls keep running in the background (they cannot be cancelled) but their eventual result is ignored. */
+    private applySmartTimeout;
     private lastConfigRefresh;
     private prepareWrongTargetRetry;
     private request;
@@ -49,13 +51,31 @@ export declare class ArchivesChain implements IArchives {
         ip: string;
     } | undefined>;
     get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
+    /** get2, but trying sources in latency order (fastest first) instead of config order. While this is much faster, it might miss immediate writes: the write node is no longer tried first, so a lagging replica may answer with a slightly older value. Exclusive with noFallbacks (which only considers one source - the write node - so there is no order to speed up); passing both throws. */
+    getFast(fileName: string, config?: GetConfig): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+        url: string;
+    } | {
+        data?: undefined;
+        writeTime?: undefined;
+        size?: undefined;
+        url: string;
+    }>;
+    /** Always resolves with a url - the authority that answered. A value that doesn't exist is still an answer FROM a server, so it comes back as { url } with no data (never plain undefined); errors from every source throw instead. */
     get2(fileName: string, config?: GetConfig): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
         url: string;
-    } | undefined>;
-    getInfo(fileName: string): Promise<{
+    } | {
+        data?: undefined;
+        writeTime?: undefined;
+        size?: undefined;
+        url: string;
+    }>;
+    getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
         url: string;
@@ -87,10 +107,13 @@ export declare class ArchivesChain implements IArchives {
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
     getURL(path: string): Promise<string>;
-    /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runWrite - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
+    /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runPrimary - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
     getURLs(path: string): Promise<string[]>;
     /** getURLs, but after the one await (initialization) the returned function is synchronous: everything underneath - route hashing, window checks, latencies, URL building - is synchronous, and the closure always reads the newest adopted config, so it stays correct across config refreshes. */
     getGetURLs(): Promise<(path: string) => string[]>;
+    /** getGetURLs, but sorted purely by latency - the write node gets no special first position. For read-only consumers that just want the fastest host. */
+    getGetFastURLs(): Promise<(path: string) => string[]>;
+    private makeGetURLs;
     dispose(): void;
 }
 export declare function createArchives(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions): ArchivesChain;

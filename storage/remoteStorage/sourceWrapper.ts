@@ -6,13 +6,15 @@ import { ROUTING_FILE, getBucketBaseUrl, parseHostedUrl, parseBackblazeUrl, pars
 import { ArchivesRemote } from "./ArchivesRemote";
 import { ArchivesUrl } from "./ArchivesUrl";
 import { ArchivesBackblaze } from "../backblaze";
-import { getStorageServerConfigOptional, getLocalArchives } from "./storageServerState";
+import { getLocalArchives, isOwnAddress } from "./storageServerState";
 
 export const RETRY_START_DELAY = 2 * 1000;
 export const RETRY_MAX_DELAY = 5 * 60 * 1000;
 export const RETRY_GROWTH = 1.5;
 const ACCESS_RECHECK_INTERVAL = 60 * 1000;
 const SOURCE_FAILURE_COOLDOWN = 30 * 60 * 1000;
+// Added to a disconnected source's latency: it still sorts and can still be picked, it just lands after every connected source
+const DISCONNECTED_LATENCY_PENALTY = 10 * 1000;
 const PING_INTERVAL = 60 * 1000;
 const PING_HISTORY = 10;
 
@@ -73,8 +75,7 @@ export class SourceWrapper {
             return wrapper;
         }
         let parsed = parseHostedUrl(config.url);
-        let server = isNode() && getStorageServerConfigOptional() || undefined;
-        if (server && parsed.address === server.domain && parsed.port === server.port) {
+        if (isNode() && isOwnAddress(parsed.address, parsed.port)) {
             // A bucket hosted by our own process - use it directly instead of calling ourselves
             wrapper.api = getLocalArchives(parsed.account, parsed.bucketName);
             return wrapper;
@@ -255,14 +256,18 @@ export class SourceWrapper {
         this.pings.push(ms);
     }
 
-    /** Median of the recent pings (API or URL-form, whichever this source measures). Sources with no measurements yet sort last (Infinity), except our own in-process server, which is the best possible target (0). */
+    /** Median of the recent pings (API or URL-form, whichever this source measures), plus DISCONNECTED_LATENCY_PENALTY while the source is disconnected - so a down source still sorts and can still be picked, just after every connected one. Sources with no measurements yet sort last (Infinity), except our own in-process server, which is the best possible target (0). */
     public getLatency(): number {
         // Our own in-process server: hosted (type remote), api present, but no remote connection - it IS us
         if (!this.remote && this.config.type === "remote" && this.api) return 0;
         if (!this.pings.length) return Infinity;
         let sorted = [...this.pings];
         sort(sorted, x => x);
-        return sorted[Math.floor(sorted.length / 2)];
+        let median = sorted[Math.floor(sorted.length / 2)];
+        if (!this.isConnected()) {
+            return median + DISCONNECTED_LATENCY_PENALTY;
+        }
+        return median;
     }
 
     /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */

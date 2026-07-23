@@ -3,13 +3,15 @@ import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { sort, binarySearchBasic } from "socket-function/src/misc";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, SetConfig, assertValidLastModified } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 // The base file-system IArchives: storage is one-to-one with the file system, every key is exactly one real file under <folder>/files, so the file system itself is the index. File handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a file run in serial, so they can't collide with each other or with handle closing. Used as the disk synchronization source of BlobStore (see remoteStorage/blobStore.ts).
 
 const HANDLE_IDLE_TIMEOUT = 1000 * 60;
 const HANDLE_SWEEP_INTERVAL = 1000 * 15;
+// Upload temp files are only garbage once they are clearly abandoned. Another process can share our folder (every deploy overlap does), so a fresh temp file may be ITS in-progress upload - deleting it would silently turn that upload into an empty file.
+const UPLOAD_ABANDONED_AGE = 1000 * 60 * 60 * 24 * 3;
 
 type HandleEntry = {
     filePath: string;
@@ -111,9 +113,14 @@ export class ArchivesDisk implements IArchives {
     public init = lazy(async () => {
         await fs.promises.mkdir(this.filesDir, { recursive: true });
         await fs.promises.mkdir(this.uploadsDir, { recursive: true });
-        // Uploads don't survive restarts (the uploader streams into them), so old ones are garbage
+        let cutoff = Date.now() - UPLOAD_ABANDONED_AGE;
         for (let file of await fs.promises.readdir(this.uploadsDir)) {
-            await fs.promises.unlink(path.join(this.uploadsDir, file));
+            let uploadPath = path.join(this.uploadsDir, file);
+            // The mtime advances on every append, so an active upload (even another process's) always looks fresh
+            let stats = await statOrUndefined(uploadPath);
+            if (!stats || stats.mtimeMs > cutoff) continue;
+            console.log(`Deleting abandoned upload temp file ${uploadPath} (last written ${new Date(stats.mtimeMs).toISOString()})`);
+            await fs.promises.unlink(uploadPath);
         }
     });
 
@@ -211,12 +218,13 @@ export class ArchivesDisk implements IArchives {
         });
     }
 
-    public async getInfo(key: string): Promise<{ writeTime: number; size: number } | undefined> {
+    public async getInfo(key: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
         await this.init();
         let filePath = this.filePath(key);
         return await this.handles.run(filePath, async () => {
             let stats = await statOrUndefined(filePath);
             if (!stats || !stats.isFile()) return undefined;
+            if (!stats.size && !config?.includeTombstones) return undefined;
             return { writeTime: stats.mtimeMs, size: stats.size };
         });
     }

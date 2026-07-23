@@ -1,8 +1,8 @@
-import { isNode, sort } from "socket-function/src/misc";
+import { isNode, sort, watchSlowPromise } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig,
-    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
+    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
     STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD,
 } from "../IArchives";
 import {
@@ -16,7 +16,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { ArchivesRemote, parseStorageUrl, authenticateStorage } from "./ArchivesRemote";
 import { onServerRoutingChanged } from "./storageClientController";
 import { ArchivesBackblaze } from "../backblaze";
-import { getStorageServerConfigOptional, getLocalArchives, ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+import { getLocalArchives, isOwnAddress, ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageController";
 import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
 
@@ -25,8 +25,21 @@ const WRONG_TARGET_BOUNDARY_WINDOW = 30 * 1000;
 const WRONG_TARGET_BOUNDARY_RETRY_DELAY = 15 * 1000;
 const CONFIG_REFRESH_THROTTLE = 30 * 1000;
 const AVAILABILITY_RECHECK_THROTTLE = 5 * 1000;
-const NO_FALLBACKS_RETRY_TIMEOUT = 30 * 1000;
-const NO_FALLBACKS_RETRY_DELAY = 2 * 1000;
+const PRIMARY_RETRY_TIMEOUT = 30 * 1000;
+const PRIMARY_RETRY_DELAY = 2 * 1000;
+// Smart timeouts: an attempt gets this long to produce anything before we probe getInfo for the file's size (and the probe itself gets the same window)
+const SMART_TIMEOUT_PROBE = 10 * 1000;
+// Very generous assumed transfer rates - the resulting deadline exists to catch stuck sources, not slow ones
+const SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND = 1024 * 1024;
+const SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND = 512 * 1024;
+// Marker in smart-timeout errors, so the read loop can log them and continue with the other sources (a connected source's other errors still throw)
+const SMART_TIMEOUT_MARKER = "ARCHIVES_SMART_TIMEOUT_c41a9d";
+
+// Sizes a generous per-attempt deadline. Get-style calls pass path: the size is only fetched (via getInfo) when the call turns out to be slow. Set-style calls pass uploadBytes, which they already know.
+type SmartTimeout = {
+    path?: string;
+    uploadBytes?: number;
+};
 
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
@@ -36,8 +49,7 @@ export function createApiArchives(source: HostedConfig | BackblazeConfig): IArch
         return new ArchivesBackblaze({ bucketName: parseBackblazeUrl(source.url).bucketName, public: source.public, immutable: source.immutable, allowedOrigins: source.allowedOrigins });
     }
     let parsed = parseHostedUrl(source.url);
-    let server = isNode() && getStorageServerConfigOptional() || undefined;
-    if (server && parsed.address === server.domain && parsed.port === server.port) {
+    if (isNode() && isOwnAddress(parsed.address, parsed.port)) {
         return getLocalArchives(parsed.account, parsed.bucketName);
     }
     return new ArchivesRemote({ url: source.url, waitForAccess: false });
@@ -407,42 +419,12 @@ export class ArchivesChain implements IArchives {
         await this.adoptNewConfig(state, latest);
     }
 
-    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
-        if (config.write) {
-            return await this.runWrite(config.route, run);
+    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
+        if (config.fast && config.noFallbacks) {
+            throw new Error(`fast and noFallbacks are mutually exclusive for ${this.getDebugName()}: noFallbacks only considers one source (the write node), so there is no order to speed up`);
         }
-        if (config.noFallbacks) {
-            // Only the primary (the source writes would target) is guaranteed current, so the caller asked to never degrade to a possibly-lagging copy. A slow call is almost always better than throwing, so a failing primary is retried until the timeout - re-resolved each attempt, as a config refresh can change which source is primary
-            let deadline = Date.now() + NO_FALLBACKS_RETRY_TIMEOUT;
-            let attempt = 0;
-            while (true) {
-                attempt++;
-                let attemptStart = Date.now();
-                // The primary is strictly the first source matching the route and valid window - identical to the write target's selection, connectivity ignored
-                let target = state.sources.find(x => configAcceptsWrites(x.config) && (config.route === undefined || routeContains(x.config.route, config.route)));
-                try {
-                    if (!target) {
-                        throw new Error(`No primary source to read from for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""} (noFallbacks: every source is outside its valid window or outside the key's route)`);
-                    }
-                    const primary = target;
-                    return await primary.read(archives => run(archives, primary.config.url));
-                } catch (e) {
-                    if (target && !target.isConnected()) target.noteFailure();
-                    if (target && (attempt === 1 || attempt % 3 === 0)) {
-                        // The reason we try the HTTP request: httpsRequest has better DNS retrying capabilities than our WebSocket server (we have more control over it), so just using it can fix some DNS issues, which can propagate to fix the WebSocket connection. It is still the primary source's own data, so noFallbacks semantics hold - and ArchivesUrl has no setup cost, so making one on the spot is fine.
-                        try {
-                            return await run(target.url || new ArchivesUrl(getBucketBaseUrl(target.config.url)), target.config.url);
-                        } catch {
-                            // Best-effort: the primary's error (thrown at the deadline) is the real one
-                        }
-                    }
-                    if (Date.now() >= deadline) throw e;
-                }
-                // At most one attempt per interval, in case the failure is fast
-                await delay(Math.max(0, attemptStart + NO_FALLBACKS_RETRY_DELAY - Date.now()));
-                await this.recheckAvailability();
-                state = await this.getState();
-            }
+        if (config.write || config.noFallbacks) {
+            return await this.runPrimary(config, run);
         }
         let recheckedAvailability = false;
         while (true) {
@@ -451,7 +433,12 @@ export class ArchivesChain implements IArchives {
                 (config.route === undefined || routeContains(source.config.route, config.route))
                 && configWindowCurrent(source.config)
             );
-            for (let source of preferUsable(candidates)) {
+            let ordered = preferUsable(candidates);
+            if (config.fast) {
+                ordered = [...ordered];
+                sort(ordered, x => x.getLatency());
+            }
+            for (let source of ordered) {
                 try {
                     if (config.apiOnly) {
                         let api = source.api;
@@ -461,11 +448,17 @@ export class ArchivesChain implements IArchives {
                         }
                         return await run(api, source.config.url);
                     }
-                    return await source.read(archives => run(archives, source.config.url));
+                    return await this.applySmartTimeout(config.timeout, source, () => source.read(archives => run(archives, source.config.url)));
                 } catch (e) {
+                    let message = String((e as Error).stack ?? e);
+                    if (message.includes(SMART_TIMEOUT_MARKER)) {
+                        console.error(`Source timed out for ${this.getDebugName()}, continuing with the next source: ${message}`);
+                        errors.push(message);
+                        continue;
+                    }
                     if (source.isConnected()) throw e;
                     source.noteFailure();
-                    errors.push(String((e as Error).stack ?? e));
+                    errors.push(message);
                 }
             }
             if (!recheckedAvailability) {
@@ -478,25 +471,26 @@ export class ArchivesChain implements IArchives {
         }
     }
 
-    // It's important that writing always accesses the same node everywhere, even if that node is down - otherwise we're just writing into the void, and who knows if the writes will even be accepted, or clobbered, or what.
-    private async runWrite<T>(route: number | undefined, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
+    // Writes and noFallbacks reads are the same case: take the authoritative node - strictly the first source matching the route and valid window, whether it is up or down - and use it, never falling back to another node. It's important that writing always accesses the same node everywhere, even if that node is down - otherwise we're just writing into the void, and who knows if the writes will even be accepted, or clobbered, or what; and noFallbacks reads want the same node precisely because it is the one writes target. A slow call is almost always better than throwing, so a failing primary is retried (the SAME node, re-resolved each attempt since a config refresh can change which source is primary) until the deadline, then throws.
+    private async runPrimary<T>(config: { write?: boolean; route?: number; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let retriedWrongWindow = false;
         let retriedWrongRoute = false;
-        let recheckedAvailability = false;
+        let deadline = Date.now() + PRIMARY_RETRY_TIMEOUT;
+        let attempt = 0;
         while (true) {
+            attempt++;
+            let attemptStart = Date.now();
             let state = await this.getState();
-            let target = state.sources.find(x => configAcceptsWrites(x.config) && (route === undefined || routeContains(x.config.route, route)));
-            if (!target) {
-                if (!recheckedAvailability) {
-                    recheckedAvailability = true;
-                    await this.recheckAvailability();
-                    continue;
-                }
-                throw new Error(`No source accepts writes for ${this.getDebugName()}${route !== undefined && ` (route ${route})` || ""} (every source is outside its valid window or outside the key's route)`);
-            }
+            let target = state.sources.find(x => configAcceptsWrites(x.config) && (config.route === undefined || routeContains(x.config.route, config.route)));
             try {
-                const writeTarget = target;
-                return await writeTarget.write(archives => run(archives, writeTarget.config.url));
+                if (!target) {
+                    throw new Error(`No source is the ${config.write && "write target" || "primary read source"} for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""} (every source is outside its valid window or outside the key's route)`);
+                }
+                const primary = target;
+                return await this.applySmartTimeout(config.timeout, primary, () => {
+                    if (config.write) return primary.write(archives => run(archives, primary.config.url));
+                    return primary.read(archives => run(archives, primary.config.url));
+                });
             } catch (e) {
                 let message = String((e as Error).stack ?? e);
                 if (message.includes(STORAGE_WRONG_VALID_WINDOW) && !retriedWrongWindow) {
@@ -509,17 +503,64 @@ export class ArchivesChain implements IArchives {
                     await this.prepareWrongTargetRetry(state, "route");
                     continue;
                 }
-                if (!target.isConnected()) {
-                    target.noteFailure();
-                    if (!recheckedAvailability) {
-                        recheckedAvailability = true;
-                        await this.recheckAvailability();
-                        continue;
+                if (target && !target.isConnected()) target.noteFailure();
+                if (!config.write && target && (attempt === 1 || attempt % 3 === 0)) {
+                    // The reason we try the HTTP request: httpsRequest has better DNS retrying capabilities than our WebSocket server (we have more control over it), so just using it can fix some DNS issues, which can propagate to fix the WebSocket connection. It is still the primary source's own data, so the no-fallback semantics hold - and ArchivesUrl has no setup cost, so making one on the spot is fine.
+                    try {
+                        return await run(target.url || new ArchivesUrl(getBucketBaseUrl(target.config.url)), target.config.url);
+                    } catch {
+                        // Best-effort: the primary's error (thrown at the deadline) is the real one
                     }
                 }
-                throw e;
+                if (Date.now() >= deadline) throw e;
             }
+            // At most one attempt per interval, in case the failure is fast
+            await delay(Math.max(0, attemptStart + PRIMARY_RETRY_DELAY - Date.now()));
+            await this.recheckAvailability();
         }
+    }
+
+    /** Races call against a size-based deadline. Uploads know their size upfront; gets are given SMART_TIMEOUT_PROBE to produce anything, and only then is the file's info fetched (from the same source, itself time-limited) to size the deadline - measured from the call's start, so a source that was slow before the probe doesn't get the full allowance again. Timed-out calls keep running in the background (they cannot be cancelled) but their eventual result is ignored. */
+    private async applySmartTimeout<T>(timeout: SmartTimeout | undefined, source: SourceWrapper, call: () => Promise<T>): Promise<T> {
+        if (!timeout) return await call();
+        let start = Date.now();
+        let callPromise = call();
+        // An abandoned call must not surface an unhandled rejection when it eventually fails
+        let abandon = () => void callPromise.then(() => { }, () => { });
+        if (timeout.uploadBytes !== undefined) {
+            // A flat base plus the predicted transfer time, so tiny uploads still get the full base window
+            let allowed = SMART_TIMEOUT_PROBE + timeout.uploadBytes / SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND * 1000;
+            let result = await Promise.race([callPromise.then(value => ({ value })), delay(allowed).then(() => undefined)]);
+            if (result) return result.value;
+            abandon();
+            throw new Error(`${SMART_TIMEOUT_MARKER} Upload of ${timeout.uploadBytes} bytes to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_PROBE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
+        }
+        const path = timeout.path;
+        if (path === undefined) return await callPromise;
+        let first = await Promise.race([callPromise.then(value => ({ value })), delay(SMART_TIMEOUT_PROBE).then(() => undefined)]);
+        if (first) return first.value;
+        let probeError: string | undefined;
+        let info: { size: number } | undefined;
+        try {
+            info = await Promise.race([
+                source.read(archives => archives.getInfo(path)).then(x => ({ size: x && x.size || 0 })),
+                delay(SMART_TIMEOUT_PROBE).then(() => undefined),
+            ]);
+        } catch (e) {
+            probeError = String((e as Error).stack ?? e);
+        }
+        if (!info) {
+            abandon();
+            throw new Error(`${SMART_TIMEOUT_MARKER} Read of ${JSON.stringify(path)} from ${source.getDebugName()} timed out: no result after ${Date.now() - start}ms, and getInfo ${probeError && `failed (${probeError})` || `could not answer within ${SMART_TIMEOUT_PROBE}ms either`}`);
+        }
+        let allowed = Math.max(SMART_TIMEOUT_PROBE, info.size / SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND * 1000);
+        let remaining = start + allowed - Date.now();
+        if (remaining > 0) {
+            let second = await Promise.race([callPromise.then(value => ({ value })), delay(remaining).then(() => undefined)]);
+            if (second) return second.value;
+        }
+        abandon();
+        throw new Error(`${SMART_TIMEOUT_MARKER} Read of ${JSON.stringify(path)} (${info.size} bytes) from ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms from the call's start, at an assumed ${SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND} bytes/s)`);
     }
 
     private lastConfigRefresh = 0;
@@ -539,7 +580,7 @@ export class ArchivesChain implements IArchives {
         await this.refreshActiveConfig();
     }
 
-    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
+    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let state = await this.getState();
         return await this.run(state, config, run);
     }
@@ -561,15 +602,23 @@ export class ArchivesChain implements IArchives {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
-    public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | undefined> {
-        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks }, async (archives, url) => {
+    /** get2, but trying sources in latency order (fastest first) instead of config order. While this is much faster, it might miss immediate writes: the write node is no longer tried first, so a lagging replica may answer with a slightly older value. Exclusive with noFallbacks (which only considers one source - the write node - so there is no order to speed up); passing both throws. */
+    public async getFast(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, fast: true, timeout: { path: fileName } }, async (archives, url) => {
             let result = await archives.get2(fileName, config);
-            return result && { ...result, url } || undefined;
+            return result && result.data && { data: result.data, writeTime: result.writeTime, size: result.size, url } || { url };
         });
     }
-    public async getInfo(fileName: string): Promise<{ writeTime: number; size: number; url: string } | undefined> {
+    /** Always resolves with a url - the authority that answered. A value that doesn't exist is still an answer FROM a server, so it comes back as { url } with no data (never plain undefined); errors from every source throw instead. */
+    public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, timeout: { path: fileName } }, async (archives, url) => {
+            let result = await archives.get2(fileName, config);
+            return result && result.data && { data: result.data, writeTime: result.writeTime, size: result.size, url } || { url };
+        });
+    }
+    public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url: string } | undefined> {
         return await this.request({ route: getRoute(fileName) }, async (archives, url) => {
-            let result = await archives.getInfo(fileName);
+            let result = await archives.getInfo(fileName, config);
             return result && { ...result, url } || undefined;
         });
     }
@@ -677,7 +726,7 @@ export class ArchivesChain implements IArchives {
         if (fileName.includes(VARIABLE_SHARD) && parseVariableRoute(fileName) === undefined) {
             return await this.setVariableShard(fileName, data, config);
         }
-        await this.request({ write: true, route: getRoute(fileName) }, archives => archives.set(fileName, data, config));
+        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: data.length } }, archives => archives.set(fileName, data, config));
         return fileName;
     }
 
@@ -706,10 +755,10 @@ export class ArchivesChain implements IArchives {
         return ROUTING_FILE;
     }
     public async del(fileName: string): Promise<void> {
-        await this.request({ write: true, route: getRoute(fileName) }, archives => archives.del(fileName));
+        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: 0 } }, archives => archives.del(fileName));
     }
 
-    // One write target per route range, lowest latency first. Within a shard the target is ALWAYS the first source in config order (see runWrite - writes must stay on the same node): connectivity only decides which SHARD we pick, never which node within it, so a shard whose node is disconnected is dropped entirely when connectedOnly is set.
+    // One write target per route range, lowest latency first. Within a shard the target is ALWAYS the first source in config order (see runPrimary - writes must stay on the same node): connectivity only decides which SHARD we pick, never which node within it, so a shard whose node is disconnected is dropped entirely when connectedOnly is set.
     private getVariableShardTargets(state: ChainState, config: { connectedOnly: boolean }): SourceWrapper[] {
         let targetsByRoute = new Map<string, SourceWrapper>();
         for (let source of state.sources) {
@@ -752,13 +801,20 @@ export class ArchivesChain implements IArchives {
             for (let target of targets) {
                 let fullKey = materializeShardKey(key, target);
                 try {
-                    await target.write(archives => archives.set(fullKey, data, config));
+                    // The shard picking already retries across shards, so a stuck shard just costs its timeout and we move on
+                    await this.applySmartTimeout({ uploadBytes: data.length }, target, () => target.write(archives => archives.set(fullKey, data, config)));
                     return fullKey;
                 } catch (e) {
+                    let message = String((e as Error).stack ?? e);
+                    if (message.includes(SMART_TIMEOUT_MARKER)) {
+                        console.error(`Variable-shard write target ${target.getDebugName()} timed out; moving to the next-lowest-latency shard: ${message}`);
+                        errors.push(message);
+                        continue;
+                    }
                     if (target.isConnected()) throw e;
                     target.noteFailure();
                     console.log(`Variable-shard write target ${target.getDebugName()} is down; moving to the next-lowest-latency shard`);
-                    errors.push(String((e as Error).stack ?? e));
+                    errors.push(message);
                 }
             }
             if (!recheckedAvailability) {
@@ -789,7 +845,7 @@ export class ArchivesChain implements IArchives {
                 throw new Error(`No source accepts writes for setLargeFile on ${this.getDebugName()} (route ${route})`);
             }
             try {
-                await target.write(archives => archives.setLargeFile(config));
+                await watchSlowPromise(`setLargeFile|${config.path}`, target.write(archives => archives.setLargeFile(config)));
                 return;
             } catch (e) {
                 if (!target.isConnected()) {
@@ -808,7 +864,7 @@ export class ArchivesChain implements IArchives {
         return urls[0];
     }
 
-    /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runWrite - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
+    /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runPrimary - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
     public async getURLs(path: string): Promise<string[]> {
         return (await this.getGetURLs())(path);
     }
@@ -816,6 +872,16 @@ export class ArchivesChain implements IArchives {
     /** getURLs, but after the one await (initialization) the returned function is synchronous: everything underneath - route hashing, window checks, latencies, URL building - is synchronous, and the closure always reads the newest adopted config, so it stays correct across config refreshes. */
     public async getGetURLs(): Promise<(path: string) => string[]> {
         let initialState = await this.getState();
+        return this.makeGetURLs(initialState, { writeNodeFirst: true });
+    }
+
+    /** getGetURLs, but sorted purely by latency - the write node gets no special first position. For read-only consumers that just want the fastest host. */
+    public async getGetFastURLs(): Promise<(path: string) => string[]> {
+        let initialState = await this.getState();
+        return this.makeGetURLs(initialState, { writeNodeFirst: false });
+    }
+
+    private makeGetURLs(initialState: ChainState, config: { writeNodeFirst: boolean }): (path: string) => string[] {
         return (path: string) => {
             let state = this.latestState || initialState;
             let route = getRoute(path);
@@ -826,9 +892,16 @@ export class ArchivesChain implements IArchives {
                 if (!configWindowCurrent(source.config)) continue;
                 sources.push(source);
             }
-            let rest = sources.slice(1);
-            sort(rest, x => x.getLatency());
-            let urls = [...sources.slice(0, 1), ...rest].map(x => buildFileUrl(getBucketBaseUrl(x.config.url), path));
+            let ordered: SourceWrapper[];
+            if (config.writeNodeFirst) {
+                let rest = sources.slice(1);
+                sort(rest, x => x.getLatency());
+                ordered = [...sources.slice(0, 1), ...rest];
+            } else {
+                ordered = [...sources];
+                sort(ordered, x => x.getLatency());
+            }
+            let urls = ordered.map(x => buildFileUrl(getBucketBaseUrl(x.config.url), path));
             return [...new Set(urls)];
         };
     }

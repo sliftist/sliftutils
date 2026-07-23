@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, SetConfig } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
 export declare class ArchivesBackblaze implements IArchives {
     private config;
     constructor(config: {
@@ -35,7 +35,7 @@ export declare class ArchivesBackblaze implements IArchives {
         lastModified?: number;
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
-    getInfo(fileName: string): Promise<{
+    getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
     } | undefined>;

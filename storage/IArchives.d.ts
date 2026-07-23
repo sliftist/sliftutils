@@ -55,6 +55,12 @@ export type GetConfig = {
     };
     /** Read ONLY from the primary source - the one writes would target - instead of falling back across the redundant sources. Use this when you want your reads and writes to be somewhat atomic: there will still be issues with the round trip, but without it you could talk to a completely different node and get a much older value. Most reads aren't followed by a write though, so for most cases it's better to get a value than to have to wait (or even throw) when the primary node is not available. */
     noFallbacks?: boolean;
+    /** Store-to-store call: the serving node answers purely from its own disk, completely short-circuiting its index holders - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). No window or route checks on reads: if the bytes are on its disk, the caller may have them. */
+    internal?: boolean;
+};
+export type GetInfoConfig = {
+    /** Also report size-0 entries (tombstones - an empty file IS a missing file). Off by default, so a deleted key reports undefined, matching get. Synchronization-style callers pass this when they need a deletion's write time (e.g. to compare it against a write they are about to make). */
+    includeTombstones?: boolean;
 };
 export type ChangesAfterConfig = {
     time: number;
@@ -67,6 +73,8 @@ export type SetConfig = {
     forceSetImmutable?: boolean;
     /** Skips the target-side safety reads around the write (backblaze: the pre-write getInfo comparison and the post-upload existence poll). For writers whose own bookkeeping already decides what to write and orders it by write time (BlobStore's index-driven writes and synchronization), those reads are pure extra API calls - but the default stays checked, because other users of the raw backends rely on the checks. */
     noChecks?: boolean;
+    /** Store-to-store push: the receiving node writes purely to its own disk and index, with NO downstream fan-out (the pushing store owns propagation - fanning its pushes back out is how write loops between stores form). Window and route ARE still checked: the stamp must fall inside one of the receiver's configured windows and routes, so a confused peer cannot stuff data onto a node that was never meant to hold it. Requires lastModified. */
+    internal?: boolean;
 };
 export type ArchiveFileInfo = {
     path: string;
@@ -121,6 +129,7 @@ export declare function copyArchiveFile(config: {
     writeTime?: number;
     forceSetImmutable?: boolean;
     noChecks?: boolean;
+    internal?: boolean;
 }): Promise<{
     writeTime: number;
     size: number;
@@ -151,12 +160,17 @@ export interface IArchives {
      * throws instead of degrading to a stale copy).
      */
     get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
-    /** See get for the fallback semantics (and when to pass noFallbacks). url is the config URL of the source that served the value - set by multi-source implementations (ArchivesChain), absent from single-source backends. */
+    /** See get for the fallback semantics (and when to pass noFallbacks). url is the config URL of the source that answered - the authority the data (or the "does not exist") came from. Multi-source implementations (ArchivesChain) ALWAYS return an object: when the value doesn't exist there is still a server saying it doesn't exist, so they return { url } alone rather than undefined. Single-source backends return undefined for absent (they ARE the authority). */
     get2(fileName: string, config?: GetConfig): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
         url?: string;
+    } | {
+        data?: undefined;
+        writeTime?: undefined;
+        size?: undefined;
+        url: string;
     } | undefined>;
     /**
      * lastModified stamps the write with that last-write time instead of now. If it is OLDER than
@@ -175,16 +189,24 @@ export interface IArchives {
         lastModified?: number;
         getNextData(): Promise<Buffer | undefined>;
     }): Promise<void>;
-    /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. */
-    getInfo(fileName: string): Promise<{
+    /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. Size-0 entries (tombstones) report undefined unless config.includeTombstones. */
+    getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
         url?: string;
     } | undefined>;
+    /**
+     * Empty (size-0) files are NEVER returned by index-backed stores (BlobStore, and therefore the
+     * chain): an empty file IS a missing file - the tombstone of a deletion. If you want a marker
+     * file that shows up in listings, add some content to it. Raw sources (disk, backblaze) DO list
+     * their empty files - that is how scans learn of deletions - but nothing built on the index
+     * ever surfaces them.
+     */
     find(prefix: string, config?: {
         shallow?: boolean;
         type: "files" | "folders";
     }): Promise<string[]>;
+    /** See find for the empty-file (tombstone) rule. */
     findInfo(prefix: string, config?: {
         shallow?: boolean;
         type: "files" | "folders";

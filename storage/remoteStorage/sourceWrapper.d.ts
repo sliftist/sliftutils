@@ -41,7 +41,7 @@ export declare class SourceWrapper {
     startPinging(): void;
     /** Seeds the latency estimate before the first ping lands (e.g. from the initial routing fetch), so variable-shard picking has something immediately. Real pings take over from the first measurement on. */
     seedLatency(ms: number): void;
-    /** Median of the recent pings (API or URL-form, whichever this source measures). Sources with no measurements yet sort last (Infinity), except our own in-process server, which is the best possible target (0). */
+    /** Median of the recent pings (API or URL-form, whichever this source measures), plus DISCONNECTED_LATENCY_PENALTY while the source is disconnected - so a down source still sorts and can still be picked, just after every connected one. Sources with no measurements yet sort last (Infinity), except our own in-process server, which is the best possible target (0). */
     getLatency(): number;
     /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */
     write<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;

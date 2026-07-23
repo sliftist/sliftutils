@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
 export type ArchivesRemoteConfig = {
     url: string;
     waitForAccess?: boolean;
@@ -47,7 +47,7 @@ export declare class ArchivesRemote implements IArchives {
     } | undefined>;
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     del(fileName: string): Promise<void>;
-    getInfo(fileName: string): Promise<{
+    getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
     } | undefined>;

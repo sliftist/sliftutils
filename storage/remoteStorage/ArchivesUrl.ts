@@ -1,5 +1,5 @@
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, GetInfoConfig } from "../IArchives";
 import { buildFileUrl } from "./remoteConfig";
 
 // Read-only IArchives over a public bucket's plain-URL form (our storage server's
@@ -52,16 +52,18 @@ export class ArchivesUrl implements IArchives {
         let writeTime = lastModified && new Date(lastModified).getTime() || 0;
         return { data, writeTime, size };
     }
-    public async getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined> {
+    public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
         // A 1-byte ranged read: Content-Range carries the full size and Last-Modified the write time, so metadata never downloads the file
+        let result: { writeTime: number; size: number } | undefined;
         try {
-            let result = await this.get2(fileName, { range: { start: 0, end: 1 } });
-            return result && { writeTime: result.writeTime, size: result.size } || undefined;
+            result = await this.get2(fileName, { range: { start: 0, end: 1 } });
         } catch {
             // Some servers reject ranged reads of empty files (416 instead of an empty 206); a full read is the fallback, and for an empty file it is free anyway
-            let result = await this.get2(fileName);
-            return result && { writeTime: result.writeTime, size: result.size } || undefined;
+            result = await this.get2(fileName);
         }
+        if (!result) return undefined;
+        if (!result.size && !config?.includeTombstones) return undefined;
+        return { writeTime: result.writeTime, size: result.size };
     }
 
     public async set(fileName: string, data: Buffer, config?: { lastModified?: number }): Promise<string> {

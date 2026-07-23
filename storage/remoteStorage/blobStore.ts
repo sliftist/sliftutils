@@ -4,7 +4,7 @@ import { runInfinitePoll, delay } from "socket-function/src/batching";
 import { timeInMinute, sort, promiseObj } from "socket-function/src/misc";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import {
-    IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, assertValidLastModified,
+    IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, assertValidLastModified,
     windowAcceptsWrites, SyncActivity, FULL_ROUTE, copyArchiveFile,
 } from "../IArchives";
 import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
@@ -58,9 +58,12 @@ export type WriteConfig = {
 export type IBucketStore = {
     get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
     get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
+    // Internal (store-to-store) forms; see GetConfig.internal / SetConfig.internal. Absent on rawDisk stores, where the normal forms already ARE the disk.
+    getInternal2?(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
+    setInternal?(fileName: string, data: Buffer, config: { lastModified: number }): Promise<void>;
     set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
     del(fileName: string, config?: WriteConfig): Promise<void>;
-    getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined>;
+    getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined>;
     findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]>;
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getSyncStatus?(): Promise<ArchivesSyncStatus>;
@@ -443,7 +446,7 @@ export class BlobStore implements IBucketStore {
                 tally.tombstone++;
                 continue;
             }
-            let copied = await copyArchiveFile({ from: source, to: this.sources[0].source, path: file.path, size: file.size, writeTime: file.createTime, forceSetImmutable: true, noChecks: true });
+            let copied = await copyArchiveFile({ from: source, to: this.sources[0].source, path: file.path, size: file.size, writeTime: file.createTime, forceSetImmutable: true, noChecks: true, internal: true });
             if (!copied) continue;
             if (copied.size === 0) {
                 this.setIndexEntry(file.path, { writeTime: copied.writeTime, size: 0, sourcesListIndex: this.sourcesListIndexOfSlot(0) });
@@ -673,14 +676,14 @@ export class BlobStore implements IBucketStore {
                 if (entry.size === 0) {
                     // A deletion only needs pushing while the source still holds an older copy
                     if (theirTime === undefined) continue;
-                    await source.set(key, Buffer.alloc(0), { lastModified: entry.writeTime, forceSetImmutable: true, noChecks: true });
+                    await source.set(key, Buffer.alloc(0), { lastModified: entry.writeTime, forceSetImmutable: true, noChecks: true, internal: true });
                     pushed++;
                     consecutiveFailures = 0;
                     continue;
                 }
                 let holder = await this.getEntryHolder(entry);
                 if (!holder) continue;
-                let copied = await copyArchiveFile({ from: holder, to: source, path: key, size: entry.size, writeTime: entry.writeTime, forceSetImmutable: true, noChecks: true });
+                let copied = await copyArchiveFile({ from: holder, to: source, path: key, size: entry.size, writeTime: entry.writeTime, forceSetImmutable: true, noChecks: true, internal: true });
                 if (!copied) continue;
                 pushed++;
                 consecutiveFailures = 0;
@@ -794,7 +797,7 @@ export class BlobStore implements IBucketStore {
                     let index = nextIndex++;
                     if (index >= pending.length) return;
                     let { key, entry } = pending[index];
-                    let copied = await copyArchiveFile({ from: source, to: this.sources[0].source, path: key, size: entry.size, writeTime: entry.writeTime, forceSetImmutable: true, noChecks: true });
+                    let copied = await copyArchiveFile({ from: source, to: this.sources[0].source, path: key, size: entry.size, writeTime: entry.writeTime, forceSetImmutable: true, noChecks: true, internal: true });
                     if (copied) {
                         // Only move the entry's source if it wasn't changed while we copied
                         if (this.mem.get(key) === entry) {
@@ -837,7 +840,8 @@ export class BlobStore implements IBucketStore {
             let { source } = this.sources[i];
             let state = this.sourceStates[i];
             if (i === 0 && !state.scanComplete) {
-                let info = await source.getInfo(key);
+                // includeTombstones: a deletion on disk (an empty file) must be ingested as a tombstone, write time included
+                let info = await source.getInfo(key, { includeTombstones: true });
                 if (info) {
                     this.updateScanIndex(i, { path: key, createTime: info.writeTime, size: info.size });
                 }
@@ -888,7 +892,10 @@ export class BlobStore implements IBucketStore {
         let holderError: Error | undefined;
         if (holderArchives) {
             try {
-                result = await holderArchives.get2(key, { range });
+                let answer = await holderArchives.get2(key, { range, internal: true });
+                if (answer && answer.data) {
+                    result = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
+                }
             } catch (e) {
                 holderError = e as Error;
             }
@@ -911,7 +918,10 @@ export class BlobStore implements IBucketStore {
             if (i === holderSlot || !this.isLive(i)) continue;
             let fallback: { data: Buffer; writeTime: number; size: number } | undefined;
             try {
-                fallback = await this.sources[i].source.get2(key);
+                let answer = await this.sources[i].source.get2(key, { internal: true });
+                if (answer && answer.data) {
+                    fallback = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
+                }
             } catch {
                 continue;
             }
@@ -927,6 +937,30 @@ export class BlobStore implements IBucketStore {
         // The holder answered "not there" and no other source has it either: the entry was stale
         this.deleteIndexEntry(key);
         return undefined;
+    }
+
+    /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note fast writes still sitting in the overlay are invisible here; the caller re-finds them after our flush. */
+    public async getInternal2(key: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+        await this.init();
+        let result = await this.getDiskSource().disk.get2(key, { range: config?.range });
+        return result && result.data && { data: result.data, writeTime: result.writeTime, size: result.size } || undefined;
+    }
+
+    /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Window/route acceptance is the caller's (writeBucketFile's) job; only-take-latest still applies here. */
+    public async setInternal(key: string, data: Buffer, config: { lastModified: number }): Promise<void> {
+        await this.init();
+        assertValidLastModified(config.lastModified);
+        let overlayEntry = this.overlay.get(key);
+        let entry = this.mem.get(key);
+        let currentTime = overlayEntry && overlayEntry.t || entry && entry.writeTime || 0;
+        if (config.lastModified < currentTime) return;
+        if (data.length === 0) {
+            // A tombstone stores nothing on our own source - the index entry alone records it
+            await this.sources[0].source.del(key);
+        } else {
+            await this.sources[0].source.set(key, data, { lastModified: config.lastModified, forceSetImmutable: true, noChecks: true });
+        }
+        this.setIndexEntry(key, { writeTime: config.lastModified, size: data.length, sourcesListIndex: this.sourcesListIndexOfSlot(0) });
     }
 
     // The read's bytes came from a remote source, so write them onto our own base source (the local disk), which becomes the entry's new holder - reads only pay the remote fetch once
@@ -1007,20 +1041,22 @@ export class BlobStore implements IBucketStore {
         for (let i of writable) {
             if (!routeContains(this.sources[i].route, route)) continue;
             // Downstream sources receive tombstones as actual empty writes, so their listings show the deletion (size 0) and other stores scan it in as a tombstone
-            void this.sources[i].source.set(key, data, { lastModified: writeTime, forceSetImmutable: true, noChecks: true }).catch((e: Error) => {
+            void this.sources[i].source.set(key, data, { lastModified: writeTime, forceSetImmutable: true, noChecks: true, internal: true }).catch((e: Error) => {
                 console.error(`Background write of ${key} to sync source ${this.sources[i].source.getDebugName()} failed: ${e.stack ?? e}`);
             });
         }
     }
 
-    public async getInfo(key: string): Promise<{ writeTime: number; size: number } | undefined> {
+    public async getInfo(key: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
         await this.init();
         let overlayEntry = this.overlay.get(key);
         if (overlayEntry) {
+            if (!overlayEntry.data.length && !config?.includeTombstones) return undefined;
             return { writeTime: overlayEntry.t, size: overlayEntry.data.length };
         }
         let entry = await this.getIndexEntry(key);
         if (!entry) return undefined;
+        if (!entry.size && !config?.includeTombstones) return undefined;
         return { writeTime: entry.writeTime, size: entry.size };
     }
 
@@ -1106,7 +1142,8 @@ export class BlobStore implements IBucketStore {
         let { disk, sourceIndex } = this.getDiskSource();
         await disk.finishLargeUpload(id, key, lastModified);
         this.overlay.delete(key);
-        let info = await disk.getInfo(key);
+        // includeTombstones: a zero-byte upload is still a real file whose index entry must be written
+        let info = await disk.getInfo(key, { includeTombstones: true });
         if (info) {
             this.setIndexEntry(key, { writeTime: info.writeTime, size: info.size, sourcesListIndex: this.sourcesListIndexOfSlot(sourceIndex) });
         }

@@ -10,7 +10,7 @@ import { ArchivesDisk } from "../ArchivesDisk";
 import { BlobStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MARGIN } from "./blobStore";
 import {
     RemoteConfig, HostedConfig, BackblazeConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
-    ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig,
+    ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig,
     STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection, normalizeSource } from "./remoteConfig";
@@ -98,78 +98,36 @@ export type BucketWriteStats = {
 function emptyWriteStats(): BucketWriteStats {
     return { originalWrites: 0, originalBytes: 0, flushedWrites: 0, flushedBytes: 0 };
 }
-function addWriteStats(a: BucketWriteStats, b: BucketWriteStats): BucketWriteStats {
-    return {
-        originalWrites: a.originalWrites + b.originalWrites,
-        originalBytes: a.originalBytes + b.originalBytes,
-        flushedWrites: a.flushedWrites + b.flushedWrites,
-        flushedBytes: a.flushedBytes + b.flushedBytes,
-    };
-}
-function getWriteStatsStorage(): Promise<IStorage<BucketWriteStats>> {
-    return getSystemStorage<BucketWriteStats>("writeStats");
-}
 
-// Counted in memory as deltas since the last flush, so counting a write never touches the disk. The flush reads the stored totals and adds the delta, which also makes it correct across restarts.
-const writeStatDeltas = new Map<string, BucketWriteStats>();
-
-async function flushWriteStats(): Promise<void> {
-    if (!writeStatDeltas.size) return;
-    let pending = [...writeStatDeltas];
-    writeStatDeltas.clear();
-    let storage = await getWriteStatsStorage();
-    for (let [key, delta] of pending) {
-        try {
-            await storage.set(key, addWriteStats(await storage.get(key) || emptyWriteStats(), delta));
-        } catch (e) {
-            // Put the delta back, so a failed flush loses nothing
-            writeStatDeltas.set(key, addWriteStats(writeStatDeltas.get(key) || emptyWriteStats(), delta));
-            console.error(`Flushing write stats for bucket ${key} failed: ${(e as Error).stack ?? e}`);
-        }
-    }
-}
-
-const startWriteStatsFlushing = lazy(() => {
-    runInfinitePoll(WRITE_STATS_FLUSH_INTERVAL, flushWriteStats);
-});
+// In memory only: totals since this process started (or the last clearWriteStats). Persisting them to disk was more machinery than the numbers were worth.
+const writeStats = new Map<string, BucketWriteStats>();
 
 function countBucketWrite(key: string, kind: "original" | "flushed", bytes: number): void {
-    let delta = writeStatDeltas.get(key);
-    if (!delta) {
-        delta = emptyWriteStats();
-        writeStatDeltas.set(key, delta);
+    let stats = writeStats.get(key);
+    if (!stats) {
+        stats = emptyWriteStats();
+        writeStats.set(key, stats);
     }
     if (kind === "original") {
-        delta.originalWrites++;
-        delta.originalBytes += bytes;
+        stats.originalWrites++;
+        stats.originalBytes += bytes;
     } else {
-        delta.flushedWrites++;
-        delta.flushedBytes += bytes;
+        stats.flushedWrites++;
+        stats.flushedBytes += bytes;
     }
-    startWriteStatsFlushing();
 }
 
-async function getBucketWriteStats(key: string): Promise<BucketWriteStats> {
-    let storage = await getWriteStatsStorage();
-    let stored = await storage.get(key) || emptyWriteStats();
-    let delta = writeStatDeltas.get(key);
-    return delta && addWriteStats(stored, delta) || stored;
+function getBucketWriteStats(key: string): BucketWriteStats {
+    return writeStats.get(key) || emptyWriteStats();
 }
 
-/** Zeroes the write statistics of every bucket in the account, including counts not yet flushed. */
-export async function clearAccountWriteStats(account: string): Promise<number> {
-    let storage = await getWriteStatsStorage();
+/** Zeroes the write statistics of every bucket in the account. */
+export function clearAccountWriteStats(account: string): number {
     let prefix = `${account}/`;
     let cleared = 0;
-    for (let key of await storage.getKeys()) {
+    for (let key of [...writeStats.keys()]) {
         if (!key.startsWith(prefix)) continue;
-        writeStatDeltas.delete(key);
-        await storage.remove(key);
-        cleared++;
-    }
-    for (let key of [...writeStatDeltas.keys()]) {
-        if (!key.startsWith(prefix)) continue;
-        writeStatDeltas.delete(key);
+        writeStats.delete(key);
         cleared++;
     }
     console.log(`Cleared the write statistics of ${cleared} buckets in account ${account}`);
@@ -211,7 +169,6 @@ const buckets = new Map<string, Promise<LoadedBucket | undefined>>();
 
 const MAX_REBUILD_TIMER_DELAY = 2 ** 31 - 1;
 const REBUILD_BOUNDARY_BUFFER = 1000;
-const WRITE_STATS_FLUSH_INTERVAL = 5 * 60 * 1000;
 
 function getBucketFolder(account: string, bucketName: string): string {
     return path.join(getStorageServerConfig().folder, "buckets2", account, bucketName);
@@ -224,15 +181,22 @@ export function addExtraListenPort(port: number): void {
 export function removeExtraListenPort(port: number): void {
     extraListenPorts.delete(port);
 }
+/** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
+export function isOwnAddress(address: string, port: number): boolean {
+    let config = getStorageServerConfigOptional();
+    if (!config) return false;
+    if (address !== config.domain) return false;
+    return port === config.port || extraListenPorts.has(port);
+}
+
 function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[] {
-    let { domain, port } = getStorageServerConfig();
     let indexes: number[] = [];
     for (let i = 0; i < routing.sources.length; i++) {
         let source = routing.sources[i];
         if (typeof source === "string" || source.type !== "remote") continue;
         let parsed = parseHostedUrl(source.url);
-        if (parsed.address !== domain || parsed.account !== account || parsed.bucketName !== bucketName) continue;
-        if (parsed.port === port || extraListenPorts.has(parsed.port)) {
+        if (parsed.account !== account || parsed.bucketName !== bucketName) continue;
+        if (isOwnAddress(parsed.address, parsed.port)) {
             indexes.push(i);
         }
     }
@@ -737,7 +701,7 @@ async function writeRoutingConfig(account: string, bucketName: string, data: Buf
     await scheduleRoutingReload(account, bucketName);
 }
 
-export async function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: { lastModified?: number; forceSetImmutable?: boolean }): Promise<void> {
+export async function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: { lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void> {
     assertWritesAllowed();
     if (filePath === ROUTING_FILE) {
         let key = `${account}/${bucketName}`;
@@ -771,6 +735,23 @@ export async function writeBucketFile(account: string, bucketName: string, fileP
         if (self?.immutable && await loaded.store.getInfo(filePath)) return;
     } else {
         await assertMutable(loaded, filePath, writeTime);
+    }
+    if (config?.internal) {
+        if (!config.lastModified) {
+            throw new Error(`Internal writes must carry lastModified (they are synchronization pushes, ordered by their write time), writing ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}`);
+        }
+        // See SetConfig.internal: the stamp must land inside SOME window+route this server is configured for (any window, including past ones - synchronization moves old data), so a confused peer can't stuff data onto a node that was never meant to hold it
+        let covered = loaded.selfEntries.some(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1] && routeContains(x.route, route));
+        if (!covered) {
+            throw new Error(`Internal write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName} rejected: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this server is configured for: ${JSON.stringify(loaded.selfEntries.map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))}`);
+        }
+        if (loaded.store.setInternal) {
+            await loaded.store.setInternal(filePath, data, { lastModified: writeTime });
+            return;
+        }
+        // rawDisk stores: the normal set already IS the disk
+        await loaded.store.set(filePath, data, { lastModified: writeTime });
+        return;
     }
     await loaded.store.set(filePath, data, { ...getWriteConfig(loaded, writeTime, route), lastModified: writeTime });
 }
@@ -1046,15 +1027,11 @@ export async function listAccountBuckets(account: string): Promise<ServerBucketI
             let key = `${account}/${bucketName}`;
             let folder = getBucketFolder(account, bucketName);
             let base: ServerBucketInfo = { bucketName, active: false, folder };
-            let [disk, writeStats] = await Promise.all([
-                timed("statfs", () => getDiskInfo(folder)).catch((e: Error) => {
-                    base.diskError = String(e.stack ?? e).slice(0, 500);
-                    return undefined;
-                }),
-                timed("writeStats", () => getBucketWriteStats(key)),
-            ]);
-            base.disk = disk;
-            base.writeStats = writeStats;
+            base.disk = await timed("statfs", () => getDiskInfo(folder)).catch((e: Error) => {
+                base.diskError = String(e.stack ?? e).slice(0, 500);
+                return undefined;
+            });
+            base.writeStats = getBucketWriteStats(key);
             const loadedPromise = buckets.get(key);
             if (loadedPromise) {
                 try {
@@ -1112,6 +1089,9 @@ class ArchivesLocalBucket implements IArchives {
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         let bucket = await this.getBucket();
         if (!bucket) return undefined;
+        if (config?.internal && bucket.store.getInternal2) {
+            return await bucket.store.getInternal2(fileName, config);
+        }
         return await bucket.store.get2(fileName, config);
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
@@ -1143,10 +1123,10 @@ class ArchivesLocalBucket implements IArchives {
             throw e;
         }
     }
-    public async getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined> {
+    public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
         let bucket = await this.getBucket();
         if (!bucket) return undefined;
-        return await bucket.store.getInfo(fileName);
+        return await bucket.store.getInfo(fileName, config);
     }
     public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         let bucket = await this.getBucket();

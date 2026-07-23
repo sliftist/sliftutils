@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, GetInfoConfig } from "../IArchives";
 export declare class ArchivesUrl implements IArchives {
     private base;
     constructor(base: string);
@@ -12,7 +12,7 @@ export declare class ArchivesUrl implements IArchives {
         writeTime: number;
         size: number;
     } | undefined>;
-    getInfo(fileName: string): Promise<{
+    getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
     } | undefined>;

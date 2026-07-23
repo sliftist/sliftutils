@@ -15,6 +15,8 @@ import {
     getActiveBucket, activateBucket, ActiveBucketInfo, getActiveBucketKeys,
 } from "./storageServerState";
 import { StorageClientController } from "./storageClientController";
+import { trackAccess, getAccessTotals, readAccessSummaries, clearAccountAccessStats, AccessTotals, AccessSummaryState } from "./accessStats";
+import type { SummaryEntry } from "../../treeSummary";
 
 export const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
@@ -289,37 +291,60 @@ class RemoteStorageControllerBase {
         let result = await this.get2(account, bucketName, path, range);
         return result && result.data || undefined;
     }
-    async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }, internal?: boolean): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         assertValidPath(path);
         let bucket = await getBucket(account, bucketName);
-        if (!bucket) return undefined;
-        return await bucket.store.get2(path, { range });
+        let result: { data: Buffer; writeTime: number; size: number } | undefined;
+        if (bucket) {
+            if (internal && bucket.store.getInternal2) {
+                result = await bucket.store.getInternal2(path, { range });
+            } else {
+                result = await bucket.store.get2(path, { range });
+            }
+        }
+        trackAccess({ account, operation: "get", path: `${bucketName}/${path}`, size: result && result.data.length || 0 });
+        return result;
     }
-    async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean): Promise<void> {
+    async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean): Promise<void> {
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
-        await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified, forceSetImmutable });
+        trackAccess({ account, operation: "set", path: `${bucketName}/${path}`, size: data.length });
+        await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified, forceSetImmutable, internal });
     }
     async del(account: string, bucketName: string, path: string): Promise<void> {
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
+        trackAccess({ account, operation: "del", path: `${bucketName}/${path}` });
         await deleteBucketFile(account, bucketName, path);
     }
-    async getInfo(account: string, bucketName: string, path: string): Promise<{ writeTime: number; size: number } | undefined> {
+    async getInfo(account: string, bucketName: string, path: string, includeTombstones?: boolean): Promise<{ writeTime: number; size: number } | undefined> {
         assertValidPath(path);
+        trackAccess({ account, operation: "getInfo", path: `${bucketName}/${path}` });
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return undefined;
-        return await bucket.store.getInfo(path);
+        return await bucket.store.getInfo(path, { includeTombstones });
     }
     async findInfo(account: string, bucketName: string, prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         let bucket = await getBucket(account, bucketName);
-        if (!bucket) return [];
-        return await bucket.store.findInfo(prefix, config);
+        let results = bucket && await bucket.store.findInfo(prefix, config) || [];
+        // The paths are only known once the results are in; an empty result still counts as one access at the prefix.
+        if (results.length) {
+            for (let info of results) {
+                trackAccess({ account, operation: "findInfo", path: `${bucketName}/${info.path}` });
+            }
+        } else {
+            trackAccess({ account, operation: "findInfo", path: `${bucketName}/${prefix}` });
+        }
+        return results;
     }
     async getChangesAfter2(account: string, bucketName: string, config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
         let bucket = await getBucket(account, bucketName);
         if (!bucket) return [];
-        return await bucket.store.getChangesAfter2(config);
+        let results = await bucket.store.getChangesAfter2(config);
+        for (let info of results) {
+            trackAccess({ account, operation: "getChangesAfter", path: `${bucketName}/${info.path}` });
+        }
+        return results;
     }
     async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
         let bucket = await getBucket(account, bucketName);
@@ -345,10 +370,21 @@ class RemoteStorageControllerBase {
         assertValidName(bucketName, "bucket name");
         return await activateBucket(account, bucketName);
     }
-    /** Zeroes the write statistics listBuckets reports, for every bucket in the account. */
+    /** Zeroes the write statistics listBuckets reports and the in-memory access statistics, for every bucket in the account. */
     async clearWriteStats(account: string): Promise<{ clearedBuckets: number }> {
         assertValidName(account, "account");
-        return { clearedBuckets: await clearAccountWriteStats(account) };
+        clearAccountAccessStats(account);
+        return { clearedBuckets: clearAccountWriteStats(account) };
+    }
+    /** In-memory totals per operation type since startup (or the last clearWriteStats). */
+    async getAccessStats(account: string): Promise<AccessTotals> {
+        assertValidName(account, "account");
+        return getAccessTotals(account);
+    }
+    /** A path breakdown of one operation's accesses (operation names come from getAccessStats). maxCount is passed straight to TreeSummary.getSummaries. weightBySize is ignored for count-only operations, which return their count breakdown. */
+    async getAccessSummaries(account: string, config: { operation: string; maxCount: number; weightBySize?: boolean }): Promise<SummaryEntry<AccessSummaryState>[]> {
+        assertValidName(account, "account");
+        return readAccessSummaries({ account, ...config });
     }
     async getIndexInfo(account: string, bucketName: string): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] } | undefined> {
         let bucket = await getBucket(account, bucketName);
@@ -380,6 +416,7 @@ class RemoteStorageControllerBase {
         assertWritesAllowed();
         let info = largeUploadInfo.get(uploadId);
         if (!info) throw new Error(`Unknown large upload ${uploadId}`);
+        trackAccess({ account: info.account, operation: "uploadPart", path: `${info.bucketName}/${info.path}`, size: data.length });
         let bucket = await getBucket(info.account, info.bucketName);
         if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
         await bucket.store.appendLargeUpload(uploadId, Buffer.from(data));
@@ -434,6 +471,7 @@ class RemoteStorageControllerBase {
         }
         let info = await bucket.store.getInfo(filePath);
         if (!info || !info.size) {
+            trackAccess({ account, operation: "httpGet", path: `${bucketName}/${filePath}`, size: 0 });
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
         }
         let ext = filePath.split(".").pop() || "";
@@ -474,6 +512,7 @@ class RemoteStorageControllerBase {
             }
         }
         let result = await bucket.store.get2(filePath, { range });
+        trackAccess({ account, operation: "httpGet", path: `${bucketName}/${filePath}`, size: result && result.data.length || 0 });
         if (!result) {
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
         }
@@ -529,6 +568,8 @@ export const RemoteStorageController = SocketFunction.register(
         getActiveBucket: { hooks: [accountAccess] },
         activateBucket: { hooks: [accountAccess] },
         clearWriteStats: { hooks: [accountAccess] },
+        getAccessStats: { hooks: [accountAccess] },
+        getAccessSummaries: { hooks: [accountAccess] },
         getSyncStatus: { hooks: [accountAccess] },
         startLargeFile: { hooks: [accountAccess] },
         uploadPart: { hooks: [uploadAccess] },

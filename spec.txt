@@ -1,5 +1,9 @@
+TODO: Use wildcard certificates, and then expose urls which match up to the shard fraction, to 2 decimal places:
+    storageshard01.domain.com
+    storageshard26.domain.com
 
+And use multiple A records in order to store all the potential matches for a specific shard.
 
-
-
-
+NOTE: ALTHOUGH, storing the key inside of the archives and then dynamically calling getGetFastURLs IS better, as it'll allow for faster updates when we add new nodes, and it will pick a closer node. Although it might not retry as fast as it won't retry per request.
+    - ALSO, of course, If the error is something like some other service using it. And so the IP technically has something listening on that port, but it's a strifekit error or some other similar thing, then the A records can't retry. However, our code can detect this and then change the getURL order. 
+    - Also, probably most importantly, if we do the sharding ourselves, we can use one server with many ports. Where as A records don't have ports, So we would need a different server per shard, which is very wasteful as each shard is single-threaded.

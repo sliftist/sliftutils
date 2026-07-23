@@ -2,7 +2,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SetConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
 import { parseHostedUrl, getBucketBaseUrl, buildFileUrl } from "./remoteConfig";
 import {
     RemoteStorageController, STORAGE_AUTH_PURPOSE,
@@ -142,18 +142,18 @@ export class ArchivesRemote implements IArchives {
         return result && result.data || undefined;
     }
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        let result = await this.call(() => this.controller.get2(this.account, this.bucketName, fileName, config?.range));
+        let result = await this.call(() => this.controller.get2(this.account, this.bucketName, fileName, config?.range, config?.internal));
         return result && { data: Buffer.from(result.data), writeTime: result.writeTime, size: result.size } || undefined;
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
-        await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified, config?.forceSetImmutable));
+        await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified, config?.forceSetImmutable, config?.internal));
         return fileName;
     }
     public async del(fileName: string): Promise<void> {
         await this.call(() => this.controller.del(this.account, this.bucketName, fileName));
     }
-    public async getInfo(fileName: string): Promise<{ writeTime: number; size: number } | undefined> {
-        return await this.call(() => this.controller.getInfo(this.account, this.bucketName, fileName));
+    public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
+        return await this.call(() => this.controller.getInfo(this.account, this.bucketName, fileName, config?.includeTombstones));
     }
     public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
         return await this.call(() => this.controller.findInfo(this.account, this.bucketName, prefix, config));

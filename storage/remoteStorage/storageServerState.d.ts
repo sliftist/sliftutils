@@ -28,8 +28,8 @@ export type BucketWriteStats = {
     flushedWrites: number;
     flushedBytes: number;
 };
-/** Zeroes the write statistics of every bucket in the account, including counts not yet flushed. */
-export declare function clearAccountWriteStats(account: string): Promise<number>;
+/** Zeroes the write statistics of every bucket in the account. */
+export declare function clearAccountWriteStats(account: string): number;
 export declare function setTrustedMachines(config: {
     account: string;
     machineIds: string[];
@@ -46,6 +46,8 @@ export type LoadedBucket = {
 };
 export declare function addExtraListenPort(port: number): void;
 export declare function removeExtraListenPort(port: number): void;
+/** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
+export declare function isOwnAddress(address: string, port: number): boolean;
 /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
 export declare function resolveSourceArchives(url: string): IArchives;
 /** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
@@ -63,6 +65,7 @@ export declare function assertMutable(bucket: LoadedBucket, filePath: string, wr
 export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
     lastModified?: number;
     forceSetImmutable?: boolean;
+    internal?: boolean;
 }): Promise<void>;
 export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
 /** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */

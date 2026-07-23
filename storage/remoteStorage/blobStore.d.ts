@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, SyncActivity } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SyncActivity } from "../IArchives";
 export declare const DEFAULT_FAST_WRITE_DELAY: number;
 export declare const WINDOW_END_FLUSH_MARGIN: number;
 export type WriteConfig = {
@@ -15,9 +15,17 @@ export type IBucketStore = {
         writeTime: number;
         size: number;
     } | undefined>;
+    getInternal2?(fileName: string, config?: GetConfig): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    setInternal?(fileName: string, data: Buffer, config: {
+        lastModified: number;
+    }): Promise<void>;
     set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
     del(fileName: string, config?: WriteConfig): Promise<void>;
-    getInfo(fileName: string): Promise<{
+    getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
     } | undefined>;
@@ -154,12 +162,22 @@ export declare class BlobStore implements IBucketStore {
         writeTime: number;
         size: number;
     } | undefined>;
+    /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note fast writes still sitting in the overlay are invisible here; the caller re-finds them after our flush. */
+    getInternal2(key: string, config?: GetConfig): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Window/route acceptance is the caller's (writeBucketFile's) job; only-take-latest still applies here. */
+    setInternal(key: string, data: Buffer, config: {
+        lastModified: number;
+    }): Promise<void>;
     private cacheRead;
     set(key: string, data: Buffer, config?: WriteConfig): Promise<string>;
     del(key: string, config?: WriteConfig): Promise<void>;
     private getWritableSources;
     private writeToSources;
-    getInfo(key: string): Promise<{
+    getInfo(key: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
     } | undefined>;

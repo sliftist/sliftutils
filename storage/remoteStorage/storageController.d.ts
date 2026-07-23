@@ -2,6 +2,8 @@
 /// <reference types="node" />
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig } from "../IArchives";
 import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+import { AccessTotals, AccessSummaryState } from "./accessStats";
+import type { SummaryEntry } from "../../treeSummary";
 export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
 export declare const STORAGE_NOT_AUTHENTICATED = "REMOTE_STORAGE_NOT_AUTHENTICATED_cf2f7b1e";
@@ -65,14 +67,14 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     get2: (account: string, bucketName: string, path: string, range?: {
         start: number;
         end: number;
-    }) => Promise<{
+    }, internal?: boolean) => Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
     } | undefined>;
-    set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean) => Promise<void>;
+    set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean) => Promise<void>;
     del: (account: string, bucketName: string, path: string) => Promise<void>;
-    getInfo: (account: string, bucketName: string, path: string) => Promise<{
+    getInfo: (account: string, bucketName: string, path: string, includeTombstones?: boolean) => Promise<{
         writeTime: number;
         size: number;
     } | undefined>;
@@ -88,6 +90,12 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     clearWriteStats: (account: string) => Promise<{
         clearedBuckets: number;
     }>;
+    getAccessStats: (account: string) => Promise<AccessTotals>;
+    getAccessSummaries: (account: string, config: {
+        operation: string;
+        maxCount: number;
+        weightBySize?: boolean;
+    }) => Promise<SummaryEntry<AccessSummaryState>[]>;
     getIndexInfo: (account: string, bucketName: string) => Promise<{
         fileCount: number;
         byteCount: number;

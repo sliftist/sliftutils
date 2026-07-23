@@ -9,7 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, SetConfig, assertValidLastModified, IMMUTABLE_CACHE_TIME } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified, IMMUTABLE_CACHE_TIME } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 type BackblazeCreds = {
@@ -709,7 +709,8 @@ export class ArchivesBackblaze implements IArchives {
         if (config?.lastModified) {
             assertValidLastModified(config.lastModified);
             if (!config.noChecks) {
-                let existing = await this.getInfo(fileName);
+                // includeTombstones: a deletion pushed to b2 is a real size-0 file, and it must still win the older-write comparison - or an older-stamped write would resurrect the deleted file
+                let existing = await this.getInfo(fileName, { includeTombstones: true });
                 // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
                 if (existing && config.lastModified < existing.writeTime) return fileName;
                 // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
@@ -882,11 +883,11 @@ export class ArchivesBackblaze implements IArchives {
         }
     }
 
-    public async getInfo(fileName: string): Promise<{ writeTime: number; size: number; } | undefined> {
+    public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; } | undefined> {
         return await this.apiRetryLogic(`getInfo ${fileName}`, async (api) => {
             try {
                 let file = await api.headFileByName({ bucketName: this.bucketName, fileName });
-                if (!file) {
+                if (!file || !file.size && !config?.includeTombstones) {
                     this.log(`Backblaze file not exists ${fileName}`);
                     return undefined;
                 }
