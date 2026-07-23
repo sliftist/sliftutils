@@ -9,7 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified, IMMUTABLE_CACHE_TIME } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified, bufferChunkStream, IMMUTABLE_CACHE_TIME } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 type BackblazeCreds = {
@@ -27,6 +27,8 @@ let backblazeCreds = lazy(async (): Promise<BackblazeCreds> => {
 });
 // B2's minimum maxAgeSeconds is 60 - anything lower gets bumped to 60 server-side, so a smaller default would never match what the bucket actually stores and we would rewrite its settings on every startup
 const MIN_BUCKET_CACHE_TIME = 60 * 1000;
+// Backblaze requires 5MB chunks for large files, but larger is more efficient for us (and their "last part" size check misbehaves on retries, which chunks this big sidestep - see setLargeFile)
+const LARGE_FILE_MIN_CHUNK_SIZE = 32 * 1024 * 1024;
 
 // A B2 download/HEAD response's headers carry the file's metadata. content-range's total wins over content-length for ranged responses (which only report the slice's length).
 function parseFileMetadataHeaders(response: HttpsResponseInfo): { size: number; uploadTimestamp: number } {
@@ -703,6 +705,9 @@ export class ArchivesBackblaze implements IArchives {
         }
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        if (!data.length) {
+            throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+        }
         if (config?.forceSetImmutable && !config.lastModified) {
             throw new Error(`forceSetImmutable requires lastModified (synchronization writes are ordered by their write time), writing ${fileName} to ${this.getDebugName()}`);
         }
@@ -716,6 +721,11 @@ export class ArchivesBackblaze implements IArchives {
                 // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
                 if (existing && config.forceSetImmutable && this.config.immutable) return fileName;
             }
+        }
+        // Big buffers stream through the large-file API: a failed part retries alone instead of restarting the whole upload. The threshold MUST stay at two full chunks - below that setLargeFile falls back to plain set, which would recurse right back here.
+        if (data.length >= LARGE_FILE_MIN_CHUNK_SIZE * 2) {
+            await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
+            return fileName;
         }
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
         let f = fileName;
@@ -737,7 +747,19 @@ export class ArchivesBackblaze implements IArchives {
         }
         return fileName;
     }
-    public async del(fileName: string): Promise<void> {
+    public async del(fileName: string, config?: DelConfig): Promise<void> {
+        if (config?.lastModified) {
+            // A synchronized deletion: b2's hide removes the file from listings entirely, so peers scanning the bucket could never learn of it. Instead the tombstone is stored as a REAL empty file (an empty file IS a missing file), which listings show and scans ingest as a deletion. (b2 stamps its own upload time, so the exact deletion time is not preserved here - same as every b2 write.)
+            if (!config.noChecks) {
+                let existing = await this.getInfo(fileName, { includeTombstones: true });
+                if (existing && config.lastModified < existing.writeTime) return;
+            }
+            this.log(`backblaze tombstone upload ${fileName}`);
+            await this.apiRetryLogic(`del ${fileName}`, async (api) => {
+                await api.uploadFile({ bucketId: this.bucketId, fileName, data: Buffer.alloc(0) });
+            });
+            return;
+        }
         this.log(`backblaze delete ${fileName}`);
         try {
             await this.apiRetryLogic(`hideFile ${fileName}`, async (api) => {
@@ -757,15 +779,13 @@ export class ArchivesBackblaze implements IArchives {
         let time = Date.now();
         try {
             let { path } = config;
-            // Backblaze requires 5MB chunks. But, larger is more efficient for us.
-            const MIN_CHUNK_SIZE = 32 * 1024 * 1024;
             let dataQueue: Buffer[] = [];
             async function getNextData(): Promise<Buffer | undefined> {
                 if (dataQueue.length) return dataQueue.shift();
                 // Get buffers until we get 5MB, OR, end. Backblaze requires this for large files.
                 let totalBytes = 0;
                 let buffers: Buffer[] = [];
-                while (totalBytes < MIN_CHUNK_SIZE) {
+                while (totalBytes < LARGE_FILE_MIN_CHUNK_SIZE) {
                     let data = await config.getNextData();
                     if (!data) break;
                     totalBytes += data.length;
@@ -777,9 +797,11 @@ export class ArchivesBackblaze implements IArchives {
 
             let fileName = path;
             let data = await getNextData();
-            if (!data?.length) return;
+            if (!data?.length) {
+                throw new Error(`setLargeFile produced no data for ${JSON.stringify(config.path)} on ${this.getDebugName()}: an empty file IS a deletion in this system - call del to delete, never write empty files`);
+            }
             // Backblaze disallows overly small files
-            if (data.length < MIN_CHUNK_SIZE) {
+            if (data.length < LARGE_FILE_MIN_CHUNK_SIZE) {
                 await this.set(fileName, data);
                 return;
             }
@@ -790,7 +812,7 @@ export class ArchivesBackblaze implements IArchives {
                 return;
             }
             // ALSO, if there are two chunks, but one is too small, combine it. This helps allow us never send small chunks.
-            if (secondData.length < MIN_CHUNK_SIZE) {
+            if (secondData.length < LARGE_FILE_MIN_CHUNK_SIZE) {
                 await this.set(fileName, Buffer.concat([data, secondData]));
                 return;
             }
@@ -825,7 +847,7 @@ export class ArchivesBackblaze implements IArchives {
                 if (partSha1Array.length > 0) {
                     let maybeLastData = await getNextData();
                     if (maybeLastData) {
-                        if (maybeLastData.length < MIN_CHUNK_SIZE) {
+                        if (maybeLastData.length < LARGE_FILE_MIN_CHUNK_SIZE) {
                             // It's the last one, so consume it now
                             data = Buffer.concat([data, maybeLastData]);
                         } else {

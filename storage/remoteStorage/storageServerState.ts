@@ -10,7 +10,7 @@ import { ArchivesDisk } from "../ArchivesDisk";
 import { BlobStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MARGIN } from "./blobStore";
 import {
     RemoteConfig, HostedConfig, BackblazeConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
-    ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig,
+    ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig,
     STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection, normalizeSource } from "./remoteConfig";
@@ -1061,13 +1061,33 @@ export async function listAccountBuckets(account: string): Promise<ServerBucketI
     }
 }
 
-export async function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void> {
+export async function deleteBucketFile(account: string, bucketName: string, filePath: string, config?: { lastModified?: number; internal?: boolean }): Promise<void> {
+    assertWritesAllowed();
     if (filePath === ROUTING_FILE) {
         throw new Error(`The routing config ${JSON.stringify(ROUTING_FILE)} cannot be deleted (overwrite it to change the bucket's configuration)`);
     }
     let loaded = await getLoadedBucket(account, bucketName);
     if (!loaded) return;
-    await loaded.store.del(filePath, getWriteConfig(loaded, Date.now(), getRoute(filePath)));
+    let writeTime = config?.lastModified || Date.now();
+    let route = getRoute(filePath);
+    if (config?.internal) {
+        if (!config.lastModified) {
+            throw new Error(`Internal deletions must carry lastModified (they are synchronization pushes, ordered by their write time), deleting ${JSON.stringify(filePath)} in bucket ${account}/${bucketName}`);
+        }
+        // Same acceptance rule as internal writes (see SetConfig.internal): the stamp must land inside SOME window+route this server is configured for
+        let covered = loaded.selfEntries.some(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1] && routeContains(x.route, route));
+        if (!covered) {
+            throw new Error(`Internal deletion of ${JSON.stringify(filePath)} in bucket ${account}/${bucketName} rejected: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this server is configured for: ${JSON.stringify(loaded.selfEntries.map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))}`);
+        }
+        if (loaded.store.setInternal) {
+            // setInternal treats an empty buffer as exactly a deletion: disk removal plus a tombstone index entry, no fan-out
+            await loaded.store.setInternal(filePath, Buffer.alloc(0), { lastModified: writeTime });
+            return;
+        }
+        await loaded.store.del(filePath);
+        return;
+    }
+    await loaded.store.del(filePath, { ...getWriteConfig(loaded, writeTime, route), lastModified: writeTime });
 }
 
 const LARGE_FILE_PART_SIZE = 8 * 1024 * 1024;
@@ -1098,8 +1118,8 @@ class ArchivesLocalBucket implements IArchives {
         await writeBucketFile(this.account, this.bucketName, fileName, data, config);
         return fileName;
     }
-    public async del(fileName: string): Promise<void> {
-        await deleteBucketFile(this.account, this.bucketName, fileName);
+    public async del(fileName: string, config?: DelConfig): Promise<void> {
+        await deleteBucketFile(this.account, this.bucketName, fileName, config);
     }
     public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         assertWritesAllowed();

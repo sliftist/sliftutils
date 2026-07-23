@@ -73,7 +73,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         size: number;
     } | undefined>;
     set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean) => Promise<void>;
-    del: (account: string, bucketName: string, path: string) => Promise<void>;
+    del: (account: string, bucketName: string, path: string, lastModified?: number, internal?: boolean) => Promise<void>;
     getInfo: (account: string, bucketName: string, path: string, includeTombstones?: boolean) => Promise<{
         writeTime: number;
         size: number;

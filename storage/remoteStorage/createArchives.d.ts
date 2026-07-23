@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
 import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
@@ -96,7 +96,7 @@ export declare class ArchivesChain implements IArchives {
     hasWriteAccess(): Promise<boolean>;
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     private setRoutingConfig;
-    del(fileName: string): Promise<void>;
+    del(fileName: string, config?: DelConfig): Promise<void>;
     private getVariableShardTargets;
     /** The key setVariableShard would materialize for this VARIABLE_SHARD key (a value in the preferred shard's route range), without writing anything. */
     getShardKey(key: string): Promise<string>;

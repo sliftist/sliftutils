@@ -674,9 +674,9 @@ export class BlobStore implements IBucketStore {
             if (theirTime !== undefined && theirTime >= entry.writeTime) continue;
             try {
                 if (entry.size === 0) {
-                    // A deletion only needs pushing while the source still holds an older copy
+                    // A deletion only needs pushing while the source still holds an older copy. It travels as del (never as an empty set - set rejects empty buffers), with the ORIGINAL deletion time so ordering survives.
                     if (theirTime === undefined) continue;
-                    await source.set(key, Buffer.alloc(0), { lastModified: entry.writeTime, forceSetImmutable: true, noChecks: true, internal: true });
+                    await source.del(key, { lastModified: entry.writeTime, noChecks: true, internal: true });
                     pushed++;
                     consecutiveFailures = 0;
                     continue;
@@ -893,7 +893,8 @@ export class BlobStore implements IBucketStore {
         if (holderArchives) {
             try {
                 let answer = await holderArchives.get2(key, { range, internal: true });
-                if (answer && answer.data) {
+                // Empty data counts as absent: an empty file IS a deletion (a tombstone stored on b2/disk), never content. NOTE: a ranged read of a real file can legitimately be empty (range past EOF), so only unranged emptiness means absent.
+                if (answer && answer.data && (answer.data.length || range && answer.size)) {
                     result = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
                 }
             } catch (e) {
@@ -919,7 +920,8 @@ export class BlobStore implements IBucketStore {
             let fallback: { data: Buffer; writeTime: number; size: number } | undefined;
             try {
                 let answer = await this.sources[i].source.get2(key, { internal: true });
-                if (answer && answer.data) {
+                // Empty data counts as absent - a tombstone, not content (this read is unranged, so emptiness is unambiguous)
+                if (answer && answer.data && answer.data.length) {
                     fallback = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
                 }
             } catch {
@@ -943,7 +945,10 @@ export class BlobStore implements IBucketStore {
     public async getInternal2(key: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         await this.init();
         let result = await this.getDiskSource().disk.get2(key, { range: config?.range });
-        return result && result.data && { data: result.data, writeTime: result.writeTime, size: result.size } || undefined;
+        if (!result || !result.data) return undefined;
+        // An empty file on disk is a tombstone, not content (a ranged read of a real file can be legitimately empty though - range past EOF)
+        if (!result.data.length && !(config?.range && result.size)) return undefined;
+        return { data: result.data, writeTime: result.writeTime, size: result.size };
     }
 
     /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Window/route acceptance is the caller's (writeBucketFile's) job; only-take-latest still applies here. */
@@ -970,6 +975,19 @@ export class BlobStore implements IBucketStore {
     }
 
     public async set(key: string, data: Buffer, config?: WriteConfig): Promise<string> {
+        if (!data.length) {
+            throw new Error(`set was called with an empty buffer for ${JSON.stringify(key)} (store ${this.folder}): an empty file IS a deletion in this system and would read back as missing - call del instead`);
+        }
+        return await this.setOrDelete(key, data, config);
+    }
+
+    public async del(key: string, config?: WriteConfig): Promise<void> {
+        // Deletes are tombstone writes (an empty file IS a missing file): the size-0 index entry is ordered by write time like any other write, propagates through synchronization, and expires after TOMBSTONE_EXPIRY
+        await this.setOrDelete(key, Buffer.alloc(0), config);
+    }
+
+    // The shared engine of set and del: an empty buffer is exactly a deletion here, which is why the empty-buffer rejection lives in set (the public API), not in this machinery
+    private async setOrDelete(key: string, data: Buffer, config?: WriteConfig): Promise<string> {
         await this.init();
         this.config?.onWriteCounted?.("original", data.length);
         let lastModified = config?.lastModified;
@@ -1004,11 +1022,6 @@ export class BlobStore implements IBucketStore {
         return key;
     }
 
-    public async del(key: string, config?: WriteConfig): Promise<void> {
-        // Deletes are tombstone writes (an empty file IS a missing file): the size-0 index entry is ordered by write time like any other write, propagates through synchronization, and expires after TOMBSTONE_EXPIRY
-        await this.set(key, Buffer.alloc(0), config);
-    }
-
     private getWritableSources(config?: { ignoreWindow?: boolean }): number[] {
         let writable: number[] = [];
         for (let i = 0; i < this.sources.length; i++) {
@@ -1040,8 +1053,14 @@ export class BlobStore implements IBucketStore {
         let route = getRoute(key);
         for (let i of writable) {
             if (!routeContains(this.sources[i].route, route)) continue;
-            // Downstream sources receive tombstones as actual empty writes, so their listings show the deletion (size 0) and other stores scan it in as a tombstone
-            void this.sources[i].source.set(key, data, { lastModified: writeTime, forceSetImmutable: true, noChecks: true, internal: true }).catch((e: Error) => {
+            // Deletions travel as del carrying the original write time (never as empty sets - set rejects empty buffers). Backblaze materializes such dels as real empty files, so its listings still show the deletion for other stores to scan in as a tombstone.
+            let push: Promise<unknown>;
+            if (data.length === 0) {
+                push = this.sources[i].source.del(key, { lastModified: writeTime, noChecks: true, internal: true });
+            } else {
+                push = this.sources[i].source.set(key, data, { lastModified: writeTime, forceSetImmutable: true, noChecks: true, internal: true });
+            }
+            void push.catch((e: Error) => {
                 console.error(`Background write of ${key} to sync source ${this.sources[i].source.getDebugName()} failed: ${e.stack ?? e}`);
             });
         }

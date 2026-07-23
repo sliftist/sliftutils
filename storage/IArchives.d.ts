@@ -58,6 +58,14 @@ export type GetConfig = {
     /** Store-to-store call: the serving node answers purely from its own disk, completely short-circuiting its index holders - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). No window or route checks on reads: if the bytes are on its disk, the caller may have them. */
     internal?: boolean;
 };
+export type DelConfig = {
+    /** Stamps the deletion (its tombstone) with this write time instead of now. Synchronization passes the ORIGINAL deletion time, so deletion ordering survives propagation exactly like any other write's ordering. */
+    lastModified?: number;
+    /** See SetConfig.internal. */
+    internal?: boolean;
+    /** See SetConfig.noChecks. */
+    noChecks?: boolean;
+};
 export type GetInfoConfig = {
     /** Also report size-0 entries (tombstones - an empty file IS a missing file). Off by default, so a deleted key reports undefined, matching get. Synchronization-style callers pass this when they need a deletion's write time (e.g. to compare it against a write they are about to make). */
     includeTombstones?: boolean;
@@ -120,6 +128,9 @@ export declare const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17"
 export declare const FULL_ROUTE: [number, number];
 export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
 export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
+export declare const LARGE_SET_THRESHOLD: number;
+/** A getNextData stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. */
+export declare function bufferChunkStream(data: Buffer): () => Promise<Buffer | undefined>;
 /** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. size/writeTime usually come from the caller's metadata scan; when either is omitted, getInfo fills them in. Returns the copied file's info, or undefined when the source doesn't have the file. */
 export declare function copyArchiveFile(config: {
     from: IArchives;
@@ -181,9 +192,14 @@ export interface IArchives {
      * VARIABLE_SHARD, where the shard value is materialized into the key (picked by shard latency,
      * see ArchivesChain) and the caller needs the returned key to ever read the value back.
      */
+    /**
+     * THROWS on an empty buffer: an empty file IS a deletion in this system (the tombstone), so a
+     * set-empty would read back as "the file is gone" - which is just asking for problems. If you
+     * want the file deleted, call del; deletions take their own path.
+     */
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
-    del(fileName: string): Promise<void>;
-    /** Streams a file too large to hold in memory. getNextData returns undefined when done. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. */
+    del(fileName: string, config?: DelConfig): Promise<void>;
+    /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
     setLargeFile(config: {
         path: string;
         lastModified?: number;

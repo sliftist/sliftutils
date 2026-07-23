@@ -94,6 +94,15 @@ export type GetConfig = {
     internal?: boolean;
 };
 
+export type DelConfig = {
+    /** Stamps the deletion (its tombstone) with this write time instead of now. Synchronization passes the ORIGINAL deletion time, so deletion ordering survives propagation exactly like any other write's ordering. */
+    lastModified?: number;
+    /** See SetConfig.internal. */
+    internal?: boolean;
+    /** See SetConfig.noChecks. */
+    noChecks?: boolean;
+};
+
 export type GetInfoConfig = {
     /** Also report size-0 entries (tombstones - an empty file IS a missing file). Off by default, so a deleted key reports undefined, matching get. Synchronization-style callers pass this when they need a deletion's write time (e.g. to compare it against a write they are about to make). */
     includeTombstones?: boolean;
@@ -182,6 +191,20 @@ export function windowAcceptsWrites(validWindow: [number, number] | undefined): 
 const LARGE_COPY_THRESHOLD = 64 * 1024 * 1024;
 const LARGE_COPY_CHUNK = 32 * 1024 * 1024;
 
+// Above this, set transparently streams through setLargeFile: one giant wire message would exceed the transport limit and lag every other client sharing the connection
+export const LARGE_SET_THRESHOLD = 8 * 1024 * 1024;
+
+/** A getNextData stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. */
+export function bufferChunkStream(data: Buffer): () => Promise<Buffer | undefined> {
+    let offset = 0;
+    return async () => {
+        if (offset >= data.length) return undefined;
+        let chunk = data.subarray(offset, offset + LARGE_SET_THRESHOLD);
+        offset += chunk.length;
+        return chunk;
+    };
+}
+
 /** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. size/writeTime usually come from the caller's metadata scan; when either is omitted, getInfo fills them in. Returns the copied file's info, or undefined when the source doesn't have the file. */
 export async function copyArchiveFile(config: {
     from: IArchives;
@@ -204,7 +227,8 @@ export async function copyArchiveFile(config: {
     }
     if (size <= LARGE_COPY_THRESHOLD) {
         let result = await from.get2(path, { internal: config.internal });
-        if (!result || !result.data) return undefined;
+        // Empty counts as absent, never as content to copy: an empty file IS a deletion, set refuses empty buffers, and deletions travel through their own path (del / scan tombstones)
+        if (!result || !result.data || !result.data.length) return undefined;
         await to.set(path, result.data, { lastModified: result.writeTime, forceSetImmutable: config.forceSetImmutable, noChecks: config.noChecks, internal: config.internal });
         return { writeTime: result.writeTime, size: result.data.length };
     }
@@ -246,6 +270,7 @@ export type ArchivesSyncStatus = {
     sources: ArchivesSyncSourceStatus[];
 };
 
+// NOTE: We don't presently have an append function here because a surprising number of storage systems don't support it (backblaze, file system api). It would also complicate things as now there needs to be really a single source of truth of a file, and if you append to the wrong single source of truth, things just become very complicated. 
 export interface IArchives {
     getDebugName(): string;
     /** Whether writes would be accepted (credentials exist, the account trusts this machine, etc). Checked without writing anything. */
@@ -269,9 +294,14 @@ export interface IArchives {
      * VARIABLE_SHARD, where the shard value is materialized into the key (picked by shard latency,
      * see ArchivesChain) and the caller needs the returned key to ever read the value back.
      */
+    /**
+     * THROWS on an empty buffer: an empty file IS a deletion in this system (the tombstone), so a
+     * set-empty would read back as "the file is gone" - which is just asking for problems. If you
+     * want the file deleted, call del; deletions take their own path.
+     */
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
-    del(fileName: string): Promise<void>;
-    /** Streams a file too large to hold in memory. getNextData returns undefined when done. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. */
+    del(fileName: string, config?: DelConfig): Promise<void>;
+    /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
     setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void>;
     /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. Size-0 entries (tombstones) report undefined unless config.includeTombstones. */
     getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url?: string } | undefined>;

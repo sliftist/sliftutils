@@ -2,8 +2,8 @@ import { isNode, sort, watchSlowPromise } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig,
-    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
-    STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD,
+    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
+    STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream,
 } from "../IArchives";
 import {
     ROUTING_FILE, getConfigVersion, parseHostedUrl, parseBackblazeUrl,
@@ -720,11 +720,19 @@ export class ArchivesChain implements IArchives {
     }
 
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        if (!data.length) {
+            throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+        }
         if (fileName === ROUTING_FILE) {
             return await this.setRoutingConfig(data, config);
         }
         if (fileName.includes(VARIABLE_SHARD) && parseVariableRoute(fileName) === undefined) {
             return await this.setVariableShard(fileName, data, config);
+        }
+        if (data.length > LARGE_SET_THRESHOLD) {
+            // Streamed automatically so callers never have to call setLargeFile themselves when they already hold the buffer - one giant message would exceed the wire limit and lag every other client on the connection
+            await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
+            return fileName;
         }
         await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: data.length } }, archives => archives.set(fileName, data, config));
         return fileName;
@@ -754,8 +762,8 @@ export class ArchivesChain implements IArchives {
         }
         return ROUTING_FILE;
     }
-    public async del(fileName: string): Promise<void> {
-        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: 0 } }, archives => archives.del(fileName));
+    public async del(fileName: string, config?: DelConfig): Promise<void> {
+        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: 0 } }, archives => archives.del(fileName, config));
     }
 
     // One write target per route range, lowest latency first. Within a shard the target is ALWAYS the first source in config order (see runPrimary - writes must stay on the same node): connectivity only decides which SHARD we pick, never which node within it, so a shard whose node is disconnected is dropped entirely when connectedOnly is set.
@@ -801,8 +809,13 @@ export class ArchivesChain implements IArchives {
             for (let target of targets) {
                 let fullKey = materializeShardKey(key, target);
                 try {
-                    // The shard picking already retries across shards, so a stuck shard just costs its timeout and we move on
-                    await this.applySmartTimeout({ uploadBytes: data.length }, target, () => target.write(archives => archives.set(fullKey, data, config)));
+                    // The shard picking already retries across shards, so a stuck shard just costs its timeout and we move on. Large data streams via setLargeFile - the key is already materialized here, so the no-VARIABLE_SHARD restriction on setLargeFile doesn't apply.
+                    await this.applySmartTimeout({ uploadBytes: data.length }, target, () => {
+                        if (data.length > LARGE_SET_THRESHOLD) {
+                            return target.write(archives => archives.setLargeFile({ path: fullKey, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) }));
+                        }
+                        return target.write(archives => archives.set(fullKey, data, config)) as any;
+                    });
                     return fullKey;
                 } catch (e) {
                     let message = String((e as Error).stack ?? e);

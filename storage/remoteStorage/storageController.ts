@@ -308,14 +308,17 @@ class RemoteStorageControllerBase {
     async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean): Promise<void> {
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
+        if (!data.length) {
+            throw new Error(`set was called with an empty buffer for ${JSON.stringify(path)} in bucket ${account}/${bucketName}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+        }
         trackAccess({ account, operation: "set", path: `${bucketName}/${path}`, size: data.length });
         await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified, forceSetImmutable, internal });
     }
-    async del(account: string, bucketName: string, path: string): Promise<void> {
+    async del(account: string, bucketName: string, path: string, lastModified?: number, internal?: boolean): Promise<void> {
         assertValidName(bucketName, "bucket name");
         assertValidPath(path);
         trackAccess({ account, operation: "del", path: `${bucketName}/${path}` });
-        await deleteBucketFile(account, bucketName, path);
+        await deleteBucketFile(account, bucketName, path, { lastModified, internal });
     }
     async getInfo(account: string, bucketName: string, path: string, includeTombstones?: boolean): Promise<{ writeTime: number; size: number } | undefined> {
         assertValidPath(path);

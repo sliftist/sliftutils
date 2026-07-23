@@ -2,7 +2,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig, LARGE_SET_THRESHOLD, bufferChunkStream } from "../IArchives";
 import { parseHostedUrl, getBucketBaseUrl, buildFileUrl } from "./remoteConfig";
 import {
     RemoteStorageController, STORAGE_AUTH_PURPOSE,
@@ -146,11 +146,16 @@ export class ArchivesRemote implements IArchives {
         return result && { data: Buffer.from(result.data), writeTime: result.writeTime, size: result.size } || undefined;
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        if (data.length > LARGE_SET_THRESHOLD) {
+            // One giant message would exceed the wire limit and lag every other client sharing this connection - stream it instead. (The large-file path cannot carry forceSetImmutable/noChecks/internal; large pushes accept plain-write semantics, and reconciliation's per-file error handling absorbs the rare immutable rejection.)
+            await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
+            return fileName;
+        }
         await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified, config?.forceSetImmutable, config?.internal));
         return fileName;
     }
-    public async del(fileName: string): Promise<void> {
-        await this.call(() => this.controller.del(this.account, this.bucketName, fileName));
+    public async del(fileName: string, config?: DelConfig): Promise<void> {
+        await this.call(() => this.controller.del(this.account, this.bucketName, fileName, config?.lastModified, config?.internal));
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
         return await this.call(() => this.controller.getInfo(this.account, this.bucketName, fileName, config?.includeTombstones));

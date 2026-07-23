@@ -858,7 +858,7 @@ declare module "sliftutils/render-utils/observer" {
 declare module "sliftutils/storage/ArchivesDisk" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
     export declare class ArchivesDisk implements IArchives {
         private folder;
         constructor(folder: string);
@@ -878,7 +878,7 @@ declare module "sliftutils/storage/ArchivesDisk" {
         hasWriteAccess(): Promise<boolean>;
         private filePath;
         set(key: string, data: Buffer, config?: SetConfig): Promise<string>;
-        del(key: string): Promise<void>;
+        del(key: string, config?: DelConfig): Promise<void>;
         get(key: string, config?: GetConfig): Promise<Buffer | undefined>;
         get2(key: string, config?: GetConfig): Promise<{
             data: Buffer;
@@ -2149,6 +2149,14 @@ declare module "sliftutils/storage/IArchives" {
         /** Store-to-store call: the serving node answers purely from its own disk, completely short-circuiting its index holders - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). No window or route checks on reads: if the bytes are on its disk, the caller may have them. */
         internal?: boolean;
     };
+    export type DelConfig = {
+        /** Stamps the deletion (its tombstone) with this write time instead of now. Synchronization passes the ORIGINAL deletion time, so deletion ordering survives propagation exactly like any other write's ordering. */
+        lastModified?: number;
+        /** See SetConfig.internal. */
+        internal?: boolean;
+        /** See SetConfig.noChecks. */
+        noChecks?: boolean;
+    };
     export type GetInfoConfig = {
         /** Also report size-0 entries (tombstones - an empty file IS a missing file). Off by default, so a deleted key reports undefined, matching get. Synchronization-style callers pass this when they need a deletion's write time (e.g. to compare it against a write they are about to make). */
         includeTombstones?: boolean;
@@ -2211,6 +2219,9 @@ declare module "sliftutils/storage/IArchives" {
     export declare const FULL_ROUTE: [number, number];
     export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
     export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
+    export declare const LARGE_SET_THRESHOLD: number;
+    /** A getNextData stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. */
+    export declare function bufferChunkStream(data: Buffer): () => Promise<Buffer | undefined>;
     /** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. size/writeTime usually come from the caller's metadata scan; when either is omitted, getInfo fills them in. Returns the copied file's info, or undefined when the source doesn't have the file. */
     export declare function copyArchiveFile(config: {
         from: IArchives;
@@ -2272,9 +2283,14 @@ declare module "sliftutils/storage/IArchives" {
          * VARIABLE_SHARD, where the shard value is materialized into the key (picked by shard latency,
          * see ArchivesChain) and the caller needs the returned key to ever read the value back.
          */
+        /**
+         * THROWS on an empty buffer: an empty file IS a deletion in this system (the tombstone), so a
+         * set-empty would read back as "the file is gone" - which is just asking for problems. If you
+         * want the file deleted, call del; deletions take their own path.
+         */
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
-        del(fileName: string): Promise<void>;
-        /** Streams a file too large to hold in memory. getNextData returns undefined when done. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. */
+        del(fileName: string, config?: DelConfig): Promise<void>;
+        /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
         setLargeFile(config: {
             path: string;
             lastModified?: number;
@@ -2576,7 +2592,7 @@ declare module "sliftutils/storage/TransactionStorage" {
 declare module "sliftutils/storage/backblaze" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+    import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
     export declare class ArchivesBackblaze implements IArchives {
         private config;
         constructor(config: {
@@ -2605,7 +2621,7 @@ declare module "sliftutils/storage/backblaze" {
         getConfig(): Promise<ArchivesConfig>;
         hasWriteAccess(): Promise<boolean>;
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
-        del(fileName: string): Promise<void>;
+        del(fileName: string, config?: DelConfig): Promise<void>;
         setLargeFile(config: {
             path: string;
             lastModified?: number;
@@ -2880,7 +2896,7 @@ declare module "sliftutils/storage/remoteFileStorage" {
 declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
     export type ArchivesRemoteConfig = {
         url: string;
         waitForAccess?: boolean;
@@ -2926,7 +2942,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
             size: number;
         } | undefined>;
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
-        del(fileName: string): Promise<void>;
+        del(fileName: string, config?: DelConfig): Promise<void>;
         getInfo(fileName: string, config?: GetInfoConfig): Promise<{
             writeTime: number;
             size: number;
@@ -3207,6 +3223,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private cacheRead;
         set(key: string, data: Buffer, config?: WriteConfig): Promise<string>;
         del(key: string, config?: WriteConfig): Promise<void>;
+        private setOrDelete;
         private getWritableSources;
         private writeToSources;
         getInfo(key: string, config?: GetInfoConfig): Promise<{
@@ -3240,7 +3257,7 @@ declare module "sliftutils/storage/remoteStorage/cliArgs" {
 declare module "sliftutils/storage/remoteStorage/createArchives" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+    import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
     import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
     /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
     export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
@@ -3336,7 +3353,7 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         hasWriteAccess(): Promise<boolean>;
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
         private setRoutingConfig;
-        del(fileName: string): Promise<void>;
+        del(fileName: string, config?: DelConfig): Promise<void>;
         private getVariableShardTargets;
         /** The key setVariableShard would materialize for this VARIABLE_SHARD key (a value in the preferred shard's route range), without writing anything. */
         getShardKey(key: string): Promise<string>;
@@ -3644,7 +3661,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             size: number;
         } | undefined>;
         set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean) => Promise<void>;
-        del: (account: string, bucketName: string, path: string) => Promise<void>;
+        del: (account: string, bucketName: string, path: string, lastModified?: number, internal?: boolean) => Promise<void>;
         getInfo: (account: string, bucketName: string, path: string, includeTombstones?: boolean) => Promise<{
             writeTime: number;
             size: number;
@@ -3819,7 +3836,10 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     /** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
     export declare function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
     export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
-    export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
+    export declare function deleteBucketFile(account: string, bucketName: string, filePath: string, config?: {
+        lastModified?: number;
+        internal?: boolean;
+    }): Promise<void>;
     export declare function getLocalArchives(account: string, bucketName: string): IArchives;
 
 }

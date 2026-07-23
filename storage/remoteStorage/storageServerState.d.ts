@@ -111,5 +111,8 @@ export declare function getActiveBucket(account: string, bucketName: string): Pr
 /** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
 export declare function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
 export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
-export declare function deleteBucketFile(account: string, bucketName: string, filePath: string): Promise<void>;
+export declare function deleteBucketFile(account: string, bucketName: string, filePath: string, config?: {
+    lastModified?: number;
+    internal?: boolean;
+}): Promise<void>;
 export declare function getLocalArchives(account: string, bucketName: string): IArchives;

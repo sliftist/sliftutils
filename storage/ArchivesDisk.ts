@@ -3,7 +3,7 @@ import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { sort, binarySearchBasic } from "socket-function/src/misc";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 // The base file-system IArchives: storage is one-to-one with the file system, every key is exactly one real file under <folder>/files, so the file system itself is the index. File handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a file run in serial, so they can't collide with each other or with handle closing. Used as the disk synchronization source of BlobStore (see remoteStorage/blobStore.ts).
@@ -151,6 +151,9 @@ export class ArchivesDisk implements IArchives {
 
     // forceSetImmutable is accepted and needs no handling: disk sources are never immutable, and the older-write no-op below already gives synchronization its only-take-the-latest semantics
     public async set(key: string, data: Buffer, config?: SetConfig): Promise<string> {
+        if (!data.length) {
+            throw new Error(`set was called with an empty buffer for ${JSON.stringify(key)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+        }
         await this.init();
         let lastModified = config?.lastModified;
         if (lastModified) {
@@ -174,7 +177,8 @@ export class ArchivesDisk implements IArchives {
         return key;
     }
 
-    public async del(key: string): Promise<void> {
+    // config is accepted and ignored: a disk deletion is a physical remove (no tombstone to stamp - BlobStore's index carries the tombstone for disk sources)
+    public async del(key: string, config?: DelConfig): Promise<void> {
         await this.init();
         let filePath = this.filePath(key);
         await this.handles.run(filePath, async () => {
@@ -319,8 +323,8 @@ export class ArchivesDisk implements IArchives {
                 await fs.promises.rename(tmpPath, filePath);
             } catch (e: any) {
                 if (e.code !== "ENOENT") throw e;
-                // Nothing was ever appended, so the upload file was never created
-                await fs.promises.writeFile(filePath, Buffer.alloc(0));
+                // Either nothing was ever appended, or the temp file was destroyed under us - both must fail loudly. Materializing an empty file here (the old behavior) silently turned the upload into a DELETION, since an empty file IS a missing file in this system.
+                throw new Error(`Large upload of ${JSON.stringify(key)} has no data: the upload temp file ${tmpPath} does not exist. Either no data was ever appended (empty files are forbidden - they read back as deletions; use del to delete) or the temp file was removed while the upload was running.`);
             }
             // The rename preserves the temp file's mtime, which is just when the last append happened - the logical write time has to be stamped explicitly (it is the metadata scans order everything by)
             if (lastModified) {

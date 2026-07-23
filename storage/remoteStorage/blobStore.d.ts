@@ -175,6 +175,7 @@ export declare class BlobStore implements IBucketStore {
     private cacheRead;
     set(key: string, data: Buffer, config?: WriteConfig): Promise<string>;
     del(key: string, config?: WriteConfig): Promise<void>;
+    private setOrDelete;
     private getWritableSources;
     private writeToSources;
     getInfo(key: string, config?: GetInfoConfig): Promise<{
