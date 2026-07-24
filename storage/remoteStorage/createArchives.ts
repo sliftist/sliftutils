@@ -618,7 +618,7 @@ export class ArchivesChain implements IArchives {
         });
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url: string } | undefined> {
-        return await this.request({ route: getRoute(fileName) }, async (archives, url) => {
+        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks }, async (archives, url) => {
             let result = await archives.getInfo(fileName, config);
             return result && { ...result, url } || undefined;
         });
@@ -671,8 +671,10 @@ export class ArchivesChain implements IArchives {
                     }
                 }));
                 if (!failures.length) return { values };
-                let phrase = failures.length === 1 && `source ${failures[0].source.getDebugName()} is unavailable` || `${failures.length} of the ${covering.length} covering sources are unavailable`;
-                return { error: new Error(`${operation} failed because ${phrase}: ${failures.map(x => `${x.source.getDebugName()}: ${x.error.stack ?? x.error}`).join(" | ")}`) };
+                if (failures.length === 1) {
+                    return { error: new Error(`${operation} failed because source ${failures[0].source.getDebugName()} is unavailable: ${failures[0].error.stack ?? failures[0].error}`) };
+                }
+                return { error: new Error(`${operation} failed because ${failures.length} of the ${covering.length} covering sources are unavailable: ${failures.map(x => `${x.source.getDebugName()}: ${x.error.stack ?? x.error}`).join(" | ")}`) };
             })();
             if ("values" in outcome) return outcome.values;
             let error = outcome.error;

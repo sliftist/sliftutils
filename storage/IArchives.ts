@@ -118,6 +118,8 @@ export type DelConfig = {
 export type GetInfoConfig = {
     /** Also report size-0 entries (tombstones - an empty file IS a missing file). Off by default, so a deleted key reports undefined, matching get. Synchronization-style callers pass this when they need a deletion's write time (e.g. to compare it against a write they are about to make). */
     includeTombstones?: boolean;
+    /** See GetConfig.noFallbacks: answer ONLY from the primary source (the one writes would target) instead of falling back across the redundant sources. */
+    noFallbacks?: boolean;
 };
 
 export type ChangesAfterConfig = {
@@ -227,18 +229,19 @@ export async function copyArchiveFile(config: {
     forceSetImmutable?: boolean;
     noChecks?: boolean;
     internal?: boolean;
+    noFallbacks?: boolean;
 }): Promise<{ writeTime: number; size: number } | undefined> {
     let { from, to, path } = config;
     let size = config.size;
     let writeTime = config.writeTime;
     if (size === undefined || writeTime === undefined) {
-        let info = await from.getInfo(path);
+        let info = await from.getInfo(path, { noFallbacks: config.noFallbacks });
         if (!info) return undefined;
         size = info.size;
         writeTime = info.writeTime;
     }
     if (size <= LARGE_COPY_THRESHOLD) {
-        let result = await from.get2(path, { internal: config.internal });
+        let result = await from.get2(path, { internal: config.internal, noFallbacks: config.noFallbacks });
         // Empty counts as absent, never as content to copy: an empty file IS a deletion, set refuses empty buffers, and deletions travel through their own path (del / scan tombstones)
         if (!result || !result.data || !result.data.length) return undefined;
         await to.set(path, result.data, { lastModified: result.writeTime, forceSetImmutable: config.forceSetImmutable, noChecks: config.noChecks, internal: config.internal });
@@ -254,7 +257,7 @@ export async function copyArchiveFile(config: {
         getNextData: async () => {
             if (offset >= totalSize) return undefined;
             let end = Math.min(offset + LARGE_COPY_CHUNK, totalSize);
-            let data = await from.get(path, { range: { start: offset, end }, internal: config.internal });
+            let data = await from.get(path, { range: { start: offset, end }, internal: config.internal, noFallbacks: config.noFallbacks });
             if (!data || !data.length) {
                 throw new Error(`Ranged read of ${JSON.stringify(path)} from ${from.getDebugName()} returned ${data && data.length || "nothing"} at ${offset}-${end} (expected ${end - offset} bytes of a ${totalSize} byte file - it changed or vanished mid-copy)`);
             }

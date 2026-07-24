@@ -2161,6 +2161,8 @@ declare module "sliftutils/storage/IArchives" {
     export type GetInfoConfig = {
         /** Also report size-0 entries (tombstones - an empty file IS a missing file). Off by default, so a deleted key reports undefined, matching get. Synchronization-style callers pass this when they need a deletion's write time (e.g. to compare it against a write they are about to make). */
         includeTombstones?: boolean;
+        /** See GetConfig.noFallbacks: answer ONLY from the primary source (the one writes would target) instead of falling back across the redundant sources. */
+        noFallbacks?: boolean;
     };
     export type ChangesAfterConfig = {
         time: number;
@@ -2233,6 +2235,7 @@ declare module "sliftutils/storage/IArchives" {
         forceSetImmutable?: boolean;
         noChecks?: boolean;
         internal?: boolean;
+        noFallbacks?: boolean;
     }): Promise<{
         writeTime: number;
         size: number;
