@@ -1,3 +1,13 @@
+Refactor
+
+    createArchives => storageController => storageServerState => BlobStore
+
+    So create Archives has to decide who we're going to talk to, and then Storage Controller, it just acts like adds security and stuff. and then it gets into load it bucket, and then load it bucket. It then decides what back-end store we're talking to, and the back-end store, it might talk to multiple sources. 
+        So there's which server we're going to talk to, which bucket on the server it maps to once we get there, and then there's which back-end stores that we talk to. So I guess it's fine. 
+
+
+
+
 TODO: Use wildcard certificates, and then expose urls which match up to the shard fraction, to 2 decimal places:
     storageshard01.domain.com
     storageshard26.domain.com

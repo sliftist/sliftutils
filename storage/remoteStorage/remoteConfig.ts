@@ -2,7 +2,7 @@ import { sort } from "socket-function/src/misc";
 import { getBufferInt } from "socket-function/src/bits";
 import { setFlag } from "socket-function/require/compileFlags";
 import jsSha256 from "js-sha256";
-import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ChangesAfterConfig, FULL_VALID_WINDOW, FULL_ROUTE, VARIABLE_SHARD } from "../IArchives";
+import { RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ChangesAfterConfig, FULL_VALID_WINDOW, FULL_ROUTE, VARIABLE_SHARD } from "../IArchives";
 
 setFlag(require, "js-sha256", "allowclient", true);
 
@@ -109,7 +109,7 @@ export function replaceHostedUrlPort(url: string, port: number): string {
     return u.toString();
 }
 
-export function normalizeSource(source: RemoteConfigBase): HostedConfig | BackblazeConfig {
+export function normalizeSource(source: RemoteConfigBase): SourceConfig {
     if (typeof source !== "string") {
         let window = source.validWindow;
         if (!Array.isArray(window) || window.length !== 2 || !window.every(x => typeof x === "number")) {
@@ -144,7 +144,7 @@ export function normalizeSource(source: RemoteConfigBase): HostedConfig | Backbl
 }
 
 /** How far up from 0 the sources' routes reach without a gap (1 means the whole key space). */
-function getRouteCoverage(sources: (HostedConfig | BackblazeConfig)[]): number {
+function getRouteCoverage(sources: SourceConfig[]): number {
     let routes = sources.map(x => x.route || FULL_ROUTE);
     sort(routes, x => x[0]);
     let covered = 0;
@@ -204,7 +204,23 @@ export function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): 
         groupEnd = Math.max(groupEnd, source.validWindow[1]);
     }
     checkGroup();
+    // Two entries with the EXACT same URL and the SAME route may never be valid at the same time: on that server the route maps to exactly one on-disk folder and one store, so simultaneous duplicates would collide on it. A different port is a different server. Non-overlapping windows are fine; that is how transitions between windows work.
+    for (let i = 0; i < sources.length; i++) {
+        for (let j = i + 1; j < sources.length; j++) {
+            let a = sources[i];
+            let b = sources[j];
+            if (sourceRouteIdentity(a) !== sourceRouteIdentity(b)) continue;
+            if (a.validWindow[0] < b.validWindow[1] && b.validWindow[0] < a.validWindow[1]) {
+                throw new Error(`Two sources with the same URL have the same route with overlapping valid windows - on that server the route maps to one on-disk folder, so these would collide. Give same-route entries non-overlapping windows instead. Conflicting: ${JSON.stringify(a)} and ${JSON.stringify(b)}`);
+            }
+        }
+    }
     return result;
+}
+
+/** The per-store identity of a source: its exact URL plus its route. Entries sharing this identity map to the same store/folder on the same server, so they may never overlap in time (see normalizeRemoteConfig). */
+function sourceRouteIdentity(source: SourceConfig): string {
+    return `${source.url}|${JSON.stringify(source.route || FULL_ROUTE)}`;
 }
 
 export function parseRoutingData(data: Buffer): RemoteConfig {

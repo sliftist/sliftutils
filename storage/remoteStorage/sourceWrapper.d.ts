@@ -1,10 +1,10 @@
-import { IArchives, HostedConfig, BackblazeConfig, RemoteConfig } from "../IArchives";
+import { IArchives, SourceConfig, RemoteConfig } from "../IArchives";
 import { ArchivesUrl } from "./ArchivesUrl";
 export declare const RETRY_START_DELAY: number;
 export declare const RETRY_MAX_DELAY: number;
 export declare const RETRY_GROWTH = 1.5;
 export declare class SourceWrapper {
-    config: HostedConfig | BackblazeConfig;
+    config: SourceConfig;
     private background;
     api?: IArchives;
     url?: ArchivesUrl;
@@ -16,7 +16,7 @@ export declare class SourceWrapper {
     private constructor();
     /** Config updates routinely just move a source's valid window (the last window extends forever, then gets reduced when a new entry is appended). The wrapper survives that: only the window changes, keeping the connection, pings, and latency history. */
     updateValidWindow(validWindow: [number, number]): void;
-    static create(config: HostedConfig | BackblazeConfig, options?: {
+    static create(config: SourceConfig, options?: {
         background?: boolean;
         readOnly?: boolean;
     }): Promise<SourceWrapper>;

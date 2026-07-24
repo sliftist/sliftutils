@@ -1,12 +1,13 @@
 import { isNode, sort } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getSecret } from "../../misc/getSecret";
-import { IArchives, HostedConfig, BackblazeConfig, RemoteConfig } from "../IArchives";
+import { IArchives, SourceConfig, RemoteConfig } from "../IArchives";
 import { ROUTING_FILE, getBucketBaseUrl, parseHostedUrl, parseBackblazeUrl, parseRoutingData } from "./remoteConfig";
 import { ArchivesRemote } from "./ArchivesRemote";
 import { ArchivesUrl } from "./ArchivesUrl";
 import { ArchivesBackblaze } from "../backblaze";
-import { getLocalArchives, isOwnAddress } from "./storageServerState";
+import { isOwnAddress } from "./serverConfig";
+import { getLocalArchives } from "./storageServerState";
 
 export const RETRY_START_DELAY = 2 * 1000;
 export const RETRY_MAX_DELAY = 5 * 60 * 1000;
@@ -40,7 +41,7 @@ export class SourceWrapper {
     private accessCache?: { hasAccess: boolean; time: number };
 
     private constructor(
-        public config: HostedConfig | BackblazeConfig,
+        public config: SourceConfig,
         // false for short-lived probe instances, which must never leave a retry loop behind
         private background: boolean,
     ) { }
@@ -53,7 +54,7 @@ export class SourceWrapper {
         this.config.validWindow = validWindow;
     }
 
-    public static async create(config: HostedConfig | BackblazeConfig, options?: { background?: boolean; readOnly?: boolean }): Promise<SourceWrapper> {
+    public static async create(config: SourceConfig, options?: { background?: boolean; readOnly?: boolean }): Promise<SourceWrapper> {
         let wrapper = new SourceWrapper(config, options?.background !== false);
         // A public bucket serves everything we can read over plain HTTPS GETs, so there is no reason to open an API connection (which costs a WebSocket, and an access grant we likely don't have) just to read it
         if (options?.readOnly && config.public !== false) {
@@ -77,10 +78,10 @@ export class SourceWrapper {
         let parsed = parseHostedUrl(config.url);
         if (isNode() && isOwnAddress(parsed.address, parsed.port)) {
             // A bucket hosted by our own process - use it directly instead of calling ourselves
-            wrapper.api = getLocalArchives(parsed.account, parsed.bucketName);
+            wrapper.api = getLocalArchives(parsed.account, parsed.bucketName, config);
             return wrapper;
         }
-        wrapper.remote = new ArchivesRemote({ url: config.url, waitForAccess: false });
+        wrapper.remote = new ArchivesRemote({ url: config.url, waitForAccess: false, sourceConfig: config });
         wrapper.api = wrapper.remote;
         if (config.public !== false) {
             wrapper.url = new ArchivesUrl(getBucketBaseUrl(config.url));

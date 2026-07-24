@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
 export declare class ArchivesBackblaze implements IArchives {
     private config;
     constructor(config: {
@@ -39,15 +39,9 @@ export declare class ArchivesBackblaze implements IArchives {
         writeTime: number;
         size: number;
     } | undefined>;
-    find(prefix: string, config?: {
-        shallow?: boolean;
-        type: "files" | "folders";
-    }): Promise<string[]>;
+    find(prefix: string, config?: FindConfig): Promise<string[]>;
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
-    findInfo(prefix: string, config?: {
-        shallow?: boolean;
-        type: "files" | "folders";
-    }): Promise<{
+    findInfo(prefix: string, config?: FindConfig): Promise<{
         path: string;
         createTime: number;
         size: number;

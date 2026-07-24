@@ -1,8 +1,8 @@
 import { isNode, sort, watchSlowPromise } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import {
-    IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig,
-    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
+    IArchives, RemoteConfig, RemoteConfigBase, SourceConfig,
+    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
     STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream,
 } from "../IArchives";
 import {
@@ -16,7 +16,8 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { ArchivesRemote, parseStorageUrl, authenticateStorage } from "./ArchivesRemote";
 import { onServerRoutingChanged } from "./storageClientController";
 import { ArchivesBackblaze } from "../backblaze";
-import { getLocalArchives, isOwnAddress, ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+import { ServerBucketInfo, ActiveBucketInfo, getLocalArchives } from "./storageServerState";
+import { isOwnAddress } from "./serverConfig";
 import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageController";
 import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
 
@@ -27,6 +28,8 @@ const CONFIG_REFRESH_THROTTLE = 30 * 1000;
 const AVAILABILITY_RECHECK_THROTTLE = 5 * 1000;
 const PRIMARY_RETRY_TIMEOUT = 30 * 1000;
 const PRIMARY_RETRY_DELAY = 2 * 1000;
+const COVERING_RETRY_TIMEOUT = 30 * 1000;
+const COVERING_RETRY_DELAY = 5 * 1000;
 // Smart timeouts: an attempt gets this long to produce anything before we probe getInfo for the file's size (and the probe itself gets the same window)
 const SMART_TIMEOUT_PROBE = 10 * 1000;
 // Very generous assumed transfer rates - the resulting deadline exists to catch stuck sources, not slow ones
@@ -39,20 +42,22 @@ const SMART_TIMEOUT_MARKER = "ARCHIVES_SMART_TIMEOUT_c41a9d";
 type SmartTimeout = {
     path?: string;
     uploadBytes?: number;
+    // Names the operation in timeout errors - without it a deletion (a tombstone write, uploadBytes 0) reads as "Upload of 0 bytes", which looks like a bug rather than a delete
+    label?: string;
 };
 
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
 
-export function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives {
+export function createApiArchives(source: SourceConfig): IArchives {
     if (source.type === "backblaze") {
         return new ArchivesBackblaze({ bucketName: parseBackblazeUrl(source.url).bucketName, public: source.public, immutable: source.immutable, allowedOrigins: source.allowedOrigins });
     }
     let parsed = parseHostedUrl(source.url);
     if (isNode() && isOwnAddress(parsed.address, parsed.port)) {
-        return getLocalArchives(parsed.account, parsed.bucketName);
+        return getLocalArchives(parsed.account, parsed.bucketName, source);
     }
-    return new ArchivesRemote({ url: source.url, waitForAccess: false });
+    return new ArchivesRemote({ url: source.url, waitForAccess: false, sourceConfig: source });
 }
 
 type ChainState = {
@@ -65,13 +70,13 @@ export type ArchivesChainOptions = {
     directConnect?: boolean;
 };
 
-function configWindowCurrent(config: HostedConfig | BackblazeConfig): boolean {
+function configWindowCurrent(config: SourceConfig): boolean {
     let now = Date.now();
     let [start, end] = config.validWindow;
     return start <= now && now < end;
 }
 
-function configAcceptsWrites(config: HostedConfig | BackblazeConfig): boolean {
+function configAcceptsWrites(config: SourceConfig): boolean {
     return configWindowCurrent(config);
 }
 
@@ -80,24 +85,16 @@ function materializeShardKey(key: string, target: SourceWrapper): string {
     return key.replace(VARIABLE_SHARD, VARIABLE_SHARD + "_" + (start + Math.random() * (end - start)));
 }
 
-/** The fewest sources whose routes span the whole key space, or undefined when they leave a gap. */
+/** Covers the whole key space with the AUTHORITATIVE sources: for each uncovered point, the FIRST source in config order whose route contains it - the exact selection every read and write uses, so listings come from the same nodes writes went to (read-your-writes). Never "fewest" or "widest": preferring a wide read replica over the routed write shards would serve listings from a node that only has the data second-hand. Returns undefined when the candidates leave a gap. */
 function coverRoutes(candidates: SourceWrapper[]): SourceWrapper[] | undefined {
     let chosen: SourceWrapper[] = [];
     let covered = 0;
     while (covered < 1) {
-        let best: SourceWrapper | undefined;
-        let bestEnd = covered;
-        for (let source of candidates) {
-            let [start, end] = source.config.route || FULL_ROUTE;
-            if (start > covered) continue;
-            if (end > bestEnd) {
-                bestEnd = end;
-                best = source;
-            }
-        }
-        if (!best) return undefined;
-        chosen.push(best);
-        covered = bestEnd;
+        let next = candidates.find(x => routeContains(x.config.route, covered));
+        if (!next) return undefined;
+        chosen.push(next);
+        let [, end] = next.config.route || FULL_ROUTE;
+        covered = end;
     }
     return chosen;
 }
@@ -129,7 +126,7 @@ export class ArchivesChain implements IArchives {
     }
 
     public getDebugName() {
-        let urls = this.activeConfig.sources.map(x => typeof x === "string" && x || (x as HostedConfig | BackblazeConfig).url);
+        let urls = this.activeConfig.sources.map(x => typeof x === "string" && x || (x as SourceConfig).url);
         return `chain ${urls.join(", ")}`;
     }
 
@@ -279,7 +276,7 @@ export class ArchivesChain implements IArchives {
         return config.sources.map(normalizeSource).some(x => x.public);
     }
 
-    private async createChainSource(sourceConfig: HostedConfig | BackblazeConfig, readOnly: boolean): Promise<SourceWrapper> {
+    private async createChainSource(sourceConfig: SourceConfig, readOnly: boolean): Promise<SourceWrapper> {
         let source = await SourceWrapper.create(sourceConfig, { readOnly });
         source.startPinging();
         return source;
@@ -354,7 +351,7 @@ export class ArchivesChain implements IArchives {
         } else {
             console.log(`Storage routing config changed (version ${getConfigVersion(state.config)} -> ${getConfigVersion(latest)}), received ${received}, rebuilding sources. New config: ${JSON.stringify(latest)}`);
         }
-        let strippedKey = (config: HostedConfig | BackblazeConfig) => JSON.stringify({ ...config, validWindow: undefined });
+        let strippedKey = (config: SourceConfig) => JSON.stringify({ ...config, validWindow: undefined });
         let oldByConfig = new Map<string, SourceWrapper[]>();
         for (let source of state.sources) {
             let key = strippedKey(source.config);
@@ -533,7 +530,7 @@ export class ArchivesChain implements IArchives {
             let result = await Promise.race([callPromise.then(value => ({ value })), delay(allowed).then(() => undefined)]);
             if (result) return result.value;
             abandon();
-            throw new Error(`${SMART_TIMEOUT_MARKER} Upload of ${timeout.uploadBytes} bytes to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_PROBE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
+            throw new Error(`${SMART_TIMEOUT_MARKER} ${timeout.label || `Upload of ${timeout.uploadBytes} bytes`} to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_PROBE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
         }
         const path = timeout.path;
         if (path === undefined) return await callPromise;
@@ -606,14 +603,18 @@ export class ArchivesChain implements IArchives {
     public async getFast(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
         return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, fast: true, timeout: { path: fileName } }, async (archives, url) => {
             let result = await archives.get2(fileName, config);
-            return result && result.data && { data: result.data, writeTime: result.writeTime, size: result.size, url } || { url };
+            // Empty data is a tombstone, not content - see get2
+            if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+            return { data: result.data, writeTime: result.writeTime, size: result.size, url };
         });
     }
     /** Always resolves with a url - the authority that answered. A value that doesn't exist is still an answer FROM a server, so it comes back as { url } with no data (never plain undefined); errors from every source throw instead. */
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
         return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, timeout: { path: fileName } }, async (archives, url) => {
             let result = await archives.get2(fileName, config);
-            return result && result.data && { data: result.data, writeTime: result.writeTime, size: result.size, url } || { url };
+            // Empty data is a tombstone, not content (unless the caller asked for tombstones) - a ranged read of a REAL file can legitimately be empty though (range past EOF), which the total size distinguishes
+            if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+            return { data: result.data, writeTime: result.writeTime, size: result.size, url };
         });
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url: string } | undefined> {
@@ -623,46 +624,83 @@ export class ArchivesChain implements IArchives {
         });
     }
 
-    private selectCoveringSources(state: ChainState, excluded: Set<SourceWrapper>): SourceWrapper[] {
-        let candidates = state.sources.filter(x => configWindowCurrent(x.config) && x.api && !excluded.has(x));
-        // Unlike the single-source paths, dropping a cooled-down source can leave a route gap - so the cooled-down set only comes back as a whole, when the healthy sources cannot cover everything on their own
-        let chosen = coverRoutes(candidates.filter(x => !x.isOnCooldown())) || coverRoutes(candidates);
+    private selectCoveringSources(state: ChainState, config?: { fallbacks?: boolean; exclude?: Set<SourceWrapper> }): SourceWrapper[] {
+        // No cooldown preference by default: listings must come from the AUTHORITATIVE sources (the first matching, like every read and write), or they miss just-written data. With fallbacks the caller chose availability over that: known-down sources move to the back so the next source covering their routes substitutes, and sources that failed THIS call are excluded outright.
+        let candidates = state.sources.filter(x => configWindowCurrent(x.config) && x.api && !config?.exclude?.has(x));
+        if (config?.fallbacks) {
+            let usable = candidates.filter(x => !x.isOnCooldown());
+            let chosen = coverRoutes(usable) || coverRoutes(candidates);
+            if (chosen) return chosen;
+        }
+        let chosen = coverRoutes(candidates);
         if (!chosen) {
             throw new Error(`Cannot cover the full route space for ${this.getDebugName()}: the available sources leave a gap (some shards are down or URL-only)`);
         }
         return chosen;
     }
 
-    private async runOnCovering<T>(run: (archives: IArchives) => Promise<T>): Promise<T[]> {
-        let state = await this.getState();
-        let excluded = new Set<SourceWrapper>();
+    private async runOnCovering<T>(operation: string, run: (archives: IArchives) => Promise<T>, config?: { fallbacks?: boolean }): Promise<T[]> {
+        let deadline = Date.now() + COVERING_RETRY_TIMEOUT;
+        // Sources that failed during this call - with fallbacks, the next attempt covers their routes with the next source holding them instead
+        let failed = new Set<SourceWrapper>();
         while (true) {
-            let covering = this.selectCoveringSources(state, excluded);
-            let results = await Promise.all(covering.map(async source => {
-                let api = source.api;
-                if (!api) {
-                    throw new Error(`${source.config.url} has URL-only access, which cannot serve this operation`);
-                }
+            let state = await this.getState();
+            // Errors name the OPERATION and the SPECIFIC sources that failed - "the find failed because source X is unavailable", never an anonymous failure attributed to the whole chain
+            let outcome = await (async (): Promise<{ values: T[] } | { error: Error }> => {
+                let covering: SourceWrapper[];
                 try {
-                    return { value: await run(api) };
+                    covering = this.selectCoveringSources(state, { fallbacks: config?.fallbacks, exclude: failed });
                 } catch (e) {
-                    if (source.isConnected()) throw e;
-                    source.noteFailure();
-                    excluded.add(source);
-                    return undefined;
+                    return { error: new Error(`${operation} cannot run: ${(e as Error).message}`) };
                 }
-            }));
-            if (results.every(x => x)) {
-                return results.map(x => (x as { value: T }).value);
+                let values: T[] = [];
+                let failures: { source: SourceWrapper; error: Error }[] = [];
+                await Promise.all(covering.map(async source => {
+                    let api = source.api;
+                    if (!api) {
+                        failed.add(source);
+                        failures.push({ source, error: new Error(`URL-only access, which cannot serve ${operation}`) });
+                        return;
+                    }
+                    try {
+                        values.push(await run(api));
+                    } catch (e) {
+                        if (!source.isConnected()) source.noteFailure();
+                        failed.add(source);
+                        failures.push({ source, error: e as Error });
+                    }
+                }));
+                if (!failures.length) return { values };
+                let phrase = failures.length === 1 && `source ${failures[0].source.getDebugName()} is unavailable` || `${failures.length} of the ${covering.length} covering sources are unavailable`;
+                return { error: new Error(`${operation} failed because ${phrase}: ${failures.map(x => `${x.source.getDebugName()}: ${x.error.stack ?? x.error}`).join(" | ")}`) };
+            })();
+            if ("values" in outcome) return outcome.values;
+            let error = outcome.error;
+            if (Date.now() >= deadline) throw error;
+            if (config?.fallbacks && failed.size) {
+                let substitutable = false;
+                try {
+                    this.selectCoveringSources(state, { fallbacks: true, exclude: failed });
+                    substitutable = true;
+                } catch { }
+                if (substitutable) {
+                    console.error(`${error.message}. Substituting the failed sources' routes with fallback sources.`);
+                    continue;
+                }
+                // No substitute covers the failed routes - retry the failed sources themselves after the delay
+                failed.clear();
             }
+            console.error(`${error.message}. Retrying in ${COVERING_RETRY_DELAY / 1000}s (giving up at ${new Date(deadline).toISOString()}).`);
+            await delay(COVERING_RETRY_DELAY);
+            await this.recheckAvailability();
         }
     }
 
-    public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
+    public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         return (await this.findInfo(prefix, config)).map(x => x.path);
     }
-    public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        let results = await this.runOnCovering(archives => archives.findInfo(prefix, config));
+    public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
+        let results = await this.runOnCovering(`The find of ${JSON.stringify(prefix)}`, archives => archives.findInfo(prefix, config), { fallbacks: config?.fallbacks });
         let byPath = new Map<string, ArchiveFileInfo>();
         for (let list of results) {
             for (let file of list) {
@@ -677,7 +715,7 @@ export class ArchivesChain implements IArchives {
         return merged;
     }
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        let results = await this.runOnCovering(archives => archives.getChangesAfter2(config));
+        let results = await this.runOnCovering(`The changes listing since ${new Date(config.time).toISOString()}`, archives => archives.getChangesAfter2(config));
         let byPath = new Map<string, ArchiveFileInfo>();
         for (let list of results) {
             for (let file of list) {
@@ -692,7 +730,7 @@ export class ArchivesChain implements IArchives {
         return merged;
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
-        let statuses = await this.runOnCovering(async archives => {
+        let statuses = await this.runOnCovering(`The sync status check`, async archives => {
             if (!archives.getSyncStatus) {
                 throw new Error(`${archives.getDebugName()} does not support getSyncStatus`);
             }
@@ -734,7 +772,7 @@ export class ArchivesChain implements IArchives {
             await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
             return fileName;
         }
-        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: data.length } }, archives => archives.set(fileName, data, config));
+        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: data.length, label: `Upload of ${JSON.stringify(fileName)} (${data.length} bytes)` } }, archives => archives.set(fileName, data, config));
         return fileName;
     }
 
@@ -763,7 +801,7 @@ export class ArchivesChain implements IArchives {
         return ROUTING_FILE;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
-        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: 0 } }, archives => archives.del(fileName, config));
+        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: 0, label: `Deletion of ${JSON.stringify(fileName)}` } }, archives => archives.del(fileName, config));
     }
 
     // One write target per route range, lowest latency first. Within a shard the target is ALWAYS the first source in config order (see runPrimary - writes must stay on the same node): connectivity only decides which SHARD we pick, never which node within it, so a shard whose node is disconnected is dropped entirely when connectedOnly is set.
@@ -810,7 +848,7 @@ export class ArchivesChain implements IArchives {
                 let fullKey = materializeShardKey(key, target);
                 try {
                     // The shard picking already retries across shards, so a stuck shard just costs its timeout and we move on. Large data streams via setLargeFile - the key is already materialized here, so the no-VARIABLE_SHARD restriction on setLargeFile doesn't apply.
-                    await this.applySmartTimeout({ uploadBytes: data.length }, target, () => {
+                    await this.applySmartTimeout({ uploadBytes: data.length, label: `Variable-shard upload of ${JSON.stringify(fullKey)} (${data.length} bytes)` }, target, () => {
                         if (data.length > LARGE_SET_THRESHOLD) {
                             return target.write(archives => archives.setLargeFile({ path: fullKey, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) }));
                         }
@@ -958,12 +996,12 @@ async function callServer<T>(url: string, run: (controller: typeof RemoteStorage
 }
 
 export async function listServerBuckets(config: { url: string; account: string }): Promise<ServerBucketInfo[]> {
-    return await callServer(config.url, controller => controller.listBuckets(config.account));
+    return await callServer(config.url, controller => controller.listBuckets({ account: config.account }));
 }
 
 /** The live, in-memory state of one bucket on a server (routing config included), or a string saying why it is unavailable. Cheap - it never touches the server's disk - but only works while that bucket is loaded there. */
 export async function getServerActiveBucket(config: { url: string; account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
-    return await callServer(config.url, controller => controller.getActiveBucket(config.account, config.bucketName));
+    return await callServer(config.url, controller => controller.getActiveBucket({ account: config.account, bucketName: config.bucketName }));
 }
 
 /** The buckets a server currently has loaded. Admin only, so in practice this is our own machine's other process - a deploy successor asking its predecessor what is actually in use. */
@@ -973,15 +1011,16 @@ export async function listServerActiveBucketKeys(config: { url: string }): Promi
 
 /** Tells a server to load one of its buckets into memory (starting its synchronization) and returns its live state, or a string saying why it could not be loaded. Only touches that server - nothing is written and no other source is contacted. */
 export async function activateServerBucket(config: { url: string; account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
-    return await callServer(config.url, controller => controller.activateBucket(config.account, config.bucketName));
+    return await callServer(config.url, controller => controller.activateBucket({ account: config.account, bucketName: config.bucketName }));
 }
 
 /** Zeroes the write statistics listServerBuckets reports, for every bucket in the account. */
 export async function clearServerWriteStats(config: { url: string; account: string }): Promise<{ clearedBuckets: number }> {
-    return await callServer(config.url, controller => controller.clearWriteStats(config.account));
+    return await callServer(config.url, controller => controller.clearWriteStats({ account: config.account }));
 }
 
 export async function getBucketInfo(config: { url: string }): Promise<ArchivesConfig> {
-    let remote = new ArchivesRemote({ url: config.url, waitForAccess: false });
+    // getConfig is bucket-level (no store selection), so the fabricated sourceConfig never has to match anything
+    let remote = new ArchivesRemote({ url: config.url, waitForAccess: false, sourceConfig: normalizeSource(config.url) });
     return await remote.getConfig();
 }

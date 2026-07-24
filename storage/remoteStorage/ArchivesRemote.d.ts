@@ -1,9 +1,11 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SourceConfig, SetConfig } from "../IArchives";
 export type ArchivesRemoteConfig = {
     url: string;
     waitForAccess?: boolean;
+    /** The exact routing-config entry this connection represents, sent with every call so the server picks the matching per-route store (one server hosts one store per route). Instances built from a bare URL fabricate one - it will never match, which only works for calls that don't select a store (internal reads, ROUTING_FILE, getConfig). */
+    sourceConfig: SourceConfig;
 };
 export declare function parseStorageUrl(url: string): {
     address: string;
@@ -51,14 +53,8 @@ export declare class ArchivesRemote implements IArchives {
         writeTime: number;
         size: number;
     } | undefined>;
-    findInfo(prefix: string, config?: {
-        shallow?: boolean;
-        type: "files" | "folders";
-    }): Promise<ArchiveFileInfo[]>;
-    find(prefix: string, config?: {
-        shallow?: boolean;
-        type: "files" | "folders";
-    }): Promise<string[]>;
+    findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
+    find(prefix: string, config?: FindConfig): Promise<string[]>;
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getConfig(): Promise<ArchivesConfig>;
     getSyncStatus(): Promise<ArchivesSyncStatus>;

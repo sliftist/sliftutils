@@ -1,37 +1,46 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SyncActivity } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SyncActivity } from "../IArchives";
+import { ArchivesDisk } from "../ArchivesDisk";
 export declare const DEFAULT_FAST_WRITE_DELAY: number;
 export declare const WINDOW_END_FLUSH_MARGIN: number;
-export type WriteConfig = {
-    fast?: boolean;
-    writeDelay?: number;
-    lastModified?: number;
-};
 export type IBucketStore = {
-    get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
-    get2(fileName: string, config?: GetConfig): Promise<{
+    /** internal (store-to-store) reads answer purely from the local disk; see GetConfig.internal */
+    get2(config: {
+        path: string;
+        range?: {
+            start: number;
+            end: number;
+        };
+        internal?: boolean;
+        includeTombstones?: boolean;
+    }): Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
     } | undefined>;
-    getInternal2?(fileName: string, config?: GetConfig): Promise<{
+    /** internal (store-to-store) writes go to the local disk + index with no fan-out; see SetConfig.internal */
+    set(config: {
+        path: string;
         data: Buffer;
-        writeTime: number;
-        size: number;
-    } | undefined>;
-    setInternal?(fileName: string, data: Buffer, config: {
-        lastModified: number;
+        lastModified?: number;
+        forceSetImmutable?: boolean;
+        internal?: boolean;
     }): Promise<void>;
-    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
-    del(fileName: string, config?: WriteConfig): Promise<void>;
-    getInfo(fileName: string, config?: GetInfoConfig): Promise<{
+    del(config: {
+        path: string;
+        lastModified?: number;
+        internal?: boolean;
+    }): Promise<void>;
+    getInfo(config: {
+        path: string;
+        includeTombstones?: boolean;
+    }): Promise<{
         writeTime: number;
         size: number;
     } | undefined>;
-    findInfo(prefix: string, config?: {
-        shallow?: boolean;
-        type?: "files" | "folders";
+    findInfo(config: FindConfig & {
+        prefix: string;
     }): Promise<ArchiveFileInfo[]>;
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getSyncStatus?(): Promise<ArchivesSyncStatus>;
@@ -57,11 +66,78 @@ export type IBucketStore = {
             byteCount: number;
         }[];
     }>;
-    startLargeUpload(): Promise<string>;
-    appendLargeUpload(id: string, data: Buffer): Promise<void>;
-    finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
-    cancelLargeUpload(id: string): Promise<void>;
+    /** path/lastModified let the store reject an upload into an immutable bucket before any bytes move */
+    startLargeUpload(config?: {
+        path?: string;
+        lastModified?: number;
+    }): Promise<string>;
+    appendLargeUpload(config: {
+        id: string;
+        data: Buffer;
+    }): Promise<void>;
+    finishLargeUpload(config: {
+        id: string;
+        path: string;
+        lastModified?: number;
+    }): Promise<void>;
+    cancelLargeUpload(config: {
+        id: string;
+    }): Promise<void>;
 };
+/** rawDisk buckets: the disk IS the store. No index, no synchronization, no window/route/immutability validation. */
+export declare class RawDiskStore implements IBucketStore {
+    private disk;
+    constructor(disk: ArchivesDisk);
+    get2(config: {
+        path: string;
+        range?: {
+            start: number;
+            end: number;
+        };
+        internal?: boolean;
+        includeTombstones?: boolean;
+    }): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    set(config: {
+        path: string;
+        data: Buffer;
+        lastModified?: number;
+        forceSetImmutable?: boolean;
+        internal?: boolean;
+    }): Promise<void>;
+    del(config: {
+        path: string;
+        lastModified?: number;
+        internal?: boolean;
+    }): Promise<void>;
+    getInfo(config: {
+        path: string;
+        includeTombstones?: boolean;
+    }): Promise<{
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    findInfo(config: FindConfig & {
+        prefix: string;
+    }): Promise<ArchiveFileInfo[]>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
+    startLargeUpload(): Promise<string>;
+    appendLargeUpload(config: {
+        id: string;
+        data: Buffer;
+    }): Promise<void>;
+    finishLargeUpload(config: {
+        id: string;
+        path: string;
+        lastModified?: number;
+    }): Promise<void>;
+    cancelLargeUpload(config: {
+        id: string;
+    }): Promise<void>;
+}
 export type BlobSourceSpec = {
     identity: string;
     url: string;
@@ -80,47 +156,51 @@ export declare class BlobStore implements IBucketStore {
         readerDiskLimit?: number | undefined;
         onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
         resolveSourceUrl?: ((url: string) => IArchives) | undefined;
+        entries?: HostedConfig[] | undefined;
     } | undefined);
-    private stopped;
-    private index;
-    private mem;
-    private indexFileCount;
-    private indexByteCount;
-    private sourceFileCounts;
-    private sourceByteCounts;
-    private syncActivities;
-    private dirty;
-    private overlay;
-    private sourceStates;
-    private syncStarted;
-    private sourcesList;
-    private slotSourcesListIndexes;
-    private slotRegistrations;
-    private isLive;
-    private registerSlot;
-    private sourcesListIndexOfSlot;
-    private slotForSourcesListIndex;
-    private getEntryHolder;
     init: {
         (): Promise<void>;
         reset(): void;
         set(newValue: Promise<void>): void;
     };
     dispose(): Promise<void>;
-    private loadIndex;
-    private countEntry;
-    private setIndexEntry;
-    private deleteIndexEntry;
-    /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
-    updateSources(specs: BlobSourceSpec[]): void;
-    private removeSource;
-    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
-    rescanBase(): Promise<void>;
-    /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
-    boundaryScanRemote(source: IArchives, config: {
-        since: number;
-        route?: [number, number];
+    get2(config: {
+        path: string;
+        range?: {
+            start: number;
+            end: number;
+        };
+        internal?: boolean;
+        includeTombstones?: boolean;
+    }): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    set(config: {
+        path: string;
+        data: Buffer;
+        lastModified?: number;
+        forceSetImmutable?: boolean;
+        internal?: boolean;
     }): Promise<void>;
+    del(config: {
+        path: string;
+        lastModified?: number;
+        internal?: boolean;
+    }): Promise<void>;
+    getInfo(config: {
+        path: string;
+        includeTombstones?: boolean;
+    }): Promise<{
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    findInfo(config: FindConfig & {
+        prefix: string;
+    }): Promise<ArchiveFileInfo[]>;
+    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
+    getSyncStatus(): Promise<ArchivesSyncStatus>;
     /** The cheap always-current totals plus any in-progress background synchronization. */
     getSyncProgress(): {
         index: {
@@ -145,7 +225,60 @@ export declare class BlobStore implements IBucketStore {
             byteCount: number;
         }[];
     }>;
+    /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
+    updateSources(specs: BlobSourceSpec[], entries?: HostedConfig[]): void;
+    /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
+    rescanBase(): Promise<void>;
+    /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
+    boundaryScanRemote(source: IArchives, config: {
+        since: number;
+        route?: [number, number];
+    }): Promise<void>;
+    startLargeUpload(config?: {
+        path?: string;
+        lastModified?: number;
+    }): Promise<string>;
+    appendLargeUpload(config: {
+        id: string;
+        data: Buffer;
+    }): Promise<void>;
+    finishLargeUpload(config: {
+        id: string;
+        path: string;
+        lastModified?: number;
+    }): Promise<void>;
+    cancelLargeUpload(config: {
+        id: string;
+    }): Promise<void>;
+    private stopped;
+    private index;
+    private mem;
+    private indexFileCount;
+    private indexByteCount;
+    private sourceFileCounts;
+    private sourceByteCounts;
+    private syncActivities;
+    private dirty;
+    private overlay;
+    private sourceStates;
+    private syncStarted;
+    private entries;
+    private sourcesList;
+    private slotSourcesListIndexes;
+    private slotRegistrations;
+    private isLive;
+    private registerSlot;
+    private sourcesListIndexOfSlot;
+    private slotForSourcesListIndex;
+    private getEntryHolder;
+    private loadIndex;
+    private countEntry;
+    private setIndexEntry;
+    private deleteIndexEntry;
+    private removeSource;
     private flushIndex;
+    private assertMutable;
+    private assertInternalWriteAccepted;
     private runSourceSync;
     private isDeadIntermediate;
     private scanSource;
@@ -156,43 +289,15 @@ export declare class BlobStore implements IBucketStore {
     private waitForRequiredScans;
     private checkMissingKey;
     private getIndexEntry;
-    get(key: string, config?: GetConfig): Promise<Buffer | undefined>;
-    get2(key: string, config?: GetConfig): Promise<{
-        data: Buffer;
-        writeTime: number;
-        size: number;
-    } | undefined>;
     /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note fast writes still sitting in the overlay are invisible here; the caller re-finds them after our flush. */
-    getInternal2(key: string, config?: GetConfig): Promise<{
-        data: Buffer;
-        writeTime: number;
-        size: number;
-    } | undefined>;
-    /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Window/route acceptance is the caller's (writeBucketFile's) job; only-take-latest still applies here. */
-    setInternal(key: string, data: Buffer, config: {
-        lastModified: number;
-    }): Promise<void>;
+    private getInternal2;
+    /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Only-take-latest still applies here. */
+    private setInternal;
     private cacheRead;
-    set(key: string, data: Buffer, config?: WriteConfig): Promise<string>;
-    del(key: string, config?: WriteConfig): Promise<void>;
     private setOrDelete;
     private getWritableSources;
     private writeToSources;
-    getInfo(key: string, config?: GetInfoConfig): Promise<{
-        writeTime: number;
-        size: number;
-    } | undefined>;
-    findInfo(prefix: string, config?: {
-        shallow?: boolean;
-        type?: "files" | "folders";
-    }): Promise<ArchiveFileInfo[]>;
-    getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
-    getSyncStatus(): Promise<ArchivesSyncStatus>;
     private getDiskSource;
-    startLargeUpload(): Promise<string>;
-    appendLargeUpload(id: string, data: Buffer): Promise<void>;
-    finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
-    cancelLargeUpload(id: string): Promise<void>;
     private flushOverlay;
     private evicting;
     private enforceDiskLimit;

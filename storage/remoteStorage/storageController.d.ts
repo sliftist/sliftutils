@@ -1,7 +1,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig } from "../IArchives";
-import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig } from "../IArchives";
+import { ActiveBucketInfo, ServerBucketInfo } from "./storageServerState";
 import { AccessTotals, AccessSummaryState } from "./accessStats";
 import type { SummaryEntry } from "../../treeSummary";
 export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
@@ -45,58 +45,124 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         machineId: string;
         ip: string;
     }>;
-    requestAccess: (account: string) => Promise<{
+    requestAccess: (config: {
+        account: string;
+    }) => Promise<{
         machineId: string;
         ip: string;
         requestId: string;
         grantAccessCommand: string;
     }>;
-    getAccessState: (account: string) => Promise<AccessState>;
-    listRequestsForIP: (account: string, ip: string) => Promise<AccessRequest[]>;
-    grantAccess: (requestId: string) => Promise<TrustRecord>;
+    getAccessState: (config: {
+        account: string;
+    }) => Promise<AccessState>;
+    listRequestsForIP: (config: {
+        account: string;
+        ip: string;
+    }) => Promise<AccessRequest[]>;
+    grantAccess: (config: {
+        requestId: string;
+    }) => Promise<TrustRecord>;
     adminListActiveBuckets: () => Promise<{
         account: string;
         bucketName: string;
     }[]>;
-    adminListRequests: (ip: string) => Promise<AccessRequest[]>;
-    adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
-    get: (account: string, bucketName: string, path: string, range?: {
-        start: number;
-        end: number;
-    }) => Promise<Buffer | undefined>;
-    get2: (account: string, bucketName: string, path: string, range?: {
-        start: number;
-        end: number;
-    }, internal?: boolean) => Promise<{
+    adminListRequests: (config: {
+        ip: string;
+    }) => Promise<AccessRequest[]>;
+    adminGrantAccess: (config: {
+        requestId: string;
+    }) => Promise<TrustRecord>;
+    get2: (config: {
+        account: string;
+        bucketName: string;
+        path: string;
+        sourceConfig: SourceConfig;
+        range?: {
+            start: number;
+            end: number;
+        };
+        internal?: boolean;
+        includeTombstones?: boolean;
+    }) => Promise<{
         data: Buffer;
         writeTime: number;
         size: number;
     } | undefined>;
-    set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean) => Promise<void>;
-    del: (account: string, bucketName: string, path: string, lastModified?: number, internal?: boolean) => Promise<void>;
-    getInfo: (account: string, bucketName: string, path: string, includeTombstones?: boolean) => Promise<{
+    set: (config: {
+        account: string;
+        bucketName: string;
+        path: string;
+        data: Buffer;
+        sourceConfig: SourceConfig;
+        lastModified?: number;
+        forceSetImmutable?: boolean;
+        internal?: boolean;
+    }) => Promise<void>;
+    del: (config: {
+        account: string;
+        bucketName: string;
+        path: string;
+        sourceConfig: SourceConfig;
+        lastModified?: number;
+        internal?: boolean;
+    }) => Promise<void>;
+    getInfo: (config: {
+        account: string;
+        bucketName: string;
+        path: string;
+        sourceConfig: SourceConfig;
+        includeTombstones?: boolean;
+    }) => Promise<{
         writeTime: number;
         size: number;
     } | undefined>;
-    findInfo: (account: string, bucketName: string, prefix: string, config?: {
-        shallow?: boolean;
-        type?: "files" | "folders";
+    findInfo: (config: FindConfig & {
+        account: string;
+        bucketName: string;
+        prefix: string;
+        sourceConfig: SourceConfig;
     }) => Promise<ArchiveFileInfo[]>;
-    getChangesAfter2: (account: string, bucketName: string, config: ChangesAfterConfig) => Promise<ArchiveFileInfo[]>;
-    getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
-    listBuckets: (account: string) => Promise<ServerBucketInfo[]>;
-    getActiveBucket: (account: string, bucketName: string) => Promise<ActiveBucketInfo | string>;
-    activateBucket: (account: string, bucketName: string) => Promise<ActiveBucketInfo | string>;
-    clearWriteStats: (account: string) => Promise<{
+    getChangesAfter2: (config: {
+        account: string;
+        bucketName: string;
+        sourceConfig: SourceConfig;
+        time: number;
+        routes?: [number, number][];
+    }) => Promise<ArchiveFileInfo[]>;
+    getArchivesConfig: (config: {
+        account: string;
+        bucketName: string;
+    }) => Promise<ArchivesConfig>;
+    listBuckets: (config: {
+        account: string;
+    }) => Promise<ServerBucketInfo[]>;
+    getActiveBucket: (config: {
+        account: string;
+        bucketName: string;
+    }) => Promise<ActiveBucketInfo | string>;
+    activateBucket: (config: {
+        account: string;
+        bucketName: string;
+    }) => Promise<ActiveBucketInfo | string>;
+    clearWriteStats: (config: {
+        account: string;
+    }) => Promise<{
         clearedBuckets: number;
     }>;
-    getAccessStats: (account: string) => Promise<AccessTotals>;
-    getAccessSummaries: (account: string, config: {
+    getAccessStats: (config: {
+        account: string;
+    }) => Promise<AccessTotals>;
+    getAccessSummaries: (config: {
+        account: string;
         operation: string;
         maxCount: number;
         weightBySize?: boolean;
     }) => Promise<SummaryEntry<AccessSummaryState>[]>;
-    getIndexInfo: (account: string, bucketName: string) => Promise<{
+    getIndexInfo: (config: {
+        account: string;
+        bucketName: string;
+    }) => Promise<{
         fileCount: number;
         byteCount: number;
         sources: {
@@ -105,11 +171,27 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
             byteCount: number;
         }[];
     } | undefined>;
-    getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
-    startLargeFile: (account: string, bucketName: string, path: string, lastModified?: number) => Promise<string>;
-    uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
-    finishLargeFile: (uploadId: string) => Promise<void>;
-    cancelLargeFile: (uploadId: string) => Promise<void>;
+    getSyncStatus: (config: {
+        account: string;
+        bucketName: string;
+    }) => Promise<ArchivesSyncStatus>;
+    startLargeFile: (config: {
+        account: string;
+        bucketName: string;
+        path: string;
+        sourceConfig: SourceConfig;
+        lastModified?: number;
+    }) => Promise<string>;
+    uploadPart: (config: {
+        uploadId: string;
+        data: Buffer;
+    }) => Promise<void>;
+    finishLargeFile: (config: {
+        uploadId: string;
+    }) => Promise<void>;
+    cancelLargeFile: (config: {
+        uploadId: string;
+    }) => Promise<void>;
     httpEntry: (config?: {
         requireCalls?: string[];
         cacheTime?: number;

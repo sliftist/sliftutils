@@ -9,7 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified, bufferChunkStream, IMMUTABLE_CACHE_TIME } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified, bufferChunkStream, IMMUTABLE_CACHE_TIME } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 type BackblazeCreds = {
@@ -639,12 +639,12 @@ export class ArchivesBackblaze implements IArchives {
                 setTimeout(downloadPoll, 5000);
             };
             setTimeout(downloadPoll, 5000);
-            let result = await this.apiRetryLogic(`get ${fileName}`, async (api): Promise<{ data: Buffer; writeTime: number; size: number }> => {
+            let result = await this.apiRetryLogic(`get ${fileName}`, async (api): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> => {
                 let range = config?.range;
                 if (range) {
-                    // The clamp needs the file's size (and gives us its metadata for free)
-                    let fileInfo = await this.getInfo(fileName);
-                    if (!fileInfo) throw new Error(`File ${fileName} not found`);
+                    // The clamp needs the file's size (and gives us its metadata for free). The tombstone flag forwards: without it a deleted file's info is hidden, so the ranged read reports absent too.
+                    let fileInfo = await this.getInfo(fileName, { includeTombstones: config?.includeTombstones });
+                    if (!fileInfo) return undefined;
                     let rangeStart = range.start;
                     let rangeEnd = Math.min(range.end, fileInfo.size);
                     // NOTE: I think if we request nothing, it confuses Backblaze and ends up giving us the entire file.
@@ -666,9 +666,15 @@ export class ArchivesBackblaze implements IArchives {
                     fileName,
                     outResponse: response,
                 });
+                // Backblaze stores this system's deletions as REAL empty files (its hide would make them invisible to scans), so an empty download IS a tombstone - absent, unless the caller asked to see tombstones
+                if (!data.length && !config?.includeTombstones) {
+                    this.log(`backblaze file is a tombstone (deleted) ${fileName}`);
+                    return undefined;
+                }
                 let meta = parseFileMetadataHeaders(response);
                 return { data, writeTime: meta.uploadTimestamp, size: data.length };
             });
+            if (!result) return undefined;
             let timeStr = formatTime(Date.now() - time);
             let rateStr = formatNumber(result.data.length / (Date.now() - time) * 1000) + "B/s";
             this.log(`backblaze download (${formatNumber(result.data.length)}B${config?.range && `, ${formatNumber(config.range.start)} - ${formatNumber(config.range.end)}` || ""}) in ${timeStr} (${rateStr}, ${fileName})`);
@@ -713,14 +719,12 @@ export class ArchivesBackblaze implements IArchives {
         }
         if (config?.lastModified) {
             assertValidLastModified(config.lastModified);
-            if (!config.noChecks) {
-                // includeTombstones: a deletion pushed to b2 is a real size-0 file, and it must still win the older-write comparison - or an older-stamped write would resurrect the deleted file
-                let existing = await this.getInfo(fileName, { includeTombstones: true });
-                // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
-                if (existing && config.lastModified < existing.writeTime) return fileName;
-                // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
-                if (existing && config.forceSetImmutable && this.config.immutable) return fileName;
-            }
+            // This comparison deliberately IGNORES noChecks: backblaze has no server of ours to enforce only-take-the-latest (unlike hosted targets, where the receiving store re-checks), so this comparison IS the ordering guard. Skipping it lets a stale push land over a newer value or tombstone - and because b2 stamps its own upload times, the stale data then becomes the newest-timestamped copy in the whole system, resurrecting globally through everyone's scans. includeTombstones: a deletion on b2 is a real size-0 file and must win this comparison too.
+            let existing = await this.getInfo(fileName, { includeTombstones: true });
+            // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
+            if (existing && config.lastModified < existing.writeTime) return fileName;
+            // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
+            if (existing && config.forceSetImmutable && this.config.immutable) return fileName;
         }
         // Big buffers stream through the large-file API: a failed part retries alone instead of restarting the whole upload. The threshold MUST stay at two full chunks - below that setLargeFile falls back to plain set, which would recurse right back here.
         if (data.length >= LARGE_FILE_MIN_CHUNK_SIZE * 2) {
@@ -750,10 +754,9 @@ export class ArchivesBackblaze implements IArchives {
     public async del(fileName: string, config?: DelConfig): Promise<void> {
         if (config?.lastModified) {
             // A synchronized deletion: b2's hide removes the file from listings entirely, so peers scanning the bucket could never learn of it. Instead the tombstone is stored as a REAL empty file (an empty file IS a missing file), which listings show and scans ingest as a deletion. (b2 stamps its own upload time, so the exact deletion time is not preserved here - same as every b2 write.)
-            if (!config.noChecks) {
-                let existing = await this.getInfo(fileName, { includeTombstones: true });
-                if (existing && config.lastModified < existing.writeTime) return;
-            }
+            // The comparison ignores noChecks for the same reason as in set: on b2 it IS the ordering guard
+            let existing = await this.getInfo(fileName, { includeTombstones: true });
+            if (existing && config.lastModified < existing.writeTime) return;
             this.log(`backblaze tombstone upload ${fileName}`);
             await this.apiRetryLogic(`del ${fileName}`, async (api) => {
                 await api.uploadFile({ bucketId: this.bucketId, fileName, data: Buffer.alloc(0) });
@@ -929,7 +932,7 @@ export class ArchivesBackblaze implements IArchives {
     }
 
     // For example findFileNames("ips/")
-    public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
+    public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         let result = await this.findInfo(prefix, config);
         return result.map(x => x.path);
     }
@@ -938,7 +941,7 @@ export class ArchivesBackblaze implements IArchives {
         return filterChanges(await this.findInfo(""), config);
     }
 
-    public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<{ path: string; createTime: number; size: number; }[]> {
+    public async findInfo(prefix: string, config?: FindConfig): Promise<{ path: string; createTime: number; size: number; }[]> {
         return await this.apiRetryLogic(`findInfo ${prefix}`, async (api) => {
             if (!config?.shallow && config?.type === "folders") {
                 let allFiles = await this.findInfo(prefix);

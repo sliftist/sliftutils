@@ -1,5 +1,5 @@
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, GetInfoConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig } from "../IArchives";
 import { buildFileUrl } from "./remoteConfig";
 
 // Read-only IArchives over a public bucket's plain-URL form (our storage server's
@@ -50,16 +50,18 @@ export class ArchivesUrl implements IArchives {
         }
         let lastModified = response.headers["last-modified"];
         let writeTime = lastModified && new Date(lastModified).getTime() || 0;
+        // A size-0 answer is a tombstone (backblaze friendly URLs serve deletions as real empty files; our own servers 404 them) - absent, unless the caller asked for tombstones. Ranged reads of a REAL file can legitimately return no bytes (range past EOF), which the total size distinguishes.
+        if (!size && !config?.includeTombstones) return undefined;
         return { data, writeTime, size };
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
         // A 1-byte ranged read: Content-Range carries the full size and Last-Modified the write time, so metadata never downloads the file
         let result: { writeTime: number; size: number } | undefined;
         try {
-            result = await this.get2(fileName, { range: { start: 0, end: 1 } });
+            result = await this.get2(fileName, { range: { start: 0, end: 1 }, includeTombstones: config?.includeTombstones });
         } catch {
             // Some servers reject ranged reads of empty files (416 instead of an empty 206); a full read is the fallback, and for an empty file it is free anyway
-            result = await this.get2(fileName);
+            result = await this.get2(fileName, { includeTombstones: config?.includeTombstones });
         }
         if (!result) return undefined;
         if (!result.size && !config?.includeTombstones) return undefined;
@@ -75,10 +77,10 @@ export class ArchivesUrl implements IArchives {
     public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         throw this.readOnlyError("setLargeFile");
     }
-    public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
+    public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         throw this.readOnlyError("find (listing)");
     }
-    public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
+    public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
         throw this.readOnlyError("findInfo (listing)");
     }
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {

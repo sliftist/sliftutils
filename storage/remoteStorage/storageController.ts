@@ -6,16 +6,20 @@ import { performLocalCall } from "socket-function/src/callManager";
 import { RequireController } from "socket-function/require/RequireController";
 import { timeInMinute } from "socket-function/src/misc";
 import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
-import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, IMMUTABLE_CACHE_TIME } from "../IArchives";
-import { ROUTING_FILE } from "./remoteConfig";
+import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig, IMMUTABLE_CACHE_TIME } from "../IArchives";
+import { ROUTING_FILE, getRoute, routeContains } from "./remoteConfig";
 import {
-    getStorageServerConfig, getTrust, getRequests, getLoadedBucket, writeBucketFile,
-    deleteBucketFile, assertWritesAllowed, assertMutable, LoadedBucket,
-    getBucketConfig, listAccountBuckets, ServerBucketInfo, clearAccountWriteStats,
-    getActiveBucket, activateBucket, ActiveBucketInfo, getActiveBucketKeys,
+    getLoadedBucket, requireBucket, findBucketStore, readBucketInternal, queueRoutingConfigWrite,
+    getBucketConfig, bucketSyncStatus, bucketIndexTotals, LoadedStore, ActiveBucketInfo,
+    listAccountBuckets, ServerBucketInfo, clearAccountWriteStats,
+    getActiveBucket, activateBucket, getActiveBucketKeys,
 } from "./storageServerState";
+import { getStorageServerConfig, getTrust, getRequests, assertWritesAllowed } from "./serverConfig";
+import { IBucketStore } from "./blobStore";
+import { getRoutingFileResult } from "./bucketDisk";
 import { StorageClientController } from "./storageClientController";
-import { trackAccess, getAccessTotals, readAccessSummaries, clearAccountAccessStats, AccessTotals, AccessSummaryState } from "./accessStats";
+import { trackAccess, trackAccessCall, getAccessTotals, readAccessSummaries, clearAccountAccessStats, AccessTotals, AccessSummaryState } from "./accessStats";
+import { assertValidName, assertValidPath, assertValidArgs } from "./validation";
 import type { SummaryEntry } from "../../treeSummary";
 
 export const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
@@ -68,23 +72,6 @@ const CONTENT_TYPES: { [ext: string]: string } = {
     webp: "image/webp", mp4: "video/mp4", webm: "video/webm",
     mp3: "audio/mpeg", wav: "audio/wav", pdf: "application/pdf",
 };
-
-function assertValidName(value: string, kind: string) {
-    if (!/^[\w-]{1,64}$/.test(value)) {
-        throw new Error(`Invalid ${kind} ${JSON.stringify(value)}, expected 1-64 characters of letters/numbers/underscore/dash`);
-    }
-}
-function assertValidPath(path: string) {
-    if (Buffer.from(path, "utf8").length > 1000) {
-        throw new Error(`Path too long: ${path.length} characters > 1000. Path: ${path.slice(0, 200)}`);
-    }
-    if (!path || path.startsWith("/") || path.endsWith("/") || path.includes("//") || path.includes("\\") || path.includes("\x00")) {
-        throw new Error(`Invalid path ${JSON.stringify(path.slice(0, 200))}, paths cannot be empty, start or end with /, or contain //, backslashes, or null characters`);
-    }
-    if (path.split("/").some(part => part === "." || part === "..")) {
-        throw new Error(`Invalid path ${JSON.stringify(path.slice(0, 200))}, paths cannot contain . or .. segments`);
-    }
-}
 
 const connectedClients = new Set<string>();
 function trackCaller(): void {
@@ -142,12 +129,6 @@ function getGrantAccessCommand(requestId: string): string {
     return `ssh ${sshTarget} '${serverCommand} --requestId ${requestId}'`;
 }
 
-async function getBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined> {
-    assertValidName(account, "account");
-    assertValidName(bucketName, "bucket name");
-    return await getLoadedBucket(account, bucketName);
-}
-
 class RemoteStorageControllerBase {
     async ping(): Promise<{}> {
         trackCaller();
@@ -182,8 +163,9 @@ class RemoteStorageControllerBase {
         return { machineId, ip: getCallerIP() };
     }
 
-    async requestAccess(account: string): Promise<{ machineId: string; ip: string; requestId: string; grantAccessCommand: string }> {
-        assertValidName(account, "account");
+    @assertValidArgs
+    async requestAccess(config: { account: string }): Promise<{ machineId: string; ip: string; requestId: string; grantAccessCommand: string }> {
+        let account = config.account;
         let machineId = getCallerMachineId();
         let ip = getCallerIP();
         let requestsStorage = await getRequests();
@@ -206,8 +188,9 @@ class RemoteStorageControllerBase {
         return { machineId, ip, requestId: existing.requestId, grantAccessCommand: getGrantAccessCommand(existing.requestId) };
     }
 
-    async getAccessState(account: string): Promise<AccessState> {
-        assertValidName(account, "account");
+    @assertValidArgs
+    async getAccessState(config: { account: string }): Promise<AccessState> {
+        let account = config.account;
         let machineId = getCallerMachineId();
         let ip = getCallerIP();
         let trust = await getTrust();
@@ -232,12 +215,13 @@ class RemoteStorageControllerBase {
         return result;
     }
 
-    async listRequestsForIP(account: string, ip: string): Promise<AccessRequest[]> {
+    async listRequestsForIP(config: { account: string; ip: string }): Promise<AccessRequest[]> {
         let requests = await getRequests();
-        return (await requests.get(ip) || []).filter(x => x.account === account);
+        return (await requests.get(config.ip) || []).filter(x => x.account === config.account);
     }
 
-    async grantAccess(requestId: string): Promise<TrustRecord> {
+    async grantAccess(config: { requestId: string }): Promise<TrustRecord> {
+        let requestId = config.requestId;
         let callerMachineId = getCallerMachineId();
         let trust = await getTrust();
         let requests = await getRequests();
@@ -264,11 +248,12 @@ class RemoteStorageControllerBase {
     async adminListActiveBuckets(): Promise<{ account: string; bucketName: string }[]> {
         return getActiveBucketKeys();
     }
-    async adminListRequests(ip: string): Promise<AccessRequest[]> {
+    async adminListRequests(config: { ip: string }): Promise<AccessRequest[]> {
         let requests = await getRequests();
-        return await requests.get(ip) || [];
+        return await requests.get(config.ip) || [];
     }
-    async adminGrantAccess(requestId: string): Promise<TrustRecord> {
+    async adminGrantAccess(config: { requestId: string }): Promise<TrustRecord> {
+        let requestId = config.requestId;
         let trust = await getTrust();
         let requests = await getRequests();
         for (let ip of await requests.getKeys()) {
@@ -287,159 +272,139 @@ class RemoteStorageControllerBase {
         throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
-    async get(account: string, bucketName: string, path: string, range?: { start: number; end: number }): Promise<Buffer | undefined> {
-        let result = await this.get2(account, bucketName, path, range);
-        return result && result.data || undefined;
-    }
-    async get2(account: string, bucketName: string, path: string, range?: { start: number; end: number }, internal?: boolean): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        assertValidPath(path);
-        let bucket = await getBucket(account, bucketName);
-        let result: { data: Buffer; writeTime: number; size: number } | undefined;
-        if (bucket) {
-            if (internal && bucket.store.getInternal2) {
-                result = await bucket.store.getInternal2(path, { range });
-            } else {
-                result = await bucket.store.get2(path, { range });
-            }
+    @assertValidArgs
+    @trackAccessCall("get")
+    async get2(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+        if (config.path === ROUTING_FILE) {
+            // The routing file lives outside every store and even outside the bucket (it is what CREATES it), so it is read straight off the disk - absent means undefined, exactly like any file read
+            return await getRoutingFileResult(config.account, config.bucketName);
         }
-        trackAccess({ account, operation: "get", path: `${bucketName}/${path}`, size: result && result.data.length || 0 });
-        return result;
-    }
-    async set(account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean): Promise<void> {
-        assertValidName(bucketName, "bucket name");
-        assertValidPath(path);
-        if (!data.length) {
-            throw new Error(`set was called with an empty buffer for ${JSON.stringify(path)} in bucket ${account}/${bucketName}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+        if (config.internal) {
+            return await readBucketInternal(config.account, config.bucketName, config);
         }
-        trackAccess({ account, operation: "set", path: `${bucketName}/${path}`, size: data.length });
-        await writeBucketFile(account, bucketName, path, Buffer.from(data), { lastModified, forceSetImmutable, internal });
+        return await withStore(config, store => store.get2(config));
     }
-    async del(account: string, bucketName: string, path: string, lastModified?: number, internal?: boolean): Promise<void> {
-        assertValidName(bucketName, "bucket name");
-        assertValidPath(path);
-        trackAccess({ account, operation: "del", path: `${bucketName}/${path}` });
-        await deleteBucketFile(account, bucketName, path, { lastModified, internal });
-    }
-    async getInfo(account: string, bucketName: string, path: string, includeTombstones?: boolean): Promise<{ writeTime: number; size: number } | undefined> {
-        assertValidPath(path);
-        trackAccess({ account, operation: "getInfo", path: `${bucketName}/${path}` });
-        let bucket = await getBucket(account, bucketName);
-        if (!bucket) return undefined;
-        return await bucket.store.getInfo(path, { includeTombstones });
-    }
-    async findInfo(account: string, bucketName: string, prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        let bucket = await getBucket(account, bucketName);
-        let results = bucket && await bucket.store.findInfo(prefix, config) || [];
-        // The paths are only known once the results are in; an empty result still counts as one access at the prefix.
-        if (results.length) {
-            for (let info of results) {
-                trackAccess({ account, operation: "findInfo", path: `${bucketName}/${info.path}` });
-            }
-        } else {
-            trackAccess({ account, operation: "findInfo", path: `${bucketName}/${prefix}` });
+    @assertValidArgs
+    @trackAccessCall("set")
+    async set(config: { account: string; bucketName: string; path: string; data: Buffer; sourceConfig: SourceConfig; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void> {
+        assertWritesAllowed();
+        // Copied because the wire hands us a plain Uint8Array view, not a real Buffer
+        let data = Buffer.from(config.data);
+        if (config.path === ROUTING_FILE) {
+            return await queueRoutingConfigWrite(config.account, config.bucketName, data, config);
         }
-        return results;
+        await withStore(config, store => store.set({ ...config, data }));
     }
-    async getChangesAfter2(account: string, bucketName: string, config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        let bucket = await getBucket(account, bucketName);
-        if (!bucket) return [];
-        let results = await bucket.store.getChangesAfter2(config);
-        for (let info of results) {
-            trackAccess({ account, operation: "getChangesAfter", path: `${bucketName}/${info.path}` });
+    @assertValidArgs
+    @trackAccessCall("del")
+    async del(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; lastModified?: number; internal?: boolean }): Promise<void> {
+        assertWritesAllowed();
+        await withStore(config, store => store.del(config));
+    }
+    @assertValidArgs
+    @trackAccessCall("getInfo")
+    async getInfo(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; includeTombstones?: boolean }): Promise<{ writeTime: number; size: number } | undefined> {
+        if (config.path === ROUTING_FILE) {
+            let result = await getRoutingFileResult(config.account, config.bucketName);
+            return result && { writeTime: result.writeTime, size: result.size } || undefined;
         }
-        return results;
+        return await withStore(config, store => store.getInfo(config));
     }
-    async getArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig> {
-        let bucket = await getBucket(account, bucketName);
-        if (!bucket) return { supportsChangesAfter: true };
-        return getBucketConfig(bucket);
+    @assertValidArgs
+    @trackAccessCall("findInfo")
+    async findInfo(config: FindConfig & { account: string; bucketName: string; prefix: string; sourceConfig: SourceConfig }): Promise<ArchiveFileInfo[]> {
+        return await withStore(config, store => store.findInfo(config));
     }
-    async listBuckets(account: string): Promise<ServerBucketInfo[]> {
+    @assertValidArgs
+    @trackAccessCall("getChangesAfter")
+    async getChangesAfter2(config: { account: string; bucketName: string; sourceConfig: SourceConfig; time: number; routes?: [number, number][] }): Promise<ArchiveFileInfo[]> {
+        return await withStore(config, store => store.getChangesAfter2(config));
+    }
+    @assertValidArgs
+    async getArchivesConfig(config: { account: string; bucketName: string }): Promise<ArchivesConfig> {
+        return getBucketConfig(await requireBucket(config.account, config.bucketName));
+    }
+    @assertValidArgs
+    async listBuckets(config: { account: string }): Promise<ServerBucketInfo[]> {
         let start = Date.now();
         try {
-            return await listAccountBuckets(account);
+            return await listAccountBuckets(config.account);
         } finally {
             // The access hook (and the storage it initializes) runs before this, so a large gap between this and the caller's timing is the hook
-            console.log(`listBuckets(${account}) call body took ${Date.now() - start}ms`);
+            console.log(`listBuckets(${config.account}) call body took ${Date.now() - start}ms`);
         }
     }
     /** The live, in-memory state of one bucket, or a string saying why it is unavailable. Answered without touching the disk, so it is cheap - but only works while the bucket is loaded here. */
-    async getActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
-        assertValidName(bucketName, "bucket name");
-        return await getActiveBucket(account, bucketName);
+    @assertValidArgs
+    async getActiveBucket(config: { account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
+        return await getActiveBucket(config.account, config.bucketName);
     }
     /** Loads a bucket that exists on this server into memory (starting its synchronization) and returns its live state, or a string saying why it could not be loaded. */
-    async activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
-        assertValidName(bucketName, "bucket name");
-        return await activateBucket(account, bucketName);
+    @assertValidArgs
+    async activateBucket(config: { account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
+        return await activateBucket(config.account, config.bucketName);
     }
     /** Zeroes the write statistics listBuckets reports and the in-memory access statistics, for every bucket in the account. */
-    async clearWriteStats(account: string): Promise<{ clearedBuckets: number }> {
-        assertValidName(account, "account");
-        clearAccountAccessStats(account);
-        return { clearedBuckets: clearAccountWriteStats(account) };
+    @assertValidArgs
+    async clearWriteStats(config: { account: string }): Promise<{ clearedBuckets: number }> {
+        clearAccountAccessStats(config.account);
+        return { clearedBuckets: clearAccountWriteStats(config.account) };
     }
     /** In-memory totals per operation type since startup (or the last clearWriteStats). */
-    async getAccessStats(account: string): Promise<AccessTotals> {
-        assertValidName(account, "account");
-        return getAccessTotals(account);
+    @assertValidArgs
+    async getAccessStats(config: { account: string }): Promise<AccessTotals> {
+        return getAccessTotals(config.account);
     }
     /** A path breakdown of one operation's accesses (operation names come from getAccessStats). maxCount is passed straight to TreeSummary.getSummaries. weightBySize is ignored for count-only operations, which return their count breakdown. */
-    async getAccessSummaries(account: string, config: { operation: string; maxCount: number; weightBySize?: boolean }): Promise<SummaryEntry<AccessSummaryState>[]> {
-        assertValidName(account, "account");
-        return readAccessSummaries({ account, ...config });
+    @assertValidArgs
+    async getAccessSummaries(config: { account: string; operation: string; maxCount: number; weightBySize?: boolean }): Promise<SummaryEntry<AccessSummaryState>[]> {
+        return readAccessSummaries(config);
     }
-    async getIndexInfo(account: string, bucketName: string): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] } | undefined> {
-        let bucket = await getBucket(account, bucketName);
-        if (!bucket || !bucket.store.computeIndexTotals) return undefined;
-        return await bucket.store.computeIndexTotals();
+    @assertValidArgs
+    async getIndexInfo(config: { account: string; bucketName: string }): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] } | undefined> {
+        return await bucketIndexTotals(await requireBucket(config.account, config.bucketName));
     }
-    async getSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus> {
-        let bucket = await getBucket(account, bucketName);
-        if (!bucket) return { allScansComplete: true, indexSize: 0, sources: [] };
-        if (!bucket.store.getSyncStatus) {
-            throw new Error(`Bucket ${account}/${bucketName} does not support getSyncStatus (rawDisk buckets have no synchronization)`);
-        }
-        return await bucket.store.getSyncStatus();
+    @assertValidArgs
+    async getSyncStatus(config: { account: string; bucketName: string }): Promise<ArchivesSyncStatus> {
+        return await bucketSyncStatus(await requireBucket(config.account, config.bucketName));
     }
 
-    async startLargeFile(account: string, bucketName: string, path: string, lastModified?: number): Promise<string> {
+    @assertValidArgs
+    async startLargeFile(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; lastModified?: number }): Promise<string> {
         assertWritesAllowed();
-        assertValidPath(path);
-        let bucket = await getBucket(account, bucketName);
-        if (!bucket) {
-            throw new Error(`Bucket ${account}/${bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
-        }
-        await assertMutable(bucket, path, lastModified || Date.now());
-        let id = await bucket.store.startLargeUpload();
-        largeUploadInfo.set(id, { account, bucketName, path, lastModified });
+        let target = await findBucketStore(config.account, config.bucketName, config.sourceConfig);
+        let id = await target.store.startLargeUpload({ path: config.path, lastModified: config.lastModified });
+        // routeKey pins the upload's parts and finish to the same store the start picked (in-flight uploads survive a bucket rebuild: the part data lives in the store's folder, which a rebuilt store still sees)
+        largeUploadInfo.set(id, { account: config.account, bucketName: config.bucketName, path: config.path, lastModified: config.lastModified, routeKey: target.routeKey });
         return id;
     }
-    async uploadPart(uploadId: string, data: Buffer): Promise<void> {
+    async uploadPart(config: { uploadId: string; data: Buffer }): Promise<void> {
         assertWritesAllowed();
-        let info = largeUploadInfo.get(uploadId);
-        if (!info) throw new Error(`Unknown large upload ${uploadId}`);
-        trackAccess({ account: info.account, operation: "uploadPart", path: `${info.bucketName}/${info.path}`, size: data.length });
-        let bucket = await getBucket(info.account, info.bucketName);
-        if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
-        await bucket.store.appendLargeUpload(uploadId, Buffer.from(data));
+        let info = largeUploadInfo.get(config.uploadId);
+        if (!info) throw new Error(`Unknown large upload ${config.uploadId}`);
+        trackAccess({ account: info.account, operation: "uploadPart", path: `${info.bucketName}/${info.path}`, size: config.data.length });
+        let target = await findUploadStore(info);
+        await target.store.appendLargeUpload({ id: config.uploadId, data: Buffer.from(config.data) });
     }
-    async finishLargeFile(uploadId: string): Promise<void> {
+    async finishLargeFile(config: { uploadId: string }): Promise<void> {
         assertWritesAllowed();
-        let info = largeUploadInfo.get(uploadId);
-        if (!info) throw new Error(`Unknown large upload ${uploadId}`);
-        largeUploadInfo.delete(uploadId);
-        let bucket = await getBucket(info.account, info.bucketName);
-        if (!bucket) throw new Error(`Bucket ${info.account}/${info.bucketName} no longer exists`);
-        await bucket.store.finishLargeUpload(uploadId, info.path, info.lastModified);
+        let info = largeUploadInfo.get(config.uploadId);
+        if (!info) throw new Error(`Unknown large upload ${config.uploadId}`);
+        largeUploadInfo.delete(config.uploadId);
+        let target = await findUploadStore(info);
+        await target.store.finishLargeUpload({ id: config.uploadId, path: info.path, lastModified: info.lastModified });
     }
-    async cancelLargeFile(uploadId: string): Promise<void> {
-        let info = largeUploadInfo.get(uploadId);
+    /** Best-effort cleanup: an upload whose bucket or store has since vanished has nothing left to cancel. */
+    async cancelLargeFile(config: { uploadId: string }): Promise<void> {
+        let info = largeUploadInfo.get(config.uploadId);
         if (!info) return;
-        largeUploadInfo.delete(uploadId);
-        let bucket = await getBucket(info.account, info.bucketName);
+        largeUploadInfo.delete(config.uploadId);
+        let bucket = await getLoadedBucket(info.account, info.bucketName);
         if (!bucket) return;
-        await bucket.store.cancelLargeUpload(uploadId);
+        const routeKey = info.routeKey;
+        let target = bucket.stores.find(x => x.routeKey === routeKey);
+        if (!target) return;
+        await target.store.cancelLargeUpload({ id: config.uploadId });
     }
 
     // IMPORTANT: We can never expose enumeration (listing, prefix search, changes feeds) over this public HTTP endpoint - only exact-key reads. Enumeration would be a massive security risk (public buckets rely on unguessable keys staying unguessable), and could also crash the client by sending them too much data. Listings exist only on the authenticated API (findInfo etc, behind accountAccess).
@@ -472,7 +437,16 @@ class RemoteStorageControllerBase {
         if (!bucket.self?.public) {
             throw new Error(`Bucket ${account}/${bucketName} is not public, so its files cannot be read over plain URLs`);
         }
-        let info = await bucket.store.getInfo(filePath);
+        // Anonymous URL reads carry no source selection - the file's route picks the store, and a route no store here covers is simply not found (the routing file itself lives outside every store)
+        let httpStore: LoadedStore | undefined;
+        let info: { writeTime: number; size: number } | undefined;
+        if (filePath !== ROUTING_FILE) {
+            let route = getRoute(filePath);
+            httpStore = bucket.stores.find(s => routeContains(s.route, route));
+            info = httpStore && await httpStore.store.getInfo({ path: filePath }) || undefined;
+        } else {
+            info = await getRoutingFileResult(account, bucketName);
+        }
         if (!info || !info.size) {
             trackAccess({ account, operation: "httpGet", path: `${bucketName}/${filePath}`, size: 0 });
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
@@ -514,7 +488,15 @@ class RemoteStorageControllerBase {
                 range = { start, end: endInclusive + 1 };
             }
         }
-        let result = await bucket.store.get2(filePath, { range });
+        let result: { data: Buffer; writeTime: number; size: number } | undefined;
+        if (httpStore) {
+            result = await httpStore.store.get2({ path: filePath, range });
+        } else {
+            result = await getRoutingFileResult(account, bucketName);
+            if (result && range) {
+                result = { ...result, data: result.data.subarray(Math.min(range.start, result.data.length), Math.min(range.end, result.data.length)) };
+            }
+        }
         trackAccess({ account, operation: "httpGet", path: `${bucketName}/${filePath}`, size: result && result.data.length || 0 });
         if (!result) {
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
@@ -526,18 +508,35 @@ class RemoteStorageControllerBase {
     }
 }
 
-const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string; lastModified?: number }>();
+/** The one resolution every data call does: the client's selected sourceConfig maps to exactly one store (loading the bucket - and so instantiating its stores - if needed), and fn runs on it. findBucketStore throws for missing buckets and unmatched configs. */
+async function withStore<T>(config: { account: string; bucketName: string; sourceConfig: SourceConfig }, fn: (store: IBucketStore) => Promise<T>): Promise<T> {
+    let target = await findBucketStore(config.account, config.bucketName, config.sourceConfig);
+    return await fn(target.store);
+}
+
+const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string; lastModified?: number; routeKey: string }>();
+
+async function findUploadStore(info: { account: string; bucketName: string; routeKey: string }): Promise<LoadedStore> {
+    let bucket = await requireBucket(info.account, info.bucketName);
+    let target = bucket.stores.find(x => x.routeKey === info.routeKey);
+    if (!target) {
+        throw new Error(`The store (route ${info.routeKey}) this upload targets no longer exists on bucket ${info.account}/${info.bucketName} (available: ${JSON.stringify(bucket.stores.map(x => x.routeKey))})`);
+    }
+    return target;
+}
 
 const accountAccess: SocketFunctionHook = async (context) => {
     let start = Date.now();
-    await requireAccess(String(context.call.args[0]));
+    let config = context.call.args[0] as { account?: string } | undefined;
+    await requireAccess(String(config?.account));
     let duration = Date.now() - start;
     if (duration > ACCESS_CHECK_SLOW_TIME) {
         console.log(`Access check for ${context.call.functionName} took ${duration}ms`);
     }
 };
 const uploadAccess: SocketFunctionHook = async (context) => {
-    let info = largeUploadInfo.get(String(context.call.args[0]));
+    let config = context.call.args[0] as { uploadId?: string } | undefined;
+    let info = largeUploadInfo.get(String(config?.uploadId));
     if (!info) return;
     await requireAccess(info.account);
 };
@@ -558,7 +557,6 @@ export const RemoteStorageController = SocketFunction.register(
         adminListRequests: { hooks: [adminAccess] },
         adminListActiveBuckets: { hooks: [adminAccess] },
         adminGrantAccess: { hooks: [adminAccess] },
-        get: { hooks: [accountAccess] },
         get2: { hooks: [accountAccess] },
         set: { hooks: [accountAccess] },
         del: { hooks: [accountAccess] },

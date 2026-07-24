@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
 export declare class ArchivesDisk implements IArchives {
     private folder;
     constructor(folder: string);
@@ -31,14 +31,8 @@ export declare class ArchivesDisk implements IArchives {
         writeTime: number;
         size: number;
     } | undefined>;
-    find(prefix: string, config?: {
-        shallow?: boolean;
-        type: "files" | "folders";
-    }): Promise<string[]>;
-    findInfo(prefix: string, config?: {
-        shallow?: boolean;
-        type?: "files" | "folders";
-    }): Promise<ArchiveFileInfo[]>;
+    find(prefix: string, config?: FindConfig): Promise<string[]>;
+    findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
     private collectFiles;
     setLargeFile(config: {
         path: string;
@@ -51,7 +45,4 @@ export declare class ArchivesDisk implements IArchives {
     cancelLargeUpload(id: string): Promise<void>;
     getURL(path: string): Promise<string>;
 }
-export declare function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: {
-    shallow?: boolean;
-    type?: "files" | "folders";
-}): ArchiveFileInfo[];
+export declare function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: FindConfig): ArchiveFileInfo[];

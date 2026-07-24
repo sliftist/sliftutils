@@ -4,17 +4,18 @@ import { runInfinitePoll, delay } from "socket-function/src/batching";
 import { timeInMinute, sort, promiseObj } from "socket-function/src/misc";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import {
-    IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, assertValidLastModified,
-    windowAcceptsWrites, SyncActivity, FULL_ROUTE, copyArchiveFile,
+    IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, assertValidLastModified,
+    windowAcceptsWrites, SyncActivity, FULL_ROUTE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, copyArchiveFile,
 } from "../IArchives";
 import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
 import { ArchivesBackblaze } from "../backblaze";
 import { ROUTING_FILE, getRoute, routeContains } from "./remoteConfig";
+import { selectEntryAt } from "./storePlan";
 import { BulkDatabaseBase, noopReactiveDeps } from "../BulkDatabase2/BulkDatabaseBase";
 import { wrapHandle, NodeJSDirectoryHandleWrapper, DirectoryWrapper } from "../FileFolderAPI";
 import { SourcesList } from "./sourcesList";
 
-// The storage engine of the remote storage server. Data lives in synchronization sources (at minimum an ArchivesDisk, the local disk); BlobStore keeps an index of every file (path, last modified time, size, and which source currently holds the data) in a BulkDatabase2, and synchronizes the index from all sources (see ArchivesSource in IArchives.ts). Every startup fully rescans each source's metadata, so the index self-heals; the file with the highest write time wins across all sources, so multiple sources need no stacking order.
+// The storage engine of the remote storage server. Data lives in synchronization sources (at minimum an ArchivesDisk, the local disk); BlobStore keeps an index of every file (path, last modified time, size, and which source currently holds the data) in a BulkDatabase2, and synchronizes the index from all sources (see ArchivesSource in IArchives.ts). Every startup fully rescans each source's metadata, so the index self-heals; the file with the highest write time wins across all sources, so multiple sources need no stacking order. The store also holds its own routing entries (the self entries of the ONE route it serves), so it validates writes itself: valid windows, routes, immutability, and internal-push acceptance.
 
 export const DEFAULT_FAST_WRITE_DELAY = timeInMinute * 5;
 const FAST_FLUSH_POLL = 1000 * 15;
@@ -45,26 +46,17 @@ const FULL_SYNC_SLOW_ERROR_INTERVAL = 1000 * 60 * 60;
 // A reconcile pass skips failing files (one bad value must not stop the rest), but this many failures in a row means the target itself is down, so the pass aborts until the next scan cycle
 const RECONCILE_MAX_CONSECUTIVE_FAILURES = 5;
 const RECONCILE_ERROR_LOG_LIMIT = 3;
+const WRONG_TARGET_LOG_THROTTLE = 60 * 1000;
 
-export type WriteConfig = {
-    // Resolve once the write is in memory; flush to the sources after writeDelay, coalescing writes to the same key (only the latest is written). Data is lost if the process crashes first.
-    fast?: boolean;
-    writeDelay?: number;
-    // Stamps the write with this last-write time instead of now. Older than the current file's time no-ops; more than 15 minutes in the future throws. See IArchives.set.
-    lastModified?: number;
-};
-
-// What the storage server needs from a bucket's store. BlobStore implements it fully; ArchivesDisk also satisfies it (used directly for rawDisk buckets), minus the optional index-backed methods.
+// What the storage server needs from a bucket's store. BlobStore implements it fully (with validation from its routing entries); RawDiskStore adapts an ArchivesDisk for rawDisk buckets (no index, no sync, no validation - raw means raw).
 export type IBucketStore = {
-    get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
-    get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
-    // Internal (store-to-store) forms; see GetConfig.internal / SetConfig.internal. Absent on rawDisk stores, where the normal forms already ARE the disk.
-    getInternal2?(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
-    setInternal?(fileName: string, data: Buffer, config: { lastModified: number }): Promise<void>;
-    set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
-    del(fileName: string, config?: WriteConfig): Promise<void>;
-    getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined>;
-    findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]>;
+    /** internal (store-to-store) reads answer purely from the local disk; see GetConfig.internal */
+    get2(config: { path: string; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined>;
+    /** internal (store-to-store) writes go to the local disk + index with no fan-out; see SetConfig.internal */
+    set(config: { path: string; data: Buffer; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void>;
+    del(config: { path: string; lastModified?: number; internal?: boolean }): Promise<void>;
+    getInfo(config: { path: string; includeTombstones?: boolean }): Promise<{ writeTime: number; size: number } | undefined>;
+    findInfo(config: FindConfig & { prefix: string }): Promise<ArchiveFileInfo[]>;
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getSyncStatus?(): Promise<ArchivesSyncStatus>;
     getSyncProgress?(): {
@@ -74,11 +66,51 @@ export type IBucketStore = {
         syncing: SyncActivity[];
     };
     computeIndexTotals?(): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] }>;
-    startLargeUpload(): Promise<string>;
-    appendLargeUpload(id: string, data: Buffer): Promise<void>;
-    finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
-    cancelLargeUpload(id: string): Promise<void>;
+    /** path/lastModified let the store reject an upload into an immutable bucket before any bytes move */
+    startLargeUpload(config?: { path?: string; lastModified?: number }): Promise<string>;
+    appendLargeUpload(config: { id: string; data: Buffer }): Promise<void>;
+    finishLargeUpload(config: { id: string; path: string; lastModified?: number }): Promise<void>;
+    cancelLargeUpload(config: { id: string }): Promise<void>;
 };
+
+/** rawDisk buckets: the disk IS the store. No index, no synchronization, no window/route/immutability validation. */
+export class RawDiskStore implements IBucketStore {
+    constructor(private disk: ArchivesDisk) { }
+
+    public async get2(config: { path: string; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+        return await this.disk.get2(config.path, { range: config.range, includeTombstones: config.includeTombstones });
+    }
+    public async set(config: { path: string; data: Buffer; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void> {
+        await this.disk.set(config.path, config.data, { lastModified: config.lastModified });
+    }
+    public async del(config: { path: string; lastModified?: number; internal?: boolean }): Promise<void> {
+        if (config.path === ROUTING_FILE) {
+            throw new Error(`The routing config ${JSON.stringify(ROUTING_FILE)} cannot be deleted (overwrite it to change the bucket's configuration)`);
+        }
+        await this.disk.del(config.path, { lastModified: config.lastModified });
+    }
+    public async getInfo(config: { path: string; includeTombstones?: boolean }): Promise<{ writeTime: number; size: number } | undefined> {
+        return await this.disk.getInfo(config.path, { includeTombstones: config.includeTombstones });
+    }
+    public async findInfo(config: FindConfig & { prefix: string }): Promise<ArchiveFileInfo[]> {
+        return await this.disk.findInfo(config.prefix, { shallow: config.shallow, type: config.type });
+    }
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
+        return await this.disk.getChangesAfter2(config);
+    }
+    public async startLargeUpload(): Promise<string> {
+        return await this.disk.startLargeUpload();
+    }
+    public async appendLargeUpload(config: { id: string; data: Buffer }): Promise<void> {
+        await this.disk.appendLargeUpload(config.id, config.data);
+    }
+    public async finishLargeUpload(config: { id: string; path: string; lastModified?: number }): Promise<void> {
+        await this.disk.finishLargeUpload(config.id, config.path, config.lastModified);
+    }
+    public async cancelLargeUpload(config: { id: string }): Promise<void> {
+        await this.disk.cancelLargeUpload(config.id);
+    }
+}
 
 type OverlayEntry = {
     // A zero-length buffer is a pending delete (tombstone)
@@ -99,7 +131,7 @@ type IndexEntry = {
     writeTime: number;
     size: number;
     sourcesListIndex: number;
-    // When WE last changed this entry (not the file's write time) — what getChangesAfter2 filters on, so late-arriving files with old write times are still reported as changes
+    // When WE last changed this entry (not the file's write time) — what getChangesAfter2 filters on, so late-arriving files with old write times are still reported
     changedAt: number;
     // In-memory only (not persisted): when the file was last served, for readerDiskLimit's LRU eviction. Starts as changedAt on load.
     lastAccess: number;
@@ -158,6 +190,13 @@ function newSourceState(): SourceState {
     };
 }
 
+let lastWrongTargetLog = 0;
+function logWrongTargetRejection(message: string): void {
+    if (Date.now() - lastWrongTargetLog < WRONG_TARGET_LOG_THROTTLE) return;
+    lastWrongTargetLog = Date.now();
+    console.log(message);
+}
+
 export class BlobStore implements IBucketStore {
     constructor(
         private folder: string,
@@ -171,78 +210,12 @@ export class BlobStore implements IBucketStore {
             onWriteCounted?: (kind: "original" | "flushed", bytes: number) => void;
             // Resolves a persisted source URL (see ArchivesSource.url) to a cached IArchives, so entries whose holder is no longer configured can still be read
             resolveSourceUrl?: (url: string) => IArchives;
+            // This store's own entries in the routing config (all the same route, different valid windows). What set/del validate against: valid windows and routes for fresh writes, immutability, internal-push acceptance, and the fast/writeDelay flags. Empty = no validation (a store serving leftover disk data with no config).
+            entries?: HostedConfig[];
         }
     ) { }
 
-    private stopped = { stop: false };
-
-    // The index's BulkDatabase2 files live under <folder>/index. "blobIndex2": the "blobIndex" generation persisted sources-array positions as the holding source, which are not stable across runs - its entries are unusable, so it is simply never read again.
-    private index = new BulkDatabaseBase<BlobIndexEntry>("blobIndex2", noopReactiveDeps, async (p: string) => {
-        let base: DirectoryWrapper = new NodeJSDirectoryHandleWrapper(path.join(this.folder, "index"));
-        for (let part of p.split("/")) {
-            if (part) base = await base.getDirectoryHandle(part, { create: true });
-        }
-        return wrapHandle(base);
-    });
-    // The in-memory copy of the index. All reads are served from it; changes are buffered in dirty and flushed to the BulkDatabase2 in batches (undefined = delete).
-    private mem = new Map<string, IndexEntry>();
-    // Live totals over mem (tombstones excluded), adjusted on every mutation and recomputed on load - so any drift heals on restart. computeIndexTotals gives the walk-the-index truth.
-    private indexFileCount = 0;
-    private indexByteCount = 0;
-    // The same totals per holding source (index 0 = our disk, which readerDiskLimit bounds)
-    private sourceFileCounts = this.sources.map(() => 0);
-    private sourceByteCounts = this.sources.map(() => 0);
-    // Background scans / full syncs currently in progress (a Set - one source can have a change poll's full sync and a rescan overlapping)
-    private syncActivities = new Set<SyncActivity>();
-    private dirty = new Map<string, IndexEntry | undefined>();
-    private overlay = new Map<string, OverlayEntry>();
-    private sourceStates = this.sources.map(() => newSourceState());
-    private syncStarted = false;
-    // The persistent identities behind IndexEntry.sourcesListIndex (see SourcesList)
-    private sourcesList = new SourcesList(path.join(this.folder, "index", "sourcesList.txt"));
-    // Per slot: the persistent sourcesListIndex of that slot's URL, filled by registerSlot before the slot's sync runs
-    private slotSourcesListIndexes: number[] = [];
-    private slotRegistrations: Promise<void>[] = [];
-
-    private isLive(sourceIndex: number): boolean {
-        return !!this.sources[sourceIndex] && !this.sourceStates[sourceIndex].dead;
-    }
-
-    private registerSlot(slot: number): Promise<void> {
-        let existing = this.slotRegistrations[slot];
-        if (existing) return existing;
-        let registration = this.sourcesList.ensure(this.sources[slot].url).then(index => {
-            this.slotSourcesListIndexes[slot] = index;
-        });
-        this.slotRegistrations[slot] = registration;
-        return registration;
-    }
-
-    // The persistent sourcesListIndex of a slot - only valid once the slot's registration resolved (init and runSourceSync guarantee that before any indexing happens)
-    private sourcesListIndexOfSlot(slot: number): number {
-        let index = this.slotSourcesListIndexes[slot];
-        if (index === undefined) {
-            throw new Error(`Source slot ${slot} (${this.sources[slot]?.url}) has no registered sourcesListIndex yet (store ${this.folder})`);
-        }
-        return index;
-    }
-
-    // The live slot currently serving a persistent sourcesListIndex, or undefined when no configured source has that URL anymore. Linear, but the sources list is tiny and this is always current (slots dying, or several slots sharing one URL across valid windows, need no bookkeeping).
-    private slotForSourcesListIndex(sourcesListIndex: number): number | undefined {
-        for (let i = 0; i < this.slotSourcesListIndexes.length; i++) {
-            if (this.slotSourcesListIndexes[i] === sourcesListIndex && this.isLive(i)) return i;
-        }
-        return undefined;
-    }
-
-    // The IArchives currently holding an entry's bytes: the live slot when the holder is still configured, otherwise resolved (cached) straight from its persisted URL - windows/routes decide when a source is scanned or written, but for reading bytes we know it holds, the URL alone is enough
-    private async getEntryHolder(entry: IndexEntry): Promise<IArchives | undefined> {
-        let slot = this.slotForSourcesListIndex(entry.sourcesListIndex);
-        if (slot !== undefined) return this.sources[slot].source;
-        let url = this.sourcesList.getUrl(entry.sourcesListIndex) || await this.sourcesList.getUrlReloading(entry.sourcesListIndex);
-        if (!url) return undefined;
-        return this.config?.resolveSourceUrl?.(url);
-    }
+    // #region Main interface
 
     public init = lazy(async () => {
         for (let i = 0; i < this.sources.length; i++) {
@@ -272,61 +245,280 @@ export class BlobStore implements IBucketStore {
         await this.flushIndex();
     }
 
-    private async loadIndex(): Promise<void> {
-        let [writeTimes, sizes, sourcesListIndexes] = await Promise.all([
-            this.index.getColumn("writeTime"),
-            this.index.getColumn("size"),
-            this.index.getColumn("sourcesListIndex"),
-        ]);
-        let sizeMap = new Map(sizes.map(x => [x.key, x.value]));
-        let sourcesListIndexMap = new Map(sourcesListIndexes.map(x => [x.key, x.value]));
-        for (let entry of writeTimes) {
-            let size = sizeMap.get(entry.key);
-            let sourcesListIndex = sourcesListIndexMap.get(entry.key);
-            // Explicit checks, as 0 is a valid size and a valid sourcesListIndex
-            if (size === undefined || sourcesListIndex === undefined) continue;
-            // The routing config is only ever read off our own disk (see updateScanIndex), and a loaded bucket always has it there - a persisted entry pointing elsewhere is stale
-            if (entry.key === ROUTING_FILE) {
-                sourcesListIndex = this.sourcesListIndexOfSlot(0);
+    public async get2(config: { path: string; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+        if (config.internal) {
+            return await this.getInternal2(config);
+        }
+        await this.init();
+        let key = config.path;
+        let range = config.range;
+        let overlayEntry = this.overlay.get(key);
+        if (overlayEntry) {
+            // An empty file IS a missing file (tombstone)
+            if (overlayEntry.data.length === 0 && !config.includeTombstones) return undefined;
+            let data = overlayEntry.data;
+            let size = data.length;
+            if (range) {
+                data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
             }
-            let full: IndexEntry = { writeTime: entry.value, size, sourcesListIndex, changedAt: entry.time, lastAccess: entry.time };
-            this.mem.set(entry.key, full);
-            this.countEntry(full, 1);
+            return { data, writeTime: overlayEntry.t, size };
         }
+        let entry = await this.getIndexEntry(key);
+        if (!entry) return undefined;
+        if (entry.size === 0) {
+            if (!config.includeTombstones) return undefined;
+            // A tombstone has no stored bytes - the index entry alone is the deletion, so the flag-caller gets its write time with empty data
+            return { data: Buffer.alloc(0), writeTime: entry.writeTime, size: 0 };
+        }
+        entry.lastAccess = Date.now();
+        let holderArchives = await this.getEntryHolder(entry);
+        let result: { data: Buffer; writeTime: number; size: number } | undefined;
+        let holderError: Error | undefined;
+        if (holderArchives) {
+            try {
+                // includeTombstones: the holder answering "deleted" (a tombstone, with its write time) must be distinguishable from "I lost the file" - the former is authoritative and must NOT fall back to older copies, which would resurrect the deletion for this read
+                let answer = await holderArchives.get2(key, { range, internal: true, includeTombstones: true });
+                if (answer && answer.data && !answer.data.length && !(range && answer.size) && answer.writeTime >= entry.writeTime) {
+                    return undefined;
+                }
+                // NOTE: a ranged read of a real file can legitimately be empty (range past EOF), so only unranged emptiness means tombstone/absent
+                if (answer && answer.data && (answer.data.length || range && answer.size)) {
+                    result = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
+                }
+            } catch (e) {
+                holderError = e as Error;
+            }
+        }
+        if (result) {
+            // Ranged reads can't populate a cache (they're partial)
+            if (this.slotForSourcesListIndex(entry.sourcesListIndex) !== 0 && !range) {
+                await this.cacheRead(key, result);
+            }
+            return result;
+        }
+        // The routing file is only ever read off our own disk - falling back to another source's copy would synchronize it between nodes through the read path, which it never is
+        if (key === ROUTING_FILE) {
+            if (holderError) throw holderError;
+            return undefined;
+        }
+        // The holder is down or lost the file. ANY other source's copy beats no value - even an OLDER one - and it's copied onto our disk so the next read doesn't depend on luck.
+        let holderSlot = this.slotForSourcesListIndex(entry.sourcesListIndex);
+        for (let i = 0; i < this.sources.length; i++) {
+            if (i === holderSlot || !this.isLive(i)) continue;
+            let fallback: { data: Buffer; writeTime: number; size: number } | undefined;
+            try {
+                let answer = await this.sources[i].source.get2(key, { internal: true });
+                // Empty data counts as absent - a tombstone, not content (this read is unranged, so emptiness is unambiguous)
+                if (answer && answer.data && answer.data.length) {
+                    fallback = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
+                }
+            } catch {
+                continue;
+            }
+            if (!fallback) continue;
+            await this.cacheRead(key, fallback);
+            let data = fallback.data;
+            if (range) {
+                data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
+            }
+            return { data, writeTime: fallback.writeTime, size: fallback.size };
+        }
+        if (holderError) throw holderError;
+        // The holder answered "not there" and no other source has it either: the entry was stale
+        this.deleteIndexEntry(key);
+        return undefined;
     }
 
-    private countEntry(entry: IndexEntry | undefined, direction: number): void {
-        if (!entry || entry.size === 0) return;
-        this.indexFileCount += direction;
-        this.indexByteCount += entry.size * direction;
-        // Entries can reference a source no longer configured (readable via getEntryHolder, but with no slot to count under)
-        let slot = this.slotForSourcesListIndex(entry.sourcesListIndex);
-        if (slot !== undefined) {
-            this.sourceFileCounts[slot] += direction;
-            this.sourceByteCounts[slot] += entry.size * direction;
+    public async set(config: { path: string; data: Buffer; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void> {
+        let { path: key, data } = config;
+        if (!data.length) {
+            throw new Error(`set was called with an empty buffer for ${JSON.stringify(key)} (store ${this.folder}): an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
+        await this.init();
+        let writeTime = config.lastModified || Date.now();
+        let route = getRoute(key);
+        // The routing file defines the windows/routes, so they can't possibly apply to it (and it never flows through validation)
+        if (key !== ROUTING_FILE && this.entries.length) {
+            if (!config.lastModified) {
+                let timeValid = this.entries.filter(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1]);
+                if (!timeValid.length) {
+                    logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(key)} (store ${this.folder}): writeTime ${writeTime} (${new Date(writeTime).toISOString()}) is outside all our valid windows ${JSON.stringify(this.entries.map(x => x.validWindow))} (a switchover moved the write target)`);
+                    throw new Error(`${STORAGE_WRONG_VALID_WINDOW} This store is not a valid write target at ${writeTime} (our valid windows: ${JSON.stringify(this.entries.map(x => x.validWindow))}, store ${this.folder}). Re-resolve the currently valid source and retry.`);
+                }
+                if (!timeValid.some(x => routeContains(x.route, route))) {
+                    logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(key)} (store ${this.folder}): route ${route} is outside our routes ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))} at writeTime ${writeTime} (the client's shard config is stale)`);
+                    throw new Error(`${STORAGE_WRONG_ROUTE} This store does not handle route ${route} (key ${JSON.stringify(key)}, our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}, store ${this.folder}). Re-resolve the source for this key and retry.`);
+                }
+            }
+            if (config.forceSetImmutable) {
+                if (!config.lastModified) {
+                    throw new Error(`forceSetImmutable requires lastModified (synchronization writes are ordered by their write time), writing ${JSON.stringify(key)} (store ${this.folder})`);
+                }
+                // Immutability wins: an existing path is kept instead of the push throwing (see SetConfig.forceSetImmutable)
+                let self = selectEntryAt(this.entries, writeTime, route);
+                if (self?.immutable && await this.getInfo({ path: key })) return;
+            } else {
+                await this.assertMutable(key, writeTime);
+            }
+        }
+        if (config.internal) {
+            if (!config.lastModified) {
+                throw new Error(`Internal writes must carry lastModified (they are synchronization pushes, ordered by their write time), writing ${JSON.stringify(key)} (store ${this.folder})`);
+            }
+            this.assertInternalWriteAccepted(key, config.lastModified, route);
+            await this.setInternal(key, data, { lastModified: config.lastModified });
+            return;
+        }
+        let self = this.entries.length && selectEntryAt(this.entries, writeTime, route) || undefined;
+        await this.setOrDelete(key, data, { fast: self?.fast, writeDelay: self?.writeDelay, lastModified: config.lastModified });
     }
 
-    private setIndexEntry(key: string, entry: { writeTime: number; size: number; sourcesListIndex: number }): void {
-        let full: IndexEntry = { ...entry, changedAt: Date.now(), lastAccess: Date.now() };
-        this.countEntry(this.mem.get(key), -1);
-        this.countEntry(full, 1);
-        this.mem.set(key, full);
-        this.dirty.set(key, full);
-        this.config?.onIndexChanged?.(key);
+    public async del(config: { path: string; lastModified?: number; internal?: boolean }): Promise<void> {
+        let key = config.path;
+        if (key === ROUTING_FILE) {
+            throw new Error(`The routing config ${JSON.stringify(ROUTING_FILE)} cannot be deleted (overwrite it to change the bucket's configuration)`);
+        }
+        await this.init();
+        if (config.internal) {
+            if (!config.lastModified) {
+                throw new Error(`Internal deletions must carry lastModified (they are synchronization pushes, ordered by their write time), deleting ${JSON.stringify(key)} (store ${this.folder})`);
+            }
+            this.assertInternalWriteAccepted(key, config.lastModified, getRoute(key));
+            // setInternal treats an empty buffer as exactly a deletion: disk removal plus a tombstone index entry, no fan-out
+            await this.setInternal(key, Buffer.alloc(0), { lastModified: config.lastModified });
+            return;
+        }
+        // Deletes are tombstone writes (an empty file IS a missing file): the size-0 index entry is ordered by write time like any other write, propagates through synchronization, and expires after TOMBSTONE_EXPIRY
+        let writeTime = config.lastModified || Date.now();
+        let self = this.entries.length && selectEntryAt(this.entries, writeTime, getRoute(key)) || undefined;
+        await this.setOrDelete(key, Buffer.alloc(0), { fast: self?.fast, writeDelay: self?.writeDelay, lastModified: config.lastModified });
     }
-    private deleteIndexEntry(key: string): void {
-        let existing = this.mem.get(key);
-        if (!existing) return;
-        this.countEntry(existing, -1);
-        this.mem.delete(key);
-        this.dirty.set(key, undefined);
+
+    public async getInfo(config: { path: string; includeTombstones?: boolean }): Promise<{ writeTime: number; size: number } | undefined> {
+        await this.init();
+        let key = config.path;
+        let overlayEntry = this.overlay.get(key);
+        if (overlayEntry) {
+            if (!overlayEntry.data.length && !config.includeTombstones) return undefined;
+            return { writeTime: overlayEntry.t, size: overlayEntry.data.length };
+        }
+        let entry = await this.getIndexEntry(key);
+        if (!entry) return undefined;
+        if (!entry.size && !config.includeTombstones) return undefined;
+        return { writeTime: entry.writeTime, size: entry.size };
+    }
+
+    public async findInfo(config: FindConfig & { prefix: string }): Promise<ArchiveFileInfo[]> {
+        await this.init();
+        await this.waitForRequiredScans();
+        let prefix = config.prefix;
+        let infos = new Map<string, ArchiveFileInfo>();
+        for (let [key, entry] of this.mem) {
+            if (!key.startsWith(prefix)) continue;
+            // Tombstones are missing files, so listings hide them
+            if (entry.size === 0) continue;
+            infos.set(key, { path: key, createTime: entry.writeTime, size: entry.size });
+        }
+        for (let [key, overlayEntry] of this.overlay) {
+            if (!key.startsWith(prefix)) continue;
+            if (overlayEntry.data.length === 0) {
+                infos.delete(key);
+                continue;
+            }
+            infos.set(key, { path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
+        }
+        let files = applyFindInfoShape(Array.from(infos.values()), prefix, { shallow: config.shallow, type: config.type });
+        sort(files, x => x.path);
+        return files;
+    }
+
+    // All files changed after config.time — fast, straight from the in-memory index. Filters on when WE learned of the change (changedAt), so files synchronized late (with old write times) are still reported. Deletions ARE reported, as size-0 tombstone entries — that's how they propagate to stores syncing from us. config.routes lets a store syncing a partial shard ask for just its slice.
+    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
+        await this.init();
+        await this.waitForRequiredScans();
+        let inRoutes = (key: string) => !config.routes || config.routes.some(route => routeContains(route, getRoute(key)));
+        let files: ArchiveFileInfo[] = [];
+        for (let [key, entry] of this.mem) {
+            if (entry.changedAt <= config.time) continue;
+            if (this.overlay.has(key)) continue;
+            if (!inRoutes(key)) continue;
+            files.push({ path: key, createTime: entry.writeTime, size: entry.size });
+        }
+        for (let [key, overlayEntry] of this.overlay) {
+            if (overlayEntry.t <= config.time) continue;
+            if (!inRoutes(key)) continue;
+            files.push({ path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
+        }
+        sort(files, x => x.path);
+        return files;
+    }
+
+    public async getSyncStatus(): Promise<ArchivesSyncStatus> {
+        await this.init();
+        return {
+            allScansComplete: this.sourceStates.every(x => x.scanComplete),
+            indexSize: this.mem.size,
+            sources: this.sources.map((x, i) => ({
+                debugName: x.source.getDebugName(),
+                validWindow: x.validWindow,
+                route: x.route,
+                noFullSync: x.noFullSync,
+                supportsChangesAfter: this.sourceStates[i].supportsChangesAfter,
+                initialScanComplete: this.sourceStates[i].scanComplete,
+                scannedCount: this.sourceStates[i].scannedCount,
+            })).filter((x, i) => this.isLive(i)),
+        };
+    }
+
+    /** The cheap always-current totals plus any in-progress background synchronization. */
+    public getSyncProgress(): {
+        index: { fileCount: number; byteCount: number };
+        sources: { debugName: string; fileCount: number; byteCount: number }[];
+        readerDiskLimit?: number;
+        syncing: SyncActivity[];
+    } {
+        return {
+            index: { fileCount: this.indexFileCount, byteCount: this.indexByteCount },
+            sources: this.sources.map((x, i) => ({
+                debugName: x.source.getDebugName(),
+                fileCount: this.sourceFileCounts[i],
+                byteCount: this.sourceByteCounts[i],
+            })).filter((x, i) => this.isLive(i)),
+            readerDiskLimit: this.config?.readerDiskLimit,
+            syncing: [...this.syncActivities],
+        };
+    }
+
+    /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
+    public async computeIndexTotals(): Promise<{
+        fileCount: number;
+        byteCount: number;
+        sources: { debugName: string; fileCount: number; byteCount: number }[];
+    }> {
+        await this.init();
+        let fileCount = 0;
+        let byteCount = 0;
+        let sources = this.sources.map(x => ({ debugName: x.source.getDebugName(), fileCount: 0, byteCount: 0 }));
+        for (let entry of this.mem.values()) {
+            if (entry.size === 0) continue;
+            fileCount++;
+            byteCount += entry.size;
+            let slot = this.slotForSourcesListIndex(entry.sourcesListIndex);
+            if (slot !== undefined) {
+                sources[slot].fileCount++;
+                sources[slot].byteCount += entry.size;
+            }
+        }
+        return { fileCount, byteCount, sources: sources.filter((x, i) => this.isLive(i)) };
     }
 
     /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
-    public updateSources(specs: BlobSourceSpec[]): void {
+    public updateSources(specs: BlobSourceSpec[], entries?: HostedConfig[]): void {
         if (!specs.length || specs[0].identity !== "disk") {
             throw new Error(`updateSources expects the disk source first (identity "disk"), got ${JSON.stringify(specs.map(x => x.identity))} (store ${this.folder})`);
+        }
+        if (entries) {
+            this.entries = entries;
         }
         let setWindow = (i: number, window: [number, number]) => {
             let old = this.sources[i].validWindow;
@@ -392,29 +584,6 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    // The slot stays in the arrays forever (index entries reference sources by slot number); it just goes dead - loops stop, and its index entries drop (other sources' scans re-find any copy that's still reachable through the new config)
-    private removeSource(sourceIndex: number): void {
-        let state = this.sourceStates[sourceIndex];
-        let source = this.sources[sourceIndex].source;
-        state.dead = true;
-        state.stopped.stop = true;
-        state.scanComplete = true;
-        state.initialScan.resolve(undefined);
-        let sourcesListIndex = this.slotSourcesListIndexes[sourceIndex];
-        // The same URL can be another live slot (one entry per valid window) - the endpoint is still configured, so its entries stay
-        if (sourcesListIndex !== undefined && this.slotForSourcesListIndex(sourcesListIndex) === undefined) {
-            let dropped = 0;
-            for (let [key, entry] of this.mem) {
-                if (entry.sourcesListIndex !== sourcesListIndex) continue;
-                this.deleteIndexEntry(key);
-                dropped++;
-            }
-            console.log(`Removed sync source ${source.getDebugName()} (store ${this.folder}): its scans are stopped and ${dropped} index entries it held were dropped`);
-            return;
-        }
-        console.log(`Removed sync source ${source.getDebugName()} (store ${this.folder}): its scans are stopped (its URL is still served by another slot, so its index entries stay)`);
-    }
-
     /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
     public async rescanBase(): Promise<void> {
         await this.init();
@@ -463,46 +632,178 @@ export class BlobStore implements IBucketStore {
         console.log(`Boundary scan of ${source.getDebugName()} finished in ${Math.round((Date.now() - scanStart) / 1000)}s (store ${this.folder}): ${changes.length} changes: ${formatScanTally(tally, changes.length)}`);
     }
 
-    /** The cheap always-current totals plus any in-progress background synchronization. */
-    public getSyncProgress(): {
-        index: { fileCount: number; byteCount: number };
-        sources: { debugName: string; fileCount: number; byteCount: number }[];
-        readerDiskLimit?: number;
-        syncing: SyncActivity[];
-    } {
-        return {
-            index: { fileCount: this.indexFileCount, byteCount: this.indexByteCount },
-            sources: this.sources.map((x, i) => ({
-                debugName: x.source.getDebugName(),
-                fileCount: this.sourceFileCounts[i],
-                byteCount: this.sourceByteCounts[i],
-            })).filter((x, i) => this.isLive(i)),
-            readerDiskLimit: this.config?.readerDiskLimit,
-            syncing: [...this.syncActivities],
-        };
+    // Large uploads stream onto the local disk source directly (they may not fit in memory)
+    public async startLargeUpload(config?: { path?: string; lastModified?: number }): Promise<string> {
+        await this.init();
+        if (config?.path) {
+            await this.assertMutable(config.path, config.lastModified || Date.now());
+        }
+        return await this.getDiskSource().disk.startLargeUpload();
+    }
+    public async appendLargeUpload(config: { id: string; data: Buffer }): Promise<void> {
+        await this.getDiskSource().disk.appendLargeUpload(config.id, config.data);
+    }
+    public async finishLargeUpload(config: { id: string; path: string; lastModified?: number }): Promise<void> {
+        let { disk, sourceIndex } = this.getDiskSource();
+        await disk.finishLargeUpload(config.id, config.path, config.lastModified);
+        this.overlay.delete(config.path);
+        // includeTombstones: a zero-byte upload is still a real file whose index entry must be written
+        let info = await disk.getInfo(config.path, { includeTombstones: true });
+        if (info) {
+            this.setIndexEntry(config.path, { writeTime: info.writeTime, size: info.size, sourcesListIndex: this.sourcesListIndexOfSlot(sourceIndex) });
+        }
+    }
+    public async cancelLargeUpload(config: { id: string }): Promise<void> {
+        await this.getDiskSource().disk.cancelLargeUpload(config.id);
     }
 
-    /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
-    public async computeIndexTotals(): Promise<{
-        fileCount: number;
-        byteCount: number;
-        sources: { debugName: string; fileCount: number; byteCount: number }[];
-    }> {
-        await this.init();
-        let fileCount = 0;
-        let byteCount = 0;
-        let sources = this.sources.map(x => ({ debugName: x.source.getDebugName(), fileCount: 0, byteCount: 0 }));
-        for (let entry of this.mem.values()) {
-            if (entry.size === 0) continue;
-            fileCount++;
-            byteCount += entry.size;
-            let slot = this.slotForSourcesListIndex(entry.sourcesListIndex);
-            if (slot !== undefined) {
-                sources[slot].fileCount++;
-                sources[slot].byteCount += entry.size;
-            }
+    // #endregion
+
+    // #region Internals
+
+    private stopped = { stop: false };
+
+    // The index's BulkDatabase2 files live under <folder>/index. "blobIndex2": the "blobIndex" generation persisted sources-array positions as the holding source, which are not stable across runs - its entries are unusable, so it is simply never read again.
+    private index = new BulkDatabaseBase<BlobIndexEntry>("blobIndex2", noopReactiveDeps, async (p: string) => {
+        let base: DirectoryWrapper = new NodeJSDirectoryHandleWrapper(path.join(this.folder, "index"));
+        for (let part of p.split("/")) {
+            if (part) base = await base.getDirectoryHandle(part, { create: true });
         }
-        return { fileCount, byteCount, sources: sources.filter((x, i) => this.isLive(i)) };
+        return wrapHandle(base);
+    });
+    // The in-memory copy of the index. All reads are served from it; changes are buffered in dirty and flushed to the BulkDatabase2 in batches (undefined = delete).
+    private mem = new Map<string, IndexEntry>();
+    // Live totals over mem (tombstones excluded), adjusted on every mutation and recomputed on load - so any drift heals on restart. computeIndexTotals gives the walk-the-index truth.
+    private indexFileCount = 0;
+    private indexByteCount = 0;
+    // The same totals per holding source (index 0 = our disk, which readerDiskLimit bounds)
+    private sourceFileCounts = this.sources.map(() => 0);
+    private sourceByteCounts = this.sources.map(() => 0);
+    // Background scans / full syncs currently in progress (a Set - one source can have a change poll's full sync and a rescan overlapping)
+    private syncActivities = new Set<SyncActivity>();
+    private dirty = new Map<string, IndexEntry | undefined>();
+    private overlay = new Map<string, OverlayEntry>();
+    private sourceStates = this.sources.map(() => newSourceState());
+    private syncStarted = false;
+    private entries = this.config?.entries || [];
+    // The persistent identities behind IndexEntry.sourcesListIndex (see SourcesList)
+    private sourcesList = new SourcesList(path.join(this.folder, "index", "sourcesList.txt"));
+    // Per slot: the persistent sourcesListIndex of that slot's URL, filled by registerSlot before the slot's sync runs
+    private slotSourcesListIndexes: number[] = [];
+    private slotRegistrations: Promise<void>[] = [];
+
+    private isLive(sourceIndex: number): boolean {
+        return !!this.sources[sourceIndex] && !this.sourceStates[sourceIndex].dead;
+    }
+
+    private registerSlot(slot: number): Promise<void> {
+        let existing = this.slotRegistrations[slot];
+        if (existing) return existing;
+        let registration = this.sourcesList.ensure(this.sources[slot].url).then(index => {
+            this.slotSourcesListIndexes[slot] = index;
+        });
+        this.slotRegistrations[slot] = registration;
+        return registration;
+    }
+
+    // The persistent sourcesListIndex of a slot - only valid once the slot's registration resolved (init and runSourceSync guarantee that before any indexing happens)
+    private sourcesListIndexOfSlot(slot: number): number {
+        let index = this.slotSourcesListIndexes[slot];
+        if (index === undefined) {
+            throw new Error(`Source slot ${slot} (${this.sources[slot]?.url}) has no registered sourcesListIndex yet (store ${this.folder})`);
+        }
+        return index;
+    }
+
+    // The live slot currently serving a persistent sourcesListIndex, or undefined when no configured source has that URL anymore. Linear, but the sources list is tiny and this is always current (slots dying, or several slots sharing one URL across valid windows, need no bookkeeping).
+    private slotForSourcesListIndex(sourcesListIndex: number): number | undefined {
+        for (let i = 0; i < this.slotSourcesListIndexes.length; i++) {
+            if (this.slotSourcesListIndexes[i] === sourcesListIndex && this.isLive(i)) return i;
+        }
+        return undefined;
+    }
+
+    // The IArchives currently holding an entry's bytes: the live slot when the holder is still configured, otherwise resolved (cached) straight from its persisted URL - windows/routes decide when a source is scanned or written, but for reading bytes we know it holds, the URL alone is enough
+    private async getEntryHolder(entry: IndexEntry): Promise<IArchives | undefined> {
+        let slot = this.slotForSourcesListIndex(entry.sourcesListIndex);
+        if (slot !== undefined) return this.sources[slot].source;
+        let url = this.sourcesList.getUrl(entry.sourcesListIndex) || await this.sourcesList.getUrlReloading(entry.sourcesListIndex);
+        if (!url) return undefined;
+        return this.config?.resolveSourceUrl?.(url);
+    }
+
+    private async loadIndex(): Promise<void> {
+        let [writeTimes, sizes, sourcesListIndexes] = await Promise.all([
+            this.index.getColumn("writeTime"),
+            this.index.getColumn("size"),
+            this.index.getColumn("sourcesListIndex"),
+        ]);
+        let sizeMap = new Map(sizes.map(x => [x.key, x.value]));
+        let sourcesListIndexMap = new Map(sourcesListIndexes.map(x => [x.key, x.value]));
+        for (let entry of writeTimes) {
+            let size = sizeMap.get(entry.key);
+            let sourcesListIndex = sourcesListIndexMap.get(entry.key);
+            // Explicit checks, as 0 is a valid size and a valid sourcesListIndex
+            if (size === undefined || sourcesListIndex === undefined) continue;
+            // The routing config is only ever read off our own disk (see updateScanIndex), and a loaded bucket always has it there - a persisted entry pointing elsewhere is stale
+            if (entry.key === ROUTING_FILE) {
+                sourcesListIndex = this.sourcesListIndexOfSlot(0);
+            }
+            let full: IndexEntry = { writeTime: entry.value, size, sourcesListIndex, changedAt: entry.time, lastAccess: entry.time };
+            this.mem.set(entry.key, full);
+            this.countEntry(full, 1);
+        }
+    }
+
+    private countEntry(entry: IndexEntry | undefined, direction: number): void {
+        if (!entry || entry.size === 0) return;
+        this.indexFileCount += direction;
+        this.indexByteCount += entry.size * direction;
+        // Entries can reference a source no longer configured (readable via getEntryHolder, but with no slot to count under)
+        let slot = this.slotForSourcesListIndex(entry.sourcesListIndex);
+        if (slot !== undefined) {
+            this.sourceFileCounts[slot] += direction;
+            this.sourceByteCounts[slot] += entry.size * direction;
+        }
+    }
+
+    private setIndexEntry(key: string, entry: { writeTime: number; size: number; sourcesListIndex: number }): void {
+        let full: IndexEntry = { ...entry, changedAt: Date.now(), lastAccess: Date.now() };
+        this.countEntry(this.mem.get(key), -1);
+        this.countEntry(full, 1);
+        this.mem.set(key, full);
+        this.dirty.set(key, full);
+        this.config?.onIndexChanged?.(key);
+    }
+    private deleteIndexEntry(key: string): void {
+        let existing = this.mem.get(key);
+        if (!existing) return;
+        this.countEntry(existing, -1);
+        this.mem.delete(key);
+        this.dirty.set(key, undefined);
+    }
+
+    // The slot stays in the arrays forever (index entries reference sources by slot number); it just goes dead - loops stop, and its index entries drop (other sources' scans re-find any copy that's still reachable through the new config)
+    private removeSource(sourceIndex: number): void {
+        let state = this.sourceStates[sourceIndex];
+        let source = this.sources[sourceIndex].source;
+        state.dead = true;
+        state.stopped.stop = true;
+        state.scanComplete = true;
+        state.initialScan.resolve(undefined);
+        let sourcesListIndex = this.slotSourcesListIndexes[sourceIndex];
+        // The same URL can be another live slot (one entry per valid window) - the endpoint is still configured, so its entries stay
+        if (sourcesListIndex !== undefined && this.slotForSourcesListIndex(sourcesListIndex) === undefined) {
+            let dropped = 0;
+            for (let [key, entry] of this.mem) {
+                if (entry.sourcesListIndex !== sourcesListIndex) continue;
+                this.deleteIndexEntry(key);
+                dropped++;
+            }
+            console.log(`Removed sync source ${source.getDebugName()} (store ${this.folder}): its scans are stopped and ${dropped} index entries it held were dropped`);
+            return;
+        }
+        console.log(`Removed sync source ${source.getDebugName()} (store ${this.folder}): its scans are stopped (its URL is still served by another slot, so its index entries stay)`);
     }
 
     private async flushIndex(): Promise<void> {
@@ -520,6 +821,26 @@ export class BlobStore implements IBucketStore {
         }
         if (writes.length) await this.index.writeBatch(writes);
         if (deletes.length) await this.index.deleteBatch(deletes);
+    }
+
+    // ── validation (from this store's own routing entries) ──
+
+    private async assertMutable(key: string, writeTime: number): Promise<void> {
+        if (!this.entries.length) return;
+        let self = selectEntryAt(this.entries, writeTime, getRoute(key));
+        if (!self?.immutable) return;
+        if (await this.getInfo({ path: key })) {
+            throw new Error(`This store is immutable (at write time ${writeTime}) and ${JSON.stringify(key)} already exists, so it cannot be written to (store ${this.folder})`);
+        }
+    }
+
+    // See SetConfig.internal: the stamp must land inside SOME window+route this store is configured for (any window, including past ones - synchronization moves old data), so a confused peer can't stuff data onto a store that was never meant to hold it
+    private assertInternalWriteAccepted(key: string, writeTime: number, route: number): void {
+        if (!this.entries.length) return;
+        let covered = this.entries.some(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1] && routeContains(x.route, route));
+        if (!covered) {
+            throw new Error(`Internal write of ${JSON.stringify(key)} rejected: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this store is configured for: ${JSON.stringify(this.entries.map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))} (store ${this.folder})`);
+        }
     }
 
     // ── synchronization ──
@@ -862,97 +1183,23 @@ export class BlobStore implements IBucketStore {
         return this.mem.get(key);
     }
 
-    // ── data operations ──
-
-    public async get(key: string, config?: GetConfig): Promise<Buffer | undefined> {
-        let result = await this.get2(key, config);
-        return result && result.data || undefined;
-    }
-
-    public async get2(key: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note fast writes still sitting in the overlay are invisible here; the caller re-finds them after our flush. */
+    private async getInternal2(config: { path: string; range?: { start: number; end: number }; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         await this.init();
-        let range = config?.range;
-        let overlayEntry = this.overlay.get(key);
-        if (overlayEntry) {
-            // An empty file IS a missing file (tombstone)
-            if (overlayEntry.data.length === 0) return undefined;
-            let data = overlayEntry.data;
-            let size = data.length;
-            if (range) {
-                data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
+        // includeTombstones forwards to the disk: a flag-caller (a peer store's synchronization) needs to see our deletions, not just our content. A tombstone deleted from disk entirely only lives in our index, so fall back to that.
+        let result = await this.getDiskSource().disk.get2(config.path, { range: config.range, includeTombstones: config.includeTombstones });
+        if (!result || !result.data) {
+            if (config.includeTombstones) {
+                let entry = this.mem.get(config.path);
+                if (entry && !entry.size) return { data: Buffer.alloc(0), writeTime: entry.writeTime, size: 0 };
             }
-            return { data, writeTime: overlayEntry.t, size };
-        }
-        let entry = await this.getIndexEntry(key);
-        if (!entry) return undefined;
-        if (entry.size === 0) return undefined;
-        entry.lastAccess = Date.now();
-        let holderArchives = await this.getEntryHolder(entry);
-        let result: { data: Buffer; writeTime: number; size: number } | undefined;
-        let holderError: Error | undefined;
-        if (holderArchives) {
-            try {
-                let answer = await holderArchives.get2(key, { range, internal: true });
-                // Empty data counts as absent: an empty file IS a deletion (a tombstone stored on b2/disk), never content. NOTE: a ranged read of a real file can legitimately be empty (range past EOF), so only unranged emptiness means absent.
-                if (answer && answer.data && (answer.data.length || range && answer.size)) {
-                    result = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
-                }
-            } catch (e) {
-                holderError = e as Error;
-            }
-        }
-        if (result) {
-            // Ranged reads can't populate a cache (they're partial)
-            if (this.slotForSourcesListIndex(entry.sourcesListIndex) !== 0 && !range) {
-                await this.cacheRead(key, result);
-            }
-            return result;
-        }
-        // The routing file is only ever read off our own disk - falling back to another source's copy would synchronize it between nodes through the read path, which it never is
-        if (key === ROUTING_FILE) {
-            if (holderError) throw holderError;
             return undefined;
         }
-        // The holder is down or lost the file. ANY other source's copy beats no value - even an OLDER one - and it's copied onto our disk so the next read doesn't depend on luck.
-        let holderSlot = this.slotForSourcesListIndex(entry.sourcesListIndex);
-        for (let i = 0; i < this.sources.length; i++) {
-            if (i === holderSlot || !this.isLive(i)) continue;
-            let fallback: { data: Buffer; writeTime: number; size: number } | undefined;
-            try {
-                let answer = await this.sources[i].source.get2(key, { internal: true });
-                // Empty data counts as absent - a tombstone, not content (this read is unranged, so emptiness is unambiguous)
-                if (answer && answer.data && answer.data.length) {
-                    fallback = { data: answer.data, writeTime: answer.writeTime, size: answer.size };
-                }
-            } catch {
-                continue;
-            }
-            if (!fallback) continue;
-            await this.cacheRead(key, fallback);
-            let data = fallback.data;
-            if (range) {
-                data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
-            }
-            return { data, writeTime: fallback.writeTime, size: fallback.size };
-        }
-        if (holderError) throw holderError;
-        // The holder answered "not there" and no other source has it either: the entry was stale
-        this.deleteIndexEntry(key);
-        return undefined;
-    }
-
-    /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note fast writes still sitting in the overlay are invisible here; the caller re-finds them after our flush. */
-    public async getInternal2(key: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        await this.init();
-        let result = await this.getDiskSource().disk.get2(key, { range: config?.range });
-        if (!result || !result.data) return undefined;
-        // An empty file on disk is a tombstone, not content (a ranged read of a real file can be legitimately empty though - range past EOF)
-        if (!result.data.length && !(config?.range && result.size)) return undefined;
         return { data: result.data, writeTime: result.writeTime, size: result.size };
     }
 
-    /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Window/route acceptance is the caller's (writeBucketFile's) job; only-take-latest still applies here. */
-    public async setInternal(key: string, data: Buffer, config: { lastModified: number }): Promise<void> {
+    /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Only-take-latest still applies here. */
+    private async setInternal(key: string, data: Buffer, config: { lastModified: number }): Promise<void> {
         await this.init();
         assertValidLastModified(config.lastModified);
         let overlayEntry = this.overlay.get(key);
@@ -974,33 +1221,20 @@ export class BlobStore implements IBucketStore {
         this.setIndexEntry(key, { writeTime: result.writeTime, size: result.data.length, sourcesListIndex: this.sourcesListIndexOfSlot(0) });
     }
 
-    public async set(key: string, data: Buffer, config?: WriteConfig): Promise<string> {
-        if (!data.length) {
-            throw new Error(`set was called with an empty buffer for ${JSON.stringify(key)} (store ${this.folder}): an empty file IS a deletion in this system and would read back as missing - call del instead`);
-        }
-        return await this.setOrDelete(key, data, config);
-    }
-
-    public async del(key: string, config?: WriteConfig): Promise<void> {
-        // Deletes are tombstone writes (an empty file IS a missing file): the size-0 index entry is ordered by write time like any other write, propagates through synchronization, and expires after TOMBSTONE_EXPIRY
-        await this.setOrDelete(key, Buffer.alloc(0), config);
-    }
-
     // The shared engine of set and del: an empty buffer is exactly a deletion here, which is why the empty-buffer rejection lives in set (the public API), not in this machinery
-    private async setOrDelete(key: string, data: Buffer, config?: WriteConfig): Promise<string> {
-        await this.init();
+    private async setOrDelete(key: string, data: Buffer, config: { fast?: boolean; writeDelay?: number; lastModified?: number }): Promise<void> {
         this.config?.onWriteCounted?.("original", data.length);
-        let lastModified = config?.lastModified;
+        let lastModified = config.lastModified;
         if (lastModified) {
             assertValidLastModified(lastModified);
             let overlayEntry = this.overlay.get(key);
             let entry = this.mem.get(key);
             let currentTime = overlayEntry && overlayEntry.t || entry && entry.writeTime || 0;
             // An older write never overwrites a newer one (see IArchives.set)
-            if (lastModified < currentTime) return key;
+            if (lastModified < currentTime) return;
         }
         let writeTime = lastModified || Date.now();
-        if (config?.fast) {
+        if (config.fast) {
             // A writeDelay of zero is a real choice (no delay at all), so only an omitted delay gets the default
             let writeDelay = config.writeDelay;
             if (writeDelay === undefined) {
@@ -1011,15 +1245,11 @@ export class BlobStore implements IBucketStore {
             if (writeDelay > 0 && Date.now() < deadline) {
                 let flushAt = Math.min(Date.now() + writeDelay, deadline);
                 this.overlay.set(key, { data, t: writeTime, flushAt });
-                return key;
+                return;
             }
-            this.overlay.delete(key);
-            await this.writeToSources(key, data, writeTime);
-            return key;
         }
         this.overlay.delete(key);
         await this.writeToSources(key, data, writeTime);
-        return key;
     }
 
     private getWritableSources(config?: { ignoreWindow?: boolean }): number[] {
@@ -1066,109 +1296,12 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    public async getInfo(key: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
-        await this.init();
-        let overlayEntry = this.overlay.get(key);
-        if (overlayEntry) {
-            if (!overlayEntry.data.length && !config?.includeTombstones) return undefined;
-            return { writeTime: overlayEntry.t, size: overlayEntry.data.length };
-        }
-        let entry = await this.getIndexEntry(key);
-        if (!entry) return undefined;
-        if (!entry.size && !config?.includeTombstones) return undefined;
-        return { writeTime: entry.writeTime, size: entry.size };
-    }
-
-    public async findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        await this.init();
-        await this.waitForRequiredScans();
-        let infos = new Map<string, ArchiveFileInfo>();
-        for (let [key, entry] of this.mem) {
-            if (!key.startsWith(prefix)) continue;
-            // Tombstones are missing files, so listings hide them
-            if (entry.size === 0) continue;
-            infos.set(key, { path: key, createTime: entry.writeTime, size: entry.size });
-        }
-        for (let [key, overlayEntry] of this.overlay) {
-            if (!key.startsWith(prefix)) continue;
-            if (overlayEntry.data.length === 0) {
-                infos.delete(key);
-                continue;
-            }
-            infos.set(key, { path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
-        }
-        let files = applyFindInfoShape(Array.from(infos.values()), prefix, config);
-        sort(files, x => x.path);
-        return files;
-    }
-
-    // All files changed after config.time — fast, straight from the in-memory index. Filters on when WE learned of the change (changedAt), so files synchronized late (with old write times) are still reported. Deletions ARE reported, as size-0 tombstone entries — that's how they propagate to stores syncing from us. config.routes lets a store syncing a partial shard ask for just its slice.
-    public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        await this.init();
-        await this.waitForRequiredScans();
-        let inRoutes = (key: string) => !config.routes || config.routes.some(route => routeContains(route, getRoute(key)));
-        let files: ArchiveFileInfo[] = [];
-        for (let [key, entry] of this.mem) {
-            if (entry.changedAt <= config.time) continue;
-            if (this.overlay.has(key)) continue;
-            if (!inRoutes(key)) continue;
-            files.push({ path: key, createTime: entry.writeTime, size: entry.size });
-        }
-        for (let [key, overlayEntry] of this.overlay) {
-            if (overlayEntry.t <= config.time) continue;
-            if (!inRoutes(key)) continue;
-            files.push({ path: key, createTime: overlayEntry.t, size: overlayEntry.data.length });
-        }
-        sort(files, x => x.path);
-        return files;
-    }
-
-    public async getSyncStatus(): Promise<ArchivesSyncStatus> {
-        await this.init();
-        return {
-            allScansComplete: this.sourceStates.every(x => x.scanComplete),
-            indexSize: this.mem.size,
-            sources: this.sources.map((x, i) => ({
-                debugName: x.source.getDebugName(),
-                validWindow: x.validWindow,
-                route: x.route,
-                noFullSync: x.noFullSync,
-                supportsChangesAfter: this.sourceStates[i].supportsChangesAfter,
-                initialScanComplete: this.sourceStates[i].scanComplete,
-                scannedCount: this.sourceStates[i].scannedCount,
-            })).filter((x, i) => this.isLive(i)),
-        };
-    }
-
-    // ── large uploads ──
-    // Large uploads stream onto the local disk source directly (they may not fit in memory)
-
     private getDiskSource(): { disk: ArchivesDisk; sourceIndex: number } {
         for (let i = 0; i < this.sources.length; i++) {
             let source = this.sources[i].source;
             if (source instanceof ArchivesDisk) return { disk: source, sourceIndex: i };
         }
         throw new Error(`Large uploads require an ArchivesDisk source, and this store has none (store ${this.folder})`);
-    }
-    public async startLargeUpload(): Promise<string> {
-        await this.init();
-        return await this.getDiskSource().disk.startLargeUpload();
-    }
-    public async appendLargeUpload(id: string, data: Buffer): Promise<void> {
-        await this.getDiskSource().disk.appendLargeUpload(id, data);
-    }
-    public async finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void> {
-        let { disk, sourceIndex } = this.getDiskSource();
-        await disk.finishLargeUpload(id, key, lastModified);
-        this.overlay.delete(key);
-        // includeTombstones: a zero-byte upload is still a real file whose index entry must be written
-        let info = await disk.getInfo(key, { includeTombstones: true });
-        if (info) {
-            this.setIndexEntry(key, { writeTime: info.writeTime, size: info.size, sourcesListIndex: this.sourcesListIndexOfSlot(sourceIndex) });
-        }
-    }
-    public async cancelLargeUpload(id: string): Promise<void> {
-        await this.getDiskSource().disk.cancelLargeUpload(id);
     }
 
     private async flushOverlay(force?: boolean): Promise<void> {
@@ -1251,4 +1384,6 @@ export class BlobStore implements IBucketStore {
             }
         }
     }
+
+    // #endregion
 }

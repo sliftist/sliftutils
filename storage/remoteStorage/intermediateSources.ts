@@ -1,4 +1,4 @@
-import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig } from "../IArchives";
+import { RemoteConfig, RemoteConfigBase, SourceConfig } from "../IArchives";
 
 export const INTERMEDIATE_EXPIRE_GRACE = 15 * 60 * 1000;
 const INTERMEDIATE_VERSION_FRACTION = 1_000_000;
@@ -12,38 +12,36 @@ export function nextIntermediateVersion(version: number): number {
     return version + step;
 }
 
-type ObjectSource = HostedConfig | BackblazeConfig;
-
-function isObjectSource(source: RemoteConfigBase): source is ObjectSource {
+function isSourceConfig(source: RemoteConfigBase): source is SourceConfig {
     return typeof source !== "string";
 }
 
 function cloneSource(source: RemoteConfigBase): RemoteConfigBase {
-    if (!isObjectSource(source)) return source;
+    if (!isSourceConfig(source)) return source;
     return { ...source, validWindow: [source.validWindow[0], source.validWindow[1]] };
 }
 
-function joinKey(source: ObjectSource): string {
+function joinKey(source: SourceConfig): string {
     return JSON.stringify({ ...source, validWindow: undefined });
 }
 
-export function getIntermediateSources(config: RemoteConfig): ObjectSource[] {
-    return config.sources.filter(x => isObjectSource(x) && x.intermediate) as ObjectSource[];
+export function getIntermediateSources(config: RemoteConfig): SourceConfig[] {
+    return config.sources.filter(x => isSourceConfig(x) && x.intermediate) as SourceConfig[];
 }
 
 export function hasIntermediateSources(config: RemoteConfig): boolean {
-    return config.sources.some(x => isObjectSource(x) && x.intermediate);
+    return config.sources.some(x => isSourceConfig(x) && x.intermediate);
 }
 
 /** Removes every intermediate entry and rejoins the windows it split, giving back the underlying configuration. Two configs that resolve equal differ only by intermediates. */
 export function resolveIntermediateSources(config: RemoteConfig): RemoteConfig {
     if (!hasIntermediateSources(config)) return config;
     let removed = getIntermediateSources(config);
-    let sources = config.sources.filter(x => !isObjectSource(x) || !x.intermediate).map(cloneSource);
+    let sources = config.sources.filter(x => !isSourceConfig(x) || !x.intermediate).map(cloneSource);
     for (let gap of removed) {
         let [gapStart, gapEnd] = gap.validWindow;
-        let before = sources.find(x => isObjectSource(x) && x.validWindow[1] === gapStart) as ObjectSource | undefined;
-        let after = sources.find(x => isObjectSource(x) && x.validWindow[0] === gapEnd) as ObjectSource | undefined;
+        let before = sources.find(x => isSourceConfig(x) && x.validWindow[1] === gapStart) as SourceConfig | undefined;
+        let after = sources.find(x => isSourceConfig(x) && x.validWindow[0] === gapEnd) as SourceConfig | undefined;
         if (before && after && joinKey(before) === joinKey(after)) {
             before.validWindow = [before.validWindow[0], after.validWindow[1]];
             sources.splice(sources.indexOf(after), 1);
@@ -64,12 +62,12 @@ export function resolveIntermediateSources(config: RemoteConfig): RemoteConfig {
 export function injectIntermediateSource(config: RemoteConfig, inject: { splitUrl: string; intermediateUrl: string; start: number; end: number }): RemoteConfig {
     let { splitUrl, intermediateUrl, start, end } = inject;
     if (start >= end) return config;
-    if (config.sources.some(x => isObjectSource(x) && x.intermediate && x.url === intermediateUrl && x.validWindow[0] === start && x.validWindow[1] === end)) {
+    if (config.sources.some(x => isSourceConfig(x) && x.intermediate && x.url === intermediateUrl && x.validWindow[0] === start && x.validWindow[1] === end)) {
         return config;
     }
     let sources: RemoteConfigBase[] = [];
     for (let source of config.sources) {
-        if (!isObjectSource(source) || source.url !== splitUrl || source.intermediate) {
+        if (!isSourceConfig(source) || source.url !== splitUrl || source.intermediate) {
             sources.push(cloneSource(source));
             continue;
         }
@@ -110,8 +108,8 @@ export function expireIntermediateSources(config: RemoteConfig, now: number): Re
 }
 
 /** The url of the entry an intermediate was split out of - the neighbour it touches. */
-export function findSplitUrl(config: RemoteConfig, intermediate: ObjectSource): string | undefined {
+export function findSplitUrl(config: RemoteConfig, intermediate: SourceConfig): string | undefined {
     let [start, end] = intermediate.validWindow;
-    let neighbour = config.sources.find(x => isObjectSource(x) && !x.intermediate && (x.validWindow[1] === start || x.validWindow[0] === end)) as ObjectSource | undefined;
+    let neighbour = config.sources.find(x => isSourceConfig(x) && !x.intermediate && (x.validWindow[1] === start || x.validWindow[0] === end)) as SourceConfig | undefined;
     return neighbour?.url;
 }

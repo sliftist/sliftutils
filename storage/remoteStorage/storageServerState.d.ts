@@ -1,73 +1,61 @@
 /// <reference types="node" />
 /// <reference types="node" />
 import { IBucketStore } from "./blobStore";
-import { RemoteConfig, HostedConfig, IArchives, ArchivesConfig } from "../IArchives";
-import type { IStorage } from "../IStorage";
-import type { AccessRequest, TrustRecord } from "./storageController";
-export type StorageServerConfig = {
-    domain: string;
-    port: number;
-    rootDomain: string;
-    sshTarget: string;
-    serverCommand: string;
+import { RemoteConfig, HostedConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { BucketDiskInfo } from "./bucketDisk";
+import { SelfSummary } from "./storePlan";
+export type LoadedStore = {
+    routeKey: string;
+    route?: [number, number];
+    entries: HostedConfig[];
     folder: string;
+    store: IBucketStore;
 };
-export declare function setStorageServerConfig(value: StorageServerConfig): void;
-export declare function getStorageServerConfig(): StorageServerConfig;
-export declare function getStorageServerConfigOptional(): StorageServerConfig | undefined;
-export declare function setWritesRejectedReason(reason: string | undefined): void;
-export declare function getWritesRejectedReason(): string | undefined;
-export declare function assertWritesAllowed(): void;
-export declare function getTrust(): Promise<IStorage<TrustRecord>>;
-export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
-export type BucketWriteStats = {
-    /** Every set call the bucket accepted */
-    originalWrites: number;
-    originalBytes: number;
-    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
-    flushedWrites: number;
-    flushedBytes: number;
-};
-/** Zeroes the write statistics of every bucket in the account. */
-export declare function clearAccountWriteStats(account: string): number;
-export declare function setTrustedMachines(config: {
-    account: string;
-    machineIds: string[];
-}): Promise<void>;
-export type LoadedBucket = {
+export type BucketState = {
     account: string;
     bucketName: string;
     routing: RemoteConfig;
     routingJSON: string;
     selfEntries: HostedConfig[];
     self: SelfSummary | undefined;
-    store: IBucketStore;
+    stores: LoadedStore[];
     structureKey: string;
 };
-export declare function addExtraListenPort(port: number): void;
-export declare function removeExtraListenPort(port: number): void;
-/** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
-export declare function isOwnAddress(address: string, port: number): boolean;
+/** The loaded bucket, loading it (which instantiates its stores and starts their synchronization) if needed. A bucket that does not exist on this server throws - callers never see undefined buckets. */
+export declare function requireBucket(account: string, bucketName: string): Promise<BucketState>;
+/** The store serving a request: the exact config entry the CLIENT selected, matched by equality (key order ignored) against the bucket's own entries. A match is honored even when its window has passed - the selection never validates, the store's own validation throws instead. Throws when nothing matches, listing what is available. */
+export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore>;
+/** Internal (store-to-store) reads skip store selection entirely: the caller is another store whose index says this MACHINE holds the bytes - the persisted holder identity is just a URL, which cannot name a store. Whichever store's folder has the newest copy answers. */
+export declare function readBucketInternal(account: string, bucketName: string, config: {
+    path: string;
+    range?: {
+        start: number;
+        end: number;
+    };
+    includeTombstones?: boolean;
+}): Promise<{
+    data: Buffer;
+    writeTime: number;
+    size: number;
+} | undefined>;
+export declare function getBucketConfig(bucket: BucketState): ArchivesConfig;
+export declare function bucketSyncStatus(bucket: BucketState): Promise<ArchivesSyncStatus>;
+export declare function bucketIndexTotals(bucket: BucketState): Promise<{
+    fileCount: number;
+    byteCount: number;
+    sources: {
+        debugName: string;
+        fileCount: number;
+        byteCount: number;
+    }[];
+} | undefined>;
 /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
 export declare function resolveSourceArchives(url: string): IArchives;
-/** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
-export type SelfSummary = {
-    /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
-    routes: [number, number][];
-    public: boolean;
-    immutable: boolean;
-    noFullSync: boolean;
-    rawDisk: boolean;
-    readerDiskLimit?: number;
-};
-export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
-export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
-export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
+export declare function getLoadedBucket(account: string, bucketName: string): Promise<BucketState | undefined>;
+/** The routing-config write path - the ONE write that cannot go through a store (it is what CREATES the bucket and its stores). Serialized per bucket: concurrent config writes would race the version check. */
+export declare function queueRoutingConfigWrite(account: string, bucketName: string, data: Buffer, config?: {
     lastModified?: number;
-    forceSetImmutable?: boolean;
-    internal?: boolean;
 }): Promise<void>;
-export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
 /** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
 export declare function getActiveBucketKeys(): {
     account: string;
@@ -79,11 +67,6 @@ export declare const startIntermediateMaintenance: {
     (): void;
     reset(): void;
     set(newValue: void): void;
-};
-export type BucketDiskInfo = {
-    totalBytes: number;
-    freeBytes: number;
-    usedBytes: number;
 };
 export type ServerBucketInfo = {
     bucketName: string;
@@ -111,8 +94,14 @@ export declare function getActiveBucket(account: string, bucketName: string): Pr
 /** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
 export declare function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
 export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
-export declare function deleteBucketFile(account: string, bucketName: string, filePath: string, config?: {
-    lastModified?: number;
-    internal?: boolean;
-}): Promise<void>;
-export declare function getLocalArchives(account: string, bucketName: string): IArchives;
+export type BucketWriteStats = {
+    /** Every set call the bucket accepted */
+    originalWrites: number;
+    originalBytes: number;
+    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+    flushedWrites: number;
+    flushedBytes: number;
+};
+/** Zeroes the write statistics of every bucket in the account. */
+export declare function clearAccountWriteStats(account: string): number;
+export declare function getLocalArchives(account: string, bucketName: string, sourceConfig: SourceConfig): IArchives;

@@ -2,7 +2,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig, LARGE_SET_THRESHOLD, bufferChunkStream } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SourceConfig, SetConfig, LARGE_SET_THRESHOLD, bufferChunkStream } from "../IArchives";
 import { parseHostedUrl, getBucketBaseUrl, buildFileUrl } from "./remoteConfig";
 import {
     RemoteStorageController, STORAGE_AUTH_PURPOSE,
@@ -20,6 +20,8 @@ export type ArchivesRemoteConfig = {
     url: string;
     // false: access-denied calls throw immediately (the error includes the access page link) instead of requesting access and blocking until it is granted (the default).
     waitForAccess?: boolean;
+    /** The exact routing-config entry this connection represents, sent with every call so the server picks the matching per-route store (one server hosts one store per route). Instances built from a bare URL fabricate one - it will never match, which only works for calls that don't select a store (internal reads, ROUTING_FILE, getConfig). */
+    sourceConfig: SourceConfig;
 };
 
 export function parseStorageUrl(url: string): { address: string; port: number } {
@@ -88,9 +90,9 @@ export class ArchivesRemote implements IArchives {
 
     // Returns undefined if this machine has access to the account. Otherwise puts in an access request and returns our machineId + ip (so the caller can display them alongside the link, for the approver to match the incoming request) and the link to the grant page.
     public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
-        let state = await this.callAuthed(() => this.controller.getAccessState(this.account));
+        let state = await this.callAuthed(() => this.controller.getAccessState({ account: this.account }));
         if (state.hasAccess) return undefined;
-        let requested = await this.callAuthed(() => this.controller.requestAccess(this.account));
+        let requested = await this.callAuthed(() => this.controller.requestAccess({ account: this.account }));
         return {
             link: `https://${this.parsed.address}:${this.parsed.port}/${this.account}`,
             machineId: requested.machineId,
@@ -99,13 +101,13 @@ export class ArchivesRemote implements IArchives {
     }
 
     public async hasWriteAccess(): Promise<boolean> {
-        let state = await this.callAuthed(() => this.controller.getAccessState(this.account));
+        let state = await this.callAuthed(() => this.controller.getAccessState({ account: this.account }));
         return !!state.hasAccess;
     }
 
     // Registers our access request server-side (so an admin has a requestId to grant) and logs the grant instructions, at most once a minute
     private async registerAccessRequest(): Promise<void> {
-        let requested = await this.callAuthed(() => this.controller.requestAccess(this.account));
+        let requested = await this.callAuthed(() => this.controller.requestAccess({ account: this.account }));
         if (Date.now() - this.lastDeniedLog > timeInMinute) {
             this.lastDeniedLog = Date.now();
             console.log(`No access to storage account ${JSON.stringify(this.account)} on ${this.parsed.address}:${this.parsed.port} (our machine ${requested.machineId}, ip ${requested.ip}). See https://${this.parsed.address}:${this.parsed.port}/${this.account} - or grant it with: ${requested.grantAccessCommand}`);
@@ -142,56 +144,59 @@ export class ArchivesRemote implements IArchives {
         return result && result.data || undefined;
     }
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        let result = await this.call(() => this.controller.get2(this.account, this.bucketName, fileName, config?.range, config?.internal));
+        let result = await this.call(() => this.controller.get2({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, range: config?.range, internal: config?.internal, includeTombstones: config?.includeTombstones }));
         return result && { data: Buffer.from(result.data), writeTime: result.writeTime, size: result.size } || undefined;
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        if (!data.length) {
+            throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+        }
         if (data.length > LARGE_SET_THRESHOLD) {
             // One giant message would exceed the wire limit and lag every other client sharing this connection - stream it instead. (The large-file path cannot carry forceSetImmutable/noChecks/internal; large pushes accept plain-write semantics, and reconciliation's per-file error handling absorbs the rare immutable rejection.)
             await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
             return fileName;
         }
-        await this.call(() => this.controller.set(this.account, this.bucketName, fileName, data, config?.lastModified, config?.forceSetImmutable, config?.internal));
+        await this.call(() => this.controller.set({ account: this.account, bucketName: this.bucketName, path: fileName, data, sourceConfig: this.config.sourceConfig, lastModified: config?.lastModified, forceSetImmutable: config?.forceSetImmutable, internal: config?.internal }));
         return fileName;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
-        await this.call(() => this.controller.del(this.account, this.bucketName, fileName, config?.lastModified, config?.internal));
+        await this.call(() => this.controller.del({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, lastModified: config?.lastModified, internal: config?.internal }));
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
-        return await this.call(() => this.controller.getInfo(this.account, this.bucketName, fileName, config?.includeTombstones));
+        return await this.call(() => this.controller.getInfo({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, includeTombstones: config?.includeTombstones }));
     }
-    public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        return await this.call(() => this.controller.findInfo(this.account, this.bucketName, prefix, config));
+    public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
+        return await this.call(() => this.controller.findInfo({ account: this.account, bucketName: this.bucketName, prefix, sourceConfig: this.config.sourceConfig, shallow: config?.shallow, type: config?.type }));
     }
-    public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
+    public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         return (await this.findInfo(prefix, config)).map(x => x.path);
     }
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        return await this.call(() => this.controller.getChangesAfter2(this.account, this.bucketName, config));
+        return await this.call(() => this.controller.getChangesAfter2({ account: this.account, bucketName: this.bucketName, sourceConfig: this.config.sourceConfig, time: config.time, routes: config.routes }));
     }
     public async getConfig(): Promise<ArchivesConfig> {
-        return await this.call(() => this.controller.getArchivesConfig(this.account, this.bucketName));
+        return await this.call(() => this.controller.getArchivesConfig({ account: this.account, bucketName: this.bucketName }));
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
-        return await this.call(() => this.controller.getSyncStatus(this.account, this.bucketName));
+        return await this.call(() => this.controller.getSyncStatus({ account: this.account, bucketName: this.bucketName }));
     }
 
     public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         // Ensure we're authenticated with access BEFORE consuming any data (the stream cannot be rewound, so we can't use the retry loop around the actual upload)
-        await this.call(() => this.controller.getInfo(this.account, this.bucketName, config.path));
-        let uploadId = await this.controller.startLargeFile(this.account, this.bucketName, config.path, config.lastModified);
+        await this.call(() => this.controller.getInfo({ account: this.account, bucketName: this.bucketName, path: config.path, sourceConfig: this.config.sourceConfig }));
+        let uploadId = await this.controller.startLargeFile({ account: this.account, bucketName: this.bucketName, path: config.path, sourceConfig: this.config.sourceConfig, lastModified: config.lastModified });
         try {
             while (true) {
                 let data = await config.getNextData();
                 if (!data) break;
                 for (let offset = 0; offset < data.length; offset += LARGE_FILE_PART_SIZE) {
-                    await this.controller.uploadPart(uploadId, data.subarray(offset, offset + LARGE_FILE_PART_SIZE));
+                    await this.controller.uploadPart({ uploadId, data: data.subarray(offset, offset + LARGE_FILE_PART_SIZE) });
                 }
             }
-            await this.controller.finishLargeFile(uploadId);
+            await this.controller.finishLargeFile({ uploadId });
         } catch (e) {
             try {
-                await this.controller.cancelLargeFile(uploadId);
+                await this.controller.cancelLargeFile({ uploadId });
             } catch { }
             throw e;
         }

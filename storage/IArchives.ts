@@ -30,7 +30,10 @@ export type RemoteConfig = {
 
     NOTE: If we're in the browser, we should allow downloading the files via the URL form (if it's a public bucket), however, we won't allow writing, because their servers do not allow secure browser writes.
 */
-export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
+export type RemoteConfigBase = string | SourceConfig;
+
+/** One configured source in a routing config: a hosted (our storage server) or backblaze entry. Requests carry the exact SourceConfig they selected, and the server matches it against its own entries to pick the backing store. */
+export type SourceConfig = HostedConfig | BackblazeConfig;
 
 export type CommonConfig = {
     /** By default a server hosting this bucket eagerly copies this source's full contents onto its own disk (on top of the lazy read-through caching). Set this to be a front end for a very large database without copying the full database - reads still down-cache individual files on demand. */
@@ -92,6 +95,15 @@ export type GetConfig = {
     noFallbacks?: boolean;
     /** Store-to-store call: the serving node answers purely from its own disk, completely short-circuiting its index holders - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). No window or route checks on reads: if the bytes are on its disk, the caller may have them. */
     internal?: boolean;
+    /** Also return size-0 results (tombstones - an empty file IS a missing file) instead of treating them as absent. Off by default, matching getInfo's flag of the same name. Synchronization passes this so a DELETED file (with its write time) is distinguishable from a file that never existed. */
+    includeTombstones?: boolean;
+};
+
+export type FindConfig = {
+    shallow?: boolean;
+    type?: "files" | "folders";
+    /** Listings normally come ONLY from the authoritative sources (the same nodes writes go to - read-your-writes). With fallbacks, a failing shard's routes are covered by the next source holding them (e.g. a wide read replica) instead of the call failing - high availability at the cost of possibly missing just-written data. Single-source archives ignore the flag. */
+    fallbacks?: boolean;
 };
 
 export type DelConfig = {
@@ -118,7 +130,7 @@ export type SetConfig = {
     lastModified?: number;
     /** Makes the write acceptable on immutable targets: an existing path is simply kept (immutability wins - nothing is overwritten) instead of the write throwing. Requires lastModified. Synchronization MUST pass this on every push - a plain set throws on immutable targets, which would abort reconciliation whenever one source in a chain is immutable. */
     forceSetImmutable?: boolean;
-    /** Skips the target-side safety reads around the write (backblaze: the pre-write getInfo comparison and the post-upload existence poll). For writers whose own bookkeeping already decides what to write and orders it by write time (BlobStore's index-driven writes and synchronization), those reads are pure extra API calls - but the default stays checked, because other users of the raw backends rely on the checks. */
+    /** Skips REDUNDANT target-side safety reads around the write (backblaze: the post-upload existence poll). It does NOT skip checks that are the target's only ordering guard: backblaze's pre-write comparison stays, because b2 has no server of ours enforcing only-take-the-latest - without it a stale push lands over a newer value or tombstone and b2's self-stamped upload time launders it into the newest copy in the system (global resurrection). Hosted targets re-check server-side, so their client-side shortcuts are safe. */
     noChecks?: boolean;
     /** Store-to-store push: the receiving node writes purely to its own disk and index, with NO downstream fan-out (the pushing store owns propagation - fanning its pushes back out is how write loops between stores form). Window and route ARE still checked: the stamp must fall inside one of the receiver's configured windows and routes, so a confused peer cannot stuff data onto a node that was never meant to hold it. Requires lastModified. */
     internal?: boolean;
@@ -312,9 +324,9 @@ export interface IArchives {
      * their empty files - that is how scans learn of deletions - but nothing built on the index
      * ever surfaces them.
      */
-    find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]>;
+    find(prefix: string, config?: FindConfig): Promise<string[]>;
     /** See find for the empty-file (tombstone) rule. */
-    findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]>;
+    findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
     /** Only works for public buckets (private buckets are API-access only). */
     getURL(path: string): Promise<string>;
     /** The bucket's configuration, which tells whether the optional functions are supported. */

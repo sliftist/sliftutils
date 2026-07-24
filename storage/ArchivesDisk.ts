@@ -3,7 +3,7 @@ import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { sort, binarySearchBasic } from "socket-function/src/misc";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 // The base file-system IArchives: storage is one-to-one with the file system, every key is exactly one real file under <folder>/files, so the file system itself is the index. File handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a file run in serial, so they can't collide with each other or with handle closing. Used as the disk synchronization source of BlobStore (see remoteStorage/blobStore.ts).
@@ -210,6 +210,8 @@ export class ArchivesDisk implements IArchives {
             }
             let stats = await handle.stat();
             let size = stats.size;
+            // A size-0 file is a tombstone (an empty file IS a missing file) - absent, unless the caller asked for tombstones. Ranged reads of a REAL file can still legitimately return no bytes (range past EOF, below).
+            if (!size && !config?.includeTombstones) return undefined;
             let start = range && Math.min(range.start, size) || 0;
             let end = range && Math.min(range.end, size) || size;
             if (end <= start) return { data: Buffer.alloc(0), writeTime: stats.mtimeMs, size };
@@ -233,11 +235,11 @@ export class ArchivesDisk implements IArchives {
         });
     }
 
-    public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
+    public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         return (await this.findInfo(prefix, config)).map(x => x.path);
     }
 
-    public async findInfo(prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
+    public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
         await this.init();
         let infos = new Map<string, ArchiveFileInfo>();
         await this.collectFiles("", prefix, infos);
@@ -362,7 +364,7 @@ async function statOrUndefined(filePath: string): Promise<fs.Stats | undefined> 
 }
 
 // The folders/shallow post-processing shared by findInfo implementations that list flat files (used by ArchivesDisk on the raw disk walk, and by BlobStore on its index).
-export function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: { shallow?: boolean; type?: "files" | "folders" }): ArchiveFileInfo[] {
+export function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: FindConfig): ArchiveFileInfo[] {
     if (config?.type === "folders") {
         let folders = new Map<string, ArchiveFileInfo>();
         for (let file of files) {

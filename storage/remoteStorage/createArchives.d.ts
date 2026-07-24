@@ -1,10 +1,10 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+import { IArchives, RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
 import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
-export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
+export declare function createApiArchives(source: SourceConfig): IArchives;
 export type ArchivesChainOptions = {
     /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
     directConnect?: boolean;
@@ -82,14 +82,8 @@ export declare class ArchivesChain implements IArchives {
     } | undefined>;
     private selectCoveringSources;
     private runOnCovering;
-    find(prefix: string, config?: {
-        shallow?: boolean;
-        type: "files" | "folders";
-    }): Promise<string[]>;
-    findInfo(prefix: string, config?: {
-        shallow?: boolean;
-        type: "files" | "folders";
-    }): Promise<ArchiveFileInfo[]>;
+    find(prefix: string, config?: FindConfig): Promise<string[]>;
+    findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getSyncStatus(): Promise<ArchivesSyncStatus>;
     getConfig(): Promise<ArchivesConfig>;

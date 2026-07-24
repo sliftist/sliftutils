@@ -3,228 +3,158 @@ import fs from "fs";
 import { lazy } from "socket-function/src/caching";
 import { sort } from "socket-function/src/misc";
 import { runInfinitePoll } from "socket-function/src/batching";
-import { getFileStorageNested2 } from "../FileFolderAPI";
-import { TransactionStorage } from "../TransactionStorage";
-import { JSONStorage } from "../JSONStorage";
 import { ArchivesDisk } from "../ArchivesDisk";
-import { BlobStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MARGIN } from "./blobStore";
+import { BlobStore, RawDiskStore, IBucketStore, DEFAULT_FAST_WRITE_DELAY, WINDOW_END_FLUSH_MARGIN } from "./blobStore";
 import {
-    RemoteConfig, HostedConfig, BackblazeConfig, IArchives, ArchivesSource, ArchiveFileInfo, ArchivesConfig,
-    ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig,
-    STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, FULL_ROUTE,
+    RemoteConfig, HostedConfig, SourceConfig, IArchives, ArchivesSource, ArchivesConfig, ArchivesSyncStatus,
+    ArchiveFileInfo, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, SyncActivity, FULL_ROUTE,
 } from "../IArchives";
-import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, getRoute, routeContains, routeIntersection, normalizeSource } from "./remoteConfig";
+import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, routeIntersection, normalizeSource } from "./remoteConfig";
 import { injectIntermediateSource, expireIntermediateSources, getIntermediateSources, findSplitUrl, nextIntermediateVersion, INTERMEDIATE_EXPIRE_GRACE } from "./intermediateSources";
 import { getTakeoverIntermediate } from "./deployTakeover";
 import { createApiArchives, listServerActiveBucketKeys } from "./createArchives";
-import type { IStorage } from "../IStorage";
 import { broadcastRoutingChanged } from "./storageController";
-import type { AccessRequest, TrustRecord } from "./storageController";
-import { getArg } from "./cliArgs";
+import { getStorageServerConfig, assertWritesAllowed } from "./serverConfig";
+import { getBucketFolder, readRoutingFile, readRoutingFromDisk, getRoutingFileResult, getDiskInfo, BucketDiskInfo } from "./bucketDisk";
+import { computeStorePlan, findSelfIndexes, StorePlan, StorePlanStore, SelfSummary } from "./storePlan";
 
-export type StorageServerConfig = {
-    domain: string;
-    port: number;
-    rootDomain: string;
-    sshTarget: string;
-    serverCommand: string;
+// The storage server's bucket lifecycle: the map of loaded buckets (each = its routing config + one BlobStore per route), keeping them current (routing reloads, window-boundary rebuilds, boundary scans), writing/propagating routing configs, deploy-switchover maintenance, and the server-level bucket listings. Store selection (sourceConfig -> store) lives here too, as findBucketStore.
+
+export type LoadedStore = {
+    // JSON of the route (FULL_ROUTE when absent) - the ONE route this store serves
+    routeKey: string;
+    route?: [number, number];
+    // The exact self entries this store serves (same route, different valid windows). Empty when we are not in the config but still serve our disk data.
+    entries: HostedConfig[];
     folder: string;
+    store: IBucketStore;
 };
 
-let config: StorageServerConfig | undefined;
-export function setStorageServerConfig(value: StorageServerConfig): void {
-    config = value;
-}
-export function getStorageServerConfig(): StorageServerConfig {
-    if (!config) {
-        throw new Error(`Storage server is not initialized (this API only works on the storage server)`);
-    }
-    return config;
-}
-export function getStorageServerConfigOptional(): StorageServerConfig | undefined {
-    return config;
-}
-
-let writesRejectedReason: string | undefined;
-export function setWritesRejectedReason(reason: string | undefined): void {
-    writesRejectedReason = reason;
-}
-export function getWritesRejectedReason(): string | undefined {
-    return writesRejectedReason;
-}
-export function assertWritesAllowed(): void {
-    if (writesRejectedReason) throw new Error(writesRejectedReason);
-}
-
-function getStorageFolder(): string {
-    let config = getStorageServerConfigOptional();
-    if (config) return config.folder;
-    let folder = getArg("folder");
-    if (!folder) {
-        throw new Error(`Storage server is not initialized and there is no --folder arg, so the storage folder is unknown`);
-    }
-    return path.resolve(folder);
-}
-
-const systemStorages = new Map<string, Promise<IStorage<unknown>>>();
-function getSystemStorage<T>(name: string): Promise<IStorage<T>> {
-    let storage = systemStorages.get(name);
-    if (!storage) {
-        storage = (async () => {
-            let root = await getFileStorageNested2(getStorageFolder());
-            let system = await root.folder.getStorage("system2");
-            let transactionName = "storage" + name[0].toUpperCase() + name.slice(1);
-            return new JSONStorage<unknown>(new TransactionStorage(await system.folder.getStorage(name), transactionName));
-        })();
-        systemStorages.set(name, storage);
-    }
-    return storage as Promise<IStorage<T>>;
-}
-export function getTrust(): Promise<IStorage<TrustRecord>> {
-    return getSystemStorage<TrustRecord>("trust");
-}
-export function getRequests(): Promise<IStorage<AccessRequest[]>> {
-    return getSystemStorage<AccessRequest[]>("requests");
-}
-
-export type BucketWriteStats = {
-    /** Every set call the bucket accepted */
-    originalWrites: number;
-    originalBytes: number;
-    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
-    flushedWrites: number;
-    flushedBytes: number;
-};
-function emptyWriteStats(): BucketWriteStats {
-    return { originalWrites: 0, originalBytes: 0, flushedWrites: 0, flushedBytes: 0 };
-}
-
-// In memory only: totals since this process started (or the last clearWriteStats). Persisting them to disk was more machinery than the numbers were worth.
-const writeStats = new Map<string, BucketWriteStats>();
-
-function countBucketWrite(key: string, kind: "original" | "flushed", bytes: number): void {
-    let stats = writeStats.get(key);
-    if (!stats) {
-        stats = emptyWriteStats();
-        writeStats.set(key, stats);
-    }
-    if (kind === "original") {
-        stats.originalWrites++;
-        stats.originalBytes += bytes;
-    } else {
-        stats.flushedWrites++;
-        stats.flushedBytes += bytes;
-    }
-}
-
-function getBucketWriteStats(key: string): BucketWriteStats {
-    return writeStats.get(key) || emptyWriteStats();
-}
-
-/** Zeroes the write statistics of every bucket in the account. */
-export function clearAccountWriteStats(account: string): number {
-    let prefix = `${account}/`;
-    let cleared = 0;
-    for (let key of [...writeStats.keys()]) {
-        if (!key.startsWith(prefix)) continue;
-        writeStats.delete(key);
-        cleared++;
-    }
-    console.log(`Cleared the write statistics of ${cleared} buckets in account ${account}`);
-    return cleared;
-}
-
-export async function setTrustedMachines(config: { account: string; machineIds: string[] }): Promise<void> {
-    let trust = await getTrust();
-    let prefix = `${config.account}|`;
-    let desired = new Set(config.machineIds);
-    for (let key of await trust.getKeys()) {
-        if (!key.startsWith(prefix)) continue;
-        let machineId = key.slice(prefix.length);
-        if (desired.has(machineId)) {
-            desired.delete(machineId);
-            continue;
-        }
-        console.log(`Removing trust for machine ${machineId} on account ${config.account}`);
-        await trust.remove(key);
-    }
-    for (let machineId of desired) {
-        console.log(`Adding trust for machine ${machineId} on account ${config.account}`);
-        await trust.set(`${prefix}${machineId}`, { account: config.account, machineId, ip: "", time: Date.now() });
-    }
-}
-
-export type LoadedBucket = {
+// A bucket loaded on this server: its routing config and its per-route stores. Pure data - the stores themselves do the work.
+export type BucketState = {
     account: string;
     bucketName: string;
     routing: RemoteConfig;
     routingJSON: string;
     selfEntries: HostedConfig[];
     self: SelfSummary | undefined;
-    store: IBucketStore;
+    stores: LoadedStore[];
     structureKey: string;
 };
 
-const buckets = new Map<string, Promise<LoadedBucket | undefined>>();
-
-const MAX_REBUILD_TIMER_DELAY = 2 ** 31 - 1;
-const REBUILD_BOUNDARY_BUFFER = 1000;
-
-function getBucketFolder(account: string, bucketName: string): string {
-    return path.join(getStorageServerConfig().folder, "buckets2", account, bucketName);
-}
-
-const extraListenPorts = new Set<number>();
-export function addExtraListenPort(port: number): void {
-    extraListenPorts.add(port);
-}
-export function removeExtraListenPort(port: number): void {
-    extraListenPorts.delete(port);
-}
-/** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
-export function isOwnAddress(address: string, port: number): boolean {
-    let config = getStorageServerConfigOptional();
-    if (!config) return false;
-    if (address !== config.domain) return false;
-    return port === config.port || extraListenPorts.has(port);
-}
-
-function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[] {
-    let indexes: number[] = [];
-    for (let i = 0; i < routing.sources.length; i++) {
-        let source = routing.sources[i];
-        if (typeof source === "string" || source.type !== "remote") continue;
-        let parsed = parseHostedUrl(source.url);
-        if (parsed.account !== account || parsed.bucketName !== bucketName) continue;
-        if (isOwnAddress(parsed.address, parsed.port)) {
-            indexes.push(i);
-        }
+/** JSON with sorted object keys and undefined-valued keys dropped, so two configs that mean the same thing compare equal regardless of key order or which side serialized them. */
+function stableStringify(value: unknown): string {
+    if (!value || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) {
+        return `[${value.map(x => stableStringify(x)).join(",")}]`;
     }
-    return indexes;
+    let entries = Object.entries(value as Record<string, unknown>).filter(x => x[1] !== undefined);
+    sort(entries, x => x[0]);
+    return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`).join(",")}}`;
 }
 
-function selectEntryAt(entries: HostedConfig[], time: number, route?: number): HostedConfig | undefined {
-    if (route !== undefined) {
-        let covering = entries.filter(x => routeContains(x.route, route));
-        if (covering.length) {
-            entries = covering;
-        }
+/** The loaded bucket, loading it (which instantiates its stores and starts their synchronization) if needed. A bucket that does not exist on this server throws - callers never see undefined buckets. */
+export async function requireBucket(account: string, bucketName: string): Promise<BucketState> {
+    let bucket = await getLoadedBucket(account, bucketName);
+    if (!bucket) {
+        throw new Error(`Bucket ${account}/${bucketName} does not exist on this server. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
     }
-    let containing = entries.find(x => x.validWindow[0] <= time && time < x.validWindow[1]);
-    if (containing) return containing;
-    let best: HostedConfig | undefined;
-    let bestDistance = Infinity;
-    for (let entry of entries) {
-        let distance = Math.min(Math.abs(time - entry.validWindow[0]), Math.abs(time - entry.validWindow[1]));
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            best = entry;
+    return bucket;
+}
+
+/** The store serving a request: the exact config entry the CLIENT selected, matched by equality (key order ignored) against the bucket's own entries. A match is honored even when its window has passed - the selection never validates, the store's own validation throws instead. Throws when nothing matches, listing what is available. */
+export async function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore> {
+    let bucket = await requireBucket(account, bucketName);
+    if (!sourceConfig) {
+        throw new Error(`No remote source configuration was provided for bucket ${account}/${bucketName}: every request must say which configured source it selected. Available: ${JSON.stringify(bucket.selfEntries)}`);
+    }
+    let wanted = stableStringify(sourceConfig);
+    for (let s of bucket.stores) {
+        if (s.entries.some(e => stableStringify(e) === wanted)) return s;
+    }
+    throw new Error(`No source on this server matches the requested remote configuration for bucket ${account}/${bucketName}. Requested: ${JSON.stringify(sourceConfig)}. Available: ${JSON.stringify(bucket.selfEntries)}`);
+}
+
+/** Internal (store-to-store) reads skip store selection entirely: the caller is another store whose index says this MACHINE holds the bytes - the persisted holder identity is just a URL, which cannot name a store. Whichever store's folder has the newest copy answers. */
+export async function readBucketInternal(account: string, bucketName: string, config: { path: string; range?: { start: number; end: number }; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    let bucket = await requireBucket(account, bucketName);
+    let results = await Promise.all(bucket.stores.map(s => s.store.get2({ path: config.path, range: config.range, includeTombstones: config.includeTombstones, internal: true })));
+    let best: { data: Buffer; writeTime: number; size: number } | undefined;
+    for (let result of results) {
+        if (result && (!best || result.writeTime > best.writeTime)) {
+            best = result;
         }
     }
     return best;
 }
 
-function scheduleWindowBoundaryRebuild(loaded: LoadedBucket): void {
+export function getBucketConfig(bucket: BucketState): ArchivesConfig {
+    let index = { fileCount: 0, byteCount: 0 };
+    let indexSources: { debugName: string; fileCount: number; byteCount: number }[] = [];
+    let syncing: SyncActivity[] = [];
+    let readerDiskLimit: number | undefined;
+    for (let s of bucket.stores) {
+        let progress = s.store.getSyncProgress?.();
+        if (!progress) continue;
+        index.fileCount += progress.index.fileCount;
+        index.byteCount += progress.index.byteCount;
+        indexSources.push(...progress.sources);
+        syncing.push(...progress.syncing);
+        readerDiskLimit = readerDiskLimit || progress.readerDiskLimit;
+    }
+    return {
+        // Native change-feed support = the stores keep an index (rawDisk buckets emulate getChangesAfter2 with a full listing) - clients use this to pick their scan cadence
+        supportsChangesAfter: bucket.stores.some(s => s.store instanceof BlobStore),
+        remoteConfig: bucket.routing,
+        index,
+        indexSources,
+        readerDiskLimit,
+        syncing,
+    };
+}
+
+export async function bucketSyncStatus(bucket: BucketState): Promise<ArchivesSyncStatus> {
+    let supported = bucket.stores.filter(s => s.store.getSyncStatus);
+    if (!supported.length) {
+        throw new Error(`Bucket ${bucket.account}/${bucket.bucketName} does not support getSyncStatus (rawDisk buckets have no synchronization)`);
+    }
+    let statuses = await Promise.all(supported.map(async s => {
+        let getSyncStatus = s.store.getSyncStatus;
+        if (!getSyncStatus) {
+            throw new Error(`getSyncStatus disappeared from a store for ${bucket.account}/${bucket.bucketName}`);
+        }
+        return await getSyncStatus.call(s.store);
+    }));
+    return {
+        allScansComplete: statuses.every(x => x.allScansComplete),
+        indexSize: statuses.reduce((sum, x) => sum + x.indexSize, 0),
+        sources: statuses.flatMap(x => x.sources),
+    };
+}
+
+export async function bucketIndexTotals(bucket: BucketState): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] } | undefined> {
+    let supported = bucket.stores.filter(s => s.store.computeIndexTotals);
+    if (!supported.length) return undefined;
+    let totals = await Promise.all(supported.map(async s => {
+        let computeIndexTotals = s.store.computeIndexTotals;
+        if (!computeIndexTotals) {
+            throw new Error(`computeIndexTotals disappeared from a store for ${bucket.account}/${bucket.bucketName}`);
+        }
+        return await computeIndexTotals.call(s.store);
+    }));
+    return {
+        fileCount: totals.reduce((sum, x) => sum + x.fileCount, 0),
+        byteCount: totals.reduce((sum, x) => sum + x.byteCount, 0),
+        sources: totals.flatMap(x => x.sources),
+    };
+}
+
+const buckets = new Map<string, Promise<BucketState | undefined>>();
+
+const MAX_REBUILD_TIMER_DELAY = 2 ** 31 - 1;
+const REBUILD_BOUNDARY_BUFFER = 1000;
+
+function scheduleWindowBoundaryRebuild(loaded: BucketState): void {
     let now = Date.now();
     let boundaries = loaded.selfEntries.flatMap(x => x.validWindow).filter(t => t > now);
     if (!boundaries.length) return;
@@ -251,7 +181,7 @@ const STARTUP_BOUNDARY_SCAN_DELAY = 30 * 1000;
 const scheduledBoundaryScans = new Set<string>();
 const boundaryScansRunning = new Set<string>();
 
-function scheduleBoundaryScans(loaded: LoadedBucket): void {
+function scheduleBoundaryScans(loaded: BucketState): void {
     let key = `${loaded.account}/${loaded.bucketName}`;
     let now = Date.now();
     let starts = new Set<number>();
@@ -305,18 +235,19 @@ async function runBoundaryScan(bucketKey: string, windowStart: number, offset: n
     try {
         let loaded = await buckets.get(bucketKey);
         if (!loaded) return;
-        let store = loaded.store;
-        if (!(store instanceof BlobStore)) return;
         let effective = loaded.routing;
         let selfIndexes = findSelfIndexes(effective, loaded.account, loaded.bucketName);
         let selfIndexSet = new Set(selfIndexes);
         let selves = selfIndexes.map(i => effective.sources[i] as HostedConfig).filter(x => x.validWindow[0] === windowStart);
         if (!selves.length) return;
         let prevTime = windowStart - 1;
-        let needDiskScan = false;
-        let remoteOwners = new Map<number, [number, number]>();
+        // Everything is per-store: each self entry's route has its own store, and that store's disk/remote boundary pulls only concern its own route slice
+        let needDiskScan = new Set<LoadedStore>();
+        let remoteOwners = new Map<LoadedStore, Map<number, [number, number]>>();
         for (let self of selves) {
             let selfRoute = self.route || FULL_ROUTE;
+            let selfStore = loaded.stores.find(x => x.routeKey === JSON.stringify(selfRoute));
+            if (!selfStore || !(selfStore.store instanceof BlobStore)) continue;
             let idx = effective.sources.indexOf(self);
             let shadowed = false;
             for (let j = 0; j < idx; j++) {
@@ -353,41 +284,42 @@ async function runBoundaryScan(bucketKey: string, windowStart: number, offset: n
                 uncovered = remaining;
                 if (!claimed) continue;
                 if (selfIndexSet.has(j)) {
-                    needDiskScan = true;
+                    needDiskScan.add(selfStore);
                 } else {
-                    let existing = remoteOwners.get(j);
-                    remoteOwners.set(j, existing && [Math.min(existing[0], claimed[0]), Math.max(existing[1], claimed[1])] as [number, number] || claimed);
+                    let owners = remoteOwners.get(selfStore);
+                    if (!owners) {
+                        owners = new Map();
+                        remoteOwners.set(selfStore, owners);
+                    }
+                    let existing = owners.get(j);
+                    owners.set(j, existing && [Math.min(existing[0], claimed[0]), Math.max(existing[1], claimed[1])] as [number, number] || claimed);
                 }
             }
         }
-        if (!needDiskScan && !remoteOwners.size) return;
-        console.log(`Boundary scan (${label}): diskScan=${needDiskScan}, remote previous-window owners: ${remoteOwners.size}`);
-        if (needDiskScan) {
-            await store.rescanBase();
+        if (!needDiskScan.size && !remoteOwners.size) return;
+        console.log(`Boundary scan (${label}): diskScans=${needDiskScan.size}, stores with remote previous-window owners: ${remoteOwners.size}`);
+        for (let selfStore of needDiskScan) {
+            if (selfStore.store instanceof BlobStore) {
+                await selfStore.store.rescanBase();
+            }
         }
         let since = windowStart - BOUNDARY_SCAN_LOOKBACK;
-        for (let [sourceIndex, route] of remoteOwners) {
-            let ownerSource = effective.sources[sourceIndex];
-            if (typeof ownerSource === "string") continue;
-            try {
-                await store.boundaryScanRemote(createApiArchives(ownerSource), { since, route });
-            } catch (e) {
-                console.error(`Boundary scan (${label}) of previous-window owner (source index ${sourceIndex}) failed: ${(e as Error).stack ?? e}`);
+        for (let [selfStore, owners] of remoteOwners) {
+            if (!(selfStore.store instanceof BlobStore)) continue;
+            for (let [sourceIndex, route] of owners) {
+                let ownerSource = effective.sources[sourceIndex];
+                if (typeof ownerSource === "string") continue;
+                try {
+                    await selfStore.store.boundaryScanRemote(createApiArchives(ownerSource), { since, route });
+                } catch (e) {
+                    console.error(`Boundary scan (${label}) of previous-window owner (source index ${sourceIndex}) failed: ${(e as Error).stack ?? e}`);
+                }
             }
         }
     } finally {
         boundaryScansRunning.delete(bucketKey);
     }
 }
-
-type StorePlan = {
-    selfEntries: HostedConfig[];
-    self: SelfSummary | undefined;
-    rawDisk: boolean;
-    sourceSpecs: { sourceConfig?: HostedConfig | BackblazeConfig; validWindow: [number, number]; route?: [number, number]; noFullSync?: boolean }[];
-    readerDiskLimit?: number;
-    structureKey: string;
-};
 
 const resolvedSourceArchives = new Map<string, IArchives>();
 /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
@@ -396,6 +328,7 @@ export function resolveSourceArchives(url: string): IArchives {
     if (existing) return existing;
     let archives: IArchives;
     if (url.startsWith("https://")) {
+        // The config is fabricated from the bare URL and can never exact-match a server's entries - which is fine, because holder reads are internal reads, and internal reads never select a store (see readBucketInternal)
         archives = createApiArchives(normalizeSource(url));
     } else {
         archives = new ArchivesDisk(url);
@@ -404,176 +337,68 @@ export function resolveSourceArchives(url: string): IArchives {
     return archives;
 }
 
-function sourceIdentity(sourceConfig: HostedConfig | BackblazeConfig | undefined): string {
+function sourceIdentity(sourceConfig: SourceConfig | undefined): string {
     if (!sourceConfig) return "disk";
     return JSON.stringify({ ...sourceConfig, validWindow: undefined, route: undefined });
 }
 
-/** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
-export type SelfSummary = {
-    /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
-    routes: [number, number][];
-    public: boolean;
-    immutable: boolean;
-    noFullSync: boolean;
-    rawDisk: boolean;
-    readerDiskLimit?: number;
-};
-
-function mergeRoutes(routes: ([number, number] | undefined)[]): [number, number][] {
-    let list = routes.map(x => x || FULL_ROUTE).map(x => [x[0], x[1]] as [number, number]);
-    sort(list, x => x[0]);
-    let merged: [number, number][] = [];
-    for (let route of list) {
-        let last = merged[merged.length - 1];
-        if (last && route[0] <= last[1]) {
-            last[1] = Math.max(last[1], route[1]);
-            continue;
-        }
-        merged.push(route);
+function buildStore(account: string, bucketName: string, planStore: StorePlanStore): IBucketStore {
+    let folder = getBucketFolder(account, bucketName, planStore.route);
+    if (planStore.rawDisk) {
+        return new RawDiskStore(new ArchivesDisk(folder));
     }
-    return merged;
-}
-
-/** anchor is the first currently-valid entry (nearest-window when none contains now, matching selectEntryAt) - the deterministic representative used only for positional things: the sync-topology cut (selfIndex) and the diskWindow seed. Everything behavioral comes from the summary, which spans every entry the anchor's group represents. */
-function summarizeSelf(selfEntries: HostedConfig[], now: number): { summary: SelfSummary | undefined; anchor: HostedConfig | undefined } {
-    let current = selfEntries.filter(x => x.validWindow[0] <= now && now < x.validWindow[1]);
-    if (!current.length) {
-        let nearest = selectEntryAt(selfEntries, now);
-        current = nearest && [nearest] || [];
-    }
-    if (!current.length) {
-        return { summary: undefined, anchor: undefined };
-    }
-    let summary: SelfSummary = {
-        routes: mergeRoutes(current.map(x => x.route)),
-        public: current.some(x => x.public),
-        immutable: current.some(x => x.immutable),
-        noFullSync: current.some(x => x.noFullSync),
-        rawDisk: current.some(x => x.rawDisk),
-        readerDiskLimit: current.find(x => x.readerDiskLimit !== undefined)?.readerDiskLimit,
-    };
-    return { summary, anchor: current[0] };
-}
-
-function computeStorePlan(account: string, bucketName: string, routing: RemoteConfig): StorePlan {
-    let selfIndexes = findSelfIndexes(routing, account, bucketName);
-    let selfEntries = selfIndexes.map(i => routing.sources[i] as HostedConfig);
-    let { summary: self, anchor } = summarizeSelf(selfEntries, Date.now());
-    let selfIndex = -1;
-    if (anchor) {
-        selfIndex = routing.sources.indexOf(anchor);
-    }
-    let diskWindow: [number, number] = [0, 0];
-    if (anchor) {
-        let [start, end] = anchor.validWindow;
-        let merged = true;
-        while (merged) {
-            merged = false;
-            for (let entry of selfEntries) {
-                let [entryStart, entryEnd] = entry.validWindow;
-                if (entryStart > end || entryEnd < start) continue;
-                if (entryStart < start || entryEnd > end) {
-                    start = Math.min(start, entryStart);
-                    end = Math.max(end, entryEnd);
-                    merged = true;
-                }
-            }
-        }
-        diskWindow = [start, end];
-    }
-    let ownIndexes = new Set(selfIndexes);
-    let sourceSpecs: StorePlan["sourceSpecs"] = [{
-        validWindow: diskWindow,
-    }];
-    if (self && selfIndex !== -1) {
-        for (let i = selfIndex + 1; i < routing.sources.length; i++) {
-            let source = routing.sources[i];
-            if (typeof source === "string" || ownIndexes.has(i)) continue;
-            // One spec per intersection segment: a peer's route can overlap several of our (disjoint) route slices, and each slice becomes its own sync-source slot (same-URL multi-slot is already the supported shape)
-            for (let selfRoute of self.routes) {
-                let sharedRoute = routeIntersection(selfRoute, source.route);
-                if (!sharedRoute) continue;
-                sourceSpecs.push({ sourceConfig: source, validWindow: source.validWindow, route: sharedRoute, noFullSync: source.noFullSync || self.noFullSync });
-            }
-        }
-    }
-    let rawDisk = !!self?.rawDisk;
-    let structureKey = JSON.stringify({
-        rawDisk,
-        readerDiskLimit: self?.readerDiskLimit,
+    let sources: ArchivesSource[] = planStore.sourceSpecs.map(spec => ({
+        source: spec.sourceConfig && createApiArchives(spec.sourceConfig) || new ArchivesDisk(folder),
+        url: spec.sourceConfig?.url || folder,
+        validWindow: spec.validWindow,
+        route: spec.route,
+        noFullSync: spec.noFullSync,
+        intermediate: spec.sourceConfig?.intermediate,
+        identity: sourceIdentity(spec.sourceConfig),
+    }));
+    return new BlobStore(folder, sources, {
+        readerDiskLimit: planStore.readerDiskLimit,
+        onWriteCounted: (kind, bytes) => countBucketWrite(`${account}/${bucketName}`, kind, bytes),
+        resolveSourceUrl: resolveSourceArchives,
+        entries: planStore.entries,
     });
-    return { selfEntries, self, rawDisk, sourceSpecs, readerDiskLimit: self?.readerDiskLimit, structureKey };
 }
 
-function buildBucket(account: string, bucketName: string, routing: RemoteConfig, plan?: StorePlan): LoadedBucket {
-    let folder = getBucketFolder(account, bucketName);
+function buildBucket(account: string, bucketName: string, routing: RemoteConfig, plan?: StorePlan): BucketState {
     if (!plan) {
         plan = computeStorePlan(account, bucketName, routing);
     }
     let { selfEntries, self } = plan;
-    let store: IBucketStore;
-    if (plan.rawDisk) {
-        store = new ArchivesDisk(folder);
-    } else {
-        if (!self) {
-            console.log(`This server is not in the routing config for bucket ${account}/${bucketName}: no longer synchronizing, valid window treated as [0, 0] (fast writes flush immediately), disk data kept and served`);
-        }
-        let sources: ArchivesSource[] = plan.sourceSpecs.map(spec => ({
-            source: spec.sourceConfig && createApiArchives(spec.sourceConfig) || new ArchivesDisk(folder),
-            url: spec.sourceConfig?.url || folder,
-            validWindow: spec.validWindow,
-            route: spec.route,
-            noFullSync: spec.noFullSync,
-            intermediate: spec.sourceConfig?.intermediate,
-            identity: sourceIdentity(spec.sourceConfig),
-        }));
-        store = new BlobStore(folder, sources, {
-            onIndexChanged: key => {
-                if (key !== ROUTING_FILE) return;
-                void scheduleRoutingReload(account, bucketName);
-            },
-            readerDiskLimit: plan.readerDiskLimit,
-            onWriteCounted: (kind, bytes) => countBucketWrite(`${account}/${bucketName}`, kind, bytes),
-            resolveSourceUrl: resolveSourceArchives,
-        });
+    if (!self) {
+        console.log(`This server is not in the routing config for bucket ${account}/${bucketName}: no longer synchronizing, valid window treated as [0, 0] (fast writes flush immediately), disk data kept and served`);
     }
-    let loaded: LoadedBucket = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, store, structureKey: plan.structureKey };
+    let stores: LoadedStore[] = plan.stores.map(planStore => ({
+        routeKey: planStore.routeKey,
+        route: planStore.route,
+        entries: planStore.entries,
+        folder: getBucketFolder(account, bucketName, planStore.route),
+        store: buildStore(account, bucketName, planStore),
+    }));
+    let loaded: BucketState = { account, bucketName, routing, routingJSON: JSON.stringify(routing), selfEntries, self, stores, structureKey: plan.structureKey };
     scheduleWindowBoundaryRebuild(loaded);
     scheduleBoundaryScans(loaded);
-    // A loaded bucket must actually be running: the store's init loads its index and starts its source synchronization, and it is lazy, so without this a bucket nothing has read from or written to sits inert - reporting no data and no syncing while its disk is full of files.
-    if (store instanceof BlobStore) {
-        void store.init().catch((e: Error) => console.error(`Initializing the store for bucket ${account}/${bucketName} failed: ${e.stack ?? e}`));
+    // A loaded bucket must actually be running: each store's init loads its index and starts its source synchronization, and it is lazy, so without this a bucket nothing has read from or written to sits inert - reporting no data and no syncing while its disk is full of files.
+    for (let s of stores) {
+        if (s.store instanceof BlobStore) {
+            let store = s.store;
+            void store.init().catch((e: Error) => console.error(`Initializing the store for bucket ${account}/${bucketName} (route ${s.routeKey}) failed: ${e.stack ?? e}`));
+        }
     }
     return loaded;
 }
 
-/** The routing file is ours, on our own disk, at a path we know - so it is read directly. Going through an ArchivesDisk would construct a whole store (handle cache sweep loop, uploads-folder cleanup) just to read one file. */
-function getRoutingFilePath(folder: string): string {
-    return path.join(folder, "files", ROUTING_FILE);
-}
-async function readRoutingFile(folder: string): Promise<Buffer | undefined> {
-    try {
-        return await fs.promises.readFile(getRoutingFilePath(folder));
-    } catch (e) {
-        if ((e as { code?: string }).code === "ENOENT") return undefined;
-        throw e;
-    }
-}
-
-async function readRoutingFromDisk(account: string, bucketName: string): Promise<RemoteConfig | undefined> {
-    let data = await readRoutingFile(getBucketFolder(account, bucketName));
-    if (!data) return undefined;
-    return parseRoutingData(data);
-}
-
-async function loadBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined> {
+async function loadBucket(account: string, bucketName: string): Promise<BucketState | undefined> {
     let routing = await readRoutingFromDisk(account, bucketName);
     if (!routing) return undefined;
     return buildBucket(account, bucketName, routing);
 }
 
-export function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined> {
+export function getLoadedBucket(account: string, bucketName: string): Promise<BucketState | undefined> {
     let key = `${account}/${bucketName}`;
     let loaded = buckets.get(key);
     if (!loaded) {
@@ -591,7 +416,6 @@ export function getLoadedBucket(account: string, bucketName: string): Promise<Lo
     }
     return loaded;
 }
-
 
 const routingReloads = new Map<string, Promise<void>>();
 function scheduleRoutingReload(account: string, bucketName: string, config?: { force?: boolean; reason?: string }): Promise<void> {
@@ -612,67 +436,66 @@ async function checkRoutingChanged(account: string, bucketName: string, config?:
     if (!config?.force && JSON.stringify(routing) === loaded.routingJSON) return;
     let reason = config?.force && (config.reason || "forced") || "routing config changed";
     let plan = computeStorePlan(account, bucketName, routing);
-    if (plan.structureKey === loaded.structureKey && loaded.store instanceof BlobStore) {
-        console.log(`Applying the routing config to the running store for bucket ${key} (${reason})`);
-        loaded.store.updateSources(plan.sourceSpecs.map(spec => {
-            const sourceConfig = spec.sourceConfig;
-            if (!sourceConfig) {
-                return { identity: sourceIdentity(undefined), url: getBucketFolder(account, bucketName), validWindow: spec.validWindow, create: (): IArchives => new ArchivesDisk(getBucketFolder(account, bucketName)) };
-            }
-            return {
-                identity: sourceIdentity(sourceConfig),
-                url: sourceConfig.url,
-                validWindow: spec.validWindow,
-                route: spec.route,
-                noFullSync: spec.noFullSync,
-                intermediate: sourceConfig.intermediate,
-                create: () => createApiArchives(sourceConfig),
-            };
-        }));
-        let updated: LoadedBucket = { ...loaded, routing, routingJSON: JSON.stringify(routing), selfEntries: plan.selfEntries, self: plan.self };
-        buckets.set(key, Promise.resolve(updated));
-        scheduleWindowBoundaryRebuild(updated);
-        scheduleBoundaryScans(updated);
+    if (plan.structureKey === loaded.structureKey) {
+        console.log(`Applying the routing config to the running stores for bucket ${key} (${reason})`);
+        for (let planStore of plan.stores) {
+            let live = loaded.stores.find(x => x.routeKey === planStore.routeKey);
+            // structureKey equality means the store set (routes, rawDisk, limits) is unchanged, so every plan store has its live twin
+            if (!live || !(live.store instanceof BlobStore)) continue;
+            let storeFolder = live.folder;
+            live.store.updateSources(planStore.sourceSpecs.map(spec => {
+                const sourceConfig = spec.sourceConfig;
+                if (!sourceConfig) {
+                    return { identity: sourceIdentity(undefined), url: storeFolder, validWindow: spec.validWindow, create: (): IArchives => new ArchivesDisk(storeFolder) };
+                }
+                return {
+                    identity: sourceIdentity(sourceConfig),
+                    url: sourceConfig.url,
+                    validWindow: spec.validWindow,
+                    route: spec.route,
+                    noFullSync: spec.noFullSync,
+                    intermediate: sourceConfig.intermediate,
+                    create: () => createApiArchives(sourceConfig),
+                };
+            }), planStore.entries);
+            live.entries = planStore.entries;
+        }
+        loaded.routing = routing;
+        loaded.routingJSON = JSON.stringify(routing);
+        loaded.selfEntries = plan.selfEntries;
+        loaded.self = plan.self;
+        scheduleWindowBoundaryRebuild(loaded);
+        scheduleBoundaryScans(loaded);
         broadcastRoutingChanged();
         return;
     }
-    console.log(`Rebuilding the store for bucket ${key} (${reason})`);
-    if (loaded.store instanceof BlobStore) {
-        await loaded.store.dispose();
+    console.log(`Rebuilding the stores for bucket ${key} (${reason}): structure changed from ${loaded.structureKey} to ${plan.structureKey}`);
+    for (let s of loaded.stores) {
+        if (s.store instanceof BlobStore) {
+            await s.store.dispose();
+        }
     }
     buckets.set(key, Promise.resolve(buildBucket(account, bucketName, routing, plan)));
     broadcastRoutingChanged();
 }
 
-function getWriteConfig(bucket: LoadedBucket, writeTime: number, route: number): { fast?: boolean; writeDelay?: number } {
-    let self = selectEntryAt(bucket.selfEntries, writeTime, route);
-    return { fast: self?.fast, writeDelay: self?.writeDelay };
-}
-
-export async function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void> {
-    let self = selectEntryAt(bucket.selfEntries, writeTime, getRoute(filePath));
-    if (!self?.immutable) return;
-    if (await bucket.store.getInfo(filePath)) {
-        throw new Error(`Bucket ${bucket.account}/${bucket.bucketName} is immutable (at write time ${writeTime}) and ${JSON.stringify(filePath)} already exists, so it cannot be written to`);
-    }
-}
-
-const WRONG_TARGET_LOG_THROTTLE = 60 * 1000;
-let lastWrongTargetLog = 0;
-function logWrongTargetRejection(message: string): void {
-    if (Date.now() - lastWrongTargetLog < WRONG_TARGET_LOG_THROTTLE) return;
-    lastWrongTargetLog = Date.now();
-    console.log(message);
-}
-
 const routingWrites = new Map<string, Promise<void>>();
+
+/** The routing-config write path - the ONE write that cannot go through a store (it is what CREATES the bucket and its stores). Serialized per bucket: concurrent config writes would race the version check. */
+export async function queueRoutingConfigWrite(account: string, bucketName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
+    assertWritesAllowed();
+    let key = `${account}/${bucketName}`;
+    let run = (routingWrites.get(key) || Promise.resolve()).then(() => writeRoutingConfig(account, bucketName, data, config));
+    routingWrites.set(key, run.then(() => { }, () => { }));
+    return await run;
+}
 
 async function writeRoutingConfig(account: string, bucketName: string, data: Buffer, config?: { lastModified?: number }): Promise<void> {
     let key = `${account}/${bucketName}`;
     let incoming = parseRoutingData(data);
     let loaded = await getLoadedBucket(account, bucketName);
     if (!loaded) {
-        await new ArchivesDisk(getBucketFolder(account, bucketName)).set(ROUTING_FILE, data, { lastModified: config?.lastModified });
+        await resolveSourceArchives(getBucketFolder(account, bucketName)).set(ROUTING_FILE, data, { lastModified: config?.lastModified });
         buckets.set(key, Promise.resolve(buildBucket(account, bucketName, incoming)));
         broadcastRoutingChanged();
         console.log(`Created bucket ${key}`);
@@ -697,76 +520,9 @@ async function writeRoutingConfig(account: string, bucketName: string, data: Buf
     if (JSON.stringify(stored) !== JSON.stringify(incoming)) {
         console.log(`Re-injected ${reinjected} in-flight switchover windows into the incoming routing config for bucket ${key} (version ${getConfigVersion(incoming)})`);
     }
-    await loaded.store.set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(stored)), { lastModified: config?.lastModified });
+    // Written straight into the plain bucket folder: the routing file defines the per-route stores, so it never flows through them
+    await resolveSourceArchives(getBucketFolder(account, bucketName)).set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(stored)), { lastModified: config?.lastModified });
     await scheduleRoutingReload(account, bucketName);
-}
-
-export async function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: { lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void> {
-    assertWritesAllowed();
-    if (filePath === ROUTING_FILE) {
-        let key = `${account}/${bucketName}`;
-        let run = (routingWrites.get(key) || Promise.resolve()).then(() => writeRoutingConfig(account, bucketName, data, config));
-        routingWrites.set(key, run.then(() => { }, () => { }));
-        return await run;
-    }
-    let loaded = await getLoadedBucket(account, bucketName);
-    if (!loaded) {
-        throw new Error(`Bucket ${account}/${bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
-    }
-    let writeTime = config?.lastModified || Date.now();
-    let route = getRoute(filePath);
-    if (!config?.lastModified && loaded.selfEntries.length) {
-        let timeValid = loaded.selfEntries.filter(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1]);
-        if (!timeValid.length) {
-            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) is outside all our valid windows ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))} (a switchover moved the write target)`);
-            throw new Error(`${STORAGE_WRONG_VALID_WINDOW} This server is not a valid write target at ${writeTime} for bucket ${account}/${bucketName} (our valid windows: ${JSON.stringify(loaded.selfEntries.map(x => x.validWindow))}). Re-resolve the currently valid source and retry.`);
-        }
-        if (!timeValid.some(x => routeContains(x.route, route))) {
-            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}: route ${route} is outside our routes ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))} at writeTime ${writeTime} (the client's shard config is stale)`);
-            throw new Error(`${STORAGE_WRONG_ROUTE} This server does not handle route ${route} (key ${JSON.stringify(filePath)}) for bucket ${account}/${bucketName} (our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}). Re-resolve the source for this key and retry.`);
-        }
-    }
-    if (config?.forceSetImmutable) {
-        if (!config.lastModified) {
-            throw new Error(`forceSetImmutable requires lastModified (synchronization writes are ordered by their write time), writing ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}`);
-        }
-        // Immutability wins: an existing path is kept instead of the push throwing (see SetConfig.forceSetImmutable)
-        let self = selectEntryAt(loaded.selfEntries, writeTime, route);
-        if (self?.immutable && await loaded.store.getInfo(filePath)) return;
-    } else {
-        await assertMutable(loaded, filePath, writeTime);
-    }
-    if (config?.internal) {
-        if (!config.lastModified) {
-            throw new Error(`Internal writes must carry lastModified (they are synchronization pushes, ordered by their write time), writing ${JSON.stringify(filePath)} to bucket ${account}/${bucketName}`);
-        }
-        // See SetConfig.internal: the stamp must land inside SOME window+route this server is configured for (any window, including past ones - synchronization moves old data), so a confused peer can't stuff data onto a node that was never meant to hold it
-        let covered = loaded.selfEntries.some(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1] && routeContains(x.route, route));
-        if (!covered) {
-            throw new Error(`Internal write of ${JSON.stringify(filePath)} to bucket ${account}/${bucketName} rejected: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this server is configured for: ${JSON.stringify(loaded.selfEntries.map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))}`);
-        }
-        if (loaded.store.setInternal) {
-            await loaded.store.setInternal(filePath, data, { lastModified: writeTime });
-            return;
-        }
-        // rawDisk stores: the normal set already IS the disk
-        await loaded.store.set(filePath, data, { lastModified: writeTime });
-        return;
-    }
-    await loaded.store.set(filePath, data, { ...getWriteConfig(loaded, writeTime, route), lastModified: writeTime });
-}
-
-export function getBucketConfig(bucket: LoadedBucket): ArchivesConfig {
-    let progress = bucket.store.getSyncProgress?.();
-    return {
-        // Native change-feed support = the store keeps an index (rawDisk buckets emulate getChangesAfter2 with a full listing) - clients use this to pick their scan cadence
-        supportsChangesAfter: bucket.store instanceof BlobStore,
-        remoteConfig: bucket.routing,
-        index: progress?.index,
-        indexSources: progress?.sources,
-        readerDiskLimit: progress?.readerDiskLimit,
-        syncing: progress?.syncing,
-    };
 }
 
 /** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
@@ -789,7 +545,7 @@ const INTERMEDIATE_MAINTAIN_INTERVAL = 60 * 1000;
 // Per bucket, not global: a switchover has to write every bucket's windows at once, and a shared throttle would let only one bucket through per interval
 const lastOwnConfigWrite = new Map<string, number>();
 
-async function writeOwnRoutingConfig(loaded: LoadedBucket, updated: RemoteConfig, reason: string): Promise<void> {
+async function writeOwnRoutingConfig(loaded: BucketState, updated: RemoteConfig, reason: string): Promise<void> {
     let key = `${loaded.account}/${loaded.bucketName}`;
     let sinceLast = Date.now() - (lastOwnConfigWrite.get(key) || 0);
     if (sinceLast < OWN_CONFIG_WRITE_THROTTLE) {
@@ -801,12 +557,12 @@ async function writeOwnRoutingConfig(loaded: LoadedBucket, updated: RemoteConfig
     let next: RemoteConfig = { ...updated, version };
     console.log(`Writing ${ROUTING_FILE} for bucket ${key} (${reason}), version ${getConfigVersion(loaded.routing)} -> ${version}: ${JSON.stringify(next)}`);
     let data = Buffer.from(serializeRemoteConfig(next));
-    await writeBucketFile(loaded.account, loaded.bucketName, ROUTING_FILE, data);
+    await queueRoutingConfigWrite(loaded.account, loaded.bucketName, data);
     await propagateRoutingConfig(loaded, next, data);
 }
 
-async function propagateRoutingConfig(loaded: LoadedBucket, next: RemoteConfig, data: Buffer): Promise<void> {
-    let targets = new Map<string, HostedConfig | BackblazeConfig>();
+async function propagateRoutingConfig(loaded: BucketState, next: RemoteConfig, data: Buffer): Promise<void> {
+    let targets = new Map<string, SourceConfig>();
     for (let source of [...loaded.routing.sources, ...next.sources]) {
         if (typeof source === "string" || source.intermediate) continue;
         if (source.type === "remote") {
@@ -912,11 +668,6 @@ export const startIntermediateMaintenance = lazy(() => {
     runInfinitePoll(INTERMEDIATE_MAINTAIN_INTERVAL, maintainIntermediates);
 });
 
-export type BucketDiskInfo = {
-    totalBytes: number;
-    freeBytes: number;
-    usedBytes: number;
-};
 export type ServerBucketInfo = {
     bucketName: string;
     active: boolean;
@@ -930,18 +681,6 @@ export type ServerBucketInfo = {
     error?: string;
 };
 
-async function getDiskInfo(folder: string): Promise<BucketDiskInfo> {
-    let stats = await fs.promises.statfs(folder);
-    let blockSize = Number(stats.bsize);
-    let totalBytes = Number(stats.blocks) * blockSize;
-    return {
-        totalBytes,
-        // Matches the server's own low-space check: what an unprivileged process can actually use
-        freeBytes: Number(stats.bavail) * blockSize,
-        usedBytes: totalBytes - Number(stats.bfree) * blockSize,
-    };
-}
-
 export type ActiveBucketInfo = {
     folder: string;
     /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
@@ -952,6 +691,16 @@ export type ActiveBucketInfo = {
     config: ArchivesConfig;
 };
 
+function toActiveBucketInfo(loaded: BucketState): ActiveBucketInfo {
+    return {
+        folder: getBucketFolder(loaded.account, loaded.bucketName),
+        routing: loaded.routing,
+        selfEntries: loaded.selfEntries,
+        self: loaded.self,
+        config: getBucketConfig(loaded),
+    };
+}
+
 /** The live in-memory state of ONE bucket, answered without touching the disk (no routing file read, no statfs, no stored write stats). Returns an error string when the bucket is not loaded here, which is the normal state for a bucket nothing has accessed since startup. */
 export async function getActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
     let key = `${account}/${bucketName}`;
@@ -959,7 +708,7 @@ export async function getActiveBucket(account: string, bucketName: string): Prom
     if (!loadedPromise) {
         return `Bucket ${key} is not loaded on this server, so it has no live state (it loads on first access)`;
     }
-    let loaded: LoadedBucket | undefined;
+    let loaded: BucketState | undefined;
     try {
         loaded = await loadedPromise;
     } catch (e) {
@@ -971,21 +720,11 @@ export async function getActiveBucket(account: string, bucketName: string): Prom
     return toActiveBucketInfo(loaded);
 }
 
-function toActiveBucketInfo(loaded: LoadedBucket): ActiveBucketInfo {
-    return {
-        folder: getBucketFolder(loaded.account, loaded.bucketName),
-        routing: loaded.routing,
-        selfEntries: loaded.selfEntries,
-        self: loaded.self,
-        config: getBucketConfig(loaded),
-    };
-}
-
 /** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
 export async function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string> {
     let key = `${account}/${bucketName}`;
     let wasLoaded = buckets.has(key);
-    let loaded: LoadedBucket | undefined;
+    let loaded: BucketState | undefined;
     try {
         loaded = await getLoadedBucket(account, bucketName);
     } catch (e) {
@@ -994,9 +733,11 @@ export async function activateBucket(account: string, bucketName: string): Promi
     if (!loaded) {
         return `Bucket ${key} does not exist on this server (no routing file in ${getBucketFolder(account, bucketName)})`;
     }
-    // Wait for the index to load, so the totals we return are the real ones rather than zeroes from a store that has not read its index yet. The source scans keep running in the background.
-    if (loaded.store instanceof BlobStore) {
-        await loaded.store.init();
+    // Wait for the indexes to load, so the totals we return are the real ones rather than zeroes from stores that have not read their index yet. The source scans keep running in the background.
+    for (let s of loaded.stores) {
+        if (s.store instanceof BlobStore) {
+            await s.store.init();
+        }
     }
     if (!wasLoaded) {
         console.log(`Activated bucket ${key} on request: it is now loaded and synchronizing`);
@@ -1022,6 +763,8 @@ export async function listAccountBuckets(account: string): Promise<ServerBucketI
     } catch {
         return [];
     }
+    // Per-route folders (bucketName-route-<start>-<end>) belong to the same bucket as the plain folder - collapse them so one bucket lists once
+    names = [...new Set(names.map(x => x.replace(/-route-[\d.]+-[\d.]+$/, "")))];
     try {
         return await Promise.all(names.map(async bucketName => {
             let key = `${account}/${bucketName}`;
@@ -1061,99 +804,121 @@ export async function listAccountBuckets(account: string): Promise<ServerBucketI
     }
 }
 
-export async function deleteBucketFile(account: string, bucketName: string, filePath: string, config?: { lastModified?: number; internal?: boolean }): Promise<void> {
-    assertWritesAllowed();
-    if (filePath === ROUTING_FILE) {
-        throw new Error(`The routing config ${JSON.stringify(ROUTING_FILE)} cannot be deleted (overwrite it to change the bucket's configuration)`);
+export type BucketWriteStats = {
+    /** Every set call the bucket accepted */
+    originalWrites: number;
+    originalBytes: number;
+    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+    flushedWrites: number;
+    flushedBytes: number;
+};
+function emptyWriteStats(): BucketWriteStats {
+    return { originalWrites: 0, originalBytes: 0, flushedWrites: 0, flushedBytes: 0 };
+}
+
+// In memory only: totals since this process started (or the last clearWriteStats). Persisting them to disk was more machinery than the numbers were worth.
+const writeStats = new Map<string, BucketWriteStats>();
+
+function countBucketWrite(key: string, kind: "original" | "flushed", bytes: number): void {
+    let stats = writeStats.get(key);
+    if (!stats) {
+        stats = emptyWriteStats();
+        writeStats.set(key, stats);
     }
-    let loaded = await getLoadedBucket(account, bucketName);
-    if (!loaded) return;
-    let writeTime = config?.lastModified || Date.now();
-    let route = getRoute(filePath);
-    if (config?.internal) {
-        if (!config.lastModified) {
-            throw new Error(`Internal deletions must carry lastModified (they are synchronization pushes, ordered by their write time), deleting ${JSON.stringify(filePath)} in bucket ${account}/${bucketName}`);
-        }
-        // Same acceptance rule as internal writes (see SetConfig.internal): the stamp must land inside SOME window+route this server is configured for
-        let covered = loaded.selfEntries.some(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1] && routeContains(x.route, route));
-        if (!covered) {
-            throw new Error(`Internal deletion of ${JSON.stringify(filePath)} in bucket ${account}/${bucketName} rejected: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this server is configured for: ${JSON.stringify(loaded.selfEntries.map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))}`);
-        }
-        if (loaded.store.setInternal) {
-            // setInternal treats an empty buffer as exactly a deletion: disk removal plus a tombstone index entry, no fan-out
-            await loaded.store.setInternal(filePath, Buffer.alloc(0), { lastModified: writeTime });
-            return;
-        }
-        await loaded.store.del(filePath);
-        return;
+    if (kind === "original") {
+        stats.originalWrites++;
+        stats.originalBytes += bytes;
+    } else {
+        stats.flushedWrites++;
+        stats.flushedBytes += bytes;
     }
-    await loaded.store.del(filePath, { ...getWriteConfig(loaded, writeTime, route), lastModified: writeTime });
+}
+
+function getBucketWriteStats(key: string): BucketWriteStats {
+    return writeStats.get(key) || emptyWriteStats();
+}
+
+/** Zeroes the write statistics of every bucket in the account. */
+export function clearAccountWriteStats(account: string): number {
+    let prefix = `${account}/`;
+    let cleared = 0;
+    for (let key of [...writeStats.keys()]) {
+        if (!key.startsWith(prefix)) continue;
+        writeStats.delete(key);
+        cleared++;
+    }
+    console.log(`Cleared the write statistics of ${cleared} buckets in account ${account}`);
+    return cleared;
 }
 
 const LARGE_FILE_PART_SIZE = 8 * 1024 * 1024;
 
-class ArchivesLocalBucket implements IArchives {
-    constructor(private account: string, private bucketName: string) { }
+// Wraps a locally hosted bucket in the IArchives interface, so code written against IArchives (the chain, sync sources, holder reads) talks to it directly instead of becoming a network client to ourselves.
+class BucketIArchivesWrapper implements IArchives {
+    constructor(private account: string, private bucketName: string, private sourceConfig: SourceConfig) { }
 
-    private async getBucket(): Promise<LoadedBucket | undefined> {
-        return await getLoadedBucket(this.account, this.bucketName);
+    private findStore(): Promise<LoadedStore> {
+        return findBucketStore(this.account, this.bucketName, this.sourceConfig);
     }
 
     public getDebugName() {
-        return `localBucket account ${this.account} bucket ${this.bucketName}`;
+        return `localBucket account ${this.account} bucket ${this.bucketName} route ${JSON.stringify(this.sourceConfig.route || FULL_ROUTE)}`;
     }
     public async get(fileName: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        let bucket = await this.getBucket();
-        if (!bucket) return undefined;
-        if (config?.internal && bucket.store.getInternal2) {
-            return await bucket.store.getInternal2(fileName, config);
+        if (fileName === ROUTING_FILE) {
+            return await getRoutingFileResult(this.account, this.bucketName);
         }
-        return await bucket.store.get2(fileName, config);
+        if (config?.internal) {
+            return await readBucketInternal(this.account, this.bucketName, { path: fileName, range: config.range, includeTombstones: config.includeTombstones });
+        }
+        return await (await this.findStore()).store.get2({ path: fileName, ...config });
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
-        await writeBucketFile(this.account, this.bucketName, fileName, data, config);
+        assertWritesAllowed();
+        if (fileName === ROUTING_FILE) {
+            await queueRoutingConfigWrite(this.account, this.bucketName, data, config);
+            return fileName;
+        }
+        await (await this.findStore()).store.set({ ...config, path: fileName, data });
         return fileName;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
-        await deleteBucketFile(this.account, this.bucketName, fileName, config);
+        assertWritesAllowed();
+        await (await this.findStore()).store.del({ path: fileName, ...config });
     }
     public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
         assertWritesAllowed();
-        let bucket = await this.getBucket();
-        if (!bucket) {
-            throw new Error(`Bucket ${this.account}/${this.bucketName} does not exist. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
-        }
-        await assertMutable(bucket, config.path, config.lastModified || Date.now());
-        let id = await bucket.store.startLargeUpload();
+        let store = (await this.findStore()).store;
+        let id = await store.startLargeUpload({ path: config.path, lastModified: config.lastModified });
         try {
             while (true) {
                 let data = await config.getNextData();
                 if (!data) break;
                 for (let offset = 0; offset < data.length; offset += LARGE_FILE_PART_SIZE) {
-                    await bucket.store.appendLargeUpload(id, data.subarray(offset, offset + LARGE_FILE_PART_SIZE));
+                    await store.appendLargeUpload({ id, data: data.subarray(offset, offset + LARGE_FILE_PART_SIZE) });
                 }
             }
-            await bucket.store.finishLargeUpload(id, config.path, config.lastModified);
+            await store.finishLargeUpload({ id, path: config.path, lastModified: config.lastModified });
         } catch (e) {
-            await bucket.store.cancelLargeUpload(id);
+            await store.cancelLargeUpload({ id });
             throw e;
         }
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
-        let bucket = await this.getBucket();
-        if (!bucket) return undefined;
-        return await bucket.store.getInfo(fileName, config);
+        if (fileName === ROUTING_FILE) {
+            let result = await getRoutingFileResult(this.account, this.bucketName);
+            return result && { writeTime: result.writeTime, size: result.size } || undefined;
+        }
+        return await (await this.findStore()).store.getInfo({ path: fileName, ...config });
     }
-    public async findInfo(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<ArchiveFileInfo[]> {
-        let bucket = await this.getBucket();
-        if (!bucket) return [];
-        return await bucket.store.findInfo(prefix, config);
+    public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
+        return await (await this.findStore()).store.findInfo({ prefix, ...config });
     }
-    public async find(prefix: string, config?: { shallow?: boolean; type: "files" | "folders" }): Promise<string[]> {
+    public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         return (await this.findInfo(prefix, config)).map(x => x.path);
     }
     public async getURL(filePath: string): Promise<string> {
@@ -1161,34 +926,25 @@ class ArchivesLocalBucket implements IArchives {
         return buildFileUrl(`https://${domain}:${port}/file/${encodeURIComponent(this.account)}/${encodeURIComponent(this.bucketName)}`, filePath);
     }
     public async getConfig(): Promise<ArchivesConfig> {
-        let bucket = await this.getBucket();
-        if (!bucket) return { supportsChangesAfter: true };
-        return getBucketConfig(bucket);
+        return getBucketConfig(await requireBucket(this.account, this.bucketName));
     }
     public async hasWriteAccess(): Promise<boolean> {
         return true;
     }
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        let bucket = await this.getBucket();
-        if (!bucket) return [];
-        return await bucket.store.getChangesAfter2(config);
+        return await (await this.findStore()).store.getChangesAfter2(config);
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
-        let bucket = await this.getBucket();
-        if (!bucket) return { allScansComplete: true, indexSize: 0, sources: [] };
-        if (!bucket.store.getSyncStatus) {
-            throw new Error(`Bucket ${this.account}/${this.bucketName} does not support getSyncStatus (rawDisk buckets have no synchronization)`);
-        }
-        return await bucket.store.getSyncStatus();
+        return await bucketSyncStatus(await requireBucket(this.account, this.bucketName));
     }
 }
 
 const localArchives = new Map<string, IArchives>();
-export function getLocalArchives(account: string, bucketName: string): IArchives {
-    let key = `${account}/${bucketName}`;
+export function getLocalArchives(account: string, bucketName: string, sourceConfig: SourceConfig): IArchives {
+    let key = `${account}/${bucketName}|${stableStringify(sourceConfig)}`;
     let existing = localArchives.get(key);
     if (existing) return existing;
-    let archives = new ArchivesLocalBucket(account, bucketName);
+    let archives = new BucketIArchivesWrapper(account, bucketName, sourceConfig);
     localArchives.set(key, archives);
     return archives;
 }

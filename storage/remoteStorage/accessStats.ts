@@ -57,6 +57,38 @@ export function trackAccess(config: { account: string; operation: string; path: 
     }
 }
 
+/** Method decorator factory, for API methods whose single config-object argument has account and bucketName: tracks the access (as `bucketName/path`) after the method succeeds. Sizes come from the config's data (writes) or the result's data (reads); operations without either are count-only. Array results (listings) track one access per returned path, or a single access at the prefix when empty. */
+export function trackAccessCall(operation: string) {
+    return function (target: unknown, key: string, descriptor: PropertyDescriptor): void {
+        let original = descriptor.value as (...args: unknown[]) => Promise<unknown>;
+        descriptor.value = async function (...args: unknown[]): Promise<unknown> {
+            let config = args[0] as { account: string; bucketName: string; path?: string; prefix?: string; data?: Buffer };
+            let result = await original.apply(this, args);
+            let base = `${config.bucketName}/`;
+            if (Array.isArray(result)) {
+                if (result.length) {
+                    for (let entry of result as { path: string }[]) {
+                        trackAccess({ account: config.account, operation, path: base + entry.path });
+                    }
+                } else {
+                    // The paths are only known once the results are in; an empty result still counts as one access at the prefix
+                    trackAccess({ account: config.account, operation, path: base + (config.prefix || config.path || "") });
+                }
+                return result;
+            }
+            let size: number | undefined;
+            if (config.data) {
+                size = config.data.length;
+            } else {
+                let data = (result as { data?: Buffer } | undefined)?.data;
+                if (data) size = data.length;
+            }
+            trackAccess({ account: config.account, operation, path: base + config.path, size });
+            return result;
+        };
+    };
+}
+
 export function getAccessTotals(account: string): AccessTotals {
     let result: AccessTotals = {};
     let operations = accounts.get(account);

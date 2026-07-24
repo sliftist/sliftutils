@@ -14,7 +14,7 @@ async function main() {
     let { address, port } = parseStorageUrl(url);
     let nodeId = SocketFunction.connect({ address, port });
     await authenticateStorage({ address, port, nodeId });
-    let record = await RemoteStorageController.nodes[nodeId].adminGrantAccess(requestId);
+    let record = await RemoteStorageController.nodes[nodeId].adminGrantAccess({ requestId });
     console.log(`Granted machine ${record.machineId} access to account ${JSON.stringify(record.account)}`);
     process.exit(0);
 }

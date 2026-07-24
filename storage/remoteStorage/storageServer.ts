@@ -8,7 +8,7 @@ import { getExternalIP } from "socket-function/src/networking";
 import { RequireController } from "socket-function/require/RequireController";
 import { hostServer } from "../../misc/https/hostServer";
 import { RemoteStorageController } from "./storageController";
-import { setStorageServerConfig, setWritesRejectedReason, addExtraListenPort, removeExtraListenPort } from "./storageServerState";
+import { setStorageServerConfig, setWritesRejectedReason, addExtraListenPort, removeExtraListenPort } from "./serverConfig";
 import { detectDeployTakeover, setAltPort, getAltPortListenEnd, getMainPortAcquireDelay } from "./deployTakeover";
 import { parseStorageUrl } from "./ArchivesRemote";
 // Import browser code, so it is allowed to be required by the client

@@ -858,7 +858,7 @@ declare module "sliftutils/render-utils/observer" {
 declare module "sliftutils/storage/ArchivesDisk" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
     export declare class ArchivesDisk implements IArchives {
         private folder;
         constructor(folder: string);
@@ -889,14 +889,8 @@ declare module "sliftutils/storage/ArchivesDisk" {
             writeTime: number;
             size: number;
         } | undefined>;
-        find(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<string[]>;
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type?: "files" | "folders";
-        }): Promise<ArchiveFileInfo[]>;
+        find(prefix: string, config?: FindConfig): Promise<string[]>;
+        findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
         private collectFiles;
         setLargeFile(config: {
             path: string;
@@ -909,10 +903,7 @@ declare module "sliftutils/storage/ArchivesDisk" {
         cancelLargeUpload(id: string): Promise<void>;
         getURL(path: string): Promise<string>;
     }
-    export declare function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: {
-        shallow?: boolean;
-        type?: "files" | "folders";
-    }): ArchiveFileInfo[];
+    export declare function applyFindInfoShape(files: ArchiveFileInfo[], prefix: string, config?: FindConfig): ArchiveFileInfo[];
 
 }
 
@@ -2109,7 +2100,9 @@ declare module "sliftutils/storage/IArchives" {
 
         NOTE: If we're in the browser, we should allow downloading the files via the URL form (if it's a public bucket), however, we won't allow writing, because their servers do not allow secure browser writes.
     */
-    export type RemoteConfigBase = string | HostedConfig | BackblazeConfig;
+    export type RemoteConfigBase = string | SourceConfig;
+    /** One configured source in a routing config: a hosted (our storage server) or backblaze entry. Requests carry the exact SourceConfig they selected, and the server matches it against its own entries to pick the backing store. */
+    export type SourceConfig = HostedConfig | BackblazeConfig;
     export type CommonConfig = {
         /** By default a server hosting this bucket eagerly copies this source's full contents onto its own disk (on top of the lazy read-through caching). Set this to be a front end for a very large database without copying the full database - reads still down-cache individual files on demand. */
         noFullSync?: boolean;
@@ -2148,6 +2141,14 @@ declare module "sliftutils/storage/IArchives" {
         noFallbacks?: boolean;
         /** Store-to-store call: the serving node answers purely from its own disk, completely short-circuiting its index holders - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). No window or route checks on reads: if the bytes are on its disk, the caller may have them. */
         internal?: boolean;
+        /** Also return size-0 results (tombstones - an empty file IS a missing file) instead of treating them as absent. Off by default, matching getInfo's flag of the same name. Synchronization passes this so a DELETED file (with its write time) is distinguishable from a file that never existed. */
+        includeTombstones?: boolean;
+    };
+    export type FindConfig = {
+        shallow?: boolean;
+        type?: "files" | "folders";
+        /** Listings normally come ONLY from the authoritative sources (the same nodes writes go to - read-your-writes). With fallbacks, a failing shard's routes are covered by the next source holding them (e.g. a wide read replica) instead of the call failing - high availability at the cost of possibly missing just-written data. Single-source archives ignore the flag. */
+        fallbacks?: boolean;
     };
     export type DelConfig = {
         /** Stamps the deletion (its tombstone) with this write time instead of now. Synchronization passes the ORIGINAL deletion time, so deletion ordering survives propagation exactly like any other write's ordering. */
@@ -2170,7 +2171,7 @@ declare module "sliftutils/storage/IArchives" {
         lastModified?: number;
         /** Makes the write acceptable on immutable targets: an existing path is simply kept (immutability wins - nothing is overwritten) instead of the write throwing. Requires lastModified. Synchronization MUST pass this on every push - a plain set throws on immutable targets, which would abort reconciliation whenever one source in a chain is immutable. */
         forceSetImmutable?: boolean;
-        /** Skips the target-side safety reads around the write (backblaze: the pre-write getInfo comparison and the post-upload existence poll). For writers whose own bookkeeping already decides what to write and orders it by write time (BlobStore's index-driven writes and synchronization), those reads are pure extra API calls - but the default stays checked, because other users of the raw backends rely on the checks. */
+        /** Skips REDUNDANT target-side safety reads around the write (backblaze: the post-upload existence poll). It does NOT skip checks that are the target's only ordering guard: backblaze's pre-write comparison stays, because b2 has no server of ours enforcing only-take-the-latest - without it a stale push lands over a newer value or tombstone and b2's self-stamped upload time launders it into the newest copy in the system (global resurrection). Hosted targets re-check server-side, so their client-side shortcuts are safe. */
         noChecks?: boolean;
         /** Store-to-store push: the receiving node writes purely to its own disk and index, with NO downstream fan-out (the pushing store owns propagation - fanning its pushes back out is how write loops between stores form). Window and route ARE still checked: the stamp must fall inside one of the receiver's configured windows and routes, so a confused peer cannot stuff data onto a node that was never meant to hold it. Requires lastModified. */
         internal?: boolean;
@@ -2309,15 +2310,9 @@ declare module "sliftutils/storage/IArchives" {
          * their empty files - that is how scans learn of deletions - but nothing built on the index
          * ever surfaces them.
          */
-        find(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<string[]>;
+        find(prefix: string, config?: FindConfig): Promise<string[]>;
         /** See find for the empty-file (tombstone) rule. */
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<ArchiveFileInfo[]>;
+        findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
         /** Only works for public buckets (private buckets are API-access only). */
         getURL(path: string): Promise<string>;
         /** The bucket's configuration, which tells whether the optional functions are supported. */
@@ -2592,7 +2587,7 @@ declare module "sliftutils/storage/TransactionStorage" {
 declare module "sliftutils/storage/backblaze" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+    import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
     export declare class ArchivesBackblaze implements IArchives {
         private config;
         constructor(config: {
@@ -2631,15 +2626,9 @@ declare module "sliftutils/storage/backblaze" {
             writeTime: number;
             size: number;
         } | undefined>;
-        find(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<string[]>;
+        find(prefix: string, config?: FindConfig): Promise<string[]>;
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<{
+        findInfo(prefix: string, config?: FindConfig): Promise<{
             path: string;
             createTime: number;
             size: number;
@@ -2896,10 +2885,12 @@ declare module "sliftutils/storage/remoteFileStorage" {
 declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SourceConfig, SetConfig } from "../IArchives";
     export type ArchivesRemoteConfig = {
         url: string;
         waitForAccess?: boolean;
+        /** The exact routing-config entry this connection represents, sent with every call so the server picks the matching per-route store (one server hosts one store per route). Instances built from a bare URL fabricate one - it will never match, which only works for calls that don't select a store (internal reads, ROUTING_FILE, getConfig). */
+        sourceConfig: SourceConfig;
     };
     export declare function parseStorageUrl(url: string): {
         address: string;
@@ -2947,14 +2938,8 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
             writeTime: number;
             size: number;
         } | undefined>;
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<ArchiveFileInfo[]>;
-        find(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<string[]>;
+        findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
+        find(prefix: string, config?: FindConfig): Promise<string[]>;
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
         getConfig(): Promise<ArchivesConfig>;
         getSyncStatus(): Promise<ArchivesSyncStatus>;
@@ -2971,7 +2956,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
 declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, GetConfig, GetInfoConfig } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig } from "../IArchives";
     export declare class ArchivesUrl implements IArchives {
         private base;
         constructor(base: string);
@@ -2995,14 +2980,8 @@ declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
             path: string;
             getNextData(): Promise<Buffer | undefined>;
         }): Promise<void>;
-        find(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<string[]>;
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<ArchiveFileInfo[]>;
+        find(prefix: string, config?: FindConfig): Promise<string[]>;
+        findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
         getURL(path: string): Promise<string>;
         getConfig(): Promise<ArchivesConfig>;
@@ -3034,6 +3013,8 @@ declare module "sliftutils/storage/remoteStorage/accessStats" {
         path: string;
         size?: number;
     }): void;
+    /** Method decorator factory, for API methods whose single config-object argument has account and bucketName: tracks the access (as `bucketName/path`) after the method succeeds. Sizes come from the config's data (writes) or the result's data (reads); operations without either are count-only. Array results (listings) track one access per returned path, or a single access at the prefix when empty. */
+    export declare function trackAccessCall(operation: string): (target: unknown, key: string, descriptor: PropertyDescriptor) => void;
     export declare function getAccessTotals(account: string): AccessTotals;
     export declare function readAccessSummaries(config: {
         account: string;
@@ -3048,38 +3029,47 @@ declare module "sliftutils/storage/remoteStorage/accessStats" {
 declare module "sliftutils/storage/remoteStorage/blobStore" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, GetConfig, GetInfoConfig, SyncActivity } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SyncActivity } from "../IArchives";
+    import { ArchivesDisk } from "../ArchivesDisk";
     export declare const DEFAULT_FAST_WRITE_DELAY: number;
     export declare const WINDOW_END_FLUSH_MARGIN: number;
-    export type WriteConfig = {
-        fast?: boolean;
-        writeDelay?: number;
-        lastModified?: number;
-    };
     export type IBucketStore = {
-        get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
-        get2(fileName: string, config?: GetConfig): Promise<{
+        /** internal (store-to-store) reads answer purely from the local disk; see GetConfig.internal */
+        get2(config: {
+            path: string;
+            range?: {
+                start: number;
+                end: number;
+            };
+            internal?: boolean;
+            includeTombstones?: boolean;
+        }): Promise<{
             data: Buffer;
             writeTime: number;
             size: number;
         } | undefined>;
-        getInternal2?(fileName: string, config?: GetConfig): Promise<{
+        /** internal (store-to-store) writes go to the local disk + index with no fan-out; see SetConfig.internal */
+        set(config: {
+            path: string;
             data: Buffer;
-            writeTime: number;
-            size: number;
-        } | undefined>;
-        setInternal?(fileName: string, data: Buffer, config: {
-            lastModified: number;
+            lastModified?: number;
+            forceSetImmutable?: boolean;
+            internal?: boolean;
         }): Promise<void>;
-        set(fileName: string, data: Buffer, config?: WriteConfig): Promise<string>;
-        del(fileName: string, config?: WriteConfig): Promise<void>;
-        getInfo(fileName: string, config?: GetInfoConfig): Promise<{
+        del(config: {
+            path: string;
+            lastModified?: number;
+            internal?: boolean;
+        }): Promise<void>;
+        getInfo(config: {
+            path: string;
+            includeTombstones?: boolean;
+        }): Promise<{
             writeTime: number;
             size: number;
         } | undefined>;
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type?: "files" | "folders";
+        findInfo(config: FindConfig & {
+            prefix: string;
         }): Promise<ArchiveFileInfo[]>;
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
         getSyncStatus?(): Promise<ArchivesSyncStatus>;
@@ -3105,11 +3095,78 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
                 byteCount: number;
             }[];
         }>;
-        startLargeUpload(): Promise<string>;
-        appendLargeUpload(id: string, data: Buffer): Promise<void>;
-        finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
-        cancelLargeUpload(id: string): Promise<void>;
+        /** path/lastModified let the store reject an upload into an immutable bucket before any bytes move */
+        startLargeUpload(config?: {
+            path?: string;
+            lastModified?: number;
+        }): Promise<string>;
+        appendLargeUpload(config: {
+            id: string;
+            data: Buffer;
+        }): Promise<void>;
+        finishLargeUpload(config: {
+            id: string;
+            path: string;
+            lastModified?: number;
+        }): Promise<void>;
+        cancelLargeUpload(config: {
+            id: string;
+        }): Promise<void>;
     };
+    /** rawDisk buckets: the disk IS the store. No index, no synchronization, no window/route/immutability validation. */
+    export declare class RawDiskStore implements IBucketStore {
+        private disk;
+        constructor(disk: ArchivesDisk);
+        get2(config: {
+            path: string;
+            range?: {
+                start: number;
+                end: number;
+            };
+            internal?: boolean;
+            includeTombstones?: boolean;
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        set(config: {
+            path: string;
+            data: Buffer;
+            lastModified?: number;
+            forceSetImmutable?: boolean;
+            internal?: boolean;
+        }): Promise<void>;
+        del(config: {
+            path: string;
+            lastModified?: number;
+            internal?: boolean;
+        }): Promise<void>;
+        getInfo(config: {
+            path: string;
+            includeTombstones?: boolean;
+        }): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        findInfo(config: FindConfig & {
+            prefix: string;
+        }): Promise<ArchiveFileInfo[]>;
+        getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
+        startLargeUpload(): Promise<string>;
+        appendLargeUpload(config: {
+            id: string;
+            data: Buffer;
+        }): Promise<void>;
+        finishLargeUpload(config: {
+            id: string;
+            path: string;
+            lastModified?: number;
+        }): Promise<void>;
+        cancelLargeUpload(config: {
+            id: string;
+        }): Promise<void>;
+    }
     export type BlobSourceSpec = {
         identity: string;
         url: string;
@@ -3128,47 +3185,51 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             readerDiskLimit?: number | undefined;
             onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
             resolveSourceUrl?: ((url: string) => IArchives) | undefined;
+            entries?: HostedConfig[] | undefined;
         } | undefined);
-        private stopped;
-        private index;
-        private mem;
-        private indexFileCount;
-        private indexByteCount;
-        private sourceFileCounts;
-        private sourceByteCounts;
-        private syncActivities;
-        private dirty;
-        private overlay;
-        private sourceStates;
-        private syncStarted;
-        private sourcesList;
-        private slotSourcesListIndexes;
-        private slotRegistrations;
-        private isLive;
-        private registerSlot;
-        private sourcesListIndexOfSlot;
-        private slotForSourcesListIndex;
-        private getEntryHolder;
         init: {
             (): Promise<void>;
             reset(): void;
             set(newValue: Promise<void>): void;
         };
         dispose(): Promise<void>;
-        private loadIndex;
-        private countEntry;
-        private setIndexEntry;
-        private deleteIndexEntry;
-        /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
-        updateSources(specs: BlobSourceSpec[]): void;
-        private removeSource;
-        /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
-        rescanBase(): Promise<void>;
-        /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
-        boundaryScanRemote(source: IArchives, config: {
-            since: number;
-            route?: [number, number];
+        get2(config: {
+            path: string;
+            range?: {
+                start: number;
+                end: number;
+            };
+            internal?: boolean;
+            includeTombstones?: boolean;
+        }): Promise<{
+            data: Buffer;
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        set(config: {
+            path: string;
+            data: Buffer;
+            lastModified?: number;
+            forceSetImmutable?: boolean;
+            internal?: boolean;
         }): Promise<void>;
+        del(config: {
+            path: string;
+            lastModified?: number;
+            internal?: boolean;
+        }): Promise<void>;
+        getInfo(config: {
+            path: string;
+            includeTombstones?: boolean;
+        }): Promise<{
+            writeTime: number;
+            size: number;
+        } | undefined>;
+        findInfo(config: FindConfig & {
+            prefix: string;
+        }): Promise<ArchiveFileInfo[]>;
+        getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
+        getSyncStatus(): Promise<ArchivesSyncStatus>;
         /** The cheap always-current totals plus any in-progress background synchronization. */
         getSyncProgress(): {
             index: {
@@ -3193,7 +3254,60 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
                 byteCount: number;
             }[];
         }>;
+        /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
+        updateSources(specs: BlobSourceSpec[], entries?: HostedConfig[]): void;
+        /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
+        rescanBase(): Promise<void>;
+        /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
+        boundaryScanRemote(source: IArchives, config: {
+            since: number;
+            route?: [number, number];
+        }): Promise<void>;
+        startLargeUpload(config?: {
+            path?: string;
+            lastModified?: number;
+        }): Promise<string>;
+        appendLargeUpload(config: {
+            id: string;
+            data: Buffer;
+        }): Promise<void>;
+        finishLargeUpload(config: {
+            id: string;
+            path: string;
+            lastModified?: number;
+        }): Promise<void>;
+        cancelLargeUpload(config: {
+            id: string;
+        }): Promise<void>;
+        private stopped;
+        private index;
+        private mem;
+        private indexFileCount;
+        private indexByteCount;
+        private sourceFileCounts;
+        private sourceByteCounts;
+        private syncActivities;
+        private dirty;
+        private overlay;
+        private sourceStates;
+        private syncStarted;
+        private entries;
+        private sourcesList;
+        private slotSourcesListIndexes;
+        private slotRegistrations;
+        private isLive;
+        private registerSlot;
+        private sourcesListIndexOfSlot;
+        private slotForSourcesListIndex;
+        private getEntryHolder;
+        private loadIndex;
+        private countEntry;
+        private setIndexEntry;
+        private deleteIndexEntry;
+        private removeSource;
         private flushIndex;
+        private assertMutable;
+        private assertInternalWriteAccepted;
         private runSourceSync;
         private isDeadIntermediate;
         private scanSource;
@@ -3204,48 +3318,42 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private waitForRequiredScans;
         private checkMissingKey;
         private getIndexEntry;
-        get(key: string, config?: GetConfig): Promise<Buffer | undefined>;
-        get2(key: string, config?: GetConfig): Promise<{
-            data: Buffer;
-            writeTime: number;
-            size: number;
-        } | undefined>;
         /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note fast writes still sitting in the overlay are invisible here; the caller re-finds them after our flush. */
-        getInternal2(key: string, config?: GetConfig): Promise<{
-            data: Buffer;
-            writeTime: number;
-            size: number;
-        } | undefined>;
-        /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Window/route acceptance is the caller's (writeBucketFile's) job; only-take-latest still applies here. */
-        setInternal(key: string, data: Buffer, config: {
-            lastModified: number;
-        }): Promise<void>;
+        private getInternal2;
+        /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Only-take-latest still applies here. */
+        private setInternal;
         private cacheRead;
-        set(key: string, data: Buffer, config?: WriteConfig): Promise<string>;
-        del(key: string, config?: WriteConfig): Promise<void>;
         private setOrDelete;
         private getWritableSources;
         private writeToSources;
-        getInfo(key: string, config?: GetInfoConfig): Promise<{
-            writeTime: number;
-            size: number;
-        } | undefined>;
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type?: "files" | "folders";
-        }): Promise<ArchiveFileInfo[]>;
-        getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
-        getSyncStatus(): Promise<ArchivesSyncStatus>;
         private getDiskSource;
-        startLargeUpload(): Promise<string>;
-        appendLargeUpload(id: string, data: Buffer): Promise<void>;
-        finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
-        cancelLargeUpload(id: string): Promise<void>;
         private flushOverlay;
         private evicting;
         private enforceDiskLimit;
         private cleanupTombstones;
     }
+
+}
+
+declare module "sliftutils/storage/remoteStorage/bucketDisk" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { RemoteConfig } from "../IArchives";
+    export declare function getBucketFolder(account: string, bucketName: string, route?: [number, number]): string;
+    export declare function readRoutingFile(folder: string): Promise<Buffer | undefined>;
+    export declare function readRoutingFromDisk(account: string, bucketName: string): Promise<RemoteConfig | undefined>;
+    /** The routing file lives ONLY in the plain (routeless) bucket folder - it is what DEFINES the per-route stores, so it cannot live inside any of them. Served directly for reads (the stores never hold it). */
+    export declare function getRoutingFileResult(account: string, bucketName: string): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    export type BucketDiskInfo = {
+        totalBytes: number;
+        freeBytes: number;
+        usedBytes: number;
+    };
+    export declare function getDiskInfo(folder: string): Promise<BucketDiskInfo>;
 
 }
 
@@ -3257,11 +3365,11 @@ declare module "sliftutils/storage/remoteStorage/cliArgs" {
 declare module "sliftutils/storage/remoteStorage/createArchives" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+    import { IArchives, RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
     import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
     /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
     export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
-    export declare function createApiArchives(source: HostedConfig | BackblazeConfig): IArchives;
+    export declare function createApiArchives(source: SourceConfig): IArchives;
     export type ArchivesChainOptions = {
         /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
         directConnect?: boolean;
@@ -3339,14 +3447,8 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         } | undefined>;
         private selectCoveringSources;
         private runOnCovering;
-        find(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<string[]>;
-        findInfo(prefix: string, config?: {
-            shallow?: boolean;
-            type: "files" | "folders";
-        }): Promise<ArchiveFileInfo[]>;
+        find(prefix: string, config?: FindConfig): Promise<string[]>;
+        findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
         getSyncStatus(): Promise<ArchivesSyncStatus>;
         getConfig(): Promise<ArchivesConfig>;
@@ -3440,12 +3542,11 @@ declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
 }
 
 declare module "sliftutils/storage/remoteStorage/intermediateSources" {
-    import { RemoteConfig, HostedConfig, BackblazeConfig } from "../IArchives";
+    import { RemoteConfig, SourceConfig } from "../IArchives";
     export declare const INTERMEDIATE_EXPIRE_GRACE: number;
     /** Adding or removing intermediates is a real config update, so it takes a real version increment - but a proportional one, so it stays far below whatever the author's next version would be (whether they count 1, 2, 3 or use timestamps), and a million of them still fit under it. */
     export declare function nextIntermediateVersion(version: number): number;
-    type ObjectSource = HostedConfig | BackblazeConfig;
-    export declare function getIntermediateSources(config: RemoteConfig): ObjectSource[];
+    export declare function getIntermediateSources(config: RemoteConfig): SourceConfig[];
     export declare function hasIntermediateSources(config: RemoteConfig): boolean;
     /** Removes every intermediate entry and rejoins the windows it split, giving back the underlying configuration. Two configs that resolve equal differ only by intermediates. */
     export declare function resolveIntermediateSources(config: RemoteConfig): RemoteConfig;
@@ -3459,8 +3560,7 @@ declare module "sliftutils/storage/remoteStorage/intermediateSources" {
     /** Intermediates whose window ended more than INTERMEDIATE_EXPIRE_GRACE ago are removed, and the windows they split are rejoined. */
     export declare function expireIntermediateSources(config: RemoteConfig, now: number): RemoteConfig;
     /** The url of the entry an intermediate was split out of - the neighbour it touches. */
-    export declare function findSplitUrl(config: RemoteConfig, intermediate: ObjectSource): string | undefined;
-    export {};
+    export declare function findSplitUrl(config: RemoteConfig, intermediate: SourceConfig): string | undefined;
 
 }
 
@@ -3471,7 +3571,7 @@ declare module "sliftutils/storage/remoteStorage/productionEnv" {
 declare module "sliftutils/storage/remoteStorage/remoteConfig" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ChangesAfterConfig } from "../IArchives";
+    import { RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ChangesAfterConfig } from "../IArchives";
     export declare const ROUTING_FILE = "storage/storagerouting.json";
     /** The variable-shard route override embedded in the key ("<sentinel>_<value>", see VARIABLE_SHARD), or undefined when the key has no sentinel or the sentinel has no value yet. */
     export declare function parseVariableRoute(key: string): number | undefined;
@@ -3497,21 +3597,52 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
         bucketName: string;
     };
     export declare function replaceHostedUrlPort(url: string, port: number): string;
-    export declare function normalizeSource(source: RemoteConfigBase): HostedConfig | BackblazeConfig;
+    export declare function normalizeSource(source: RemoteConfigBase): SourceConfig;
     export declare function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig;
     export declare function parseRoutingData(data: Buffer): RemoteConfig;
     export declare function serializeRemoteConfig(config: RemoteConfig): Buffer;
 
 }
 
+declare module "sliftutils/storage/remoteStorage/serverConfig" {
+    import type { IStorage } from "../IStorage";
+    import type { AccessRequest, TrustRecord } from "./storageController";
+    export type StorageServerConfig = {
+        domain: string;
+        port: number;
+        rootDomain: string;
+        sshTarget: string;
+        serverCommand: string;
+        folder: string;
+    };
+    export declare function setStorageServerConfig(value: StorageServerConfig): void;
+    export declare function getStorageServerConfig(): StorageServerConfig;
+    export declare function getStorageServerConfigOptional(): StorageServerConfig | undefined;
+    export declare function setWritesRejectedReason(reason: string | undefined): void;
+    export declare function getWritesRejectedReason(): string | undefined;
+    export declare function assertWritesAllowed(): void;
+    export declare function getStorageFolder(): string;
+    export declare function getTrust(): Promise<IStorage<TrustRecord>>;
+    export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
+    export declare function setTrustedMachines(config: {
+        account: string;
+        machineIds: string[];
+    }): Promise<void>;
+    export declare function addExtraListenPort(port: number): void;
+    export declare function removeExtraListenPort(port: number): void;
+    /** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
+    export declare function isOwnAddress(address: string, port: number): boolean;
+
+}
+
 declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
-    import { IArchives, HostedConfig, BackblazeConfig, RemoteConfig } from "../IArchives";
+    import { IArchives, SourceConfig, RemoteConfig } from "../IArchives";
     import { ArchivesUrl } from "./ArchivesUrl";
     export declare const RETRY_START_DELAY: number;
     export declare const RETRY_MAX_DELAY: number;
     export declare const RETRY_GROWTH = 1.5;
     export declare class SourceWrapper {
-        config: HostedConfig | BackblazeConfig;
+        config: SourceConfig;
         private background;
         api?: IArchives;
         url?: ArchivesUrl;
@@ -3523,7 +3654,7 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         private constructor();
         /** Config updates routinely just move a source's valid window (the last window extends forever, then gets reduced when a new entry is appended). The wrapper survives that: only the window changes, keeping the connection, pings, and latency history. */
         updateValidWindow(validWindow: [number, number]): void;
-        static create(config: HostedConfig | BackblazeConfig, options?: {
+        static create(config: SourceConfig, options?: {
             background?: boolean;
             readOnly?: boolean;
         }): Promise<SourceWrapper>;
@@ -3588,8 +3719,8 @@ declare module "sliftutils/storage/remoteStorage/storageClientController" {
 declare module "sliftutils/storage/remoteStorage/storageController" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig } from "../IArchives";
-    import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+    import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig } from "../IArchives";
+    import { ActiveBucketInfo, ServerBucketInfo } from "./storageServerState";
     import { AccessTotals, AccessSummaryState } from "./accessStats";
     import type { SummaryEntry } from "../../treeSummary";
     export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
@@ -3633,58 +3764,124 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             machineId: string;
             ip: string;
         }>;
-        requestAccess: (account: string) => Promise<{
+        requestAccess: (config: {
+            account: string;
+        }) => Promise<{
             machineId: string;
             ip: string;
             requestId: string;
             grantAccessCommand: string;
         }>;
-        getAccessState: (account: string) => Promise<AccessState>;
-        listRequestsForIP: (account: string, ip: string) => Promise<AccessRequest[]>;
-        grantAccess: (requestId: string) => Promise<TrustRecord>;
+        getAccessState: (config: {
+            account: string;
+        }) => Promise<AccessState>;
+        listRequestsForIP: (config: {
+            account: string;
+            ip: string;
+        }) => Promise<AccessRequest[]>;
+        grantAccess: (config: {
+            requestId: string;
+        }) => Promise<TrustRecord>;
         adminListActiveBuckets: () => Promise<{
             account: string;
             bucketName: string;
         }[]>;
-        adminListRequests: (ip: string) => Promise<AccessRequest[]>;
-        adminGrantAccess: (requestId: string) => Promise<TrustRecord>;
-        get: (account: string, bucketName: string, path: string, range?: {
-            start: number;
-            end: number;
-        }) => Promise<Buffer | undefined>;
-        get2: (account: string, bucketName: string, path: string, range?: {
-            start: number;
-            end: number;
-        }, internal?: boolean) => Promise<{
+        adminListRequests: (config: {
+            ip: string;
+        }) => Promise<AccessRequest[]>;
+        adminGrantAccess: (config: {
+            requestId: string;
+        }) => Promise<TrustRecord>;
+        get2: (config: {
+            account: string;
+            bucketName: string;
+            path: string;
+            sourceConfig: SourceConfig;
+            range?: {
+                start: number;
+                end: number;
+            };
+            internal?: boolean;
+            includeTombstones?: boolean;
+        }) => Promise<{
             data: Buffer;
             writeTime: number;
             size: number;
         } | undefined>;
-        set: (account: string, bucketName: string, path: string, data: Buffer, lastModified?: number, forceSetImmutable?: boolean, internal?: boolean) => Promise<void>;
-        del: (account: string, bucketName: string, path: string, lastModified?: number, internal?: boolean) => Promise<void>;
-        getInfo: (account: string, bucketName: string, path: string, includeTombstones?: boolean) => Promise<{
+        set: (config: {
+            account: string;
+            bucketName: string;
+            path: string;
+            data: Buffer;
+            sourceConfig: SourceConfig;
+            lastModified?: number;
+            forceSetImmutable?: boolean;
+            internal?: boolean;
+        }) => Promise<void>;
+        del: (config: {
+            account: string;
+            bucketName: string;
+            path: string;
+            sourceConfig: SourceConfig;
+            lastModified?: number;
+            internal?: boolean;
+        }) => Promise<void>;
+        getInfo: (config: {
+            account: string;
+            bucketName: string;
+            path: string;
+            sourceConfig: SourceConfig;
+            includeTombstones?: boolean;
+        }) => Promise<{
             writeTime: number;
             size: number;
         } | undefined>;
-        findInfo: (account: string, bucketName: string, prefix: string, config?: {
-            shallow?: boolean;
-            type?: "files" | "folders";
+        findInfo: (config: FindConfig & {
+            account: string;
+            bucketName: string;
+            prefix: string;
+            sourceConfig: SourceConfig;
         }) => Promise<ArchiveFileInfo[]>;
-        getChangesAfter2: (account: string, bucketName: string, config: ChangesAfterConfig) => Promise<ArchiveFileInfo[]>;
-        getArchivesConfig: (account: string, bucketName: string) => Promise<ArchivesConfig>;
-        listBuckets: (account: string) => Promise<ServerBucketInfo[]>;
-        getActiveBucket: (account: string, bucketName: string) => Promise<ActiveBucketInfo | string>;
-        activateBucket: (account: string, bucketName: string) => Promise<ActiveBucketInfo | string>;
-        clearWriteStats: (account: string) => Promise<{
+        getChangesAfter2: (config: {
+            account: string;
+            bucketName: string;
+            sourceConfig: SourceConfig;
+            time: number;
+            routes?: [number, number][];
+        }) => Promise<ArchiveFileInfo[]>;
+        getArchivesConfig: (config: {
+            account: string;
+            bucketName: string;
+        }) => Promise<ArchivesConfig>;
+        listBuckets: (config: {
+            account: string;
+        }) => Promise<ServerBucketInfo[]>;
+        getActiveBucket: (config: {
+            account: string;
+            bucketName: string;
+        }) => Promise<ActiveBucketInfo | string>;
+        activateBucket: (config: {
+            account: string;
+            bucketName: string;
+        }) => Promise<ActiveBucketInfo | string>;
+        clearWriteStats: (config: {
+            account: string;
+        }) => Promise<{
             clearedBuckets: number;
         }>;
-        getAccessStats: (account: string) => Promise<AccessTotals>;
-        getAccessSummaries: (account: string, config: {
+        getAccessStats: (config: {
+            account: string;
+        }) => Promise<AccessTotals>;
+        getAccessSummaries: (config: {
+            account: string;
             operation: string;
             maxCount: number;
             weightBySize?: boolean;
         }) => Promise<SummaryEntry<AccessSummaryState>[]>;
-        getIndexInfo: (account: string, bucketName: string) => Promise<{
+        getIndexInfo: (config: {
+            account: string;
+            bucketName: string;
+        }) => Promise<{
             fileCount: number;
             byteCount: number;
             sources: {
@@ -3693,11 +3890,27 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
                 byteCount: number;
             }[];
         } | undefined>;
-        getSyncStatus: (account: string, bucketName: string) => Promise<ArchivesSyncStatus>;
-        startLargeFile: (account: string, bucketName: string, path: string, lastModified?: number) => Promise<string>;
-        uploadPart: (uploadId: string, data: Buffer) => Promise<void>;
-        finishLargeFile: (uploadId: string) => Promise<void>;
-        cancelLargeFile: (uploadId: string) => Promise<void>;
+        getSyncStatus: (config: {
+            account: string;
+            bucketName: string;
+        }) => Promise<ArchivesSyncStatus>;
+        startLargeFile: (config: {
+            account: string;
+            bucketName: string;
+            path: string;
+            sourceConfig: SourceConfig;
+            lastModified?: number;
+        }) => Promise<string>;
+        uploadPart: (config: {
+            uploadId: string;
+            data: Buffer;
+        }) => Promise<void>;
+        finishLargeFile: (config: {
+            uploadId: string;
+        }) => Promise<void>;
+        cancelLargeFile: (config: {
+            uploadId: string;
+        }) => Promise<void>;
         httpEntry: (config?: {
             requireCalls?: string[];
             cacheTime?: number;
@@ -3726,73 +3939,61 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { IBucketStore } from "./blobStore";
-    import { RemoteConfig, HostedConfig, IArchives, ArchivesConfig } from "../IArchives";
-    import type { IStorage } from "../IStorage";
-    import type { AccessRequest, TrustRecord } from "./storageController";
-    export type StorageServerConfig = {
-        domain: string;
-        port: number;
-        rootDomain: string;
-        sshTarget: string;
-        serverCommand: string;
+    import { RemoteConfig, HostedConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+    import { BucketDiskInfo } from "./bucketDisk";
+    import { SelfSummary } from "./storePlan";
+    export type LoadedStore = {
+        routeKey: string;
+        route?: [number, number];
+        entries: HostedConfig[];
         folder: string;
+        store: IBucketStore;
     };
-    export declare function setStorageServerConfig(value: StorageServerConfig): void;
-    export declare function getStorageServerConfig(): StorageServerConfig;
-    export declare function getStorageServerConfigOptional(): StorageServerConfig | undefined;
-    export declare function setWritesRejectedReason(reason: string | undefined): void;
-    export declare function getWritesRejectedReason(): string | undefined;
-    export declare function assertWritesAllowed(): void;
-    export declare function getTrust(): Promise<IStorage<TrustRecord>>;
-    export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
-    export type BucketWriteStats = {
-        /** Every set call the bucket accepted */
-        originalWrites: number;
-        originalBytes: number;
-        /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
-        flushedWrites: number;
-        flushedBytes: number;
-    };
-    /** Zeroes the write statistics of every bucket in the account. */
-    export declare function clearAccountWriteStats(account: string): number;
-    export declare function setTrustedMachines(config: {
-        account: string;
-        machineIds: string[];
-    }): Promise<void>;
-    export type LoadedBucket = {
+    export type BucketState = {
         account: string;
         bucketName: string;
         routing: RemoteConfig;
         routingJSON: string;
         selfEntries: HostedConfig[];
         self: SelfSummary | undefined;
-        store: IBucketStore;
+        stores: LoadedStore[];
         structureKey: string;
     };
-    export declare function addExtraListenPort(port: number): void;
-    export declare function removeExtraListenPort(port: number): void;
-    /** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
-    export declare function isOwnAddress(address: string, port: number): boolean;
+    /** The loaded bucket, loading it (which instantiates its stores and starts their synchronization) if needed. A bucket that does not exist on this server throws - callers never see undefined buckets. */
+    export declare function requireBucket(account: string, bucketName: string): Promise<BucketState>;
+    /** The store serving a request: the exact config entry the CLIENT selected, matched by equality (key order ignored) against the bucket's own entries. A match is honored even when its window has passed - the selection never validates, the store's own validation throws instead. Throws when nothing matches, listing what is available. */
+    export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore>;
+    /** Internal (store-to-store) reads skip store selection entirely: the caller is another store whose index says this MACHINE holds the bytes - the persisted holder identity is just a URL, which cannot name a store. Whichever store's folder has the newest copy answers. */
+    export declare function readBucketInternal(account: string, bucketName: string, config: {
+        path: string;
+        range?: {
+            start: number;
+            end: number;
+        };
+        includeTombstones?: boolean;
+    }): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    export declare function getBucketConfig(bucket: BucketState): ArchivesConfig;
+    export declare function bucketSyncStatus(bucket: BucketState): Promise<ArchivesSyncStatus>;
+    export declare function bucketIndexTotals(bucket: BucketState): Promise<{
+        fileCount: number;
+        byteCount: number;
+        sources: {
+            debugName: string;
+            fileCount: number;
+            byteCount: number;
+        }[];
+    } | undefined>;
     /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
     export declare function resolveSourceArchives(url: string): IArchives;
-    /** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
-    export type SelfSummary = {
-        /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
-        routes: [number, number][];
-        public: boolean;
-        immutable: boolean;
-        noFullSync: boolean;
-        rawDisk: boolean;
-        readerDiskLimit?: number;
-    };
-    export declare function getLoadedBucket(account: string, bucketName: string): Promise<LoadedBucket | undefined>;
-    export declare function assertMutable(bucket: LoadedBucket, filePath: string, writeTime: number): Promise<void>;
-    export declare function writeBucketFile(account: string, bucketName: string, filePath: string, data: Buffer, config?: {
+    export declare function getLoadedBucket(account: string, bucketName: string): Promise<BucketState | undefined>;
+    /** The routing-config write path - the ONE write that cannot go through a store (it is what CREATES the bucket and its stores). Serialized per bucket: concurrent config writes would race the version check. */
+    export declare function queueRoutingConfigWrite(account: string, bucketName: string, data: Buffer, config?: {
         lastModified?: number;
-        forceSetImmutable?: boolean;
-        internal?: boolean;
     }): Promise<void>;
-    export declare function getBucketConfig(bucket: LoadedBucket): ArchivesConfig;
     /** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
     export declare function getActiveBucketKeys(): {
         account: string;
@@ -3804,11 +4005,6 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         (): void;
         reset(): void;
         set(newValue: void): void;
-    };
-    export type BucketDiskInfo = {
-        totalBytes: number;
-        freeBytes: number;
-        usedBytes: number;
     };
     export type ServerBucketInfo = {
         bucketName: string;
@@ -3836,11 +4032,63 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     /** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
     export declare function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
     export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
-    export declare function deleteBucketFile(account: string, bucketName: string, filePath: string, config?: {
-        lastModified?: number;
-        internal?: boolean;
-    }): Promise<void>;
-    export declare function getLocalArchives(account: string, bucketName: string): IArchives;
+    export type BucketWriteStats = {
+        /** Every set call the bucket accepted */
+        originalWrites: number;
+        originalBytes: number;
+        /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+        flushedWrites: number;
+        flushedBytes: number;
+    };
+    /** Zeroes the write statistics of every bucket in the account. */
+    export declare function clearAccountWriteStats(account: string): number;
+    export declare function getLocalArchives(account: string, bucketName: string, sourceConfig: SourceConfig): IArchives;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storePlan" {
+    import { RemoteConfig, HostedConfig, SourceConfig } from "../IArchives";
+    export declare function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[];
+    export declare function selectEntryAt(entries: HostedConfig[], time: number, route?: number): HostedConfig | undefined;
+    /** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
+    export type SelfSummary = {
+        /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
+        routes: [number, number][];
+        public: boolean;
+        immutable: boolean;
+        noFullSync: boolean;
+        rawDisk: boolean;
+        readerDiskLimit?: number;
+    };
+    export type StoreSourceSpec = {
+        sourceConfig?: SourceConfig;
+        validWindow: [number, number];
+        route?: [number, number];
+        noFullSync?: boolean;
+    };
+    export type StorePlanStore = {
+        routeKey: string;
+        route?: [number, number];
+        entries: HostedConfig[];
+        rawDisk: boolean;
+        readerDiskLimit?: number;
+        sourceSpecs: StoreSourceSpec[];
+    };
+    export type StorePlan = {
+        selfEntries: HostedConfig[];
+        self: SelfSummary | undefined;
+        stores: StorePlanStore[];
+        structureKey: string;
+    };
+    export declare function computeStorePlan(account: string, bucketName: string, routing: RemoteConfig): StorePlan;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/validation" {
+    export declare function assertValidName(value: string, kind: string): void;
+    export declare function assertValidPath(path: string): void;
+    /** Method decorator: validates the well-known fields of the method's single config-object argument - account/bucketName as names, path as a path - before the method runs. Fields the config doesn't have are skipped, so it applies to every API method uniformly. prefix is deliberately NOT validated: prefixes may be empty or end with "/", both invalid for paths. */
+    export declare function assertValidArgs(target: unknown, key: string, descriptor: PropertyDescriptor): void;
 
 }
 

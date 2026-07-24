@@ -1,4 +1,5 @@
 import fs from "fs";
+import path from "path";
 
 const RELOAD_THROTTLE = 5 * 1000;
 
@@ -54,6 +55,8 @@ export class SourcesList {
             await this.load();
             let existing = this.indexes.get(url);
             if (existing !== undefined) return existing;
+            // appendFile creates the file but not its parent directories, and on a fresh bucket we run before anything else has created them
+            await fs.promises.mkdir(path.dirname(this.filePath), { recursive: true });
             let prefix = this.endsClean && "" || "\n";
             await fs.promises.appendFile(this.filePath, prefix + url + "\n");
             this.endsClean = true;

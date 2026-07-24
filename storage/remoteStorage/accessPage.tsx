@@ -82,8 +82,8 @@ class AccessPage extends preact.Component {
     }
     private async refresh(account: string) {
         let controller = await this.controller();
-        await controller.requestAccess(account);
-        this.synced.state = await controller.getAccessState(account);
+        await controller.requestAccess({ account });
+        this.synced.state = await controller.getAccessState({ account });
         this.synced.error = "";
     }
 
@@ -94,7 +94,7 @@ class AccessPage extends preact.Component {
         this.synced.lookupError = "";
         try {
             let controller = await this.controller();
-            let requests = await controller.listRequestsForIP(this.synced.account, ip);
+            let requests = await controller.listRequestsForIP({ account: this.synced.account, ip });
             this.synced.lookupResults = { ip, requests };
         } catch (e) {
             this.synced.lookupError = String(e);
@@ -107,7 +107,7 @@ class AccessPage extends preact.Component {
         this.synced.granting = request.requestId;
         try {
             let controller = await this.controller();
-            await controller.grantAccess(request.requestId);
+            await controller.grantAccess({ requestId: request.requestId });
             if (this.synced.lookupResults) {
                 this.synced.lookupResults.requests = this.synced.lookupResults.requests.filter(r => r.requestId !== request.requestId);
             }

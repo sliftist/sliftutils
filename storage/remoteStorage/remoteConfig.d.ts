@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { RemoteConfig, RemoteConfigBase, HostedConfig, BackblazeConfig, ArchiveFileInfo, ChangesAfterConfig } from "../IArchives";
+import { RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ChangesAfterConfig } from "../IArchives";
 export declare const ROUTING_FILE = "storage/storagerouting.json";
 /** The variable-shard route override embedded in the key ("<sentinel>_<value>", see VARIABLE_SHARD), or undefined when the key has no sentinel or the sentinel has no value yet. */
 export declare function parseVariableRoute(key: string): number | undefined;
@@ -26,7 +26,7 @@ export declare function parseBackblazeUrl(url: string): {
     bucketName: string;
 };
 export declare function replaceHostedUrlPort(url: string, port: number): string;
-export declare function normalizeSource(source: RemoteConfigBase): HostedConfig | BackblazeConfig;
+export declare function normalizeSource(source: RemoteConfigBase): SourceConfig;
 export declare function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig;
 export declare function parseRoutingData(data: Buffer): RemoteConfig;
 export declare function serializeRemoteConfig(config: RemoteConfig): Buffer;
