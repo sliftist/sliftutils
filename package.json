@@ -1,6 +1,6 @@
 {
     "name": "sliftutils",
-    "version": "1.7.74",
+    "version": "1.7.80",
     "main": "index.js",
     "license": "MIT",
     "files": [
@@ -68,7 +68,7 @@
     },
     "devDependencies": {
         "@types/yargs": "15.0.19",
-        "debugbreak": "^0.9.9",
+        "debugbreak": "^0.11.0",
         "electron": "^33.2.1",
         "open": "^8.4.0",
         "typedev": "^0.1.1"
