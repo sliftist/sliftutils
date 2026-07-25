@@ -81,7 +81,8 @@ export function injectIntermediateSource(config: RemoteConfig, inject: { splitUr
         if (middleStart > windowStart) {
             sources.push({ ...source, validWindow: [windowStart, middleStart] });
         }
-        sources.push({ ...source, url: intermediateUrl, validWindow: [middleStart, middleEnd], intermediate: true });
+        // intermediate = the url this entry was split out of, so a request naming the intermediate still resolves to the original source
+        sources.push({ ...source, url: intermediateUrl, validWindow: [middleStart, middleEnd], intermediate: splitUrl });
         if (windowEnd > middleEnd) {
             sources.push({ ...source, validWindow: [middleEnd, windowEnd] });
         }
@@ -98,18 +99,12 @@ export function expireIntermediateSources(config: RemoteConfig, now: number): Re
     let result = resolved;
     for (let keep of keptIntermediates) {
         result = injectIntermediateSource(result, {
-            splitUrl: findSplitUrl(config, keep) || keep.url,
+            // The intermediate carries the url it was split out of; fall back to its own url only for a legacy entry that predates that
+            splitUrl: keep.intermediate || keep.url,
             intermediateUrl: keep.url,
             start: keep.validWindow[0],
             end: keep.validWindow[1],
         });
     }
     return result;
-}
-
-/** The url of the entry an intermediate was split out of - the neighbour it touches. */
-export function findSplitUrl(config: RemoteConfig, intermediate: SourceConfig): string | undefined {
-    let [start, end] = intermediate.validWindow;
-    let neighbour = config.sources.find(x => isSourceConfig(x) && !x.intermediate && (x.validWindow[1] === start || x.validWindow[0] === end)) as SourceConfig | undefined;
-    return neighbour?.url;
 }

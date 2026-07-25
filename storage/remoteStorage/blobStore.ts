@@ -170,7 +170,7 @@ export type BlobSourceSpec = {
     route?: [number, number];
     noFullSync?: boolean;
     // See ArchivesSource.intermediate
-    intermediate?: boolean;
+    intermediate?: string;
     // See ArchivesSource.sourceConfig (absent for the base disk source)
     sourceConfig?: SourceConfig;
     // Only called for sources that don't match an existing live slot

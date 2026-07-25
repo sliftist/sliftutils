@@ -2112,8 +2112,8 @@ declare module "sliftutils/storage/IArchives" {
         validWindow: [number, number];
         /** Sharding: the fraction of the key space this source handles, as [start, end) over [0, 1) (keys are routed by getRoute in remoteConfig.ts). Defaults to FULL_ROUTE (unsharded). At every point in time the sources' routes must fully cover [0, 1), or some keys could never be read. */
         route?: [number, number];
-        /** Set on entries injected into the in-memory config by an overlay (a deploy switchover's alternate-port window). Never written to disk: resolveIntermediateSources strips these and rejoins the windows around them, which is also how a client tells whether an update is a real configuration change or just an overlay. */
-        intermediate?: boolean;
+        /** Set on entries injected into the in-memory config by an overlay (a deploy switchover's alternate-port window). Never written to disk: resolveIntermediateSources strips these and rejoins the windows around them, which is also how a client tells whether an update is a real configuration change or just an overlay. The VALUE is the url of the source this intermediate was split out of (its alternate-port view) - so a request naming the intermediate still resolves to the ORIGINAL source, even after the intermediate rejoins and the entry is gone. */
+        intermediate?: string;
     };
     export type HostedConfig = CommonConfig & {
         type: "remote";
@@ -2218,7 +2218,7 @@ declare module "sliftutils/storage/IArchives" {
         validWindows: [number, number][];
         route?: [number, number];
         noFullSync?: boolean;
-        intermediate?: boolean;
+        intermediate?: string;
         sourceConfig?: SourceConfig;
         identity?: string;
     };
@@ -3182,7 +3182,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         validWindows: [number, number][];
         route?: [number, number];
         noFullSync?: boolean;
-        intermediate?: boolean;
+        intermediate?: string;
         sourceConfig?: SourceConfig;
         create: () => IArchives;
     };
@@ -3571,8 +3571,6 @@ declare module "sliftutils/storage/remoteStorage/intermediateSources" {
     }): RemoteConfig;
     /** Intermediates whose window ended more than INTERMEDIATE_EXPIRE_GRACE ago are removed, and the windows they split are rejoined. */
     export declare function expireIntermediateSources(config: RemoteConfig, now: number): RemoteConfig;
-    /** The url of the entry an intermediate was split out of - the neighbour it touches. */
-    export declare function findSplitUrl(config: RemoteConfig, intermediate: SourceConfig): string | undefined;
 
 }
 

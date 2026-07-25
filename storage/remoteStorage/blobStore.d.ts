@@ -144,7 +144,7 @@ export type BlobSourceSpec = {
     validWindows: [number, number][];
     route?: [number, number];
     noFullSync?: boolean;
-    intermediate?: boolean;
+    intermediate?: string;
     sourceConfig?: SourceConfig;
     create: () => IArchives;
 };

@@ -15,5 +15,3 @@ export declare function injectIntermediateSource(config: RemoteConfig, inject: {
 }): RemoteConfig;
 /** Intermediates whose window ended more than INTERMEDIATE_EXPIRE_GRACE ago are removed, and the windows they split are rejoined. */
 export declare function expireIntermediateSources(config: RemoteConfig, now: number): RemoteConfig;
-/** The url of the entry an intermediate was split out of - the neighbour it touches. */
-export declare function findSplitUrl(config: RemoteConfig, intermediate: SourceConfig): string | undefined;

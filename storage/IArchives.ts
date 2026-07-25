@@ -44,8 +44,8 @@ export type CommonConfig = {
     validWindow: [number, number];
     /** Sharding: the fraction of the key space this source handles, as [start, end) over [0, 1) (keys are routed by getRoute in remoteConfig.ts). Defaults to FULL_ROUTE (unsharded). At every point in time the sources' routes must fully cover [0, 1), or some keys could never be read. */
     route?: [number, number];
-    /** Set on entries injected into the in-memory config by an overlay (a deploy switchover's alternate-port window). Never written to disk: resolveIntermediateSources strips these and rejoins the windows around them, which is also how a client tells whether an update is a real configuration change or just an overlay. */
-    intermediate?: boolean;
+    /** Set on entries injected into the in-memory config by an overlay (a deploy switchover's alternate-port window). Never written to disk: resolveIntermediateSources strips these and rejoins the windows around them, which is also how a client tells whether an update is a real configuration change or just an overlay. The VALUE is the url of the source this intermediate was split out of (its alternate-port view) - so a request naming the intermediate still resolves to the ORIGINAL source, even after the intermediate rejoins and the entry is gone. */
+    intermediate?: string;
 };
 
 export type HostedConfig = CommonConfig & {
@@ -183,8 +183,8 @@ export type ArchivesSource = {
     route?: [number, number];
     // From the source's CommonConfig; see there.
     noFullSync?: boolean;
-    // From the source's CommonConfig: a deploy switchover's temporary alternate-port entry. Once its window is past, the port it points at is gone for good - so it is never scanned then, and scan failures are never retried.
-    intermediate?: boolean;
+    // From the source's CommonConfig: a deploy switchover's temporary alternate-port entry (the value is the url of the source it was split out of). Once its window is past, the port it points at is gone for good - so it is never scanned then, and scan failures are never retried.
+    intermediate?: string;
     // The routing-config entry this source was built from (absent for the base disk source). Its `type` decides fast-write flush timing: type-"remote" downstream sources (our own storage servers) flush quickly (cheap, and we want cross-node redundancy fast), while others (e.g. backblaze) keep the full writeDelay so expensive external writes stay coalesced. The window/route ON this config are the SOURCE's own; ArchivesSource.validWindow/route are what the owning store actually uses (route is intersected with the store's route).
     sourceConfig?: SourceConfig;
     // Stable identity of the underlying endpoint (its config with windows/routes stripped) - how BlobStore.updateSources recognizes a source across config changes so it can update it in place instead of removing and re-adding it

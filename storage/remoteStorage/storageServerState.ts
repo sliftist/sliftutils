@@ -10,7 +10,7 @@ import {
     ArchiveFileInfo, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, SyncActivity, FULL_ROUTE,
 } from "../IArchives";
 import { ROUTING_FILE, parseRoutingData, serializeRemoteConfig, parseHostedUrl, replaceHostedUrlPort, buildFileUrl, getConfigVersion, routeIntersection, normalizeSource } from "./remoteConfig";
-import { injectIntermediateSource, expireIntermediateSources, getIntermediateSources, findSplitUrl, nextIntermediateVersion, INTERMEDIATE_EXPIRE_GRACE } from "./intermediateSources";
+import { injectIntermediateSource, expireIntermediateSources, getIntermediateSources, nextIntermediateVersion, INTERMEDIATE_EXPIRE_GRACE } from "./intermediateSources";
 import { getTakeoverIntermediate } from "./deployTakeover";
 import { createApiArchives, listServerActiveBucketKeys } from "./createArchives";
 import { broadcastRoutingChanged } from "./storageController";
@@ -62,9 +62,10 @@ export async function requireBucket(account: string, bucketName: string): Promis
     return bucket;
 }
 
-/** The stable identity of a source config for matching: everything EXCEPT the valid window. The window drifts (a switchover splits one window in two around an intermediate, then rejoins it), so a caller and this server routinely disagree on it while naming the very same source - matching on it would wrongly reject the request. The route stays in the identity (it selects the store/folder). */
+/** The stable identity of a source config for matching: everything EXCEPT the valid window, and with an intermediate resolved back to the source it was split out of. The window drifts (a switchover splits one window in two around an intermediate, then rejoins it), so a caller and this server routinely disagree on it - matching on it would wrongly reject the request. An intermediate is a transient alt-port view of another source, so it must resolve to THAT source (config.intermediate holds its url + the intermediate flag is dropped), or a request naming the intermediate would fail to match once the intermediate has rejoined and its entry is gone. The route stays in the identity (it selects the store/folder). */
 function sourceMatchKey(config: SourceConfig): string {
-    return stableStringify({ ...config, validWindow: undefined });
+    let url = config.intermediate || config.url;
+    return stableStringify({ ...config, url, intermediate: undefined, validWindow: undefined });
 }
 
 /** The store serving a request: the config entry the CLIENT selected, matched against the bucket's own entries by identity EXCLUDING the valid window (see sourceMatchKey). The selection never validates - the store's own window/route checks throw if the caller is stale - so honoring a window mismatch here is exactly right. Throws when nothing matches, listing what is available. */
@@ -517,7 +518,7 @@ async function writeRoutingConfig(account: string, bucketName: string, data: Buf
     let reinjected = 0;
     for (let intermediate of getIntermediateSources(expireIntermediateSources(loaded.routing, Date.now()))) {
         stored = injectIntermediateSource(stored, {
-            splitUrl: findSplitUrl(loaded.routing, intermediate) || intermediate.url,
+            splitUrl: intermediate.intermediate || intermediate.url,
             intermediateUrl: intermediate.url,
             start: intermediate.validWindow[0],
             end: intermediate.validWindow[1],
