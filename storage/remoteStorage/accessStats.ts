@@ -57,7 +57,7 @@ export function trackAccess(config: { account: string; operation: string; path: 
     }
 }
 
-/** Method decorator factory, for API methods whose single config-object argument has account and bucketName: tracks the access (as `bucketName/path`) after the method succeeds. Sizes come from the config's data (writes) or the result's data (reads); operations without either are count-only. Array results (listings - findInfo, getChangesAfter) are tracked as two count-only operations: "<op> queries" at the query prefix (one per call), and "<op> results" at each returned path (one per result). */
+/** Method decorator factory, for API methods whose single config-object argument has account and bucketName: tracks the access (as `bucketName/path`) after the method succeeds. Sizes come from the config's data (writes) or the result's data (reads); operations without either are count-only. Array results (listings - findInfo, getChangesAfter) are tracked as two breakdowns: "<op> queries" - one access per CALL, at the query prefix, sized by the number of results (so the tree shows which QUERY returns the most) - and "<op> results" - one count-only access per returned path (so the tree shows which PATHS come back most). */
 export function trackAccessCall(operation: string) {
     return function (target: unknown, key: string, descriptor: PropertyDescriptor): void {
         let original = descriptor.value as (...args: unknown[]) => Promise<unknown>;
@@ -66,8 +66,8 @@ export function trackAccessCall(operation: string) {
             let result = await original.apply(this, args);
             let base = `${config.bucketName}/`;
             if (Array.isArray(result)) {
-                // Two separate breakdowns, both count-only: WHAT was queried, and WHAT was returned
-                trackAccess({ account: config.account, operation: `${operation} queries`, path: base + (config.prefix || config.path || "") });
+                // The query, sized by how many results it returned (which query is heaviest); and each returned path, count-only (which paths come back most)
+                trackAccess({ account: config.account, operation: `${operation} queries`, path: base + (config.prefix || config.path || ""), size: result.length });
                 for (let entry of result as { path: string }[]) {
                     trackAccess({ account: config.account, operation: `${operation} results`, path: base + entry.path });
                 }

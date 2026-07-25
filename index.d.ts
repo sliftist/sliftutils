@@ -3022,7 +3022,7 @@ declare module "sliftutils/storage/remoteStorage/accessStats" {
         path: string;
         size?: number;
     }): void;
-    /** Method decorator factory, for API methods whose single config-object argument has account and bucketName: tracks the access (as `bucketName/path`) after the method succeeds. Sizes come from the config's data (writes) or the result's data (reads); operations without either are count-only. Array results (listings - findInfo, getChangesAfter) are tracked as two count-only operations: "<op> queries" at the query prefix (one per call), and "<op> results" at each returned path (one per result). */
+    /** Method decorator factory, for API methods whose single config-object argument has account and bucketName: tracks the access (as `bucketName/path`) after the method succeeds. Sizes come from the config's data (writes) or the result's data (reads); operations without either are count-only. Array results (listings - findInfo, getChangesAfter) are tracked as two breakdowns: "<op> queries" - one access per CALL, at the query prefix, sized by the number of results (so the tree shows which QUERY returns the most) - and "<op> results" - one count-only access per returned path (so the tree shows which PATHS come back most). */
     export declare function trackAccessCall(operation: string): (target: unknown, key: string, descriptor: PropertyDescriptor) => void;
     export declare function getAccessTotals(account: string): AccessTotals;
     export declare function readAccessSummaries(config: {
