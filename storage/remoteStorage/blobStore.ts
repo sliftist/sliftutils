@@ -4,8 +4,8 @@ import { runInfinitePoll, delay } from "socket-function/src/batching";
 import { timeInMinute, sort, promiseObj } from "socket-function/src/misc";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import {
-    IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, assertValidLastModified,
-    windowAcceptsWrites, SyncActivity, FULL_ROUTE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, copyArchiveFile,
+    IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SourceConfig, assertValidLastModified,
+    windowAcceptsWrites, windowsAcceptWrites, SyncActivity, FULL_ROUTE, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, copyArchiveFile,
 } from "../IArchives";
 import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
 import { ArchivesBackblaze } from "../backblaze";
@@ -18,7 +18,10 @@ import { SourcesList } from "./sourcesList";
 // The storage engine of the remote storage server. Data lives in synchronization sources (at minimum an ArchivesDisk, the local disk); BlobStore keeps an index of every file (path, last modified time, size, and which source currently holds the data) in a BulkDatabase2, and synchronizes the index from all sources (see ArchivesSource in IArchives.ts). Every startup fully rescans each source's metadata, so the index self-heals; the file with the highest write time wins across all sources, so multiple sources need no stacking order. The store also holds its own routing entries (the self entries of the ONE route it serves), so it validates writes itself: valid windows, routes, immutability, and internal-push acceptance.
 
 export const DEFAULT_FAST_WRITE_DELAY = timeInMinute * 5;
-const FAST_FLUSH_POLL = 1000 * 15;
+// The most a fast write is buffered before reaching our OWN storage servers (type-"remote" downstream sources) and our own disk - short, so cross-node redundancy and read-your-writes across nodes don't wait the full writeDelay. The writeDelay (default 5 min) is reserved for the non-"remote" sources (backblaze etc). A fast write with a writeDelay shorter than this uses the shorter one for both.
+const MAX_REMOTE_FAST_BUFFER = 1000 * 5;
+// The overlay is polled this often for due flushes - fine enough that the fast (remote) flush lands close to MAX_REMOTE_FAST_BUFFER, not one coarse tick later
+const FAST_FLUSH_POLL = 1000 * 2;
 // Fast writes are never delayed past our own valid window, and within this margin of the window's end they write through immediately - so when the next window's source takes over, the writes are already on disk
 export const WINDOW_END_FLUSH_MARGIN = timeInMinute * 5;
 // Index changes are buffered in memory and written to the BulkDatabase2 in batches
@@ -116,7 +119,12 @@ type OverlayEntry = {
     // A zero-length buffer is a pending delete (tombstone)
     data: Buffer;
     t: number;
-    flushAt: number;
+    // When to flush to our own disk + type-"remote" downstream sources (our own storage servers): short, so cross-node reads and redundancy don't wait the full writeDelay
+    fastFlushAt: number;
+    // When to flush to the remaining (non-"remote") downstream sources, e.g. backblaze: the full writeDelay, coalescing to keep expensive external writes rare
+    slowFlushAt: number;
+    // Set once the fast flush has run (own disk + remote peers written); the slow flush then only needs the non-remote sources
+    fastFlushed?: boolean;
 };
 
 // One row of the BulkDatabase2 index (key is the file path)
@@ -158,11 +166,13 @@ export type BlobSourceSpec = {
     identity: string;
     // See ArchivesSource.url
     url: string;
-    validWindow: [number, number];
+    validWindows: [number, number][];
     route?: [number, number];
     noFullSync?: boolean;
     // See ArchivesSource.intermediate
     intermediate?: boolean;
+    // See ArchivesSource.sourceConfig (absent for the base disk source)
+    sourceConfig?: SourceConfig;
     // Only called for sources that don't match an existing live slot
     create: () => IArchives;
 };
@@ -460,7 +470,7 @@ export class BlobStore implements IBucketStore {
             indexSize: this.mem.size,
             sources: this.sources.map((x, i) => ({
                 debugName: x.source.getDebugName(),
-                validWindow: x.validWindow,
+                validWindows: x.validWindows,
                 route: x.route,
                 noFullSync: x.noFullSync,
                 supportsChangesAfter: this.sourceStates[i].supportsChangesAfter,
@@ -520,14 +530,14 @@ export class BlobStore implements IBucketStore {
         if (entries) {
             this.entries = entries;
         }
-        let setWindow = (i: number, window: [number, number]) => {
-            let old = this.sources[i].validWindow;
-            if (old[0] === window[0] && old[1] === window[1]) return;
-            console.log(`Valid window changed for ${this.sources[i].source.getDebugName()} (store ${this.folder}): [${old.join(", ")}] -> [${window.join(", ")}]`);
-            this.sources[i].validWindow = window;
+        let setWindows = (i: number, windows: [number, number][]) => {
+            let old = this.sources[i].validWindows;
+            if (JSON.stringify(old) === JSON.stringify(windows)) return;
+            console.log(`Valid windows changed for ${this.sources[i].source.getDebugName()} (store ${this.folder}): ${JSON.stringify(old)} -> ${JSON.stringify(windows)}`);
+            this.sources[i].validWindows = windows;
         };
-        setWindow(0, specs[0].validWindow);
-        // Live slots pair with specs by identity, in order (the same endpoint can appear several times, e.g. one entry per window)
+        setWindows(0, specs[0].validWindows);
+        // Live slots pair with specs by identity. Each endpoint is now ONE spec carrying all its windows, so this is a 1:1 pairing; any leftover duplicate slots from before (an endpoint that used to be split into several slots) go unmatched below and are collapsed away.
         let liveByIdentity = new Map<string, number[]>();
         let originalLength = this.sources.length;
         for (let i = 1; i < originalLength; i++) {
@@ -546,17 +556,18 @@ export class BlobStore implements IBucketStore {
             let slot = liveByIdentity.get(spec.identity)?.shift();
             if (slot !== undefined) {
                 matched.add(slot);
-                setWindow(slot, spec.validWindow);
+                setWindows(slot, spec.validWindows);
                 let existing = this.sources[slot];
                 if (JSON.stringify(existing.route) !== JSON.stringify(spec.route)) {
                     console.log(`Route changed for ${existing.source.getDebugName()} (store ${this.folder}): ${JSON.stringify(existing.route)} -> ${JSON.stringify(spec.route)}`);
                     existing.route = spec.route;
                 }
                 existing.noFullSync = spec.noFullSync;
+                existing.sourceConfig = spec.sourceConfig;
                 continue;
             }
             let source = spec.create();
-            this.sources.push({ source, url: spec.url, validWindow: spec.validWindow, route: spec.route, noFullSync: spec.noFullSync, intermediate: spec.intermediate, identity: spec.identity });
+            this.sources.push({ source, url: spec.url, validWindows: spec.validWindows, route: spec.route, noFullSync: spec.noFullSync, intermediate: spec.intermediate, sourceConfig: spec.sourceConfig, identity: spec.identity });
             this.sourceStates.push(newSourceState());
             this.sourceFileCounts.push(0);
             this.sourceByteCounts.push(0);
@@ -569,11 +580,12 @@ export class BlobStore implements IBucketStore {
             if (!this.isLive(i) || matched.has(i)) continue;
             this.removeSource(i);
         }
-        let deadline = this.sources[0].validWindow[1] - WINDOW_END_FLUSH_MARGIN;
+        let deadline = this.baseWriteWindowEnd() - WINDOW_END_FLUSH_MARGIN;
         let recapped = 0;
         for (let entry of this.overlay.values()) {
-            if (entry.flushAt <= deadline) continue;
-            entry.flushAt = deadline;
+            if (entry.fastFlushAt <= deadline && entry.slowFlushAt <= deadline) continue;
+            entry.fastFlushAt = Math.min(entry.fastFlushAt, deadline);
+            entry.slowFlushAt = Math.min(entry.slowFlushAt, deadline);
             recapped++;
         }
         if (recapped) {
@@ -909,10 +921,10 @@ export class BlobStore implements IBucketStore {
         }
     }
 
-    // An intermediate is a deploy switchover's temporary alternate port: once its window is past, the port is gone for good, so scanning it (or retrying a failed scan) can never succeed - it would just log errors forever
+    // An intermediate is a deploy switchover's temporary alternate port: once its window is past, the port is gone for good, so scanning it (or retrying a failed scan) can never succeed - it would just log errors forever. (Dead only once EVERY window has ended - an intermediate normally has just one.)
     private isDeadIntermediate(sourceIndex: number): boolean {
-        let { intermediate, validWindow } = this.sources[sourceIndex];
-        return !!intermediate && validWindow[1] <= Date.now();
+        let { intermediate, validWindows } = this.sources[sourceIndex];
+        return !!intermediate && validWindows.every(w => w[1] <= Date.now());
     }
 
     // Full metadata scan (size, writeTime, path) of one source, applied to the index. Returns the source's listing (path -> write time), which reconcileSource uses for the push direction.
@@ -975,9 +987,9 @@ export class BlobStore implements IBucketStore {
 
     // The push direction of synchronization: everything we know that the source is missing (or holds an older copy of) is written to it — including deletions, as tombstone writes. This is what heals a source whose background writes failed (e.g. it was down): the next scan sees what's missing and re-sends it. A failing file is skipped, not fatal (immutable targets are handled by forceSetImmutable, and one unreadable value must not stop the rest of the pass) - only a run of consecutive failures (the source itself is down) aborts until the next scan cycle.
     private async reconcileSource(sourceIndex: number, listing: Map<string, number>): Promise<void> {
-        let { source, validWindow, route } = this.sources[sourceIndex];
+        let { source, validWindows, route } = this.sources[sourceIndex];
         let state = this.sourceStates[sourceIndex];
-        let acceptsWrites = windowAcceptsWrites(validWindow);
+        let acceptsWrites = windowsAcceptWrites(validWindows);
         let targetSourcesListIndex = this.sourcesListIndexOfSlot(sourceIndex);
         let pushed = 0;
         let failed = 0;
@@ -1241,10 +1253,12 @@ export class BlobStore implements IBucketStore {
                 writeDelay = DEFAULT_FAST_WRITE_DELAY;
             }
             // The delay never extends past our own valid window's end (minus the margin, so the writes are on disk before the next window's source takes over - a deploy switchover is just this too, since its remap ends our window). Past that point fast writes write through immediately.
-            let deadline = this.sources[0].validWindow[1] - WINDOW_END_FLUSH_MARGIN;
+            let deadline = this.baseWriteWindowEnd() - WINDOW_END_FLUSH_MARGIN;
             if (writeDelay > 0 && Date.now() < deadline) {
-                let flushAt = Math.min(Date.now() + writeDelay, deadline);
-                this.overlay.set(key, { data, t: writeTime, flushAt });
+                // Own disk + our own storage servers (type-"remote") flush within MAX_REMOTE_FAST_BUFFER; the non-"remote" sources (backblaze) wait the full writeDelay
+                let fastFlushAt = Math.min(Date.now() + Math.min(writeDelay, MAX_REMOTE_FAST_BUFFER), deadline);
+                let slowFlushAt = Math.min(Date.now() + writeDelay, deadline);
+                this.overlay.set(key, { data, t: writeTime, fastFlushAt, slowFlushAt });
                 return;
             }
         }
@@ -1252,17 +1266,28 @@ export class BlobStore implements IBucketStore {
         await this.writeToSources(key, data, writeTime);
     }
 
+    // The end of our own (base disk) write window that CONTAINS now - the deadline fast writes must flush before, so the next window's source has the data on handoff. The LATEST end among covering windows (overlapping windows hand off at the last one). No window contains now (an inert store, or a moment between our windows) -> 0, i.e. flush through immediately.
+    private baseWriteWindowEnd(): number {
+        let now = Date.now();
+        let end = 0;
+        for (let w of this.sources[0].validWindows) {
+            if (w[0] <= now && now < w[1]) end = Math.max(end, w[1]);
+        }
+        return end;
+    }
+
     private getWritableSources(config?: { ignoreWindow?: boolean }): number[] {
         let writable: number[] = [];
         for (let i = 0; i < this.sources.length; i++) {
             if (!this.isLive(i)) continue;
-            if (!config?.ignoreWindow && !windowAcceptsWrites(this.sources[i].validWindow)) continue;
+            if (!config?.ignoreWindow && !windowsAcceptWrites(this.sources[i].validWindows)) continue;
             writable.push(i);
         }
         return writable;
     }
 
-    private async writeToSources(key: string, data: Buffer, writeTime: number): Promise<void> {
+    // config lets a staged fast flush write only PART of the sources: writeBase (our own disk + index) defaults on, and downstream filters which non-base peers get the fan-out (the fast flush writes only type-"remote" peers, the slow flush only the rest). A full write (no config) does base + every route-matching peer, as before.
+    private async writeToSources(key: string, data: Buffer, writeTime: number, config?: { writeBase?: boolean; downstream?: (source: ArchivesSource) => boolean }): Promise<void> {
         // The routing file is NEVER synchronized between storage nodes: the writer writes it directly to each node, so we store it on our own disk only (no valid-window filter - routing/valid windows can't possibly apply to the file defining them) and never forward it to other sources.
         this.config?.onWriteCounted?.("flushed", data.length);
         let isRouting = key === ROUTING_FILE;
@@ -1271,18 +1296,21 @@ export class BlobStore implements IBucketStore {
         if (first === undefined) {
             throw new Error(`No source accepts writes (every source's valid window is in the past), so writes cannot be stored (store ${this.folder})`);
         }
-        // Only our own (first) source blocks the write. Downstream sources are written in the background: a down downstream source must not fail or stall writes, and reconcileSource re-sends anything they missed once they come back.
-        if (data.length === 0) {
-            // A tombstone stores nothing on our own source - the index entry alone records it
-            await this.sources[first].source.del(key);
-        } else {
-            await this.sources[first].source.set(key, data, { lastModified: writeTime, noChecks: true });
+        if (config?.writeBase ?? true) {
+            // Only our own (first) source blocks the write. Downstream sources are written in the background: a down downstream source must not fail or stall writes, and reconcileSource re-sends anything they missed once they come back.
+            if (data.length === 0) {
+                // A tombstone stores nothing on our own source - the index entry alone records it
+                await this.sources[first].source.del(key);
+            } else {
+                await this.sources[first].source.set(key, data, { lastModified: writeTime, noChecks: true });
+            }
+            this.setIndexEntry(key, { writeTime, size: data.length, sourcesListIndex: this.sourcesListIndexOfSlot(first) });
         }
-        this.setIndexEntry(key, { writeTime, size: data.length, sourcesListIndex: this.sourcesListIndexOfSlot(first) });
         if (isRouting) return;
         let route = getRoute(key);
         for (let i of writable) {
             if (!routeContains(this.sources[i].route, route)) continue;
+            if (config?.downstream && !config.downstream(this.sources[i])) continue;
             // Deletions travel as del carrying the original write time (never as empty sets - set rejects empty buffers). Backblaze materializes such dels as real empty files, so its listings still show the deletion for other stores to scan in as a tombstone.
             let push: Promise<unknown>;
             if (data.length === 0) {
@@ -1304,15 +1332,28 @@ export class BlobStore implements IBucketStore {
         throw new Error(`Large uploads require an ArchivesDisk source, and this store has none (store ${this.folder})`);
     }
 
+    private isRemoteSource(source: ArchivesSource): boolean {
+        return source.sourceConfig?.type === "remote";
+    }
+
     private async flushOverlay(force?: boolean): Promise<void> {
         let now = Date.now();
         for (let [key, entry] of this.overlay) {
-            if (!force && entry.flushAt > now) continue;
-            await this.writeToSources(key, entry.data, entry.t);
-            // Only remove if it wasn't overwritten while we were flushing
-            if (this.overlay.get(key) === entry) {
-                this.overlay.delete(key);
+            let doFast = !entry.fastFlushed && (force || entry.fastFlushAt <= now);
+            let doSlow = force || entry.slowFlushAt <= now;
+            if (!doFast && !doSlow) continue;
+            if (doSlow) {
+                // The remaining sources: if the fast flush already ran, only the non-"remote" ones (own disk + remote peers are done); otherwise everything at once (writeDelay was <= MAX_REMOTE_FAST_BUFFER, or a forced/window-boundary flush)
+                await this.writeToSources(key, entry.data, entry.t, entry.fastFlushed ? { writeBase: false, downstream: s => !this.isRemoteSource(s) } : undefined);
+                // Only remove if it wasn't overwritten while we were flushing
+                if (this.overlay.get(key) === entry) {
+                    this.overlay.delete(key);
+                }
+                continue;
             }
+            // Fast stage: own disk + our own storage servers only; the entry stays in the overlay for its slow flush
+            await this.writeToSources(key, entry.data, entry.t, { downstream: s => this.isRemoteSource(s) });
+            entry.fastFlushed = true;
         }
     }
 
@@ -1375,7 +1416,7 @@ export class BlobStore implements IBucketStore {
             for (let i = 0; i < this.sources.length; i++) {
                 if (!this.isLive(i)) continue;
                 let sourceEntry = this.sources[i];
-                if (!windowAcceptsWrites(sourceEntry.validWindow)) continue;
+                if (!windowsAcceptWrites(sourceEntry.validWindows)) continue;
                 let source = sourceEntry.source;
                 if (!(source instanceof ArchivesBackblaze)) continue;
                 void source.del(key).catch((e: Error) => {

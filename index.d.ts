@@ -2215,10 +2215,11 @@ declare module "sliftutils/storage/IArchives" {
         source: IArchives;
         /** The persistent identity of the endpoint: its routing URL (hosted/backblaze), or the disk folder path for the base disk source. The store persists this (via its append-only sources list) as IndexEntry.sourcesListIndex, so it must mean the same endpoint forever. */
         url: string;
-        validWindow: [number, number];
+        validWindows: [number, number][];
         route?: [number, number];
         noFullSync?: boolean;
         intermediate?: boolean;
+        sourceConfig?: SourceConfig;
         identity?: string;
     };
     export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
@@ -2226,6 +2227,7 @@ declare module "sliftutils/storage/IArchives" {
     export declare const FULL_ROUTE: [number, number];
     export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
     export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
+    export declare function windowsAcceptWrites(validWindows: [number, number][]): boolean;
     export declare const LARGE_SET_THRESHOLD: number;
     /** A getNextData stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. */
     export declare function bufferChunkStream(data: Buffer): () => Promise<Buffer | undefined>;
@@ -2246,7 +2248,7 @@ declare module "sliftutils/storage/IArchives" {
     } | undefined>;
     export type ArchivesSyncSourceStatus = {
         debugName: string;
-        validWindow: [number, number];
+        validWindows: [number, number][];
         route?: [number, number];
         noFullSync?: boolean;
         supportsChangesAfter: boolean;
@@ -3036,7 +3038,7 @@ declare module "sliftutils/storage/remoteStorage/accessStats" {
 declare module "sliftutils/storage/remoteStorage/blobStore" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SyncActivity } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SourceConfig, SyncActivity } from "../IArchives";
     import { ArchivesDisk } from "../ArchivesDisk";
     export declare const DEFAULT_FAST_WRITE_DELAY: number;
     export declare const WINDOW_END_FLUSH_MARGIN: number;
@@ -3177,10 +3179,11 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
     export type BlobSourceSpec = {
         identity: string;
         url: string;
-        validWindow: [number, number];
+        validWindows: [number, number][];
         route?: [number, number];
         noFullSync?: boolean;
         intermediate?: boolean;
+        sourceConfig?: SourceConfig;
         create: () => IArchives;
     };
     export declare class BlobStore implements IBucketStore {
@@ -3331,9 +3334,11 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private setInternal;
         private cacheRead;
         private setOrDelete;
+        private baseWriteWindowEnd;
         private getWritableSources;
         private writeToSources;
         private getDiskSource;
+        private isRemoteSource;
         private flushOverlay;
         private evicting;
         private enforceDiskLimit;
@@ -3968,7 +3973,7 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     };
     /** The loaded bucket, loading it (which instantiates its stores and starts their synchronization) if needed. A bucket that does not exist on this server throws - callers never see undefined buckets. */
     export declare function requireBucket(account: string, bucketName: string): Promise<BucketState>;
-    /** The store serving a request: the exact config entry the CLIENT selected, matched by equality (key order ignored) against the bucket's own entries. A match is honored even when its window has passed - the selection never validates, the store's own validation throws instead. Throws when nothing matches, listing what is available. */
+    /** The store serving a request: the config entry the CLIENT selected, matched against the bucket's own entries by identity EXCLUDING the valid window (see sourceMatchKey). The selection never validates - the store's own window/route checks throw if the caller is stale - so honoring a window mismatch here is exactly right. Throws when nothing matches, listing what is available. */
     export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore>;
     /** Internal (store-to-store) reads skip store selection entirely: the caller is another store whose index says this MACHINE holds the bytes - the persisted holder identity is just a URL, which cannot name a store. Whichever store's folder has the newest copy answers. */
     export declare function readBucketInternal(account: string, bucketName: string, config: {
@@ -4069,7 +4074,7 @@ declare module "sliftutils/storage/remoteStorage/storePlan" {
     };
     export type StoreSourceSpec = {
         sourceConfig?: SourceConfig;
-        validWindow: [number, number];
+        validWindows: [number, number][];
         route?: [number, number];
         noFullSync?: boolean;
     };

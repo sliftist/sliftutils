@@ -177,14 +177,16 @@ export type ArchivesSource = {
     source: IArchives;
     /** The persistent identity of the endpoint: its routing URL (hosted/backblaze), or the disk folder path for the base disk source. The store persists this (via its append-only sources list) as IndexEntry.sourcesListIndex, so it must mean the same endpoint forever. */
     url: string;
-    // From the source's CommonConfig. The window routes WRITES: once its end is past (see windowAcceptsWrites) the source stops receiving writes entirely - it just stops growing. It does NOT filter scanning: a scan is us asking the source what it already holds, and existing values synchronize regardless of their write times (the same reasoning that lets synchronization ignore the immutable flag).
-    validWindow: [number, number];
+    // From the source's CommonConfig, but ALL of them: the same endpoint (same url+route, ignoring the window) can appear in the routing config under several windows at once - most commonly when a deploy switchover has split one window in two around an intermediate. It is ONE source that knows all its windows, never several sources. The window routes WRITES: the source receives writes while ANY of its windows is still open (see windowsAcceptWrites). Windows do NOT filter scanning: a scan is us asking the source what it already holds, and existing values synchronize regardless of their write times (the same reasoning that lets synchronization ignore the immutable flag).
+    validWindows: [number, number][];
     // From the source's CommonConfig (intersected with the owning store's own route): only keys routing into [start, end) are accepted from this source's scans and sent to it in writes/reconciliation. The routing file is exempt - config flows everywhere. Absent = all keys.
     route?: [number, number];
     // From the source's CommonConfig; see there.
     noFullSync?: boolean;
     // From the source's CommonConfig: a deploy switchover's temporary alternate-port entry. Once its window is past, the port it points at is gone for good - so it is never scanned then, and scan failures are never retried.
     intermediate?: boolean;
+    // The routing-config entry this source was built from (absent for the base disk source). Its `type` decides fast-write flush timing: type-"remote" downstream sources (our own storage servers) flush quickly (cheap, and we want cross-node redundancy fast), while others (e.g. backblaze) keep the full writeDelay so expensive external writes stay coalesced. The window/route ON this config are the SOURCE's own; ArchivesSource.validWindow/route are what the owning store actually uses (route is intersected with the store's route).
+    sourceConfig?: SourceConfig;
     // Stable identity of the underlying endpoint (its config with windows/routes stripped) - how BlobStore.updateSources recognizes a source across config changes so it can update it in place instead of removing and re-adding it
     identity?: string;
 };
@@ -204,6 +206,10 @@ export const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
 export function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean {
     if (!validWindow) return true;
     return validWindow[1] > Date.now();
+}
+// A source (which can hold several windows) accepts writes while ANY of its windows is still open. No windows = the base disk of an inert store (not in the config), which never receives fan-out writes anyway.
+export function windowsAcceptWrites(validWindows: [number, number][]): boolean {
+    return validWindows.some(windowAcceptsWrites);
 }
 
 const LARGE_COPY_THRESHOLD = 64 * 1024 * 1024;
@@ -274,7 +280,7 @@ export async function copyArchiveFile(config: {
 
 export type ArchivesSyncSourceStatus = {
     debugName: string;
-    validWindow: [number, number];
+    validWindows: [number, number][];
     route?: [number, number];
     noFullSync?: boolean;
     supportsChangesAfter: boolean;

@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SyncActivity } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SourceConfig, SyncActivity } from "../IArchives";
 import { ArchivesDisk } from "../ArchivesDisk";
 export declare const DEFAULT_FAST_WRITE_DELAY: number;
 export declare const WINDOW_END_FLUSH_MARGIN: number;
@@ -141,10 +141,11 @@ export declare class RawDiskStore implements IBucketStore {
 export type BlobSourceSpec = {
     identity: string;
     url: string;
-    validWindow: [number, number];
+    validWindows: [number, number][];
     route?: [number, number];
     noFullSync?: boolean;
     intermediate?: boolean;
+    sourceConfig?: SourceConfig;
     create: () => IArchives;
 };
 export declare class BlobStore implements IBucketStore {
@@ -295,9 +296,11 @@ export declare class BlobStore implements IBucketStore {
     private setInternal;
     private cacheRead;
     private setOrDelete;
+    private baseWriteWindowEnd;
     private getWritableSources;
     private writeToSources;
     private getDiskSource;
+    private isRemoteSource;
     private flushOverlay;
     private evicting;
     private enforceDiskLimit;

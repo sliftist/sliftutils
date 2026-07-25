@@ -85,7 +85,7 @@ function summarizeSelf(selfEntries: HostedConfig[], now: number): SelfSummary | 
     };
 }
 
-export type StoreSourceSpec = { sourceConfig?: SourceConfig; validWindow: [number, number]; route?: [number, number]; noFullSync?: boolean };
+export type StoreSourceSpec = { sourceConfig?: SourceConfig; validWindows: [number, number][]; route?: [number, number]; noFullSync?: boolean };
 export type StorePlanStore = {
     routeKey: string;
     route?: [number, number];
@@ -139,14 +139,23 @@ export function computeStorePlan(account: string, bucketName: string, routing: R
             }
             diskWindow = [start, end];
         }
-        let sourceSpecs: StoreSourceSpec[] = [{ validWindow: diskWindow }];
+        let sourceSpecs: StoreSourceSpec[] = [{ validWindows: [diskWindow] }];
         let noFullSync = group.entries.some(x => x.noFullSync);
+        // The same peer endpoint (url+route+flags) can appear under several windows at once (a switchover splits one window around an intermediate). It is ONE sync source that carries ALL those windows - never several sources, which would double-scan it and, worse, make matching a request depend on which window the caller happened to hold.
+        let peerByKey = new Map<string, StoreSourceSpec>();
         for (let i = group.firstIndex + 1; i < routing.sources.length; i++) {
             let source = routing.sources[i];
             if (typeof source === "string" || ownIndexes.has(i)) continue;
             let sharedRoute = routeIntersection(group.route, source.route);
             if (!sharedRoute) continue;
-            sourceSpecs.push({ sourceConfig: source, validWindow: source.validWindow, route: sharedRoute, noFullSync: source.noFullSync || noFullSync });
+            let key = JSON.stringify({ ...source, validWindow: undefined });
+            let spec = peerByKey.get(key);
+            if (!spec) {
+                spec = { sourceConfig: source, validWindows: [], route: sharedRoute, noFullSync: source.noFullSync || noFullSync };
+                peerByKey.set(key, spec);
+                sourceSpecs.push(spec);
+            }
+            spec.validWindows.push(source.validWindow);
         }
         stores.push({
             routeKey,
@@ -159,7 +168,7 @@ export function computeStorePlan(account: string, bucketName: string, routing: R
     }
     if (!stores.length) {
         // Not in the config at all: still serve whatever the plain folder holds, through one inert full-route store
-        stores.push({ routeKey: JSON.stringify(FULL_ROUTE), route: undefined, entries: [], rawDisk: false, readerDiskLimit: undefined, sourceSpecs: [{ validWindow: [0, 0] }] });
+        stores.push({ routeKey: JSON.stringify(FULL_ROUTE), route: undefined, entries: [], rawDisk: false, readerDiskLimit: undefined, sourceSpecs: [{ validWindows: [[0, 0]] }] });
     }
     let structureKey = JSON.stringify(stores.map(s => ({ routeKey: s.routeKey, rawDisk: s.rawDisk, readerDiskLimit: s.readerDiskLimit })));
     return { selfEntries, self, stores, structureKey };

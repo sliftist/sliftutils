@@ -133,10 +133,11 @@ export type ArchivesSource = {
     source: IArchives;
     /** The persistent identity of the endpoint: its routing URL (hosted/backblaze), or the disk folder path for the base disk source. The store persists this (via its append-only sources list) as IndexEntry.sourcesListIndex, so it must mean the same endpoint forever. */
     url: string;
-    validWindow: [number, number];
+    validWindows: [number, number][];
     route?: [number, number];
     noFullSync?: boolean;
     intermediate?: boolean;
+    sourceConfig?: SourceConfig;
     identity?: string;
 };
 export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
@@ -144,6 +145,7 @@ export declare const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17"
 export declare const FULL_ROUTE: [number, number];
 export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
 export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
+export declare function windowsAcceptWrites(validWindows: [number, number][]): boolean;
 export declare const LARGE_SET_THRESHOLD: number;
 /** A getNextData stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. */
 export declare function bufferChunkStream(data: Buffer): () => Promise<Buffer | undefined>;
@@ -164,7 +166,7 @@ export declare function copyArchiveFile(config: {
 } | undefined>;
 export type ArchivesSyncSourceStatus = {
     debugName: string;
-    validWindow: [number, number];
+    validWindows: [number, number][];
     route?: [number, number];
     noFullSync?: boolean;
     supportsChangesAfter: boolean;

@@ -62,15 +62,20 @@ export async function requireBucket(account: string, bucketName: string): Promis
     return bucket;
 }
 
-/** The store serving a request: the exact config entry the CLIENT selected, matched by equality (key order ignored) against the bucket's own entries. A match is honored even when its window has passed - the selection never validates, the store's own validation throws instead. Throws when nothing matches, listing what is available. */
+/** The stable identity of a source config for matching: everything EXCEPT the valid window. The window drifts (a switchover splits one window in two around an intermediate, then rejoins it), so a caller and this server routinely disagree on it while naming the very same source - matching on it would wrongly reject the request. The route stays in the identity (it selects the store/folder). */
+function sourceMatchKey(config: SourceConfig): string {
+    return stableStringify({ ...config, validWindow: undefined });
+}
+
+/** The store serving a request: the config entry the CLIENT selected, matched against the bucket's own entries by identity EXCLUDING the valid window (see sourceMatchKey). The selection never validates - the store's own window/route checks throw if the caller is stale - so honoring a window mismatch here is exactly right. Throws when nothing matches, listing what is available. */
 export async function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore> {
     let bucket = await requireBucket(account, bucketName);
     if (!sourceConfig) {
         throw new Error(`No remote source configuration was provided for bucket ${account}/${bucketName}: every request must say which configured source it selected. Available: ${JSON.stringify(bucket.selfEntries)}`);
     }
-    let wanted = stableStringify(sourceConfig);
+    let wanted = sourceMatchKey(sourceConfig);
     for (let s of bucket.stores) {
-        if (s.entries.some(e => stableStringify(e) === wanted)) return s;
+        if (s.entries.some(e => sourceMatchKey(e) === wanted)) return s;
     }
     throw new Error(`No source on this server matches the requested remote configuration for bucket ${account}/${bucketName}. Requested: ${JSON.stringify(sourceConfig)}. Available: ${JSON.stringify(bucket.selfEntries)}`);
 }
@@ -350,10 +355,11 @@ function buildStore(account: string, bucketName: string, planStore: StorePlanSto
     let sources: ArchivesSource[] = planStore.sourceSpecs.map(spec => ({
         source: spec.sourceConfig && createApiArchives(spec.sourceConfig) || new ArchivesDisk(folder),
         url: spec.sourceConfig?.url || folder,
-        validWindow: spec.validWindow,
+        validWindows: spec.validWindows,
         route: spec.route,
         noFullSync: spec.noFullSync,
         intermediate: spec.sourceConfig?.intermediate,
+        sourceConfig: spec.sourceConfig,
         identity: sourceIdentity(spec.sourceConfig),
     }));
     return new BlobStore(folder, sources, {
@@ -446,15 +452,16 @@ async function checkRoutingChanged(account: string, bucketName: string, config?:
             live.store.updateSources(planStore.sourceSpecs.map(spec => {
                 const sourceConfig = spec.sourceConfig;
                 if (!sourceConfig) {
-                    return { identity: sourceIdentity(undefined), url: storeFolder, validWindow: spec.validWindow, create: (): IArchives => new ArchivesDisk(storeFolder) };
+                    return { identity: sourceIdentity(undefined), url: storeFolder, validWindows: spec.validWindows, create: (): IArchives => new ArchivesDisk(storeFolder) };
                 }
                 return {
                     identity: sourceIdentity(sourceConfig),
                     url: sourceConfig.url,
-                    validWindow: spec.validWindow,
+                    validWindows: spec.validWindows,
                     route: spec.route,
                     noFullSync: spec.noFullSync,
                     intermediate: sourceConfig.intermediate,
+                    sourceConfig,
                     create: () => createApiArchives(sourceConfig),
                 };
             }), planStore.entries);

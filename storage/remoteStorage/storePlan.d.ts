@@ -13,7 +13,7 @@ export type SelfSummary = {
 };
 export type StoreSourceSpec = {
     sourceConfig?: SourceConfig;
-    validWindow: [number, number];
+    validWindows: [number, number][];
     route?: [number, number];
     noFullSync?: boolean;
 };

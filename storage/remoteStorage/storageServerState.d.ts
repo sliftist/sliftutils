@@ -23,7 +23,7 @@ export type BucketState = {
 };
 /** The loaded bucket, loading it (which instantiates its stores and starts their synchronization) if needed. A bucket that does not exist on this server throws - callers never see undefined buckets. */
 export declare function requireBucket(account: string, bucketName: string): Promise<BucketState>;
-/** The store serving a request: the exact config entry the CLIENT selected, matched by equality (key order ignored) against the bucket's own entries. A match is honored even when its window has passed - the selection never validates, the store's own validation throws instead. Throws when nothing matches, listing what is available. */
+/** The store serving a request: the config entry the CLIENT selected, matched against the bucket's own entries by identity EXCLUDING the valid window (see sourceMatchKey). The selection never validates - the store's own window/route checks throw if the caller is stale - so honoring a window mismatch here is exactly right. Throws when nothing matches, listing what is available. */
 export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore>;
 /** Internal (store-to-store) reads skip store selection entirely: the caller is another store whose index says this MACHINE holds the bytes - the persisted holder identity is just a URL, which cannot name a store. Whichever store's folder has the newest copy answers. */
 export declare function readBucketInternal(account: string, bucketName: string, config: {
