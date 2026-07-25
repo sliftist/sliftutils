@@ -801,13 +801,6 @@ debugbreak@^0.6.3:
   dependencies:
     open "^8.4.0"
 
-debugbreak@^0.9.9:
-  version "0.9.9"
-  resolved "https://registry.yarnpkg.com/debugbreak/-/debugbreak-0.9.9.tgz#1cb613e2034d55f18c28e284101dc940c645dfd2"
-  integrity sha512-lUXaiUuF1jC+cvN90miNLhUn/yXn4H3zrkIVu/9MEx9qPgcSvZZOcPQWpkLbSm7hqMSUVCSnia0btniX9oIE1w==
-  dependencies:
-    open "^8.4.0"
-
 decamelize@^1.2.0:
   version "1.2.0"
   resolved "https://registry.yarnpkg.com/decamelize/-/decamelize-1.2.0.tgz#f6534d15148269b20352e7bee26f501f9a191290"
@@ -1944,10 +1937,10 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^1.2.29:
-  version "1.2.29"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.2.29.tgz#d92d996e1a30a05360623c5d8287b592c5d8b054"
-  integrity sha512-THzX+uYytt7w5ck0lsNvVSAbb+j0CXtVaOraYbkBiQYS4F3S4o3ZNhWekewZ0Kp9tMSKgt+74fFtuwn5634m5Q==
+socket-function@^1.2.30:
+  version "1.2.30"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.2.30.tgz#95979b29a322c7e8d184ce7219310820d00cd042"
+  integrity sha512-A69c6ejRICUQXjC/3S3S2cd7CpoUjR1jjenPIEMA5b6G7xfUdQQqVM51hvxH73qDY/QhGV2UyZTDmlmgPh+f+g==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"

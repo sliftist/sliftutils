@@ -152,7 +152,8 @@ export class SourceWrapper {
                 // Even a failing call (e.g. access denied) proves the connection is back
                 if (this.isConnected()) break;
                 if (this.isConnectionProblemWorthReporting()) {
-                    console.error(`Cannot connect to storage ${this.getDebugName()}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).stack ?? e}`);
+                    // NOTE: In this case, I'm just showing the message because the call stack is almost always completely uninteresting.
+                    console.error(`Cannot connect to storage ${this.getDebugName()}, retrying in ${Math.round(retryDelay / 1000)}s. ${(e as Error).message ?? e}`);
                 }
             }
             retryDelay = Math.min(RETRY_MAX_DELAY, retryDelay * RETRY_GROWTH);

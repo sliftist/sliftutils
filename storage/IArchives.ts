@@ -113,6 +113,8 @@ export type DelConfig = {
     internal?: boolean;
     /** See SetConfig.noChecks. */
     noChecks?: boolean;
+    /** See SetConfig.fallbacks. */
+    fallbacks?: boolean;
 };
 
 export type GetInfoConfig = {
@@ -136,6 +138,8 @@ export type SetConfig = {
     noChecks?: boolean;
     /** Store-to-store push: the receiving node writes purely to its own disk and index, with NO downstream fan-out (the pushing store owns propagation - fanning its pushes back out is how write loops between stores form). Window and route ARE still checked: the stamp must fall inside one of the receiver's configured windows and routes, so a confused peer cannot stuff data onto a node that was never meant to hold it. Requires lastModified. */
     internal?: boolean;
+    /** Writes normally go ONLY to the write node (the first current-window source covering the key), retrying it even while it is down - consistent, but unavailable when that node is. With fallbacks, the write node is still tried first, but on failure the write lands on the next current-window source covering the key (synchronization moves it to the write node later) - availability at the cost of reads possibly missing the write until it propagates. Single-source archives ignore the flag. */
+    fallbacks?: boolean;
 };
 
 // createTime is a misnomer kept for compatibility — it is really the LAST-WRITE time, same as getInfo's writeTime. Neither Backblaze nor our remote storage tracks a distinct creation date: each write stamps a fresh timestamp on the current version, so both fields are just "when the bytes served by get() were most recently written".
