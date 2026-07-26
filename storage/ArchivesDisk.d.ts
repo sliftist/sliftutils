@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "./IArchives";
 export declare class ArchivesDisk implements IArchives {
     private folder;
     constructor(folder: string);
@@ -21,6 +21,7 @@ export declare class ArchivesDisk implements IArchives {
     private filePath;
     set(key: string, data: Buffer, config?: SetConfig): Promise<string>;
     del(key: string, config?: DelConfig): Promise<void>;
+    move(config: MoveFileConfig): Promise<void>;
     get(key: string, config?: GetConfig): Promise<Buffer | undefined>;
     get2(key: string, config?: GetConfig): Promise<{
         data: Buffer;
@@ -34,11 +35,7 @@ export declare class ArchivesDisk implements IArchives {
     find(prefix: string, config?: FindConfig): Promise<string[]>;
     findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
     private collectFiles;
-    setLargeFile(config: {
-        path: string;
-        lastModified?: number;
-        getNextData(): Promise<Buffer | undefined>;
-    }): Promise<void>;
+    setLargeFile(config: SetLargeFileConfig): Promise<void>;
     startLargeUpload(): Promise<string>;
     appendLargeUpload(id: string, data: Buffer): Promise<void>;
     finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;

@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { startIntermediateMaintenance } from "./storageServerState";
+import { startIntermediateMaintenance } from "./intermediateManagement";
 
 const PARAMETERS_TIMELINE_FILE_REGEX = /^(\d+)-parameters\.json$/;
 const DEPLOY_DETECT_RETRY_DELAY = 5 * 1000;

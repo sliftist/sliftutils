@@ -2,7 +2,7 @@ import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SourceConfig, SetConfig, LARGE_SET_THRESHOLD, bufferChunkStream } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SourceConfig, SetConfig, SetLargeFileConfig, LARGE_SET_THRESHOLD, bufferChunkStream } from "../IArchives";
 import { parseHostedUrl, getBucketBaseUrl, buildFileUrl } from "./remoteConfig";
 import {
     RemoteStorageController, STORAGE_AUTH_PURPOSE,
@@ -63,6 +63,14 @@ export class ArchivesRemote implements IArchives {
 
     public getDebugName() {
         return `remoteStorage ${this.parsed.address}:${this.parsed.port} account ${this.account} bucket ${this.bucketName}`;
+    }
+
+    /** The config travels with every request (the server matches it against its own entries to pick the store), so a config change has to land here - otherwise we keep asking for a source description the server no longer recognizes. Only ever called with a config for the SAME endpoint (see sourceIdentity), so the connection, account, and bucket cannot change under us. */
+    public updateSourceConfig(sourceConfig: SourceConfig): void {
+        if (sourceConfig.url !== this.config.url) {
+            throw new Error(`updateSourceConfig must stay on the same endpoint, got ${JSON.stringify(sourceConfig.url)} for ${this.getDebugName()} (${JSON.stringify(this.config.url)})`);
+        }
+        this.config.sourceConfig = sourceConfig;
     }
 
     public isConnected(): boolean {
@@ -152,8 +160,8 @@ export class ArchivesRemote implements IArchives {
             throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
         if (data.length > LARGE_SET_THRESHOLD) {
-            // One giant message would exceed the wire limit and lag every other client sharing this connection - stream it instead. (The large-file path cannot carry forceSetImmutable/noChecks/internal; large pushes accept plain-write semantics, and reconciliation's per-file error handling absorbs the rare immutable rejection.)
-            await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
+            // One giant message would exceed the wire limit and lag every other client sharing this connection - stream it instead. The config travels with it, so crossing the threshold changes only HOW the bytes move, never what the write means.
+            await this.setLargeFile({ path: fileName, ...config, ...bufferChunkStream(data) });
             return fileName;
         }
         await this.call(() => this.controller.set({ account: this.account, bucketName: this.bucketName, path: fileName, data, sourceConfig: this.config.sourceConfig, lastModified: config?.lastModified, forceSetImmutable: config?.forceSetImmutable, internal: config?.internal }));
@@ -161,6 +169,9 @@ export class ArchivesRemote implements IArchives {
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
         await this.call(() => this.controller.del({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, lastModified: config?.lastModified, internal: config?.internal }));
+    }
+    public async move(config: MoveFileConfig): Promise<void> {
+        await this.call(() => this.controller.move({ account: this.account, bucketName: this.bucketName, fromPath: config.fromPath, toPath: config.toPath, sourceConfig: this.config.sourceConfig }));
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number } | undefined> {
         return await this.call(() => this.controller.getInfo({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, includeTombstones: config?.includeTombstones }));
@@ -181,10 +192,20 @@ export class ArchivesRemote implements IArchives {
         return await this.call(() => this.controller.getSyncStatus({ account: this.account, bucketName: this.bucketName }));
     }
 
-    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
         // Ensure we're authenticated with access BEFORE consuming any data (the stream cannot be rewound, so we can't use the retry loop around the actual upload)
         await this.call(() => this.controller.getInfo({ account: this.account, bucketName: this.bucketName, path: config.path, sourceConfig: this.config.sourceConfig }));
-        let uploadId = await this.controller.startLargeFile({ account: this.account, bucketName: this.bucketName, path: config.path, sourceConfig: this.config.sourceConfig, lastModified: config.lastModified });
+        // The write's semantics (immutability, ordering, internal) are decided by the server at start, before any bytes move - a rejection then costs nothing, while one at finish would waste the whole transfer
+        let uploadId = await this.controller.startLargeFile({
+            account: this.account,
+            bucketName: this.bucketName,
+            path: config.path,
+            sourceConfig: this.config.sourceConfig,
+            lastModified: config.lastModified,
+            forceSetImmutable: config.forceSetImmutable,
+            noChecks: config.noChecks,
+            internal: config.internal,
+        });
         try {
             while (true) {
                 let data = await config.getNextData();

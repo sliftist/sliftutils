@@ -1,5 +1,5 @@
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig, SetLargeFileConfig } from "../IArchives";
 import { buildFileUrl } from "./remoteConfig";
 
 // Read-only IArchives over a public bucket's plain-URL form (our storage server's
@@ -74,7 +74,7 @@ export class ArchivesUrl implements IArchives {
     public async del(fileName: string): Promise<void> {
         throw this.readOnlyError("del");
     }
-    public async setLargeFile(config: { path: string; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
         throw this.readOnlyError("setLargeFile");
     }
     public async find(prefix: string, config?: FindConfig): Promise<string[]> {

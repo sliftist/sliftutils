@@ -100,7 +100,7 @@ export function addExtraListenPort(port: number): void {
 export function removeExtraListenPort(port: number): void {
     extraListenPorts.delete(port);
 }
-/** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
+/** Whether address:port is this server process, including its extra listen ports (a deploy switchover's alternate port is still us). Used to tell which config entries are OUR copy of a bucket - the stores we run - as opposed to peers we synchronize with. Talking to ourselves is not one of the things it prevents: a source that happens to be us is reached over the API like any other. */
 export function isOwnAddress(address: string, port: number): boolean {
     let config = getStorageServerConfigOptional();
     if (!config) return false;

@@ -204,8 +204,20 @@ class AccessPage extends preact.Component {
     }
 }
 
+// Reached via the cert-trust flow (showCertTrustModal links here as ?trustCert=1). The browser only loads this page if it has ACCEPTED the certificate - so the mere fact that it rendered is the confirmation. Once accepted, the app's background connection to this same server works, so the user just returns.
+function CertTrustedPage() {
+    return <div className={css.vbox(8).pad2(16)}>
+        <div>This server's certificate is now trusted by this browser.</div>
+        <div>Close this tab and return to the page you came from - it will connect to the storage server automatically.</div>
+    </div>;
+}
+
 async function main() {
     if (isNode()) return;
+    if (new URLSearchParams(location.search).has("trustCert")) {
+        preact.render(<CertTrustedPage />, document.body);
+        return;
+    }
     preact.render(<AccessPage />, document.body);
 }
 

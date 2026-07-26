@@ -113,3 +113,50 @@ export function clearAccountAccessStats(account: string): void {
         console.log(`Cleared the in-memory access statistics for account ${account}`);
     }
 }
+
+export type BucketWriteStats = {
+    /** Every set call the bucket accepted */
+    originalWrites: number;
+    originalBytes: number;
+    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+    flushedWrites: number;
+    flushedBytes: number;
+};
+function emptyWriteStats(): BucketWriteStats {
+    return { originalWrites: 0, originalBytes: 0, flushedWrites: 0, flushedBytes: 0 };
+}
+
+// In memory only, keyed `${account}/${bucketName}`: totals since this process started (or the last clearWriteStats). Persisting them to disk was more machinery than the numbers were worth.
+const writeStats = new Map<string, BucketWriteStats>();
+
+export function countBucketWrite(key: string, kind: "original" | "flushed", bytes: number): void {
+    let stats = writeStats.get(key);
+    if (!stats) {
+        stats = emptyWriteStats();
+        writeStats.set(key, stats);
+    }
+    if (kind === "original") {
+        stats.originalWrites++;
+        stats.originalBytes += bytes;
+    } else {
+        stats.flushedWrites++;
+        stats.flushedBytes += bytes;
+    }
+}
+
+export function getBucketWriteStats(key: string): BucketWriteStats {
+    return writeStats.get(key) || emptyWriteStats();
+}
+
+/** Zeroes the write statistics of every bucket in the account. */
+export function debugClearAccountWriteStats(account: string): number {
+    let prefix = `${account}/`;
+    let cleared = 0;
+    for (let key of [...writeStats.keys()]) {
+        if (!key.startsWith(prefix)) continue;
+        writeStats.delete(key);
+        cleared++;
+    }
+    console.log(`Cleared the write statistics of ${cleared} buckets in account ${account}`);
+    return cleared;
+}

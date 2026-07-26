@@ -1,18 +1,23 @@
-import { sort } from "socket-function/src/misc";
 import { RemoteConfig, HostedConfig, SourceConfig, FULL_ROUTE } from "../IArchives";
 import { parseHostedUrl, routeContains, routeIntersection } from "./remoteConfig";
 import { isOwnAddress } from "./serverConfig";
 
-// Turns a bucket's routing config into this server's store plan: which of the entries are us, what stores (one per route) we run, and which peers each store synchronizes from.
+// Pure helpers over a bucket's routing config: which entries are this server, which entry applies at a moment, and who owned what before a window boundary. Config in, answer out - nothing here reads a store, a clock, or the network (except selectEntryAt being handed a time).
+
+/** Whether a config entry is THIS server's copy of this bucket - the same account and bucket, at an address this process answers on. */
+export function isSelfSource(source: SourceConfig, account: string, bucketName: string): boolean {
+    if (source.type !== "remote") return false;
+    let parsed = parseHostedUrl(source.url);
+    if (parsed.account !== account || parsed.bucketName !== bucketName) return false;
+    return isOwnAddress(parsed.address, parsed.port);
+}
 
 export function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[] {
     let indexes: number[] = [];
     for (let i = 0; i < routing.sources.length; i++) {
         let source = routing.sources[i];
-        if (typeof source === "string" || source.type !== "remote") continue;
-        let parsed = parseHostedUrl(source.url);
-        if (parsed.account !== account || parsed.bucketName !== bucketName) continue;
-        if (isOwnAddress(parsed.address, parsed.port)) {
+        if (typeof source === "string") continue;
+        if (isSelfSource(source, account, bucketName)) {
             indexes.push(i);
         }
     }
@@ -40,136 +45,90 @@ export function selectEntryAt(entries: HostedConfig[], time: number, route?: num
     return best;
 }
 
-/** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
-export type SelfSummary = {
-    /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
-    routes: [number, number][];
-    public: boolean;
-    immutable: boolean;
-    noFullSync: boolean;
-    rawDisk: boolean;
-    readerDiskLimit?: number;
-};
-
-function mergeRoutes(routes: ([number, number] | undefined)[]): [number, number][] {
-    let list = routes.map(x => x || FULL_ROUTE).map(x => [x[0], x[1]] as [number, number]);
-    sort(list, x => x[0]);
-    let merged: [number, number][] = [];
-    for (let route of list) {
-        let last = merged[merged.length - 1];
-        if (last && route[0] <= last[1]) {
-            last[1] = Math.max(last[1], route[1]);
+/** The parts of `ranges` that `cut` does not cover, plus the single range spanning what it did. Routes are half-open [start, end), so subtracting one from another leaves at most a piece on each side. */
+function subtractRoute(ranges: [number, number][], cut: [number, number]): { remaining: [number, number][]; claimed?: [number, number] } {
+    let remaining: [number, number][] = [];
+    let claimed: [number, number] | undefined;
+    for (let range of ranges) {
+        let overlap = routeIntersection(range, cut);
+        if (!overlap) {
+            remaining.push(range);
             continue;
         }
-        merged.push(route);
+        claimed = claimed && [Math.min(claimed[0], overlap[0]), Math.max(claimed[1], overlap[1])] as [number, number] || overlap;
+        if (range[0] < overlap[0]) remaining.push([range[0], overlap[0]]);
+        if (overlap[1] < range[1]) remaining.push([overlap[1], range[1]]);
     }
-    return merged;
+    return { remaining, claimed };
 }
 
-function summarizeSelf(selfEntries: HostedConfig[], now: number): SelfSummary | undefined {
-    let current = selfEntries.filter(x => x.validWindow[0] <= now && now < x.validWindow[1]);
-    if (!current.length) {
-        let nearest = selectEntryAt(selfEntries, now);
-        current = nearest && [nearest] || [];
-    }
-    if (!current.length) {
-        return undefined;
-    }
-    return {
-        routes: mergeRoutes(current.map(x => x.route)),
-        public: current.some(x => x.public),
-        immutable: current.some(x => x.immutable),
-        noFullSync: current.some(x => x.noFullSync),
-        rawDisk: current.some(x => x.rawDisk),
-        readerDiskLimit: current.find(x => x.readerDiskLimit !== undefined)?.readerDiskLimit,
-    };
-}
-
-export type StoreSourceSpec = { sourceConfig?: SourceConfig; validWindows: [number, number][]; route?: [number, number]; noFullSync?: boolean };
-export type StorePlanStore = {
-    routeKey: string;
-    route?: [number, number];
-    entries: HostedConfig[];
-    rawDisk: boolean;
-    readerDiskLimit?: number;
-    sourceSpecs: StoreSourceSpec[];
-};
-export type StorePlan = {
-    selfEntries: HostedConfig[];
-    self: SelfSummary | undefined;
-    stores: StorePlanStore[];
-    structureKey: string;
+/** What one of our stores has to pull in at a valid-window boundary, so the writes that landed just before the handover are not missed. */
+export type BoundaryHandover = {
+    // The store that needs the data: the name of the self entry taking over at the boundary
+    name: string;
+    // The route it is taking over, which is the slice of the key space the pulls below are limited to
+    route: [number, number];
+    // We held part of this route in the previous window too, so those writes are already in our own folder and a disk rescan finds them
+    scanOwnDisk: boolean;
+    // Per source index in the config, the slice of our route THAT source held in the previous window - a boundary scan pulls its recent changes
+    remotes: Map<number, [number, number]>;
 };
 
-export function computeStorePlan(account: string, bucketName: string, routing: RemoteConfig): StorePlan {
-    let selfIndexes = findSelfIndexes(routing, account, bucketName);
-    let selfEntries = selfIndexes.map(i => routing.sources[i] as HostedConfig);
-    let self = summarizeSelf(selfEntries, Date.now());
-    let ownIndexes = new Set(selfIndexes);
-    // One store per distinct route among ALL our entries - past and future windows included, so historical route folders keep serving their data and upcoming routes sync ahead of their window
-    let groups = new Map<string, { route?: [number, number]; entries: HostedConfig[]; firstIndex: number }>();
-    for (let i of selfIndexes) {
-        let entry = routing.sources[i] as HostedConfig;
-        let routeKey = JSON.stringify(entry.route || FULL_ROUTE);
-        let group = groups.get(routeKey);
-        if (!group) {
-            group = { route: entry.route, entries: [], firstIndex: i };
-            groups.set(routeKey, group);
-        }
-        group.entries.push(entry);
-    }
-    let stores: StorePlanStore[] = [];
-    for (let [routeKey, group] of groups) {
-        let anchor = selectEntryAt(group.entries, Date.now());
-        let diskWindow: [number, number] = [0, 0];
-        if (anchor) {
-            let [start, end] = anchor.validWindow;
-            let merged = true;
-            while (merged) {
-                merged = false;
-                for (let entry of group.entries) {
-                    let [entryStart, entryEnd] = entry.validWindow;
-                    if (entryStart > end || entryEnd < start) continue;
-                    if (entryStart < start || entryEnd > end) {
-                        start = Math.min(start, entryStart);
-                        end = Math.max(end, entryEnd);
-                        merged = true;
-                    }
-                }
+/**
+ * Who held each slice of our route in the window before windowStart, for every self entry whose
+ * window starts exactly then. This is the whole of "who do we take over from": a store taking over a
+ * route may be taking it from several previous owners at once (their shards need not line up with
+ * ours), and from itself for the parts it already held.
+ *
+ * A self entry is skipped when an EARLIER entry valid at the boundary already covers its whole route:
+ * config order is priority, so that entry is the write target and we are not the one taking over.
+ * Owners are then resolved in config order too, each claiming the part of our route still unclaimed -
+ * the same first-match-wins rule that picks a write target at any other moment.
+ *
+ * Pure: config in, plan out. Nothing here reads a store, a clock, or the network.
+ */
+export function previousWindowOwners(config: RemoteConfig, windowStart: number, selfIndexes: number[]): BoundaryHandover[] {
+    let selfIndexSet = new Set(selfIndexes);
+    let previousTime = windowStart - 1;
+    let validAt = (source: SourceConfig, time: number) => source.validWindow[0] <= time && time < source.validWindow[1];
+    let byRoute = new Map<string, BoundaryHandover>();
+    for (let selfIndex of selfIndexes) {
+        let self = config.sources[selfIndex];
+        if (typeof self === "string" || self.validWindow[0] !== windowStart) continue;
+        let selfRoute = self.route || FULL_ROUTE;
+        let shadowed = false;
+        for (let i = 0; i < selfIndex; i++) {
+            let other = config.sources[i];
+            if (typeof other === "string" || !validAt(other, windowStart)) continue;
+            let route = other.route || FULL_ROUTE;
+            if (route[0] <= selfRoute[0] && selfRoute[1] <= route[1]) {
+                shadowed = true;
+                break;
             }
-            diskWindow = [start, end];
         }
-        let sourceSpecs: StoreSourceSpec[] = [{ validWindows: [diskWindow] }];
-        let noFullSync = group.entries.some(x => x.noFullSync);
-        // The same peer endpoint (url+route+flags) can appear under several windows at once (a switchover splits one window around an intermediate). It is ONE sync source that carries ALL those windows - never several sources, which would double-scan it and, worse, make matching a request depend on which window the caller happened to hold.
-        let peerByKey = new Map<string, StoreSourceSpec>();
-        for (let i = group.firstIndex + 1; i < routing.sources.length; i++) {
-            let source = routing.sources[i];
-            if (typeof source === "string" || ownIndexes.has(i)) continue;
-            let sharedRoute = routeIntersection(group.route, source.route);
-            if (!sharedRoute) continue;
-            let key = JSON.stringify({ ...source, validWindow: undefined });
-            let spec = peerByKey.get(key);
-            if (!spec) {
-                spec = { sourceConfig: source, validWindows: [], route: sharedRoute, noFullSync: source.noFullSync || noFullSync };
-                peerByKey.set(key, spec);
-                sourceSpecs.push(spec);
+        if (shadowed) continue;
+        // Keyed by both: one name can take over several routes at the same boundary, and each is pulled separately
+        let handoverKey = `${self.name}|${JSON.stringify(selfRoute)}`;
+        let handover = byRoute.get(handoverKey);
+        if (!handover) {
+            handover = { name: self.name, route: selfRoute, scanOwnDisk: false, remotes: new Map() };
+            byRoute.set(handoverKey, handover);
+        }
+        let unclaimed: [number, number][] = [[selfRoute[0], selfRoute[1]]];
+        for (let i = 0; i < config.sources.length && unclaimed.length; i++) {
+            let other = config.sources[i];
+            if (typeof other === "string" || !validAt(other, previousTime)) continue;
+            let { remaining, claimed } = subtractRoute(unclaimed, other.route || FULL_ROUTE);
+            unclaimed = remaining;
+            if (!claimed) continue;
+            if (selfIndexSet.has(i)) {
+                handover.scanOwnDisk = true;
+                continue;
             }
-            spec.validWindows.push(source.validWindow);
+            let existing = handover.remotes.get(i);
+            handover.remotes.set(i, existing && [Math.min(existing[0], claimed[0]), Math.max(existing[1], claimed[1])] as [number, number] || claimed);
         }
-        stores.push({
-            routeKey,
-            route: group.route,
-            entries: group.entries,
-            rawDisk: group.entries.some(x => x.rawDisk),
-            readerDiskLimit: group.entries.find(x => x.readerDiskLimit !== undefined)?.readerDiskLimit,
-            sourceSpecs,
-        });
     }
-    if (!stores.length) {
-        // Not in the config at all: still serve whatever the plain folder holds, through one inert full-route store
-        stores.push({ routeKey: JSON.stringify(FULL_ROUTE), route: undefined, entries: [], rawDisk: false, readerDiskLimit: undefined, sourceSpecs: [{ validWindows: [[0, 0]] }] });
-    }
-    let structureKey = JSON.stringify(stores.map(s => ({ routeKey: s.routeKey, rawDisk: s.rawDisk, readerDiskLimit: s.readerDiskLimit })));
-    return { selfEntries, self, stores, structureKey };
+    return [...byRoute.values()].filter(x => x.scanOwnDisk || x.remotes.size);
 }
+

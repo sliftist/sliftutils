@@ -9,7 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified, bufferChunkStream, IMMUTABLE_CACHE_TIME } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, SourceConfig, assertValidLastModified, bufferChunkStream, IMMUTABLE_CACHE_TIME } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 type BackblazeCreds = {
@@ -441,6 +441,14 @@ export class ArchivesBackblaze implements IArchives {
         return "backblaze " + this.config.bucketName;
     }
 
+    /** Policy flags changed in the routing config. The bucket-level settings getBucketAPI applied (CORS, cache time) are NOT re-applied - those are one-time bucket setup, and re-running them on every config edit would rewrite the bucket's settings from whichever process noticed first. */
+    public updateSourceConfig(sourceConfig: SourceConfig): void {
+        if (sourceConfig.type !== "backblaze") return;
+        this.config.public = sourceConfig.public;
+        this.config.immutable = sourceConfig.immutable;
+        this.config.allowedOrigins = sourceConfig.allowedOrigins;
+    }
+
     private getBucketAPI = lazy(async () => {
         let api = await getAPI();
 
@@ -710,6 +718,19 @@ export class ArchivesBackblaze implements IArchives {
             return false;
         }
     }
+    /** Whether an existing file already beats this write, so it must not be sent at all. Shared by set and setLargeFile - the size a value happens to have must never change which ordering rules apply to it. */
+    private async writeIsSuperseded(fileName: string, config?: SetConfig): Promise<boolean> {
+        if (!config?.lastModified) return false;
+        assertValidLastModified(config.lastModified);
+        // This comparison deliberately IGNORES noChecks: backblaze has no server of ours to enforce only-take-the-latest (unlike hosted targets, where the receiving store re-checks), so this comparison IS the ordering guard. Skipping it lets a stale push land over a newer value or tombstone - and because b2 stamps its own upload times, the stale data then becomes the newest-timestamped copy in the whole system, resurrecting globally through everyone's scans. includeTombstones: a deletion on b2 is a real size-0 file and must win this comparison too.
+        let existing = await this.getInfo(fileName, { includeTombstones: true });
+        if (!existing) return false;
+        // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
+        if (config.lastModified < existing.writeTime) return true;
+        // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
+        if (config.forceSetImmutable && this.config.immutable) return true;
+        return false;
+    }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
         if (!data.length) {
             throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
@@ -717,18 +738,10 @@ export class ArchivesBackblaze implements IArchives {
         if (config?.forceSetImmutable && !config.lastModified) {
             throw new Error(`forceSetImmutable requires lastModified (synchronization writes are ordered by their write time), writing ${fileName} to ${this.getDebugName()}`);
         }
-        if (config?.lastModified) {
-            assertValidLastModified(config.lastModified);
-            // This comparison deliberately IGNORES noChecks: backblaze has no server of ours to enforce only-take-the-latest (unlike hosted targets, where the receiving store re-checks), so this comparison IS the ordering guard. Skipping it lets a stale push land over a newer value or tombstone - and because b2 stamps its own upload times, the stale data then becomes the newest-timestamped copy in the whole system, resurrecting globally through everyone's scans. includeTombstones: a deletion on b2 is a real size-0 file and must win this comparison too.
-            let existing = await this.getInfo(fileName, { includeTombstones: true });
-            // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
-            if (existing && config.lastModified < existing.writeTime) return fileName;
-            // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
-            if (existing && config.forceSetImmutable && this.config.immutable) return fileName;
-        }
+        if (await this.writeIsSuperseded(fileName, config)) return fileName;
         // Big buffers stream through the large-file API: a failed part retries alone instead of restarting the whole upload. The threshold MUST stay at two full chunks - below that setLargeFile falls back to plain set, which would recurse right back here.
         if (data.length >= LARGE_FILE_MIN_CHUNK_SIZE * 2) {
-            await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
+            await this.setLargeFile({ path: fileName, ...config, ...bufferChunkStream(data) });
             return fileName;
         }
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
@@ -775,8 +788,10 @@ export class ArchivesBackblaze implements IArchives {
         // NOTE: Deletion SEEMS to work. This DOES break if we delete a file which keeps being recreated, ex, the heartbeat. let existsChecks = 10; while (existsChecks > 0) { let exists = await this.getInfo(fileName); if (!exists) break; await delay(1000); existsChecks--; } if (existsChecks === 0) { let exists = await this.getInfo(fileName); devDebugbreak(); console.warn(`File ${fileName} was deleted, but was still found afterwards`); exists = await this.getInfo(fileName); }
     }
 
-    // lastModified is accepted but cannot be honored - b2 stamps its own uploadTimestamp, which is what our getInfo/findInfo report as the write time
-    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined>; }): Promise<void> {
+    // lastModified is accepted but cannot be honored - b2 stamps its own uploadTimestamp, which is what our getInfo/findInfo report as the write time. fallbacks means nothing here: a single bucket has nowhere to fall back to.
+    public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
+        // Checked before a single byte moves: an upload that is already superseded must not be started at all (a cancelled large upload still costs the transfer)
+        if (await this.writeIsSuperseded(config.path, config)) return;
 
         let onError: (() => Promise<void>)[] = [];
         let time = Date.now();
@@ -805,18 +820,18 @@ export class ArchivesBackblaze implements IArchives {
             }
             // Backblaze disallows overly small files
             if (data.length < LARGE_FILE_MIN_CHUNK_SIZE) {
-                await this.set(fileName, data);
+                await this.set(fileName, data, config);
                 return;
             }
             // Backblaze disallows less than 2 chunks
             let secondData = await getNextData();
             if (!secondData?.length) {
-                await this.set(fileName, data);
+                await this.set(fileName, data, config);
                 return;
             }
             // ALSO, if there are two chunks, but one is too small, combine it. This helps allow us never send small chunks.
             if (secondData.length < LARGE_FILE_MIN_CHUNK_SIZE) {
-                await this.set(fileName, Buffer.concat([data, secondData]));
+                await this.set(fileName, Buffer.concat([data, secondData]), config);
                 return;
             }
             this.log(`Uploading large file ${config.path}`);
@@ -989,46 +1004,17 @@ export class ArchivesBackblaze implements IArchives {
         }
     }
 
-    public async move(config: {
-        path: string;
-        target: IArchives;
-        targetPath: string;
-        copyInstead?: boolean;
-    }) {
-        let { path, target, targetPath } = config;
-        // A self move should NOOP (and definitely not copy, and then delete itself!)
-        if (target === this && path === targetPath) {
-            this.log(`Backblaze move path to itself. Skipping move, as there is no work to do. ${path}`);
-            return;
+    public async move(config: MoveFileConfig): Promise<void> {
+        let { fromPath, toPath } = config;
+        if (fromPath === toPath) return;
+        // A b2 copy is a NEW file version, so its uploadTimestamp is stamped at copy time - the fresh write time move requires (see IArchives.move)
+        await this.copy({ path: fromPath, target: this, targetPath: toPath });
+        // The source is only deleted once the destination CONFIRMS the file - a failure here leaves it in both places, never in neither
+        let exists = await this.getInfo(toPath);
+        if (!exists) {
+            throw new Error(`Not deleting ${JSON.stringify(fromPath)} after the move on ${this.getDebugName()}: ${JSON.stringify(toPath)} was not found after the copy claimed to succeed (the file is left at the source)`);
         }
-        if (target instanceof ArchivesBackblaze) {
-            let targetBucketId = target.bucketId;
-            if (targetBucketId === this.bucketId && path === targetPath) return;
-            await this.apiRetryLogic(`move ${path} -> ${targetPath}`, async (api) => {
-                // Ugh... listing the file name sucks, but... I guess it's still better than downloading and re-uploading the entire file.
-                let info = await api.listFileNames({ bucketId: this.bucketId, prefix: path, maxFileCount: 10 });
-                let file = info.files.find(x => x.fileName === path);
-                if (!file) throw new Error(`File not found to move: ${path}`);
-                await api.copyFile({
-                    sourceFileId: file.fileId,
-                    fileName: targetPath,
-                    destinationBucketId: targetBucketId,
-                });
-            });
-        } else {
-            let data = await this.get(path);
-            if (!data) throw new Error(`File not found to move: ${path}`);
-            await target.set(targetPath, data);
-        }
-
-        if (!config.copyInstead) {
-            let exists = await this.getInfo(targetPath);
-            if (!exists) {
-                console.error(`File not found after move. Leaving BOTH files. ${targetPath} was not found. Being moved from ${path}`);
-            } else {
-                await this.del(path);
-            }
-        }
+        await this.del(fromPath);
     }
 
     public async copy(config: {
@@ -1036,7 +1022,26 @@ export class ArchivesBackblaze implements IArchives {
         target: IArchives;
         targetPath: string;
     }): Promise<void> {
-        return this.move({ ...config, copyInstead: true });
+        let { path, target, targetPath } = config;
+        if (target === this && path === targetPath) return;
+        if (target instanceof ArchivesBackblaze) {
+            let targetBucketId = target.bucketId;
+            await this.apiRetryLogic(`copy ${path} -> ${targetPath}`, async (api) => {
+                // Ugh... listing the file name sucks, but... I guess it's still better than downloading and re-uploading the entire file.
+                let info = await api.listFileNames({ bucketId: this.bucketId, prefix: path, maxFileCount: 10 });
+                let file = info.files.find(x => x.fileName === path);
+                if (!file) throw new Error(`File not found to copy: ${path}`);
+                await api.copyFile({
+                    sourceFileId: file.fileId,
+                    fileName: targetPath,
+                    destinationBucketId: targetBucketId,
+                });
+            });
+            return;
+        }
+        let data = await this.get(path);
+        if (!data) throw new Error(`File not found to copy: ${path}`);
+        await target.set(targetPath, data);
     }
 
     public async getURL(path: string) {

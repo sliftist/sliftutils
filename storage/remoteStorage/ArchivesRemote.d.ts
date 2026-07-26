@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SourceConfig, SetConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SourceConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
 export type ArchivesRemoteConfig = {
     url: string;
     waitForAccess?: boolean;
@@ -29,6 +29,8 @@ export declare class ArchivesRemote implements IArchives {
     private controller;
     private lastDeniedLog;
     getDebugName(): string;
+    /** The config travels with every request (the server matches it against its own entries to pick the store), so a config change has to land here - otherwise we keep asking for a source description the server no longer recognizes. Only ever called with a config for the SAME endpoint (see sourceIdentity), so the connection, account, and bucket cannot change under us. */
+    updateSourceConfig(sourceConfig: SourceConfig): void;
     isConnected(): boolean;
     ping(): Promise<{}>;
     private authenticate;
@@ -49,6 +51,7 @@ export declare class ArchivesRemote implements IArchives {
     } | undefined>;
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     del(fileName: string, config?: DelConfig): Promise<void>;
+    move(config: MoveFileConfig): Promise<void>;
     getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
@@ -58,10 +61,6 @@ export declare class ArchivesRemote implements IArchives {
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
     getConfig(): Promise<ArchivesConfig>;
     getSyncStatus(): Promise<ArchivesSyncStatus>;
-    setLargeFile(config: {
-        path: string;
-        lastModified?: number;
-        getNextData(): Promise<Buffer | undefined>;
-    }): Promise<void>;
+    setLargeFile(config: SetLargeFileConfig): Promise<void>;
     getURL(path: string): Promise<string>;
 }

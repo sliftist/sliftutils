@@ -1,30 +1,17 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IBucketStore } from "./blobStore";
-import { RemoteConfig, HostedConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+import { BlobStore } from "./blobStore";
+import { RemoteConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 import { BucketDiskInfo } from "./bucketDisk";
-import { SelfSummary } from "./storePlan";
-export type LoadedStore = {
-    routeKey: string;
-    route?: [number, number];
-    entries: HostedConfig[];
-    folder: string;
-    store: IBucketStore;
-};
-export type BucketState = {
-    account: string;
-    bucketName: string;
-    routing: RemoteConfig;
-    routingJSON: string;
-    selfEntries: HostedConfig[];
-    self: SelfSummary | undefined;
-    stores: LoadedStore[];
-    structureKey: string;
-};
-/** The loaded bucket, loading it (which instantiates its stores and starts their synchronization) if needed. A bucket that does not exist on this server throws - callers never see undefined buckets. */
-export declare function requireBucket(account: string, bucketName: string): Promise<BucketState>;
-/** The store serving a request: the config entry the CLIENT selected, matched against the bucket's own entries by identity EXCLUDING the valid window (see sourceMatchKey). The selection never validates - the store's own window/route checks throw if the caller is stale - so honoring a window mismatch here is exactly right. Throws when nothing matches, listing what is available. */
-export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore>;
+import { BucketWriteStats } from "./accessStats";
+export declare function getStore(account: string, bucketName: string, name: string): BlobStore;
+/** The store serving a request: the one the client's selected entry NAMES. Account, name, and bucket ARE the folder, so this is a direct lookup, never a search of what exists - and a name this server has never seen is CREATED, never rejected, because asking for a name is the instruction to have that store (one name, one folder, one index; it configures itself once the routing config lands in it). Nothing else about the request is compared - not the window, not the route, not the flags - which is the whole point of naming it: a client a config version behind on some flag still reaches the right store. */
+export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): BlobStore;
+/** The stores of a bucket as the DISK records them (a bucket is nothing more than the store folders sharing its name), opened - so the ones that weren't running yet start synchronizing. Empty when the bucket does not exist here. */
+export declare function getBucketStores(account: string, bucketName: string): Promise<{
+    name: string;
+    store: BlobStore;
+}[]>;
 /** Internal (store-to-store) reads skip store selection entirely: the caller is another store whose index says this MACHINE holds the bytes - the persisted holder identity is just a URL, which cannot name a store. Whichever store's folder has the newest copy answers. */
 export declare function readBucketInternal(account: string, bucketName: string, config: {
     path: string;
@@ -38,9 +25,9 @@ export declare function readBucketInternal(account: string, bucketName: string, 
     writeTime: number;
     size: number;
 } | undefined>;
-export declare function getBucketConfig(bucket: BucketState): ArchivesConfig;
-export declare function bucketSyncStatus(bucket: BucketState): Promise<ArchivesSyncStatus>;
-export declare function bucketIndexTotals(bucket: BucketState): Promise<{
+export declare function getBucketArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig>;
+export declare function bucketSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus>;
+export declare function debugBucketIndexTotals(account: string, bucketName: string): Promise<{
     fileCount: number;
     byteCount: number;
     sources: {
@@ -48,26 +35,26 @@ export declare function bucketIndexTotals(bucket: BucketState): Promise<{
         fileCount: number;
         byteCount: number;
     }[];
-} | undefined>;
+}>;
 /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
 export declare function resolveSourceArchives(url: string): IArchives;
-export declare function getLoadedBucket(account: string, bucketName: string): Promise<BucketState | undefined>;
-/** The routing-config write path - the ONE write that cannot go through a store (it is what CREATES the bucket and its stores). Serialized per bucket: concurrent config writes would race the version check. */
-export declare function queueRoutingConfigWrite(account: string, bucketName: string, data: Buffer, config?: {
+/**
+ * Writing the routing config is a write like any other: it goes into a store, and the store applies
+ * it to itself and lets its peers pull it. The only thing that happens here is picking WHICH store,
+ * because the writer names a source and a source names a store.
+ *
+ * In-flight switchover windows are re-injected first (see intermediateManagement): an operator's
+ * config knows nothing about a switchover that is happening right now, and writing it as-is would
+ * cancel it mid-flight.
+ */
+export declare function writeRoutingConfig(account: string, bucketName: string, name: string, data: Buffer, config?: {
     lastModified?: number;
 }): Promise<void>;
-/** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
+/** Which buckets this process currently has active (some store of theirs was opened) - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
 export declare function getActiveBucketKeys(): {
     account: string;
     bucketName: string;
 }[];
-export declare function rebuildAllLoadedBuckets(): Promise<void>;
-/** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
-export declare const startIntermediateMaintenance: {
-    (): void;
-    reset(): void;
-    set(newValue: void): void;
-};
 export type ServerBucketInfo = {
     bucketName: string;
     active: boolean;
@@ -82,26 +69,12 @@ export type ServerBucketInfo = {
 };
 export type ActiveBucketInfo = {
     folder: string;
-    /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
-    routing: RemoteConfig;
-    /** Our own entries in that config, and their summarized current role (routes union + flags) */
-    selfEntries: HostedConfig[];
-    self?: SelfSummary;
+    /** The bucket's routing config, the newest copy among its stores. Absent when none of them has one yet. */
+    routing?: RemoteConfig;
     config: ArchivesConfig;
 };
-/** The live in-memory state of ONE bucket, answered without touching the disk (no routing file read, no statfs, no stored write stats). Returns an error string when the bucket is not loaded here, which is the normal state for a bucket nothing has accessed since startup. */
-export declare function getActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
-/** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
+/** The state of ONE active bucket. Returns an error string when the bucket is not active here, which is the normal state for a bucket nothing has accessed since startup. */
+export declare function debugGetActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
+/** Loads every store of a bucket that exists on this server's disk into memory, which starts their synchronization and window timers, and returns the bucket's state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-active buckets just return their state. */
 export declare function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
-export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
-export type BucketWriteStats = {
-    /** Every set call the bucket accepted */
-    originalWrites: number;
-    originalBytes: number;
-    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
-    flushedWrites: number;
-    flushedBytes: number;
-};
-/** Zeroes the write statistics of every bucket in the account. */
-export declare function clearAccountWriteStats(account: string): number;
-export declare function getLocalArchives(account: string, bucketName: string, sourceConfig: SourceConfig): IArchives;
+export declare function debugListAccountBuckets(account: string): Promise<ServerBucketInfo[]>;

@@ -4,6 +4,16 @@ export function assertValidName(value: string, kind: string): void {
     }
 }
 
+/** A store's name (see CommonConfig.name), which also allows dots - a name is often a host or a version, and both read wrong without them. It is one path segment of the store's folder, so the two names that would mean a different folder entirely are rejected: everything else containing dots is just a name. */
+export function assertValidSourceName(value: string): void {
+    if (!/^[\w.-]{1,64}$/.test(value)) {
+        throw new Error(`Invalid source name ${JSON.stringify(value)}, expected 1-64 characters of letters/numbers/underscore/dash/dot`);
+    }
+    if (/^\.+$/.test(value)) {
+        throw new Error(`Invalid source name ${JSON.stringify(value)}: a name of only dots refers to a directory rather than naming one`);
+    }
+}
+
 export function assertValidPath(path: string): void {
     if (Buffer.from(path, "utf8").length > 1000) {
         throw new Error(`Path too long: ${path.length} characters > 1000. Path: ${path.slice(0, 200)}`);

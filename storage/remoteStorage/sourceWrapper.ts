@@ -6,8 +6,7 @@ import { ROUTING_FILE, getBucketBaseUrl, parseHostedUrl, parseBackblazeUrl, pars
 import { ArchivesRemote } from "./ArchivesRemote";
 import { ArchivesUrl } from "./ArchivesUrl";
 import { ArchivesBackblaze } from "../backblaze";
-import { isOwnAddress } from "./serverConfig";
-import { getLocalArchives } from "./storageServerState";
+import { showCertTrustModal } from "./certTrustModal";
 
 export const RETRY_START_DELAY = 2 * 1000;
 export const RETRY_MAX_DELAY = 5 * 60 * 1000;
@@ -75,12 +74,7 @@ export class SourceWrapper {
             }
             return wrapper;
         }
-        let parsed = parseHostedUrl(config.url);
-        if (isNode() && isOwnAddress(parsed.address, parsed.port)) {
-            // A bucket hosted by our own process - use it directly instead of calling ourselves
-            wrapper.api = getLocalArchives(parsed.account, parsed.bucketName, config);
-            return wrapper;
-        }
+        // A bucket hosted by our own process is reached the same way as any other: over the API, to our own port
         wrapper.remote = new ArchivesRemote({ url: config.url, waitForAccess: false, sourceConfig: config });
         wrapper.api = wrapper.remote;
         if (config.public !== false) {
@@ -128,6 +122,8 @@ export class SourceWrapper {
         let now = Date.now();
         if (now >= this.cooldownUntil && this.isConnectionProblemWorthReporting()) {
             console.error(`Cannot connect to storage ${this.getDebugName()}; skipping it until ${new Date(now + SOURCE_FAILURE_COOLDOWN).toISOString()} (now ${new Date(now).toISOString()}) unless no other source can serve the request`);
+            // In a browser this is often an untrusted (self-signed) certificate the user hasn't accepted yet - offer them the trust flow (a no-op in Node, and shown at most once per server)
+            showCertTrustModal(this.config.url);
         }
         this.cooldownUntil = now + SOURCE_FAILURE_COOLDOWN;
         if (!this.background || this.reconnectRunning) return;

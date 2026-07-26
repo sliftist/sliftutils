@@ -6,6 +6,10 @@ export type HostServerConfig = {
     setDNSRecord?: boolean;
     publicIp?: string;
     allowHostnames?: string[];
+    /** LAN-only: do NOT forward the port (no UPnP/NAT mapping), for a server reachable only on the local network. */
+    internal?: boolean;
+    /** Serve a TLS cert signed by this machine's CA instead of obtaining a real (ACME) one. See getFreshHTTPSCert. */
+    selfSigned?: boolean;
     /** When the port is busy (e.g. the previous deploy still holds it), mount on an alternate port instead (the socket server's built-in free-port scan), and keep trying to take the real port - once it frees, a raw TCP relay on the real port forwards to our listener (SocketFunction can only mount once per process). */
     portFallback?: {
         /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
@@ -18,8 +22,8 @@ export type HostServerConfig = {
 };
 /** Hosts a SocketFunction server on a real domain, with an automatically created and renewed Let's Encrypt HTTPS certificate (cached in the home folder, shared between processes on the machine). Expose your controllers (and any RequireController setup) before calling this. Returns the mounted nodeId. */
 export declare function hostServer(config: HostServerConfig): Promise<string>;
-/** Returns the cached HTTPS cert for the domain, creating/renewing it first if it is past this process's renewal threshold. Reads the disk cache on every call, so a renewal done by a parallel process is picked up instead of renewing again. */
-export declare function getFreshHTTPSCert(domain: string): Promise<{
+/** Returns the cached HTTPS cert for the domain, creating/renewing it first if it is past this process's renewal threshold. Reads the disk cache on every call, so a renewal done by a parallel process is picked up instead of renewing again. selfSigned: sign it with this machine's CA instead of getting a real ACME cert. */
+export declare function getFreshHTTPSCert(domain: string, selfSigned?: boolean): Promise<{
     key: string;
     cert: string;
 }>;

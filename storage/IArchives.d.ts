@@ -22,6 +22,21 @@ export type RemoteConfigBase = string | SourceConfig;
 /** One configured source in a routing config: a hosted (our storage server) or backblaze entry. Requests carry the exact SourceConfig they selected, and the server matches it against its own entries to pick the backing store. */
 export type SourceConfig = HostedConfig | BackblazeConfig;
 export type CommonConfig = {
+    /**
+     * The storage this entry names, as opposed to the rules for using it. Every entry with the same
+     * name (for the same account and bucket) IS the same storage: one folder on the server, one
+     * store, one index - however many entries there are and whatever their windows and routes say.
+     * Everything about WHEN and WHICH KEYS (validWindow, route) is policy layered on top of it, and
+     * changing that policy never moves data.
+     *
+     * Letters, numbers, underscore, dash and periods, up to 64 characters - so a host or a version
+     * can be used as-is. It is the folder name, so it must stay unique and must never be reused for
+     * different storage:
+     * pointing two unrelated entries at one name merges their data, and re-using a retired name
+     * hands the new entry the retired one's files. Deciding that is the developer's job - the server
+     * only ever does what the name says.
+     */
+    name: string;
     /** By default a server hosting this bucket eagerly copies this source's full contents onto its own disk (on top of the lazy read-through caching). Set this to be a front end for a very large database without copying the full database - reads still down-cache individual files on demand. */
     noFullSync?: boolean;
     /** Bytes of read-cache this server's disk may hold; least-recently-used files are deleted from disk to stay under it (only ever when another source verifiably holds the file - the only copy is never deleted). Requires noFullSync (a full copy can't be bounded). */
@@ -39,7 +54,6 @@ export type HostedConfig = CommonConfig & {
     public?: boolean;
     fast?: boolean;
     writeDelay?: number;
-    rawDisk?: boolean;
     immutable?: boolean;
 };
 export type BackblazeConfig = CommonConfig & {
@@ -100,6 +114,13 @@ export type SetConfig = {
     /** Writes normally go ONLY to the write node (the first current-window source covering the key), retrying it even while it is down - consistent, but unavailable when that node is. With fallbacks, the write node is still tried first, but on failure the write lands on the next current-window source covering the key (synchronization moves it to the write node later) - availability at the cost of reads possibly missing the write until it propagates. Single-source archives ignore the flag. */
     fallbacks?: boolean;
 };
+/** setLargeFile's config: a SetConfig (it IS a set - the same immutability, ordering, internal, and fallbacks rules apply) plus the stream carrying the bytes. */
+export type SetLargeFileConfig = SetConfig & {
+    path: string;
+    getNextData(): Promise<Buffer | undefined>;
+    /** Rewinds the stream to its first byte. Without it the write gets exactly ONE attempt: a retry (a fallback source, or the write node coming back) would upload whatever is left of an already-consumed stream as if it were the whole file. Callers holding the data (a buffer, or a source they can re-read) always pass it - a large set with fallbacks is only as available as this. */
+    restartStream?(): Promise<void> | void;
+};
 export type ArchiveFileInfo = {
     path: string;
     createTime: number;
@@ -142,28 +163,23 @@ export type ArchivesSource = {
 };
 export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
 export declare const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17";
+export declare const STORAGE_NOT_CONFIGURED = "REMOTE_STORAGE_NOT_CONFIGURED_e51b7d92";
 export declare const FULL_ROUTE: [number, number];
 export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
 export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
 export declare function windowsAcceptWrites(validWindows: [number, number][]): boolean;
 export declare const LARGE_SET_THRESHOLD: number;
-/** A getNextData stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. */
-export declare function bufferChunkStream(data: Buffer): () => Promise<Buffer | undefined>;
-/** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. size/writeTime usually come from the caller's metadata scan; when either is omitted, getInfo fills them in. Returns the copied file's info, or undefined when the source doesn't have the file. */
-export declare function copyArchiveFile(config: {
-    from: IArchives;
-    to: IArchives;
-    path: string;
-    size?: number;
-    writeTime?: number;
-    forceSetImmutable?: boolean;
-    noChecks?: boolean;
-    internal?: boolean;
-    noFallbacks?: boolean;
-}): Promise<{
-    writeTime: number;
-    size: number;
-} | undefined>;
+/** The setLargeFile stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. Spread into the config: it provides both getNextData and restartStream (the buffer is still held, so a retry costs nothing). */
+export declare function bufferChunkStream(data: Buffer): {
+    getNextData(): Promise<Buffer | undefined>;
+    restartStream(): void;
+};
+export { copyArchiveFile } from "./archiveHelpers";
+/** move's config. There is deliberately no lastModified: the destination is ALWAYS stamped fresh (see IArchives.move) - a move is a new write at the new path, and a preserved old stamp is how a moved file loses to a stale tombstone there and vanishes. */
+export type MoveFileConfig = {
+    fromPath: string;
+    toPath: string;
+};
 export type ArchivesSyncSourceStatus = {
     debugName: string;
     validWindows: [number, number][];
@@ -218,12 +234,10 @@ export interface IArchives {
      */
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     del(fileName: string, config?: DelConfig): Promise<void>;
-    /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
-    setLargeFile(config: {
-        path: string;
-        lastModified?: number;
-        getNextData(): Promise<Buffer | undefined>;
-    }): Promise<void>;
+    /** Moves a file to a new path within THIS archives, backend-side where the backend can (backblaze copies server-side, disk renames, the storage server relocates node-side) - the bytes never travel through the caller. The destination is stamped with a FRESH write time, even when the underlying operation (a rename) would preserve the old one, so the moved file cannot immediately lose to something newer sitting at its new path (e.g. the tombstone of an earlier deletion there); the source is then deleted, exactly like del. THROWS when the source file does not exist. Optional - callers go through moveArchiveFile (archiveHelpers.ts), which falls back to copy + confirm + delete. */
+    move?(config: MoveFileConfig): Promise<void>;
+    /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. The rest of the config is a plain SetConfig and means exactly what it means on set (that is what makes a large set behave like a small one instead of quietly losing immutability, ordering, internal, or fallbacks semantics as the file crosses the threshold); backends that stamp their own times (backblaze) accept and ignore lastModified. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
+    setLargeFile(config: SetLargeFileConfig): Promise<void>;
     /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. Size-0 entries (tombstones) report undefined unless config.includeTombstones. */
     getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;

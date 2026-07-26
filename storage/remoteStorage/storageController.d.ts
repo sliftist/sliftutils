@@ -107,6 +107,13 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         lastModified?: number;
         internal?: boolean;
     }) => Promise<void>;
+    move: (config: {
+        account: string;
+        bucketName: string;
+        fromPath: string;
+        toPath: string;
+        sourceConfig: SourceConfig;
+    }) => Promise<void>;
     getInfo: (config: {
         account: string;
         bucketName: string;
@@ -181,6 +188,9 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         path: string;
         sourceConfig: SourceConfig;
         lastModified?: number;
+        forceSetImmutable?: boolean;
+        noChecks?: boolean;
+        internal?: boolean;
     }) => Promise<string>;
     uploadPart: (config: {
         uploadId: string;

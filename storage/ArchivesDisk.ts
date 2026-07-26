@@ -3,7 +3,7 @@ import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { sort, binarySearchBasic } from "socket-function/src/misc";
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, assertValidLastModified } from "./IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, assertValidLastModified } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 // The base file-system IArchives: storage is one-to-one with the file system, every key is exactly one real file under <folder>/files, so the file system itself is the index. File handles are cached and reused, and closed once idle (see FileHandleCache). All operations on a file run in serial, so they can't collide with each other or with handle closing. Used as the disk synchronization source of BlobStore (see remoteStorage/blobStore.ts).
@@ -191,6 +191,29 @@ export class ArchivesDisk implements IArchives {
         });
     }
 
+    public async move(config: MoveFileConfig): Promise<void> {
+        await this.init();
+        if (config.fromPath === config.toPath) return;
+        let fromPath = this.filePath(config.fromPath);
+        let toPath = this.filePath(config.toPath);
+        await this.handles.run(fromPath, async () => {
+            await this.handles.closeNow(fromPath);
+            await this.handles.run(toPath, async () => {
+                await this.handles.closeNow(toPath);
+                await fs.promises.mkdir(path.dirname(toPath), { recursive: true });
+                try {
+                    await fs.promises.rename(fromPath, toPath);
+                } catch (e: any) {
+                    if (e.code !== "ENOENT") throw e;
+                    throw new Error(`Cannot move ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)} on ${this.getDebugName()}: the source file does not exist`);
+                }
+                // The rename preserves the mtime, but a move must stamp FRESH (see IArchives.move) - the old stamp is how a moved file loses to a stale tombstone at its new path
+                let now = new Date();
+                await fs.promises.utimes(toPath, now, now);
+            });
+        });
+    }
+
     public async get(key: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(key, config);
         return result && result.data || undefined;
@@ -276,7 +299,8 @@ export class ArchivesDisk implements IArchives {
         }
     }
 
-    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    // The raw disk has no windows, routes, or immutability, so the rest of the SetConfig has nothing to apply to here (the store wrapping this disk is what enforces them)
+    public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
         let id = await this.startLargeUpload();
         try {
             while (true) {

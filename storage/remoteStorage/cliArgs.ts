@@ -7,3 +7,8 @@ export function getArg(name: string): string | undefined {
     }
     return value;
 }
+
+/** A valueless boolean flag: true when --name is present (with nothing, or a following flag). */
+export function getFlag(name: string): boolean {
+    return process.argv.includes(`--${name}`);
+}

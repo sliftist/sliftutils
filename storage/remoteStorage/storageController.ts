@@ -9,13 +9,14 @@ import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMach
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig, IMMUTABLE_CACHE_TIME } from "../IArchives";
 import { ROUTING_FILE, getRoute, routeContains } from "./remoteConfig";
 import {
-    getLoadedBucket, requireBucket, findBucketStore, readBucketInternal, queueRoutingConfigWrite,
-    getBucketConfig, bucketSyncStatus, bucketIndexTotals, LoadedStore, ActiveBucketInfo,
-    listAccountBuckets, ServerBucketInfo, clearAccountWriteStats,
-    getActiveBucket, activateBucket, getActiveBucketKeys,
+    findBucketStore, getStore, getBucketStores, readBucketInternal, writeRoutingConfig,
+    getBucketArchivesConfig, bucketSyncStatus, debugBucketIndexTotals, ActiveBucketInfo,
+    debugListAccountBuckets, ServerBucketInfo,
+    debugGetActiveBucket, activateBucket, getActiveBucketKeys,
 } from "./storageServerState";
+import { debugClearAccountWriteStats } from "./accessStats";
 import { getStorageServerConfig, getTrust, getRequests, assertWritesAllowed } from "./serverConfig";
-import { IBucketStore } from "./blobStore";
+import { BlobStore } from "./blobStore";
 import { getRoutingFileResult } from "./bucketDisk";
 import { StorageClientController } from "./storageClientController";
 import { trackAccess, trackAccessCall, getAccessTotals, readAccessSummaries, clearAccountAccessStats, AccessTotals, AccessSummaryState } from "./accessStats";
@@ -291,7 +292,8 @@ class RemoteStorageControllerBase {
         // Copied because the wire hands us a plain Uint8Array view, not a real Buffer
         let data = Buffer.from(config.data);
         if (config.path === ROUTING_FILE) {
-            return await queueRoutingConfigWrite(config.account, config.bucketName, data, config);
+            // The store the caller selected owns this file: it applies it, enforces the version rule, and its peers pull it from there
+            return await writeRoutingConfig(config.account, config.bucketName, config.sourceConfig.name, data, config);
         }
         await withStore(config, store => store.set({ ...config, data }));
     }
@@ -300,6 +302,15 @@ class RemoteStorageControllerBase {
     async del(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; lastModified?: number; internal?: boolean }): Promise<void> {
         assertWritesAllowed();
         await withStore(config, store => store.del(config));
+    }
+    @assertValidArgs
+    @trackAccessCall("move")
+    async move(config: { account: string; bucketName: string; fromPath: string; toPath: string; sourceConfig: SourceConfig }): Promise<void> {
+        assertWritesAllowed();
+        // assertValidArgs only knows the well-known `path` field, so the two paths of a move are validated here
+        assertValidPath(config.fromPath);
+        assertValidPath(config.toPath);
+        await withStore(config, store => store.move(config));
     }
     @assertValidArgs
     @trackAccessCall("getInfo")
@@ -322,13 +333,13 @@ class RemoteStorageControllerBase {
     }
     @assertValidArgs
     async getArchivesConfig(config: { account: string; bucketName: string }): Promise<ArchivesConfig> {
-        return getBucketConfig(await requireBucket(config.account, config.bucketName));
+        return await getBucketArchivesConfig(config.account, config.bucketName);
     }
     @assertValidArgs
     async listBuckets(config: { account: string }): Promise<ServerBucketInfo[]> {
         let start = Date.now();
         try {
-            return await listAccountBuckets(config.account);
+            return await debugListAccountBuckets(config.account);
         } finally {
             // The access hook (and the storage it initializes) runs before this, so a large gap between this and the caller's timing is the hook
             console.log(`listBuckets(${config.account}) call body took ${Date.now() - start}ms`);
@@ -337,7 +348,7 @@ class RemoteStorageControllerBase {
     /** The live, in-memory state of one bucket, or a string saying why it is unavailable. Answered without touching the disk, so it is cheap - but only works while the bucket is loaded here. */
     @assertValidArgs
     async getActiveBucket(config: { account: string; bucketName: string }): Promise<ActiveBucketInfo | string> {
-        return await getActiveBucket(config.account, config.bucketName);
+        return await debugGetActiveBucket(config.account, config.bucketName);
     }
     /** Loads a bucket that exists on this server into memory (starting its synchronization) and returns its live state, or a string saying why it could not be loaded. */
     @assertValidArgs
@@ -348,7 +359,7 @@ class RemoteStorageControllerBase {
     @assertValidArgs
     async clearWriteStats(config: { account: string }): Promise<{ clearedBuckets: number }> {
         clearAccountAccessStats(config.account);
-        return { clearedBuckets: clearAccountWriteStats(config.account) };
+        return { clearedBuckets: debugClearAccountWriteStats(config.account) };
     }
     /** In-memory totals per operation type since startup (or the last clearWriteStats). */
     @assertValidArgs
@@ -362,20 +373,22 @@ class RemoteStorageControllerBase {
     }
     @assertValidArgs
     async getIndexInfo(config: { account: string; bucketName: string }): Promise<{ fileCount: number; byteCount: number; sources: { debugName: string; fileCount: number; byteCount: number }[] } | undefined> {
-        return await bucketIndexTotals(await requireBucket(config.account, config.bucketName));
+        return await debugBucketIndexTotals(config.account, config.bucketName);
     }
     @assertValidArgs
     async getSyncStatus(config: { account: string; bucketName: string }): Promise<ArchivesSyncStatus> {
-        return await bucketSyncStatus(await requireBucket(config.account, config.bucketName));
+        return await bucketSyncStatus(config.account, config.bucketName);
     }
 
     @assertValidArgs
-    async startLargeFile(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; lastModified?: number }): Promise<string> {
+    async startLargeFile(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; lastModified?: number; forceSetImmutable?: boolean; noChecks?: boolean; internal?: boolean }): Promise<string> {
         assertWritesAllowed();
-        let target = await findBucketStore(config.account, config.bucketName, config.sourceConfig);
-        let id = await target.store.startLargeUpload({ path: config.path, lastModified: config.lastModified });
-        // routeKey pins the upload's parts and finish to the same store the start picked (in-flight uploads survive a bucket rebuild: the part data lives in the store's folder, which a rebuilt store still sees)
-        largeUploadInfo.set(id, { account: config.account, bucketName: config.bucketName, path: config.path, lastModified: config.lastModified, routeKey: target.routeKey });
+        let store = findBucketStore(config.account, config.bucketName, config.sourceConfig);
+        // The store validates the write here, before any bytes move (see BlobStore.startLargeUpload) - a large file is a set, and its SetConfig decides whether it is even allowed
+        let write = { path: config.path, lastModified: config.lastModified, forceSetImmutable: config.forceSetImmutable, noChecks: config.noChecks, internal: config.internal };
+        let id = await store.startLargeUpload(write);
+        // The store name pins the upload's parts and finish to the same store the start picked (in-flight uploads survive a bucket rebuild: the part data lives in that store's folder, which a rebuilt store still opens)
+        largeUploadInfo.set(id, { ...write, account: config.account, bucketName: config.bucketName, storeName: config.sourceConfig.name });
         return id;
     }
     async uploadPart(config: { uploadId: string; data: Buffer }): Promise<void> {
@@ -383,28 +396,21 @@ class RemoteStorageControllerBase {
         let info = largeUploadInfo.get(config.uploadId);
         if (!info) throw new Error(`Unknown large upload ${config.uploadId}`);
         trackAccess({ account: info.account, operation: "uploadPart", path: `${info.bucketName}/${info.path}`, size: config.data.length });
-        let target = await findUploadStore(info);
-        await target.store.appendLargeUpload({ id: config.uploadId, data: Buffer.from(config.data) });
+        await getStore(info.account, info.bucketName, info.storeName).appendLargeUpload({ id: config.uploadId, data: Buffer.from(config.data) });
     }
     async finishLargeFile(config: { uploadId: string }): Promise<void> {
         assertWritesAllowed();
         let info = largeUploadInfo.get(config.uploadId);
         if (!info) throw new Error(`Unknown large upload ${config.uploadId}`);
         largeUploadInfo.delete(config.uploadId);
-        let target = await findUploadStore(info);
-        await target.store.finishLargeUpload({ id: config.uploadId, path: info.path, lastModified: info.lastModified });
+        await getStore(info.account, info.bucketName, info.storeName).finishLargeUpload({ id: config.uploadId, path: info.path, lastModified: info.lastModified, forceSetImmutable: info.forceSetImmutable, noChecks: info.noChecks, internal: info.internal });
     }
-    /** Best-effort cleanup: an upload whose bucket or store has since vanished has nothing left to cancel. */
+    /** Best-effort cleanup: an unknown upload has nothing left to cancel. */
     async cancelLargeFile(config: { uploadId: string }): Promise<void> {
         let info = largeUploadInfo.get(config.uploadId);
         if (!info) return;
         largeUploadInfo.delete(config.uploadId);
-        let bucket = await getLoadedBucket(info.account, info.bucketName);
-        if (!bucket) return;
-        const routeKey = info.routeKey;
-        let target = bucket.stores.find(x => x.routeKey === routeKey);
-        if (!target) return;
-        await target.store.cancelLargeUpload({ id: config.uploadId });
+        await getStore(info.account, info.bucketName, info.storeName).cancelLargeUpload({ id: config.uploadId });
     }
 
     // IMPORTANT: We can never expose enumeration (listing, prefix search, changes feeds) over this public HTTP endpoint - only exact-key reads. Enumeration would be a massive security risk (public buckets rely on unguessable keys staying unguessable), and could also crash the client by sending them too much data. Listings exist only on the authenticated API (findInfo etc, behind accountAccess).
@@ -430,20 +436,26 @@ class RemoteStorageControllerBase {
         assertValidName(account, "account");
         assertValidName(bucketName, "bucket name");
         assertValidPath(filePath);
-        let bucket = await getLoadedBucket(account, bucketName);
-        if (!bucket) {
+        let bucketStores = await getBucketStores(account, bucketName);
+        if (!bucketStores.length) {
             return setHTTPResultHeaders(Buffer.from(""), { status: "404" });
         }
-        if (!bucket.self?.public) {
+        // Each store's policy comes from its own config, which it has only read once init ran
+        await Promise.all(bucketStores.map(x => x.store.init()));
+        let policies = bucketStores.map(x => ({ store: x.store, policy: x.store.storeConfig.current() }));
+        if (!policies.some(x => x.policy.public)) {
             throw new Error(`Bucket ${account}/${bucketName} is not public, so its files cannot be read over plain URLs`);
         }
         // Anonymous URL reads carry no source selection - the file's route picks the store, and a route no store here covers is simply not found (the routing file itself lives outside every store)
-        let httpStore: LoadedStore | undefined;
+        let httpStore: BlobStore | undefined;
+        let immutable = false;
         let info: { writeTime: number; size: number } | undefined;
         if (filePath !== ROUTING_FILE) {
             let route = getRoute(filePath);
-            httpStore = bucket.stores.find(s => routeContains(s.route, route));
-            info = httpStore && await httpStore.store.getInfo({ path: filePath }) || undefined;
+            let serving = policies.find(x => x.policy.public && routeContains(x.policy.route, route));
+            httpStore = serving?.store;
+            immutable = !!serving?.policy.immutable;
+            info = httpStore && await httpStore.getInfo({ path: filePath }) || undefined;
         } else {
             info = await getRoutingFileResult(account, bucketName);
         }
@@ -457,7 +469,8 @@ class RemoteStorageControllerBase {
             "Last-Modified": new Date(info.writeTime).toUTCString(),
             "Accept-Ranges": "bytes",
         };
-        if (bucket.self?.immutable) {
+        // The serving store's own policy - and never for the routing file, which changing is the whole point of
+        if (immutable) {
             headers["Cache-Control"] = `max-age=${IMMUTABLE_CACHE_TIME / 1000}`;
         }
         let ifModifiedSince = request?.headers["if-modified-since"];
@@ -490,7 +503,7 @@ class RemoteStorageControllerBase {
         }
         let result: { data: Buffer; writeTime: number; size: number } | undefined;
         if (httpStore) {
-            result = await httpStore.store.get2({ path: filePath, range });
+            result = await httpStore.get2({ path: filePath, range });
         } else {
             result = await getRoutingFileResult(account, bucketName);
             if (result && range) {
@@ -508,22 +521,12 @@ class RemoteStorageControllerBase {
     }
 }
 
-/** The one resolution every data call does: the client's selected sourceConfig maps to exactly one store (loading the bucket - and so instantiating its stores - if needed), and fn runs on it. findBucketStore throws for missing buckets and unmatched configs. */
-async function withStore<T>(config: { account: string; bucketName: string; sourceConfig: SourceConfig }, fn: (store: IBucketStore) => Promise<T>): Promise<T> {
-    let target = await findBucketStore(config.account, config.bucketName, config.sourceConfig);
-    return await fn(target.store);
+/** The one resolution every data call does: the client's selected sourceConfig NAMES exactly one store (created on first use), and fn runs on it. */
+async function withStore<T>(config: { account: string; bucketName: string; sourceConfig: SourceConfig }, fn: (store: BlobStore) => Promise<T>): Promise<T> {
+    return await fn(findBucketStore(config.account, config.bucketName, config.sourceConfig));
 }
 
-const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string; lastModified?: number; routeKey: string }>();
-
-async function findUploadStore(info: { account: string; bucketName: string; routeKey: string }): Promise<LoadedStore> {
-    let bucket = await requireBucket(info.account, info.bucketName);
-    let target = bucket.stores.find(x => x.routeKey === info.routeKey);
-    if (!target) {
-        throw new Error(`The store (route ${info.routeKey}) this upload targets no longer exists on bucket ${info.account}/${info.bucketName} (available: ${JSON.stringify(bucket.stores.map(x => x.routeKey))})`);
-    }
-    return target;
-}
+const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string; lastModified?: number; forceSetImmutable?: boolean; noChecks?: boolean; internal?: boolean; storeName: string }>();
 
 const accountAccess: SocketFunctionHook = async (context) => {
     let start = Date.now();
@@ -560,6 +563,7 @@ export const RemoteStorageController = SocketFunction.register(
         get2: { hooks: [accountAccess] },
         set: { hooks: [accountAccess] },
         del: { hooks: [accountAccess] },
+        move: { hooks: [accountAccess] },
         getInfo: { hooks: [accountAccess] },
         findInfo: { hooks: [accountAccess] },
         getChangesAfter2: { hooks: [accountAccess] },

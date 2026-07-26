@@ -1,5 +1,5 @@
 import { hostStorageServer } from "./storageServer";
-import { getArg } from "./cliArgs";
+import { getArg, getFlag } from "./cliArgs";
 
 // Hosts a storage server from the command line (via the storageserver bin, see package.json).
 
@@ -28,6 +28,10 @@ async function main() {
         url,
         folder,
         lowSpaceThresholdBytes,
+        // Do not forward ports, and base the ip-domain on our internal LAN ip instead of our external ip (for LAN-only servers behind a NAT we can't/won't open)
+        internal: getFlag("internal"),
+        // Serve a self-signed TLS cert signed by this machine's CA instead of getting a real (ACME) one - for servers without a Cloudflare-managed domain. Clients trust it by trusting the CA, or by visiting the server once and accepting the certificate.
+        selfSigned: getFlag("selfSigned"),
     });
 }
 

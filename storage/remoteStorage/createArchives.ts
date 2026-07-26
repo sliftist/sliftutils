@@ -1,32 +1,28 @@
-import { isNode, sort, timeoutToUndefinedSilent, watchSlowPromise } from "socket-function/src/misc";
+import { sort, watchSlowPromise } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, SourceConfig,
-    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, STORAGE_WRONG_VALID_WINDOW,
-    STORAGE_WRONG_ROUTE, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream,
+    ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, STORAGE_WRONG_VALID_WINDOW,
+    STORAGE_WRONG_ROUTE, STORAGE_NOT_CONFIGURED, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream,
 } from "../IArchives";
+import { copyArchiveFile } from "../archiveHelpers";
 import {
-    ROUTING_FILE, getConfigVersion, parseHostedUrl, parseBackblazeUrl,
-    normalizeRemoteConfig, normalizeSource, serializeRemoteConfig,
+    ROUTING_FILE, parseHostedUrl, parseBackblazeUrl, parseRoutingData, assertValidRemoteConfig,
+    normalizeRemoteConfig, normalizeSource,
     getRoute, routeContains, parseVariableRoute, getBucketBaseUrl, buildFileUrl,
 } from "./remoteConfig";
 import { ArchivesUrl } from "./ArchivesUrl";
-import { resolveIntermediateSources } from "./intermediateSources";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { ArchivesRemote, parseStorageUrl, authenticateStorage } from "./ArchivesRemote";
-import { onServerRoutingChanged } from "./storageClientController";
-import { ArchivesBackblaze } from "../backblaze";
-import { ServerBucketInfo, ActiveBucketInfo, getLocalArchives } from "./storageServerState";
-import { isOwnAddress } from "./serverConfig";
+import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageController";
-import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
+import { SourceWrapper } from "./sourceWrapper";
+import { ChainState, ChainStateManager } from "./chainStartup";
 import { formatTime } from "socket-function/src/formatting/format";
 
-const CONFIG_POLL_INTERVAL = 5 * 60 * 1000;
 const WRONG_TARGET_BOUNDARY_WINDOW = 30 * 1000;
 const WRONG_TARGET_BOUNDARY_RETRY_DELAY = 15 * 1000;
 const CONFIG_REFRESH_THROTTLE = 30 * 1000;
-const AVAILABILITY_RECHECK_THROTTLE = 5 * 1000;
 const PRIMARY_RETRY_TIMEOUT = 30 * 1000;
 const PRIMARY_RETRY_DELAY = 2 * 1000;
 const COVERING_RETRY_TIMEOUT = 30 * 1000;
@@ -50,21 +46,8 @@ type SmartTimeout = {
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
 
-export function createApiArchives(source: SourceConfig): IArchives {
-    if (source.type === "backblaze") {
-        return new ArchivesBackblaze({ bucketName: parseBackblazeUrl(source.url).bucketName, public: source.public, immutable: source.immutable, allowedOrigins: source.allowedOrigins });
-    }
-    let parsed = parseHostedUrl(source.url);
-    if (isNode() && isOwnAddress(parsed.address, parsed.port)) {
-        return getLocalArchives(parsed.account, parsed.bucketName, source);
-    }
-    return new ArchivesRemote({ url: source.url, waitForAccess: false, sourceConfig: source });
-}
-
-type ChainState = {
-    config: RemoteConfig;
-    sources: SourceWrapper[];
-};
+/** A client for ONE source - see storeSources.ts. Re-exported here because a chain is built out of them. */
+export { createApiArchives } from "./storeSources";
 
 export type ArchivesChainOptions = {
     /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
@@ -75,10 +58,6 @@ function configWindowCurrent(config: SourceConfig): boolean {
     let now = Date.now();
     let [start, end] = config.validWindow;
     return start <= now && now < end;
-}
-
-function configAcceptsWrites(config: SourceConfig): boolean {
-    return configWindowCurrent(config);
 }
 
 function materializeShardKey(key: string, target: SourceWrapper): string {
@@ -107,314 +86,20 @@ function preferUsable(sources: SourceWrapper[]): SourceWrapper[] {
 }
 
 export class ArchivesChain implements IArchives {
-    private configured: RemoteConfig;
-    private activeConfig: RemoteConfig;
-    private statePromise: Promise<ChainState> | undefined;
-    // The resolved state, for synchronous access (getGetURLs) - always the newest adopted config, where statePromise may briefly lag during a rebuild
-    private latestState: ChainState | undefined;
-    private initRetryDelay = RETRY_START_DELAY;
-    private initRetryTimer: ReturnType<typeof setTimeout> | undefined;
-    private pollTimer: ReturnType<typeof setInterval> | undefined;
-    private disposed = false;
-    private unsubscribeRoutingPush: (() => void) | undefined;
+    // The chain's state, and everything about having one (init + its retry, config polling/adoption, availability rechecks, the config rewrite loop), lives in the manager - what stays in this class is dispatch over that state
+    private state: ChainStateManager;
 
-    constructor(config: RemoteConfig | RemoteConfigBase, private options?: ArchivesChainOptions) {
-        this.configured = normalizeRemoteConfig(config);
-        this.activeConfig = this.configured;
-        this.unsubscribeRoutingPush = onServerRoutingChanged(() => {
-            void this.refreshActiveConfig().catch((e: Error) => console.error(`Config refresh failed for ${this.getDebugName()}: ${e.stack ?? e}`));
+    constructor(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions) {
+        this.state = new ChainStateManager({
+            configured: normalizeRemoteConfig(config),
+            debugName: () => this.getDebugName(),
+            directConnect: options?.directConnect,
         });
     }
 
     public getDebugName() {
-        let urls = this.activeConfig.sources.map(x => typeof x === "string" && x || (x as SourceConfig).url);
+        let urls = this.state.activeConfig.sources.map(x => typeof x === "string" && x || (x as SourceConfig).url);
         return `chain ${urls.join(", ")}`;
-    }
-
-    private getState(): Promise<ChainState> {
-        if (this.disposed) {
-            return Promise.reject(new Error(`ArchivesChain ${this.getDebugName()} has been disposed`));
-        }
-        if (!this.statePromise) {
-            let promise = this.init();
-            this.statePromise = promise;
-            promise.then(() => {
-                this.initRetryDelay = RETRY_START_DELAY;
-            }, (e: Error) => {
-                if (this.disposed || this.initRetryTimer) return;
-                console.error(`Storage init failed for ${this.getDebugName()}, retrying in ${Math.round(this.initRetryDelay / 1000)}s. ${e.stack ?? e}`);
-                this.initRetryTimer = setTimeout(() => {
-                    this.initRetryTimer = undefined;
-                    if (this.disposed) return;
-                    if (this.statePromise === promise) {
-                        this.statePromise = undefined;
-                    }
-                    this.getState().catch(() => { });
-                }, this.initRetryDelay);
-                (this.initRetryTimer as { unref?: () => void }).unref?.();
-                this.initRetryDelay = Math.min(RETRY_MAX_DELAY, this.initRetryDelay * RETRY_GROWTH);
-            });
-        }
-        return this.statePromise;
-    }
-
-    private async init(): Promise<ChainState> {
-        let configs = this.configured.sources.map(normalizeSource);
-        let readOnly = this.isReadOnly(this.configured);
-        let fetches = await Promise.all(configs.map(async sourceConfig => {
-            let probe = await SourceWrapper.create(sourceConfig, { background: false, readOnly });
-            let start = Date.now();
-            try {
-                let existing = await probe.readRoutingConfig();
-                return { probe, sourceConfig, responded: true, latency: Date.now() - start, existing, error: "" };
-            } catch (e) {
-                return { probe, sourceConfig, responded: false, latency: 0, existing: undefined, error: `${sourceConfig.url}: ${(e as Error).stack ?? e}` };
-            }
-        }));
-        try {
-            let found = fetches.find(x => x.responded);
-            if (!found) {
-                throw new Error(`Cannot initialize storage for ${this.getDebugName()}: no source answered. ${fetches.map(x => x.error).join(" | ")}`);
-            }
-            let existing = found.existing;
-            let active = this.configured;
-            let needsWrite = true;
-            if (existing && getConfigVersion(existing) >= getConfigVersion(this.configured)) {
-                if (getConfigVersion(existing) === getConfigVersion(this.configured) && JSON.stringify(existing) !== JSON.stringify(this.configured)) {
-                    console.error(`Archives configuration updated without updating the version, for ${found.sourceConfig.url}. Updates will be ignored until you increase the version. Using: ${JSON.stringify(existing)}, ignoring: ${JSON.stringify(this.configured)}`);
-                }
-                active = existing;
-                needsWrite = false;
-            }
-            if (needsWrite) {
-                let best: RemoteConfig | undefined;
-                let conflictUrl: string | undefined;
-                for (let fetch of fetches) {
-                    let stored = fetch.existing;
-                    if (!stored) continue;
-                    if (!best || getConfigVersion(stored) > getConfigVersion(best)) {
-                        best = stored;
-                    }
-                    if (getConfigVersion(stored) === getConfigVersion(this.configured) && JSON.stringify(stored) !== JSON.stringify(this.configured)) {
-                        conflictUrl = fetch.sourceConfig.url;
-                    }
-                }
-                if (best && getConfigVersion(best) >= getConfigVersion(this.configured)) {
-                    if (conflictUrl && getConfigVersion(best) === getConfigVersion(this.configured)) {
-                        console.error(`Archives configuration updated without updating the version, for ${conflictUrl}. Updates will be ignored until you increase the version. Using: ${JSON.stringify(best)}, ignoring: ${JSON.stringify(this.configured)}`);
-                    }
-                    active = best;
-                    needsWrite = false;
-                }
-            }
-            let sources = await this.buildSources(active);
-            if (needsWrite) {
-                let missing: string[] = [];
-                for (let source of sources) {
-                    try {
-                        if (!await source.hasWriteAccess()) {
-                            missing.push(source.config.url);
-                        }
-                    } catch (e) {
-                        missing.push(`${source.config.url} (check failed: ${(e as Error).stack ?? e})`);
-                    }
-                }
-                if (missing.length) {
-                    console.error(`Not writing the storage routing config for ${this.getDebugName()} (version ${getConfigVersion(this.configured)}): no write access to ${missing.join(", ")}. ${existing && `Running on the stored config (version ${getConfigVersion(existing)}) instead.` || `No stored config exists, so the bucket cannot be created until write access is granted.`}`);
-                    if (existing) {
-                        active = existing;
-                        for (let source of sources) {
-                            source.dispose();
-                        }
-                        sources = await this.buildSources(active);
-                    }
-                } else {
-                    try {
-                        let routingData = serializeRemoteConfig(this.configured);
-                        let routingWriteTime = Date.now();
-                        let writtenUrls = new Set<string>();
-                        for (let source of sources) {
-                            if (writtenUrls.has(source.config.url)) continue;
-                            writtenUrls.add(source.config.url);
-                        }
-                        console.log(`Storage routing config for ${this.getDebugName()} is out of date (stored version ${existing && getConfigVersion(existing) || "none"}, ours ${getConfigVersion(this.configured)}): writing ours to all ${writtenUrls.size} nodes (write time ${new Date(routingWriteTime).toISOString()}): ${[...writtenUrls].join(", ")}`);
-                        writtenUrls.clear();
-                        for (let source of sources) {
-                            if (writtenUrls.has(source.config.url)) continue;
-                            writtenUrls.add(source.config.url);
-                            await source.write(archives => archives.set(ROUTING_FILE, routingData, { lastModified: routingWriteTime }));
-                            console.log(`Wrote storage routing config version ${getConfigVersion(this.configured)} to ${source.config.url}`);
-                        }
-                    } catch (e) {
-                        for (let source of sources) {
-                            source.dispose();
-                        }
-                        throw e;
-                    }
-                }
-            }
-            for (let source of sources) {
-                let fetch = fetches.find(x => x.responded && x.sourceConfig.url === source.config.url);
-                if (fetch) {
-                    source.seedLatency(fetch.latency);
-                }
-            }
-            this.activeConfig = active;
-            this.startConfigPoll();
-            let state: ChainState = { config: active, sources };
-            this.latestState = state;
-            return state;
-        } finally {
-            for (let fetch of fetches) {
-                fetch.probe.dispose();
-            }
-        }
-    }
-
-    /** Clientside, a config with public sources is served entirely over plain URL downloads - no API connection, no access grant, and no writing. directConnect opts out of that. */
-    private isReadOnly(config: RemoteConfig): boolean {
-        if (this.options?.directConnect || isNode()) return false;
-        return config.sources.map(normalizeSource).some(x => x.public);
-    }
-
-    private async createChainSource(sourceConfig: SourceConfig, readOnly: boolean): Promise<SourceWrapper> {
-        let source = await SourceWrapper.create(sourceConfig, { readOnly });
-        source.startPinging();
-        return source;
-    }
-
-    private async buildSources(config: RemoteConfig): Promise<SourceWrapper[]> {
-        let readOnly = this.isReadOnly(config);
-        let sources: SourceWrapper[] = [];
-        for (let sourceConfig of config.sources.map(normalizeSource)) {
-            sources.push(await this.createChainSource(sourceConfig, readOnly));
-        }
-        return sources;
-    }
-
-    private startConfigPoll(): void {
-        if (this.pollTimer || this.disposed) return;
-        this.pollTimer = setInterval(() => {
-            void this.refreshActiveConfig().catch((e: Error) => {
-                console.error(`Checking for a new storage routing config failed for ${this.getDebugName()}: ${e.stack ?? e}`);
-            });
-        }, CONFIG_POLL_INTERVAL);
-        (this.pollTimer as { unref?: () => void }).unref?.();
-    }
-
-    // Deduplicates concurrent refreshes (the poll timer and wrong-target write retries share this)
-    private configRefreshInFlight: Promise<void> | undefined;
-    private refreshActiveConfig(): Promise<void> {
-        if (!this.configRefreshInFlight) {
-            this.configRefreshInFlight = this.checkForNewConfig().finally(() => {
-                this.configRefreshInFlight = undefined;
-            });
-        }
-        return this.configRefreshInFlight;
-    }
-
-    // The latest config, as the server INTERPRETS it: getConfig carries in-memory overlays (deploy
-    private async fetchLatestConfig(state: ChainState): Promise<RemoteConfig | undefined> {
-        let errors: string[] = [];
-        for (let source of state.sources) {
-            try {
-                let latest = await source.readRoutingConfig();
-                if (latest) return normalizeRemoteConfig(latest);
-            } catch (e) {
-                errors.push(`${source.config.url}: ${(e as Error).stack ?? e}`);
-            }
-        }
-        if (errors.length === state.sources.length) {
-            throw new Error(`No storage source could give us the routing config for ${this.getDebugName()}: ${errors.join(" | ")}`);
-        }
-        return undefined;
-    }
-
-    private async checkForNewConfig(): Promise<void> {
-        if (this.disposed || !this.statePromise) return;
-        let state: ChainState;
-        try {
-            state = await this.statePromise;
-        } catch {
-            return;
-        }
-        let latest = await this.fetchLatestConfig(state);
-        if (!latest) return;
-        await this.adoptNewConfig(state, latest);
-    }
-
-    private async adoptNewConfig(state: ChainState, latest: RemoteConfig): Promise<void> {
-        if (JSON.stringify(latest) === JSON.stringify(state.config)) return;
-        let received = new Date().toISOString();
-        let onlyIntermediatesChanged = JSON.stringify(resolveIntermediateSources(latest)) === JSON.stringify(resolveIntermediateSources(state.config));
-        if (onlyIntermediatesChanged) {
-            console.log(`Storage routing switchover windows changed (version ${getConfigVersion(state.config)} -> ${getConfigVersion(latest)}), received ${received}, rebuilding sources. New config: ${JSON.stringify(latest)}`);
-        } else {
-            console.log(`Storage routing config changed (version ${getConfigVersion(state.config)} -> ${getConfigVersion(latest)}), received ${received}, rebuilding sources. New config: ${JSON.stringify(latest)}`);
-        }
-        let strippedKey = (config: SourceConfig) => JSON.stringify({ ...config, validWindow: undefined });
-        let oldByConfig = new Map<string, SourceWrapper[]>();
-        for (let source of state.sources) {
-            let key = strippedKey(source.config);
-            let list = oldByConfig.get(key);
-            if (!list) {
-                list = [];
-                oldByConfig.set(key, list);
-            }
-            list.push(source);
-        }
-        let readOnly = this.isReadOnly(latest);
-        let sources: SourceWrapper[] = [];
-        for (let sourceConfig of latest.sources.map(normalizeSource)) {
-            let old = oldByConfig.get(strippedKey(sourceConfig))?.shift();
-            if (old) {
-                old.updateValidWindow(sourceConfig.validWindow);
-                sources.push(old);
-            } else {
-                sources.push(await this.createChainSource(sourceConfig, readOnly));
-            }
-        }
-        for (let leftovers of oldByConfig.values()) {
-            for (let leftover of leftovers) {
-                leftover.dispose();
-            }
-        }
-        this.activeConfig = latest;
-        let newState: ChainState = { config: latest, sources };
-        this.latestState = newState;
-        this.statePromise = Promise.resolve(newState);
-    }
-
-    private lastAvailabilityRecheck = 0;
-    private availabilityRecheckInFlight: Promise<void> | undefined;
-    private recheckAvailability(): Promise<void> {
-        if (this.availabilityRecheckInFlight) return this.availabilityRecheckInFlight;
-        if (Date.now() - this.lastAvailabilityRecheck < AVAILABILITY_RECHECK_THROTTLE) return Promise.resolve();
-        this.lastAvailabilityRecheck = Date.now();
-        this.availabilityRecheckInFlight = this.recheckAvailabilityNow().finally(() => {
-            this.availabilityRecheckInFlight = undefined;
-        });
-        return this.availabilityRecheckInFlight;
-    }
-    private async recheckAvailabilityNow(): Promise<void> {
-        if (this.disposed || !this.statePromise) return;
-        let state: ChainState;
-        try {
-            state = await this.statePromise;
-        } catch {
-            return;
-        }
-        console.log(`Every storage source failed for ${this.getDebugName()}; re-contacting all ${state.sources.length} sources (routing re-read + connection re-attempt)`);
-        let results = await Promise.all(state.sources.map(async source => {
-            try {
-                return await source.readRoutingConfig();
-            } catch {
-                return undefined;
-            }
-        }));
-        let latest = results.find(x => x);
-        if (!latest) return;
-        await this.adoptNewConfig(state, latest);
     }
 
     // The ONE dispatch for every operation: no fallbacks (all writes by default, and noFallbacks reads) -> the primary node only, via runPrimary; everything else -> the shared fallback loop, trying sources in config order (or latency order for fast reads) and only moving on when one fails. Writes in the loop differ from reads only in calling source.write.
@@ -462,12 +147,19 @@ export class ArchivesChain implements IArchives {
                         errors.push(message);
                         continue;
                     }
-                    // A wrong-window/route rejection means OUR config is stale, so every source we'd fall back to is judged by the same stale config - refresh it and restart the pass instead
-                    if ((message.includes(STORAGE_WRONG_VALID_WINDOW) || message.includes(STORAGE_WRONG_ROUTE)) && !retriedWrongTarget) {
+                    // A wrong-window/route/unconfigured rejection means OUR config disagrees with the server's, so every source we'd fall back to is judged by the same stale config - refresh it and restart the pass instead
+                    if ((message.includes(STORAGE_WRONG_VALID_WINDOW) || message.includes(STORAGE_WRONG_ROUTE) || message.includes(STORAGE_NOT_CONFIGURED)) && !retriedWrongTarget) {
                         retriedWrongTarget = true;
                         wrongTarget = true;
-                        await this.prepareWrongTargetRetry(state, message.includes(STORAGE_WRONG_VALID_WINDOW) && "window" || "route");
+                        await this.prepareWrongTargetRetry(state, message.includes(STORAGE_WRONG_VALID_WINDOW) && "window" || message.includes(STORAGE_WRONG_ROUTE) && "route" || "unconfigured");
                         break;
+                    }
+                    // fallbacks means availability above everything: ANY failing source - down, misconfigured, rejecting, mid-switchover - is skipped and the next covering source takes the call. Only every source failing throws (below). Without fallbacks, a CONNECTED source's error is a real answer and throws.
+                    if (config.fallbacks) {
+                        console.error(`Source failed for ${this.getDebugName()}, falling back to the next source: ${message}`);
+                        if (!source.isConnected()) source.noteFailure();
+                        errors.push(message);
+                        continue;
                     }
                     if (source.isConnected()) throw e;
                     source.noteFailure();
@@ -475,13 +167,13 @@ export class ArchivesChain implements IArchives {
                 }
             }
             if (wrongTarget) {
-                state = await this.getState();
+                state = await this.state.getState();
                 continue;
             }
             if (!recheckedAvailability) {
                 recheckedAvailability = true;
-                await this.recheckAvailability();
-                state = await this.getState();
+                await this.state.recheckAvailability();
+                state = await this.state.getState();
                 continue;
             }
             throw new Error(`All sources failed for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""}: ${errors.join(" | ") || "no sources available"}`);
@@ -492,13 +184,14 @@ export class ArchivesChain implements IArchives {
     private async runPrimary<T>(config: { write?: boolean; route?: number; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let retriedWrongWindow = false;
         let retriedWrongRoute = false;
+        let retriedNotConfigured = false;
         let deadline = Date.now() + PRIMARY_RETRY_TIMEOUT;
         let attempt = 0;
         while (true) {
             attempt++;
             let attemptStart = Date.now();
-            let state = await this.getState();
-            let target = state.sources.find(x => configAcceptsWrites(x.config) && (config.route === undefined || routeContains(x.config.route, config.route)));
+            let state = await this.state.getState();
+            let target = state.sources.find(x => configWindowCurrent(x.config) && (config.route === undefined || routeContains(x.config.route, config.route)));
             try {
                 if (!target) {
                     throw new Error(`No source is the ${config.write && "write target" || "primary read source"} for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""} (every source is outside its valid window or outside the key's route)`);
@@ -520,6 +213,11 @@ export class ArchivesChain implements IArchives {
                     await this.prepareWrongTargetRetry(state, "route");
                     continue;
                 }
+                if (message.includes(STORAGE_NOT_CONFIGURED) && !retriedNotConfigured) {
+                    retriedNotConfigured = true;
+                    await this.prepareWrongTargetRetry(state, "unconfigured");
+                    continue;
+                }
                 if (target && !target.isConnected()) target.noteFailure();
                 if (!config.write && target && (attempt === 1 || attempt % 3 === 0)) {
                     // The reason we try the HTTP request: httpsRequest has better DNS retrying capabilities than our WebSocket server (we have more control over it), so just using it can fix some DNS issues, which can propagate to fix the WebSocket connection. It is still the primary source's own data, so the no-fallback semantics hold - and ArchivesUrl has no setup cost, so making one on the spot is fine.
@@ -533,7 +231,7 @@ export class ArchivesChain implements IArchives {
             }
             // At most one attempt per interval, in case the failure is fast
             await delay(Math.max(0, attemptStart + PRIMARY_RETRY_DELAY - Date.now()));
-            await this.recheckAvailability();
+            await this.state.recheckAvailability();
         }
     }
 
@@ -581,7 +279,7 @@ export class ArchivesChain implements IArchives {
     }
 
     private lastConfigRefresh = 0;
-    private async prepareWrongTargetRetry(state: ChainState, kind: "window" | "route"): Promise<void> {
+    private async prepareWrongTargetRetry(state: ChainState, kind: "window" | "route" | "unconfigured"): Promise<void> {
         if (kind === "window") {
             let now = Date.now();
             let nearBoundary = state.sources.some(source => source.config.validWindow.some(t => t > 0 && t < Number.MAX_SAFE_INTEGER && Math.abs(t - now) <= WRONG_TARGET_BOUNDARY_WINDOW));
@@ -593,17 +291,18 @@ export class ArchivesChain implements IArchives {
         }
         if (Date.now() - this.lastConfigRefresh < CONFIG_REFRESH_THROTTLE) return;
         this.lastConfigRefresh = Date.now();
-        console.log(`Write rejected by ${this.getDebugName()} (wrong ${kind}): our config is stale (likely a deploy switchover); refreshing it and retrying`);
-        await this.refreshActiveConfig();
+        let reason = kind === "window" && "wrong valid window" || kind === "route" && "wrong route" || "the store has no configuration entry on that server";
+        console.log(`Write rejected by ${this.getDebugName()} (${reason}): our config disagrees with the server's (likely stale, or a deploy switchover); refreshing it and retrying`);
+        await this.state.refreshActiveConfig();
     }
 
     private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fallbacks?: boolean; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
-        let state = await this.getState();
+        let state = await this.state.getState();
         return await this.run(state, config, run);
     }
 
     public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
-        let state = await this.getState();
+        let state = await this.state.getState();
         for (let source of state.sources) {
             // A source whose window has passed is never read or written again, so its access state is irrelevant - and asking a dead intermediate would just hang or throw. Future windows DO matter: access should be granted before their window starts.
             if (source.config.validWindow[1] <= Date.now()) continue;
@@ -669,7 +368,7 @@ export class ArchivesChain implements IArchives {
         let tries = 0;
         while (true) {
             tries++;
-            let state = await this.getState();
+            let state = await this.state.getState();
             // Errors name the OPERATION and the SPECIFIC sources that failed - "the find failed because source X is unavailable", never an anonymous failure attributed to the whole chain
             let outcome = await (async (): Promise<{ values: T[] } | { error: Error }> => {
                 let covering: SourceWrapper[];
@@ -705,9 +404,7 @@ export class ArchivesChain implements IArchives {
             })();
             if ("values" in outcome) return outcome.values;
             let error = outcome.error;
-            if (Date.now() >= deadline) {
-                throw error;
-            }
+            // Substitution comes BEFORE the deadline check: a single connect timeout can eat the entire deadline, and giving up then - without ever trying the substitute that fallbacks exist for - throws exactly when falling back matters most. Substitution cannot loop past the deadline forever: every pass adds its failures to `failed`, so the substitutes run out with the sources.
             if (config?.fallbacks && failed.size) {
                 let substitutable = false;
                 try {
@@ -721,8 +418,11 @@ export class ArchivesChain implements IArchives {
                 // No substitute covers the failed routes - retry the failed sources themselves after the delay
                 failed.clear();
             }
+            if (Date.now() >= deadline) {
+                throw error;
+            }
             console.error(`${error.message}. Retrying in ${COVERING_RETRY_DELAY / 1000}s (giving up at ${new Date(deadline).toISOString()}).`);
-            void this.recheckAvailability();
+            void this.state.recheckAvailability();
             await delay(COVERING_RETRY_DELAY);
         }
     }
@@ -774,15 +474,15 @@ export class ArchivesChain implements IArchives {
         };
     }
     public async getConfig(): Promise<ArchivesConfig> {
-        let state = await this.getState();
+        let state = await this.state.getState();
         if (!state.sources.some(x => x.api)) return { remoteConfig: state.config };
         let config = await this.run(state, { apiOnly: true }, archives => archives.getConfig());
         return { ...config, remoteConfig: state.config };
     }
     public async hasWriteAccess(): Promise<boolean> {
-        let state = await this.getState();
+        let state = await this.state.getState();
         for (let source of state.sources) {
-            if (!configAcceptsWrites(source.config)) continue;
+            if (!configWindowCurrent(source.config)) continue;
             if (!await source.hasWriteAccess()) return false;
         }
         return true;
@@ -799,8 +499,8 @@ export class ArchivesChain implements IArchives {
             return await this.setVariableShard(fileName, data, config);
         }
         if (data.length > LARGE_SET_THRESHOLD) {
-            // Streamed automatically so callers never have to call setLargeFile themselves when they already hold the buffer - one giant message would exceed the wire limit and lag every other client on the connection
-            await this.setLargeFile({ path: fileName, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) });
+            // Streamed automatically so callers never have to call setLargeFile themselves when they already hold the buffer - one giant message would exceed the wire limit and lag every other client on the connection. The whole config goes with it (including fallbacks, which the buffer's restartStream makes possible): a file must not get different write semantics just for being big.
+            await this.setLargeFile({ path: fileName, ...config, ...bufferChunkStream(data) });
             return fileName;
         }
         await this.request({ write: true, fallbacks: config?.fallbacks, route: getRoute(fileName), timeout: { uploadBytes: data.length, label: `Upload of ${JSON.stringify(fileName)} (${data.length} bytes)` } }, archives => archives.set(fileName, data, config));
@@ -808,26 +508,35 @@ export class ArchivesChain implements IArchives {
     }
 
     private async setRoutingConfig(data: Buffer, config?: { lastModified?: number }): Promise<string> {
-        let state = await this.getState();
+        // Checked before the first node is written to, not just by each node as it arrives: every server would reject it anyway, and finding that out one node at a time is how a config write ends up half-applied
+        assertValidRemoteConfig(parseRoutingData(data));
+        let state = await this.state.getState();
         let writeTime = config?.lastModified || Date.now();
         let written: string[] = [];
         let errors: string[] = [];
+        // One write per STORE, not per server: the write lands in the store the entry NAMES, so two entries sharing a URL but naming different stores are two separate deliveries - deduping by URL alone leaves the second store unconfigured forever
+        let targets: SourceWrapper[] = [];
         let seen = new Set<string>();
-        console.log(`Writing storage routing config for ${this.getDebugName()} to every node (write time ${new Date(writeTime).toISOString()}): ${data.toString("utf8").slice(0, 2000)}`);
         for (let source of state.sources) {
-            if (seen.has(source.config.url)) continue;
-            seen.add(source.config.url);
+            let key = `${source.config.url}|${source.config.name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            targets.push(source);
+        }
+        console.log(`Writing storage routing config for ${this.getDebugName()} to all ${targets.length} stores (write time ${new Date(writeTime).toISOString()}): ${data.toString("utf8").slice(0, 2000)}`);
+        await Promise.all(targets.map(async source => {
+            let label = `${source.config.url} (store ${JSON.stringify(source.config.name)})`;
             try {
                 await source.write(archives => archives.set(ROUTING_FILE, data, { lastModified: writeTime }));
-                written.push(source.config.url);
-                console.log(`Wrote the storage routing config to ${source.config.url}`);
+                written.push(label);
+                console.log(`Wrote the storage routing config to ${label}`);
             } catch (e) {
-                errors.push(`${source.config.url}: ${(e as Error).stack ?? e}`);
+                errors.push(`${label}: ${(e as Error).stack ?? e}`);
             }
-        }
-        await this.refreshActiveConfig();
+        }));
+        await this.state.refreshActiveConfig();
         if (errors.length) {
-            throw new Error(`Storage routing config write for ${this.getDebugName()} failed on ${errors.length} of ${seen.size} nodes (succeeded on: ${written.join(", ") || "none"}): ${errors.join(" | ")}`);
+            throw new Error(`Storage routing config write for ${this.getDebugName()} failed on ${errors.length} of ${targets.length} stores (succeeded on: ${written.join(", ") || "none"}): ${errors.join(" | ")}`);
         }
         return ROUTING_FILE;
     }
@@ -835,11 +544,42 @@ export class ArchivesChain implements IArchives {
         await this.request({ write: true, fallbacks: config?.fallbacks, route: getRoute(fileName), timeout: { uploadBytes: 0, label: `Deletion of ${JSON.stringify(fileName)}` } }, archives => archives.del(fileName, config));
     }
 
+    /** See IArchives.move. When one node is the write target for BOTH paths, that node moves the file itself - the bytes never come through us - with the same wrong-window/route re-resolution as any write. When the paths route to different shards no single node holds both, so the move degrades to a copy through us plus a delete, CONFIRMED at the destination before the source is touched. No smart timeout on the node-side move: it can be a big file's worth of node-side work, which the upload-sized deadlines would misjudge. */
+    public async move(config: MoveFileConfig): Promise<void> {
+        if (config.fromPath === config.toPath) return;
+        if (config.fromPath === ROUTING_FILE || config.toPath === ROUTING_FILE) {
+            throw new Error(`The routing config ${JSON.stringify(ROUTING_FILE)} cannot be moved`);
+        }
+        let fromRoute = getRoute(config.fromPath);
+        let toRoute = getRoute(config.toPath);
+        let state = await this.state.getState();
+        let target = state.sources.find(x => configWindowCurrent(x.config) && routeContains(x.config.route, fromRoute));
+        if (target && routeContains(target.config.route, toRoute)) {
+            await this.request({ write: true, route: fromRoute }, async archives => {
+                if (!archives.move) {
+                    throw new Error(`${archives.getDebugName()} does not support move (moving ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)})`);
+                }
+                await archives.move(config);
+            });
+            return;
+        }
+        // Inline rather than moveArchiveFile, which - given one archives that implements move - would just call back into this method
+        let copied = await copyArchiveFile({ from: this, to: this, path: config.fromPath, toPath: config.toPath });
+        if (!copied) {
+            throw new Error(`Cannot move ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)}: the source file does not exist on ${this.getDebugName()}`);
+        }
+        let confirmed = await this.getInfo(config.toPath);
+        if (!confirmed) {
+            throw new Error(`Not deleting ${JSON.stringify(config.fromPath)} after copying it to ${JSON.stringify(config.toPath)}: the destination does not report it (${this.getDebugName()}) - the file is left at the source`);
+        }
+        await this.del(config.fromPath);
+    }
+
     // One write target per route range, lowest latency first. Within a shard the target is ALWAYS the first source in config order (see runPrimary - writes must stay on the same node): connectivity only decides which SHARD we pick, never which node within it, so a shard whose node is disconnected is dropped entirely when connectedOnly is set.
     private getVariableShardTargets(state: ChainState, config: { connectedOnly: boolean }): SourceWrapper[] {
         let targetsByRoute = new Map<string, SourceWrapper>();
         for (let source of state.sources) {
-            if (!configAcceptsWrites(source.config)) continue;
+            if (!configWindowCurrent(source.config)) continue;
             let routeKey = JSON.stringify(source.config.route || FULL_ROUTE);
             if (!targetsByRoute.has(routeKey)) {
                 targetsByRoute.set(routeKey, source);
@@ -858,7 +598,7 @@ export class ArchivesChain implements IArchives {
         if (!key.includes(VARIABLE_SHARD) || parseVariableRoute(key) !== undefined) {
             throw new Error(`getShardKey requires a key containing an unmaterialized ${JSON.stringify(VARIABLE_SHARD)}, got ${JSON.stringify(key)}`);
         }
-        let state = await this.getState();
+        let state = await this.state.getState();
         let target = this.getVariableShardTargets(state, { connectedOnly: true })[0]
             || this.getVariableShardTargets(state, { connectedOnly: false })[0];
         if (!target) {
@@ -872,7 +612,7 @@ export class ArchivesChain implements IArchives {
         // There's no point talking to a shard whose node was fast but is now disconnected - only when no connected shard works do we recheck availability and try every shard
         let connectedOnly = true;
         while (true) {
-            let state = await this.getState();
+            let state = await this.state.getState();
             let targets = this.getVariableShardTargets(state, { connectedOnly });
             let errors: string[] = [];
             for (let target of targets) {
@@ -881,7 +621,7 @@ export class ArchivesChain implements IArchives {
                     // The shard picking already retries across shards, so a stuck shard just costs its timeout and we move on. Large data streams via setLargeFile - the key is already materialized here, so the no-VARIABLE_SHARD restriction on setLargeFile doesn't apply.
                     await this.applySmartTimeout({ uploadBytes: data.length, label: `Variable-shard upload of ${JSON.stringify(fullKey)} (${data.length} bytes)` }, target, () => {
                         if (data.length > LARGE_SET_THRESHOLD) {
-                            return target.write(archives => archives.setLargeFile({ path: fullKey, lastModified: config?.lastModified, getNextData: bufferChunkStream(data) }));
+                            return target.write(archives => archives.setLargeFile({ path: fullKey, ...config, ...bufferChunkStream(data) }));
                         }
                         return target.write(archives => archives.set(fullKey, data, config)) as any;
                     });
@@ -902,26 +642,43 @@ export class ArchivesChain implements IArchives {
             if (!recheckedAvailability) {
                 recheckedAvailability = true;
                 connectedOnly = false;
-                await this.recheckAvailability();
+                await this.state.recheckAvailability();
                 continue;
             }
             throw new Error(`Every variable-shard write target failed for ${this.getDebugName()}: ${errors.join(" | ") || "no sources accept writes"}`);
         }
     }
 
-    public async setLargeFile(config: { path: string; lastModified?: number; getNextData(): Promise<Buffer | undefined> }): Promise<void> {
+    /** A large file is written exactly like a small one - same write node, same wrong-window/route re-resolution, same fallbacks - so a value's SIZE never decides its write semantics (set streams through here past LARGE_SET_THRESHOLD, and a file that grew past it must not suddenly lose the availability its caller asked for). The one difference: every attempt after the first has to rewind the stream, so a config without restartStream gets a single attempt. */
+    public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
         if (config.path.includes(VARIABLE_SHARD) && parseVariableRoute(config.path) === undefined) {
             throw new Error(`setLargeFile does not support VARIABLE_SHARD keys (there is no way to return the materialized key); write the file with set, or materialize the key yourself. Key: ${JSON.stringify(config.path)}`);
         }
         let route = getRoute(config.path);
+        const restartStream = config.restartStream;
+        if (!restartStream) {
+            await this.setLargeFileOnce(config, route);
+            return;
+        }
+        let attempt = 0;
+        await this.request({ write: true, fallbacks: config.fallbacks, route }, async archives => {
+            attempt++;
+            // The previous attempt consumed some (or all) of the stream, and this source needs the file from its first byte
+            if (attempt > 1) await restartStream();
+            await watchSlowPromise(`setLargeFile|${config.path}`, archives.setLargeFile(config));
+        });
+    }
+
+    // A stream that cannot rewind gets exactly ONE attempt at the write node: retrying anywhere (another source, or this one again) would send whatever is left of an already-consumed stream as if it were the whole file.
+    private async setLargeFileOnce(config: SetLargeFileConfig, route: number): Promise<void> {
         let recheckedAvailability = false;
         while (true) {
-            let state = await this.getState();
-            let target = state.sources.find(x => configAcceptsWrites(x.config) && routeContains(x.config.route, route));
+            let state = await this.state.getState();
+            let target = state.sources.find(x => configWindowCurrent(x.config) && routeContains(x.config.route, route));
             if (!target) {
                 if (!recheckedAvailability) {
                     recheckedAvailability = true;
-                    await this.recheckAvailability();
+                    await this.state.recheckAvailability();
                     continue;
                 }
                 throw new Error(`No source accepts writes for setLargeFile on ${this.getDebugName()} (route ${route})`);
@@ -953,19 +710,19 @@ export class ArchivesChain implements IArchives {
 
     /** getURLs, but after the one await (initialization) the returned function is synchronous: everything underneath - route hashing, window checks, latencies, URL building - is synchronous, and the closure always reads the newest adopted config, so it stays correct across config refreshes. */
     public async getGetURLs(): Promise<(path: string) => string[]> {
-        let initialState = await this.getState();
+        let initialState = await this.state.getState();
         return this.makeGetURLs(initialState, { writeNodeFirst: true });
     }
 
     /** getGetURLs, but sorted purely by latency - the write node gets no special first position. For read-only consumers that just want the fastest host. */
     public async getGetFastURLs(): Promise<(path: string) => string[]> {
-        let initialState = await this.getState();
+        let initialState = await this.state.getState();
         return this.makeGetURLs(initialState, { writeNodeFirst: false });
     }
 
     private makeGetURLs(initialState: ChainState, config: { writeNodeFirst: boolean }): (path: string) => string[] {
         return (path: string) => {
-            let state = this.latestState || initialState;
+            let state = this.state.latest() || initialState;
             let route = getRoute(path);
             let sources: SourceWrapper[] = [];
             for (let source of state.sources) {
@@ -989,22 +746,7 @@ export class ArchivesChain implements IArchives {
     }
 
     public dispose(): void {
-        this.disposed = true;
-        this.unsubscribeRoutingPush?.();
-        if (this.pollTimer) {
-            clearInterval(this.pollTimer);
-        }
-        if (this.initRetryTimer) {
-            clearTimeout(this.initRetryTimer);
-        }
-        let statePromise = this.statePromise;
-        if (statePromise) {
-            void statePromise.then(state => {
-                for (let source of state.sources) {
-                    source.dispose();
-                }
-            }, () => { });
-        }
+        this.state.dispose();
     }
 }
 

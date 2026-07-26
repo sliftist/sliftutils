@@ -14,6 +14,12 @@ If the client tries to do a write where the valid state is far enough away or th
 
 Storage routing JSON is only written to if we have write access and it's only written to on startup, it doesn't propagate. that way things don't revert without the developer intentionally rerunning it. 
 
+## A source's name is the storage; everything else about it is policy
+
+Every source entry carries a name, and that name is the storage it refers to: one folder on the server that holds it, one store, one index. Entries sharing a name (for the same account and bucket) ARE the same storage, however many there are and whatever their windows and routes say — and a request resolves to a store by that name alone, comparing nothing else. Windows and routes are policy layered on top: they decide WHEN a source is written to and WHICH KEYS it takes, and changing them never moves a byte, because they were never what said where the bytes live.
+
+This is why re-routing is safe and free. Previously the folder was derived from the route, so re-sharding renamed the storage under a running server and stranded whatever was in the old folder. Now the route can change as often as you like and the data does not move; if you want data in a different place, you say so by using a different name, which is a decision the developer makes deliberately. The flip side is that names must be treated as permanent identifiers: two unrelated entries sharing a name merge their data, and reusing a retired name hands the new entry the retired one's files. The server does exactly what the name says and does not try to guess.
+
 ## Redundancy, sharding, and deployment
 
 For redundancy, we can just have multiple different configurations that will satisfy the same request. The first one is the one that we write to. If that one's down, we don't do writes.
@@ -22,13 +28,15 @@ However, there's also sharding, where we have different route ranges that values
 
 The valid windows allow us to schedule deployments, so the nodes can switch over gracefully.
 
-## BulkDatabase2 index + our own disk as just another source
+## The index is a Map + a transaction log, and our own disk is just another source
 
-Each bucket's store keeps a BulkDatabase2 index of every file (path, write time, size, holding source), served from memory — existence checks and listings are extremely fast, never touching a source. The trick that keeps the index accurate: our own disk is not special-cased, it is simply the first synchronization source. The same scan/reconcile code that synchronizes remote sources also synchronizes the disk with the index, so the index self-heals from the same machinery instead of needing separate consistency logic.
+Each bucket's store keeps an index of every file (path, write time, size, holding source) as a plain in-memory Map, with an append-only transaction log behind it (LogMap) — one file, one record per set, delete or purge. Deletions live in a second map beside it, holding the time each key was deleted, so a tombstone is not a file with a size of zero that every listing, scan and count has to remember to skip: it is simply not among the files. That also makes expiring them a walk of the tombstones alone. The index takes the time of every change and refuses anything older than what it has, so ordering is decided in one place rather than at each of the paths a write can arrive by — and a write older than the deletion that removed a key cannot bring it back. Existence checks and the file count are Map operations, listings and totals are one pass over memory, and nothing reads a source to answer them. The log is only ever there to rebuild the Map on startup: it is replayed once, and rewritten from the Map whenever it has grown past a few records per surviving value, so rewriting the same keys forever cannot make it grow forever. Appends are coalesced, so a crash can lose the last moment of index changes — which is acceptable precisely because of the section above: a scan reconstructs anything the index is missing. The trick that keeps the index accurate: our own disk is not special-cased, it is simply the first synchronization source. The same scan/reconcile code that synchronizes remote sources also synchronizes the disk with the index, so the index self-heals from the same machinery instead of needing separate consistency logic.
 
 ## Metadata first, data second
 
 We have an index that says where our data is, which we load immediately. Therefore, we can start acting as the authority immediately. And then we do a fast sync based on all of our sources, one of them being a disk source, in order to update this. This means that almost all the time we are immediately ready, and if anything is out of sync, we'll find it as quickly as possible. The index and our syncs just synchronize which files exist, their write times, and their sizes, which is almost always sufficient to characterize a unique state, while being very fast, and supported for all sources (backblaze, etc).
+
+Being the authority means the index IS the answer: a key that is not in it does not exist here, and a read that misses it does nothing special — it does not go poke the sources, and it does not wait. Scans are what fill the index, on their own schedule. Listings are the one exception, and they wait for our own disk's first scan before answering: a single key coming back missing is a miss the caller can retry, but a listing that quietly omits half a folder looks like an answer and gets acted on. The gap this leaves is a store that comes up with files in its folder that its persisted index doesn't know about (another process wrote them), which stay invisible to reads until the disk scan reaches them — and that is fine, because valid windows hand over with notice: a node becomes the write target at a scheduled time, not the moment it starts, so it has finished scanning long before anyone is asking it for those files.
 
 ## Client writes are consistent; client reads are redundant
 
@@ -42,13 +50,19 @@ Machines authenticate with their certs.ts identity (proving ownership of their m
 
     This is our special file that stores the routing information. We write it directly to each node. The client side tries to keep an updated version of these (that's mentioned earlier And is how the client can keep up to date even if the client's code isn't up to date, As long as at least one of the sources is still alive).
 
-    IMPORTANTLY! This special file is never synchronized between different storage nodes. It's only directly written to, and it's only read off of our disk. It can be written to on any node. We don't take into account the valid state window or the shard. We still do take into account the write time, though, the latest write time wins. We only allow writes if version >= the previous version.
+    It is a file IN the store, and the store OWNS it: a store reads its own copy and configures itself from it - its routes, its windows, its flags, and which peers it synchronizes with. A store that has no copy is a complete, working store of just its own disk, valid always, for the whole key space, which is what lets a store exist before it has ever heard of a configuration.
+
+    It propagates by PULL, not push: beside the scan loops, every peer is asked for this one file every five minutes - far more often than a full rescan, because it is small and because it is the file that decides what everything else does. A copy with a greater version is written into our own store as an internal write, exactly like a scan storing anything else it pulled, and the store notices that file landing and re-configures itself. So an operator writing a config and a peer's copy arriving are the same event, and there is one mechanism instead of two. Older or equal versions are ignored, which is what stops a config from ever reverting.
+
+    It is exempt from every check a normal write passes - windows, routes, immutability, internal-write acceptance - because it is the file that DEFINES those things: judging it by the config it is about to replace is how a store gets stuck on a configuration it can never be told to leave. The write time still applies, latest wins.
 
 ## fast writes
 
     We support a flag that does fast writes, which will cause us to batch all the writes in memory, Returning from the set call immediately. This allows you to do many writes to the same file with very little disk I/O. This uses a configurable delay amount. You could set it to zero and then we just won't delay it at all, and we'll flush everything to the disk immediately away. 
 
-    The deploy system will tell us if it's intending to switch over a source, which we use to create a virtual valid state window in the middle that uses a different port. 
+    The delay is a wrapper around ONE source, not a buffer inside the store: a delayed source takes the write into memory, returns, collapses repeated writes to the same path, and serves its own pending writes to anything reading through it. So each source gets its own delay, passed in when it is built — our own disk and our own storage servers take a short one (cross-node redundancy should not wait minutes), an expensive external source like backblaze takes the full one. The store itself has no idea any of this is happening; it writes to its sources and updates its index, and the index records the write when it is accepted, not when it reaches storage.
+
+    The deploy system will tell us if it's intending to switch over a source, which we use to create a virtual valid state window in the middle that uses a different port. That port is only ever a second way to reach a source we already have, so we never scan it (its listing would be the listing we already get from that source) and we never record it as the holder of anything — index entries name the source it was split out of, which outlives it. 
 
     We look at the valid state windows and we make sure we never delay past the valid state window. In fact, if we are within five minutes of being invalid due to the valid state window, we flush the writes immediately. That way, when the next valid window starts running, the writes will be already on disk. 
 

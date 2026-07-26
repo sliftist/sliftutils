@@ -164,7 +164,7 @@ export class BulkDatabaseReader<T extends { key: string }> {
         return { key, value: r.value as T[C], time: r.time };
     }
 
-    // ── sync (reactive) reads ────────────────────────────────────────────────────────────────────────
+    // ── synchronized (reactive) reads ────────────────────────────────────────────────────────────────────────
     getSingleFieldSync<C extends keyof T>(key: string, column: C): T[C] | undefined {
         return this.getSingleFieldObjSync(key, column)?.value;
     }

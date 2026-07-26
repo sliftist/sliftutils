@@ -1,43 +1,19 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
+import { IArchives, RemoteConfig, RemoteConfigBase, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
 import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
-export declare function createApiArchives(source: SourceConfig): IArchives;
+/** A client for ONE source - see storeSources.ts. Re-exported here because a chain is built out of them. */
+export { createApiArchives } from "./storeSources";
 export type ArchivesChainOptions = {
     /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
     directConnect?: boolean;
 };
 export declare class ArchivesChain implements IArchives {
-    private options?;
-    private configured;
-    private activeConfig;
-    private statePromise;
-    private latestState;
-    private initRetryDelay;
-    private initRetryTimer;
-    private pollTimer;
-    private disposed;
-    private unsubscribeRoutingPush;
-    constructor(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions | undefined);
+    private state;
+    constructor(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions);
     getDebugName(): string;
-    private getState;
-    private init;
-    /** Clientside, a config with public sources is served entirely over plain URL downloads - no API connection, no access grant, and no writing. directConnect opts out of that. */
-    private isReadOnly;
-    private createChainSource;
-    private buildSources;
-    private startConfigPoll;
-    private configRefreshInFlight;
-    private refreshActiveConfig;
-    private fetchLatestConfig;
-    private checkForNewConfig;
-    private adoptNewConfig;
-    private lastAvailabilityRecheck;
-    private availabilityRecheckInFlight;
-    private recheckAvailability;
-    private recheckAvailabilityNow;
     private run;
     private runPrimary;
     /** Races call against a size-based deadline. Uploads know their size upfront; gets are given SMART_TIMEOUT_PROBE to produce anything, and only then is the file's info fetched (from the same source, itself time-limited) to size the deadline - measured from the call's start, so a source that was slow before the probe doesn't get the full allowance again. Timed-out calls keep running in the background (they cannot be cancelled) but their eventual result is ignored. */
@@ -91,15 +67,15 @@ export declare class ArchivesChain implements IArchives {
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     private setRoutingConfig;
     del(fileName: string, config?: DelConfig): Promise<void>;
+    /** See IArchives.move. When one node is the write target for BOTH paths, that node moves the file itself - the bytes never come through us - with the same wrong-window/route re-resolution as any write. When the paths route to different shards no single node holds both, so the move degrades to a copy through us plus a delete, CONFIRMED at the destination before the source is touched. No smart timeout on the node-side move: it can be a big file's worth of node-side work, which the upload-sized deadlines would misjudge. */
+    move(config: MoveFileConfig): Promise<void>;
     private getVariableShardTargets;
     /** The key setVariableShard would materialize for this VARIABLE_SHARD key (a value in the preferred shard's route range), without writing anything. */
     getShardKey(key: string): Promise<string>;
     private setVariableShard;
-    setLargeFile(config: {
-        path: string;
-        lastModified?: number;
-        getNextData(): Promise<Buffer | undefined>;
-    }): Promise<void>;
+    /** A large file is written exactly like a small one - same write node, same wrong-window/route re-resolution, same fallbacks - so a value's SIZE never decides its write semantics (set streams through here past LARGE_SET_THRESHOLD, and a file that grew past it must not suddenly lose the availability its caller asked for). The one difference: every attempt after the first has to rewind the stream, so a config without restartStream gets a single attempt. */
+    setLargeFile(config: SetLargeFileConfig): Promise<void>;
+    private setLargeFileOnce;
     getURL(path: string): Promise<string>;
     /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runPrimary - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
     getURLs(path: string): Promise<string[]>;

@@ -220,6 +220,10 @@ declare module "sliftutils/misc/https/hostServer" {
         setDNSRecord?: boolean;
         publicIp?: string;
         allowHostnames?: string[];
+        /** LAN-only: do NOT forward the port (no UPnP/NAT mapping), for a server reachable only on the local network. */
+        internal?: boolean;
+        /** Serve a TLS cert signed by this machine's CA instead of obtaining a real (ACME) one. See getFreshHTTPSCert. */
+        selfSigned?: boolean;
         /** When the port is busy (e.g. the previous deploy still holds it), mount on an alternate port instead (the socket server's built-in free-port scan), and keep trying to take the real port - once it frees, a raw TCP relay on the real port forwards to our listener (SocketFunction can only mount once per process). */
         portFallback?: {
             /** Delay until the next main-port acquisition attempt (tightened around the predecessor's scheduled death) */
@@ -232,11 +236,22 @@ declare module "sliftutils/misc/https/hostServer" {
     };
     /** Hosts a SocketFunction server on a real domain, with an automatically created and renewed Let's Encrypt HTTPS certificate (cached in the home folder, shared between processes on the machine). Expose your controllers (and any RequireController setup) before calling this. Returns the mounted nodeId. */
     export declare function hostServer(config: HostServerConfig): Promise<string>;
-    /** Returns the cached HTTPS cert for the domain, creating/renewing it first if it is past this process's renewal threshold. Reads the disk cache on every call, so a renewal done by a parallel process is picked up instead of renewing again. */
-    export declare function getFreshHTTPSCert(domain: string): Promise<{
+    /** Returns the cached HTTPS cert for the domain, creating/renewing it first if it is past this process's renewal threshold. Reads the disk cache on every call, so a renewal done by a parallel process is picked up instead of renewing again. selfSigned: sign it with this machine's CA instead of getting a real ACME cert. */
+    export declare function getFreshHTTPSCert(domain: string, selfSigned?: boolean): Promise<{
         key: string;
         cert: string;
     }>;
+
+}
+
+declare module "sliftutils/misc/https/hostsFile" {
+    /** Ensures the hosts file maps `hostname` to `ip` (adding our tagged line, or updating it/an existing line for the same hostname). Idempotent. Returns false, with a warning telling the user the line to add by hand, if the file can't be written (writing the hosts file needs admin/root). */
+    export declare function setHostsEntry(config: {
+        ip: string;
+        hostname: string;
+    }): boolean;
+    /** Removes our managed entry for `hostname` (only lines we added, tagged with the marker). No-op if absent or the file can't be written. */
+    export declare function removeHostsEntry(hostname: string): void;
 
 }
 
@@ -858,7 +873,7 @@ declare module "sliftutils/render-utils/observer" {
 declare module "sliftutils/storage/ArchivesDisk" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "./IArchives";
     export declare class ArchivesDisk implements IArchives {
         private folder;
         constructor(folder: string);
@@ -879,6 +894,7 @@ declare module "sliftutils/storage/ArchivesDisk" {
         private filePath;
         set(key: string, data: Buffer, config?: SetConfig): Promise<string>;
         del(key: string, config?: DelConfig): Promise<void>;
+        move(config: MoveFileConfig): Promise<void>;
         get(key: string, config?: GetConfig): Promise<Buffer | undefined>;
         get2(key: string, config?: GetConfig): Promise<{
             data: Buffer;
@@ -892,11 +908,7 @@ declare module "sliftutils/storage/ArchivesDisk" {
         find(prefix: string, config?: FindConfig): Promise<string[]>;
         findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
         private collectFiles;
-        setLargeFile(config: {
-            path: string;
-            lastModified?: number;
-            getNextData(): Promise<Buffer | undefined>;
-        }): Promise<void>;
+        setLargeFile(config: SetLargeFileConfig): Promise<void>;
         startLargeUpload(): Promise<string>;
         appendLargeUpload(id: string, data: Buffer): Promise<void>;
         finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
@@ -2104,6 +2116,21 @@ declare module "sliftutils/storage/IArchives" {
     /** One configured source in a routing config: a hosted (our storage server) or backblaze entry. Requests carry the exact SourceConfig they selected, and the server matches it against its own entries to pick the backing store. */
     export type SourceConfig = HostedConfig | BackblazeConfig;
     export type CommonConfig = {
+        /**
+         * The storage this entry names, as opposed to the rules for using it. Every entry with the same
+         * name (for the same account and bucket) IS the same storage: one folder on the server, one
+         * store, one index - however many entries there are and whatever their windows and routes say.
+         * Everything about WHEN and WHICH KEYS (validWindow, route) is policy layered on top of it, and
+         * changing that policy never moves data.
+         *
+         * Letters, numbers, underscore, dash and periods, up to 64 characters - so a host or a version
+         * can be used as-is. It is the folder name, so it must stay unique and must never be reused for
+         * different storage:
+         * pointing two unrelated entries at one name merges their data, and re-using a retired name
+         * hands the new entry the retired one's files. Deciding that is the developer's job - the server
+         * only ever does what the name says.
+         */
+        name: string;
         /** By default a server hosting this bucket eagerly copies this source's full contents onto its own disk (on top of the lazy read-through caching). Set this to be a front end for a very large database without copying the full database - reads still down-cache individual files on demand. */
         noFullSync?: boolean;
         /** Bytes of read-cache this server's disk may hold; least-recently-used files are deleted from disk to stay under it (only ever when another source verifiably holds the file - the only copy is never deleted). Requires noFullSync (a full copy can't be bounded). */
@@ -2121,7 +2148,6 @@ declare module "sliftutils/storage/IArchives" {
         public?: boolean;
         fast?: boolean;
         writeDelay?: number;
-        rawDisk?: boolean;
         immutable?: boolean;
     };
     export type BackblazeConfig = CommonConfig & {
@@ -2182,6 +2208,13 @@ declare module "sliftutils/storage/IArchives" {
         /** Writes normally go ONLY to the write node (the first current-window source covering the key), retrying it even while it is down - consistent, but unavailable when that node is. With fallbacks, the write node is still tried first, but on failure the write lands on the next current-window source covering the key (synchronization moves it to the write node later) - availability at the cost of reads possibly missing the write until it propagates. Single-source archives ignore the flag. */
         fallbacks?: boolean;
     };
+    /** setLargeFile's config: a SetConfig (it IS a set - the same immutability, ordering, internal, and fallbacks rules apply) plus the stream carrying the bytes. */
+    export type SetLargeFileConfig = SetConfig & {
+        path: string;
+        getNextData(): Promise<Buffer | undefined>;
+        /** Rewinds the stream to its first byte. Without it the write gets exactly ONE attempt: a retry (a fallback source, or the write node coming back) would upload whatever is left of an already-consumed stream as if it were the whole file. Callers holding the data (a buffer, or a source they can re-read) always pass it - a large set with fallbacks is only as available as this. */
+        restartStream?(): Promise<void> | void;
+    };
     export type ArchiveFileInfo = {
         path: string;
         createTime: number;
@@ -2224,28 +2257,23 @@ declare module "sliftutils/storage/IArchives" {
     };
     export declare const STORAGE_WRONG_VALID_WINDOW = "REMOTE_STORAGE_WRONG_VALID_WINDOW_a7c1f04e";
     export declare const STORAGE_WRONG_ROUTE = "REMOTE_STORAGE_WRONG_ROUTE_c94d2e17";
+    export declare const STORAGE_NOT_CONFIGURED = "REMOTE_STORAGE_NOT_CONFIGURED_e51b7d92";
     export declare const FULL_ROUTE: [number, number];
     export declare const VARIABLE_SHARD = "VARIABLE_SHARD_f0234jfah08fgyhfgyssdds83nmp";
     export declare function windowAcceptsWrites(validWindow: [number, number] | undefined): boolean;
     export declare function windowsAcceptWrites(validWindows: [number, number][]): boolean;
     export declare const LARGE_SET_THRESHOLD: number;
-    /** A getNextData stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. */
-    export declare function bufferChunkStream(data: Buffer): () => Promise<Buffer | undefined>;
-    /** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. size/writeTime usually come from the caller's metadata scan; when either is omitted, getInfo fills them in. Returns the copied file's info, or undefined when the source doesn't have the file. */
-    export declare function copyArchiveFile(config: {
-        from: IArchives;
-        to: IArchives;
-        path: string;
-        size?: number;
-        writeTime?: number;
-        forceSetImmutable?: boolean;
-        noChecks?: boolean;
-        internal?: boolean;
-        noFallbacks?: boolean;
-    }): Promise<{
-        writeTime: number;
-        size: number;
-    } | undefined>;
+    /** The setLargeFile stream over an in-memory buffer, in LARGE_SET_THRESHOLD slices - how set transparently becomes setLargeFile for large buffers. Spread into the config: it provides both getNextData and restartStream (the buffer is still held, so a retry costs nothing). */
+    export declare function bufferChunkStream(data: Buffer): {
+        getNextData(): Promise<Buffer | undefined>;
+        restartStream(): void;
+    };
+    export { copyArchiveFile } from "./archiveHelpers";
+    /** move's config. There is deliberately no lastModified: the destination is ALWAYS stamped fresh (see IArchives.move) - a move is a new write at the new path, and a preserved old stamp is how a moved file loses to a stale tombstone there and vanishes. */
+    export type MoveFileConfig = {
+        fromPath: string;
+        toPath: string;
+    };
     export type ArchivesSyncSourceStatus = {
         debugName: string;
         validWindows: [number, number][];
@@ -2300,12 +2328,10 @@ declare module "sliftutils/storage/IArchives" {
          */
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
         del(fileName: string, config?: DelConfig): Promise<void>;
-        /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. lastModified stamps the finished file like set's (synchronized copies need it to keep write ordering); backends that stamp their own times (backblaze) accept and ignore it. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
-        setLargeFile(config: {
-            path: string;
-            lastModified?: number;
-            getNextData(): Promise<Buffer | undefined>;
-        }): Promise<void>;
+        /** Moves a file to a new path within THIS archives, backend-side where the backend can (backblaze copies server-side, disk renames, the storage server relocates node-side) - the bytes never travel through the caller. The destination is stamped with a FRESH write time, even when the underlying operation (a rename) would preserve the old one, so the moved file cannot immediately lose to something newer sitting at its new path (e.g. the tombstone of an earlier deletion there); the source is then deleted, exactly like del. THROWS when the source file does not exist. Optional - callers go through moveArchiveFile (archiveHelpers.ts), which falls back to copy + confirm + delete. */
+        move?(config: MoveFileConfig): Promise<void>;
+        /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. The rest of the config is a plain SetConfig and means exactly what it means on set (that is what makes a large set behave like a small one instead of quietly losing immutability, ordering, internal, or fallbacks semantics as the file crosses the threshold); backends that stamp their own times (backblaze) accept and ignore lastModified. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
+        setLargeFile(config: SetLargeFileConfig): Promise<void>;
         /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. Size-0 entries (tombstones) report undefined unless config.includeTombstones. */
         getInfo(fileName: string, config?: GetInfoConfig): Promise<{
             writeTime: number;
@@ -2414,6 +2440,66 @@ declare module "sliftutils/storage/JSONStorage" {
         } | undefined>;
         watchResync(callback: () => void): void;
         reset(): Promise<void>;
+    }
+
+}
+
+declare module "sliftutils/storage/LogMap" {
+    /** A live value: what was stored, when it was written (the caller's ordering), and when we last changed it (ours). */
+    export type LogEntry<T> = {
+        value: T;
+        time: number;
+        changedAt: number;
+    };
+    /** A deleted key: when it was deleted, and when we learned. The value is gone; the time is the point of a tombstone. */
+    export type LogTombstone = {
+        time: number;
+        changedAt: number;
+    };
+    export declare class LogMap<T> {
+        private filePath;
+        constructor(filePath: string);
+        private values;
+        private deleted;
+        private logRecords;
+        private pending;
+        private flushTimer;
+        private writeChain;
+        /** Reads the log and replays it into memory. Every other method assumes this has finished. */
+        load: {
+            (): Promise<void>;
+            reset(): void;
+            set(newValue: Promise<void>): void;
+        };
+        /** The live value, or undefined when the key does not exist here (deleted included - a deletion is an absence, see getDeleted for its time). */
+        get(key: string): LogEntry<T> | undefined;
+        /** When the key was deleted, if it was. Absent both here and in get means we have never heard of it. */
+        getDeleted(key: string): LogTombstone | undefined;
+        /** The time the key last changed either way, or 0 if we have never heard of it - what a new write has to beat. */
+        timeOf(key: string): number;
+        /** O(1), and counts only what exists. */
+        get size(): number;
+        get deletedSize(): number;
+        /** Live values only. Live, in insertion order - deleting during iteration is safe (JS skips entries removed before they are reached), which is what the passes that walk everything and prune as they go rely on. */
+        entries(): IterableIterator<[string, LogEntry<T>]>;
+        /** The tombstones, which is a much smaller walk than the values - so expiring them, or listing what was deleted since some time, costs what it should. */
+        deletedEntries(): IterableIterator<[string, LogTombstone]>;
+        /** Stores a value as of `time`. Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
+        set(key: string, value: T, time: number): boolean;
+        /** Deletes as of `time`, keeping the tombstone. Returns false when something at least as new is already here. */
+        delete(key: string, time: number): boolean;
+        /** Forgets the key entirely, tombstone included - for a tombstone old enough that nobody needs to hear about the deletion any more, and for an entry that turned out never to have existed. Not a deletion: it leaves nothing behind to propagate. */
+        purge(key: string): void;
+        private applySet;
+        private applyDelete;
+        private append;
+        private scheduleFlush;
+        /** Writes everything pending (rewriting the log first if it has grown too far past what it describes). */
+        flush(): Promise<void>;
+        private directory;
+        private write;
+        private appendPending;
+        private compact;
     }
 
 }
@@ -2593,10 +2679,50 @@ declare module "sliftutils/storage/TransactionStorage" {
 
 }
 
+declare module "sliftutils/storage/archiveHelpers" {
+    import type { IArchives } from "./IArchives";
+    /** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. Returns the copied file's info, or undefined when the source doesn't have the file. */
+    export declare function copyArchiveFile(config: {
+        from: IArchives;
+        to: IArchives;
+        path: string;
+        /** The path at the destination - defaults to path (the common case: the same key moving between two archives). */
+        toPath?: string;
+        size?: number;
+        /** Stamps the destination write with this time INSTEAD of now - which makes the copy lose (silently) to anything newer at the destination, tombstones included. That is exactly right for synchronization, which copies the same key between replicas and must preserve its ordering, and exactly wrong for anything else - so omit it unless the destination is another copy of the same key. */
+        writeTime?: number;
+        forceSetImmutable?: boolean;
+        noChecks?: boolean;
+        internal?: boolean;
+        noFallbacks?: boolean;
+    }): Promise<{
+        writeTime: number;
+        size: number;
+    } | undefined>;
+    /**
+     * Moves one file - between two archives, or between two paths of one. When from and to are the SAME
+     * archives instance and it implements move, the backend moves the file itself (backblaze copies
+     * server-side, disk renames, the storage server relocates it node-side) and the bytes never travel
+     * through us. Everything else is the safe fallback: copy, then CONFIRM the destination actually
+     * reports the file (getInfo), and only then delete the source - the one order in which no failure
+     * can lose the file, only at worst leave it in both places. Throws when the source doesn't have the
+     * file, or when the copy cannot be confirmed (the source is then left untouched).
+     */
+    export declare function moveArchiveFile(config: {
+        from: IArchives;
+        to: IArchives;
+        path: string;
+        /** The path at the destination - defaults to path (moving between two archives). Required in practice when from and to are the same archives, where the same path would be a no-op. */
+        toPath?: string;
+        noFallbacks?: boolean;
+    }): Promise<void>;
+
+}
+
 declare module "sliftutils/storage/backblaze" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "./IArchives";
+    import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, SourceConfig } from "./IArchives";
     export declare class ArchivesBackblaze implements IArchives {
         private config;
         constructor(config: {
@@ -2612,6 +2738,8 @@ declare module "sliftutils/storage/backblaze" {
         enableLogging(): void;
         private log;
         getDebugName(): string;
+        /** Policy flags changed in the routing config. The bucket-level settings getBucketAPI applied (CORS, cache time) are NOT re-applied - those are one-time bucket setup, and re-running them on every config edit would rewrite the bucket's settings from whichever process noticed first. */
+        updateSourceConfig(sourceConfig: SourceConfig): void;
         private getBucketAPI;
         private currentReset;
         private last503Reset;
@@ -2624,13 +2752,11 @@ declare module "sliftutils/storage/backblaze" {
         } | undefined>;
         getConfig(): Promise<ArchivesConfig>;
         hasWriteAccess(): Promise<boolean>;
+        /** Whether an existing file already beats this write, so it must not be sent at all. Shared by set and setLargeFile - the size a value happens to have must never change which ordering rules apply to it. */
+        private writeIsSuperseded;
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
         del(fileName: string, config?: DelConfig): Promise<void>;
-        setLargeFile(config: {
-            path: string;
-            lastModified?: number;
-            getNextData(): Promise<Buffer | undefined>;
-        }): Promise<void>;
+        setLargeFile(config: SetLargeFileConfig): Promise<void>;
         getInfo(fileName: string, config?: GetInfoConfig): Promise<{
             writeTime: number;
             size: number;
@@ -2643,12 +2769,7 @@ declare module "sliftutils/storage/backblaze" {
             size: number;
         }[]>;
         assertPathValid(path: string): Promise<void>;
-        move(config: {
-            path: string;
-            target: IArchives;
-            targetPath: string;
-            copyInstead?: boolean;
-        }): Promise<void>;
+        move(config: MoveFileConfig): Promise<void>;
         copy(config: {
             path: string;
             target: IArchives;
@@ -2891,10 +3012,80 @@ declare module "sliftutils/storage/remoteFileStorage" {
 
 }
 
+declare module "sliftutils/storage/remoteStorage/ArchivesDelayed" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig, SetLargeFileConfig, SourceConfig } from "../IArchives";
+    export declare const DEFAULT_FAST_WRITE_DELAY: number;
+    export declare const MAX_REMOTE_FAST_BUFFER: number;
+    export declare class ArchivesDelayed implements IArchives {
+        inner: IArchives;
+        private delay;
+        private pending;
+        private stopped;
+        /** The instant every pending write must be on the source no matter its delay - our own valid window's end, minus the flush margin (the next window's source has to find the data on handoff). The store binds it; without it there is no deadline, only the delay. */
+        private flushBefore?;
+        constructor(inner: IArchives, delay: number);
+        /** Called by the store that owns this source: fast writes are never delayed past the store's own write window. */
+        bindFlushDeadline(flushBefore: () => number): void;
+        /** The config changed the delay (fast writes turned on or off, or a different writeDelay). Anything already pending keeps the due time it was accepted with - shortening the delay must not strand it, and lengthening it must not hold it longer than promised. */
+        setDelay(delay: number): void;
+        getDebugName(): string;
+        hasWriteAccess(): Promise<boolean>;
+        set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
+        del(fileName: string, config?: DelConfig): Promise<void>;
+        private buffer;
+        private deadlinePassed;
+        private write;
+        /** Writes everything due (its delay elapsed, or the store's window deadline reached). force writes everything, however recent - shutdown and window handoffs cannot leave writes in memory. */
+        flush(force?: boolean): Promise<void>;
+        private flushDue;
+        /** Stops the flush loop, after writing everything still pending. */
+        dispose(): Promise<void>;
+        get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
+        get2(fileName: string, config?: GetConfig): Promise<{
+            data: Buffer;
+            writeTime: number;
+            size: number;
+            url?: string;
+        } | {
+            data?: undefined;
+            writeTime?: undefined;
+            size?: undefined;
+            url: string;
+        } | undefined>;
+        getInfo(fileName: string, config?: GetInfoConfig): Promise<{
+            writeTime: number;
+            size: number;
+            url?: string;
+        } | undefined>;
+        find(prefix: string, config?: FindConfig): Promise<string[]>;
+        /** Pending writes are part of the listing: a scan of this source that couldn't see them would conclude the files had vanished from it, and drop them from the scanner's index. */
+        findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
+        getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
+        /** Never buffered: a file too large to hold in memory is exactly the file that must not sit in memory. Any pending write for the path goes first, so the two land in order. */
+        setLargeFile(config: SetLargeFileConfig): Promise<void>;
+        getURL(path: string): Promise<string>;
+        getConfig(): Promise<ArchivesConfig>;
+        getSyncStatus(): Promise<ArchivesSyncStatus>;
+    }
+    /** How long a source may hold a write. Our own disk and our own storage servers take the SHORT delay however large writeDelay is: they are what cross-node reads and redundancy depend on, and making those wait minutes is not a trade anyone asked for. Everything else (backblaze) takes the full delay, which is where coalescing actually saves money. Not fast -> no delay at all, and no wrapper. */
+    export declare function sourceWriteDelay(config: {
+        sourceConfig?: SourceConfig;
+        fast?: boolean;
+        writeDelay?: number;
+    }): number;
+    /** The delayed wrapper around a source, when it has one - how the store reaches past the delay (to the real disk for large uploads) and flushes on shutdown. */
+    export declare function asDelayed(source: IArchives): ArchivesDelayed | undefined;
+    /** The source itself, past any write delay. */
+    export declare function unwrapDelayed(source: IArchives): IArchives;
+
+}
+
 declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SourceConfig, SetConfig } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SourceConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
     export type ArchivesRemoteConfig = {
         url: string;
         waitForAccess?: boolean;
@@ -2923,6 +3114,8 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         private controller;
         private lastDeniedLog;
         getDebugName(): string;
+        /** The config travels with every request (the server matches it against its own entries to pick the store), so a config change has to land here - otherwise we keep asking for a source description the server no longer recognizes. Only ever called with a config for the SAME endpoint (see sourceIdentity), so the connection, account, and bucket cannot change under us. */
+        updateSourceConfig(sourceConfig: SourceConfig): void;
         isConnected(): boolean;
         ping(): Promise<{}>;
         private authenticate;
@@ -2943,6 +3136,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         } | undefined>;
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
         del(fileName: string, config?: DelConfig): Promise<void>;
+        move(config: MoveFileConfig): Promise<void>;
         getInfo(fileName: string, config?: GetInfoConfig): Promise<{
             writeTime: number;
             size: number;
@@ -2952,11 +3146,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
         getConfig(): Promise<ArchivesConfig>;
         getSyncStatus(): Promise<ArchivesSyncStatus>;
-        setLargeFile(config: {
-            path: string;
-            lastModified?: number;
-            getNextData(): Promise<Buffer | undefined>;
-        }): Promise<void>;
+        setLargeFile(config: SetLargeFileConfig): Promise<void>;
         getURL(path: string): Promise<string>;
     }
 
@@ -2965,7 +3155,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
 declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig } from "../IArchives";
+    import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig, SetLargeFileConfig } from "../IArchives";
     export declare class ArchivesUrl implements IArchives {
         private base;
         constructor(base: string);
@@ -2985,10 +3175,7 @@ declare module "sliftutils/storage/remoteStorage/ArchivesUrl" {
             lastModified?: number;
         }): Promise<string>;
         del(fileName: string): Promise<void>;
-        setLargeFile(config: {
-            path: string;
-            getNextData(): Promise<Buffer | undefined>;
-        }): Promise<void>;
+        setLargeFile(config: SetLargeFileConfig): Promise<void>;
         find(prefix: string, config?: FindConfig): Promise<string[]>;
         findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
@@ -3032,150 +3219,38 @@ declare module "sliftutils/storage/remoteStorage/accessStats" {
         weightBySize?: boolean;
     }): SummaryEntry<AccessSummaryState>[];
     export declare function clearAccountAccessStats(account: string): void;
+    export type BucketWriteStats = {
+        /** Every set call the bucket accepted */
+        originalWrites: number;
+        originalBytes: number;
+        /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+        flushedWrites: number;
+        flushedBytes: number;
+    };
+    export declare function countBucketWrite(key: string, kind: "original" | "flushed", bytes: number): void;
+    export declare function getBucketWriteStats(key: string): BucketWriteStats;
+    /** Zeroes the write statistics of every bucket in the account. */
+    export declare function debugClearAccountWriteStats(account: string): number;
 
 }
 
 declare module "sliftutils/storage/remoteStorage/blobStore" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, SourceConfig, SyncActivity } from "../IArchives";
-    import { ArchivesDisk } from "../ArchivesDisk";
-    export declare const DEFAULT_FAST_WRITE_DELAY: number;
+    import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, RemoteConfig, SourceConfig, SyncActivity } from "../IArchives";
+    import { StoreSync } from "./storeSync";
+    import { StoreConfig } from "./storeConfig";
     export declare const WINDOW_END_FLUSH_MARGIN: number;
-    export type IBucketStore = {
-        /** internal (store-to-store) reads answer purely from the local disk; see GetConfig.internal */
-        get2(config: {
-            path: string;
-            range?: {
-                start: number;
-                end: number;
-            };
-            internal?: boolean;
-            includeTombstones?: boolean;
-        }): Promise<{
-            data: Buffer;
-            writeTime: number;
-            size: number;
-        } | undefined>;
-        /** internal (store-to-store) writes go to the local disk + index with no fan-out; see SetConfig.internal */
-        set(config: {
-            path: string;
-            data: Buffer;
-            lastModified?: number;
-            forceSetImmutable?: boolean;
-            internal?: boolean;
-        }): Promise<void>;
-        del(config: {
-            path: string;
-            lastModified?: number;
-            internal?: boolean;
-        }): Promise<void>;
-        getInfo(config: {
-            path: string;
-            includeTombstones?: boolean;
-        }): Promise<{
-            writeTime: number;
-            size: number;
-        } | undefined>;
-        findInfo(config: FindConfig & {
-            prefix: string;
-        }): Promise<ArchiveFileInfo[]>;
-        getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
-        getSyncStatus?(): Promise<ArchivesSyncStatus>;
-        getSyncProgress?(): {
-            index: {
-                fileCount: number;
-                byteCount: number;
-            };
-            sources: {
-                debugName: string;
-                fileCount: number;
-                byteCount: number;
-            }[];
-            readerDiskLimit?: number;
-            syncing: SyncActivity[];
-        };
-        computeIndexTotals?(): Promise<{
-            fileCount: number;
-            byteCount: number;
-            sources: {
-                debugName: string;
-                fileCount: number;
-                byteCount: number;
-            }[];
-        }>;
-        /** path/lastModified let the store reject an upload into an immutable bucket before any bytes move */
-        startLargeUpload(config?: {
-            path?: string;
-            lastModified?: number;
-        }): Promise<string>;
-        appendLargeUpload(config: {
-            id: string;
-            data: Buffer;
-        }): Promise<void>;
-        finishLargeUpload(config: {
-            id: string;
-            path: string;
-            lastModified?: number;
-        }): Promise<void>;
-        cancelLargeUpload(config: {
-            id: string;
-        }): Promise<void>;
+    /** What we store about a file. Its times are not in here: the index keeps those for every key, deleted ones included (see LogMap). */
+    type IndexValue = {
+        size: number;
+        sourcesListIndex: number;
     };
-    /** rawDisk buckets: the disk IS the store. No index, no synchronization, no window/route/immutability validation. */
-    export declare class RawDiskStore implements IBucketStore {
-        private disk;
-        constructor(disk: ArchivesDisk);
-        get2(config: {
-            path: string;
-            range?: {
-                start: number;
-                end: number;
-            };
-            internal?: boolean;
-            includeTombstones?: boolean;
-        }): Promise<{
-            data: Buffer;
-            writeTime: number;
-            size: number;
-        } | undefined>;
-        set(config: {
-            path: string;
-            data: Buffer;
-            lastModified?: number;
-            forceSetImmutable?: boolean;
-            internal?: boolean;
-        }): Promise<void>;
-        del(config: {
-            path: string;
-            lastModified?: number;
-            internal?: boolean;
-        }): Promise<void>;
-        getInfo(config: {
-            path: string;
-            includeTombstones?: boolean;
-        }): Promise<{
-            writeTime: number;
-            size: number;
-        } | undefined>;
-        findInfo(config: FindConfig & {
-            prefix: string;
-        }): Promise<ArchiveFileInfo[]>;
-        getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
-        startLargeUpload(): Promise<string>;
-        appendLargeUpload(config: {
-            id: string;
-            data: Buffer;
-        }): Promise<void>;
-        finishLargeUpload(config: {
-            id: string;
-            path: string;
-            lastModified?: number;
-        }): Promise<void>;
-        cancelLargeUpload(config: {
-            id: string;
-        }): Promise<void>;
-    }
+    /** One file we hold, as everything outside the index sees it. */
+    export type IndexEntry = IndexValue & {
+        writeTime: number;
+        changedAt: number;
+    };
     export type BlobSourceSpec = {
         identity: string;
         url: string;
@@ -3185,23 +3260,72 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         intermediate?: string;
         sourceConfig?: SourceConfig;
         create: () => IArchives;
+        applyConfig?: (source: IArchives) => void;
     };
-    export declare class BlobStore implements IBucketStore {
-        private folder;
-        private sources;
+    export declare class BlobStore {
+        folder: string;
+        /** The name this store answers to (see CommonConfig.name) - the entries of the routing config that carry it are the ones that configure it, and the rest are its peers. */
+        storeName: string;
         private config?;
-        constructor(folder: string, sources: ArchivesSource[], config?: {
+        stopped: {
+            stop: boolean;
+        };
+        syncStarted: boolean;
+        /** Its sources, in config order: slot 0 is always its own disk folder, the rest are the peers it synchronizes with. Filled by updateSources, which is also how they change. The store OWNS them - writes pick among them, reads resolve holders through them - and StoreSync only scans whatever is in here at the time. */
+        sources: ArchivesSource[];
+        private discardedUploads;
+        private nextDiscardedUpload;
+        private sourcesList;
+        private slotSourcesListIndexes;
+        private slotRegistrations;
+        private index;
+        /** Keeping the index in agreement with the sources: scanning, pulling, pushing, and the maintenance that follows from holding an index (disk-limit eviction, tombstone expiry). It reads and writes this store's index and sources - it does not own them. */
+        sync: StoreSync;
+        constructor(folder: string, 
+        /** The name this store answers to (see CommonConfig.name) - the entries of the routing config that carry it are the ones that configure it, and the rest are its peers. */
+        storeName: string, config?: {
+            /** Whether a config entry is THIS SERVER (same account, same bucket, our own address). Injected because a store knows nothing about servers - it only needs to tell its own entries apart from its peers'. Absent means nothing is us, which is what a bare store (no server around it) wants. */
+            isSelf?: ((source: SourceConfig) => boolean) | undefined;
+            /** Builds one of its sources. Injected for the same reason, and because the delay it is created with is this store's policy. */
+            createSource?: ((config: {
+                sourceConfig?: SourceConfig;
+                writeDelay: number;
+            }) => IArchives) | undefined;
+            /** Hands a running source a changed config, so an endpoint we already talk to is never rebuilt just because a flag moved. */
+            applySource?: ((source: IArchives, sourceConfig: SourceConfig | undefined, writeDelay: number) => void) | undefined;
             onIndexChanged?: ((key: string) => void) | undefined;
-            readerDiskLimit?: number | undefined;
+            /** Called every time this store applies a routing config to itself (startup, an operator's write, a peer's copy arriving) - the store is the one that knows when a config landed, and the server arms window-boundary scans from it. */
+            onRoutingApplied?: ((routing: RemoteConfig) => void) | undefined;
             onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
             resolveSourceUrl?: ((url: string) => IArchives) | undefined;
-            entries?: HostedConfig[] | undefined;
         } | undefined);
+        /** This store's folder, unwrapped: the same bytes slot 0 serves, but reached without its write delay. Used for the two things that cannot go through a buffered source - reading our own routing config before we have any sources, and streaming a large upload that must not sit in memory. */
+        private ownDisk;
+        /** What this store is configured to be. It owns this: the routing config is a file IN the store, so the store reads it, applies it to itself, and re-applies it whenever the file changes - by our own write, or by a peer's copy arriving through synchronization. */
+        storeConfig: StoreConfig;
+        private appliedRoutingVersion;
+        private appliedRouting;
         init: {
             (): Promise<void>;
             reset(): void;
             set(newValue: Promise<void>): void;
         };
+        /**
+         * Re-reads the routing config out of this store and applies it to itself. Called at startup and
+         * whenever that file changes here - which is the ONE mechanism: a config written by an operator
+         * and a config pulled off a peer are the same event, a write of that path into this store.
+         *
+         * A store with no routing config configures itself as its own disk, valid always, for the whole
+         * key space. That is a complete, working store - it just has nobody to synchronize with - and it
+         * is what lets a store exist before it has ever heard of a configuration.
+         */
+        applyRoutingConfig(): Promise<void>;
+        private readRoutingConfig;
+        /** The version of the routing config this store is running, so a copy found on a peer is only taken when it is genuinely newer. -1 means it has none. */
+        routingVersion(): number;
+        private routingApplies;
+        reapplyRoutingConfig(): void;
+        private planSources;
         dispose(): Promise<void>;
         get2(config: {
             path: string;
@@ -3228,6 +3352,11 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             lastModified?: number;
             internal?: boolean;
         }): Promise<void>;
+        /** A node-side move: the bytes never travel through the client. Deliberately just get2 + set + del rather than a disk rename, so the destination write passes EVERY rule a set passes (windows, routes, immutability, only-take-latest, index, fan-out to peers) and the deletion propagates as a normal tombstone - a rename would bypass all of it. The set stamps fresh, so the moved file beats any tombstone at its new path. */
+        move(config: {
+            fromPath: string;
+            toPath: string;
+        }): Promise<void>;
         getInfo(config: {
             path: string;
             includeTombstones?: boolean;
@@ -3240,7 +3369,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         }): Promise<ArchiveFileInfo[]>;
         getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;
         getSyncStatus(): Promise<ArchivesSyncStatus>;
-        /** The cheap always-current totals plus any in-progress background synchronization. */
+        /** The index's totals plus any in-progress background synchronization. */
         getSyncProgress(): {
             index: {
                 fileCount: number;
@@ -3254,7 +3383,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             readerDiskLimit?: number;
             syncing: SyncActivity[];
         };
-        /** Walks the whole index for exact totals - more expensive than getSyncProgress, but immune to any drift in the maintained counters (and loads the index first, so it's never cold zeros). */
+        /** getSyncProgress's totals, but loading the index first, so they are never the zeroes of a store nothing has touched yet. */
         computeIndexTotals(): Promise<{
             fileCount: number;
             byteCount: number;
@@ -3264,11 +3393,22 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
                 byteCount: number;
             }[];
         }>;
-        /** Applies a config change to the RUNNING store: windows/routes update in place, new sources are added (their sync starts immediately), and removed sources' slots go dead (their scans stop, their index entries drop). The store survives every routine config evolution - it is never destroyed for a source-list change, only for structural flips it cannot express (rawDisk). Pending fast writes are re-capped to the new flush deadline (flushing immediately when it has already passed). */
-        updateSources(specs: BlobSourceSpec[], entries?: HostedConfig[]): void;
+        private namedIndexTotals;
+        /**
+         * The store's sources, as the current routing config says they should be. This is the ONLY way
+         * they are ever set: the first call populates an empty store, every later one applies a change to
+         * the running one. Windows, routes and flags move in place, genuinely new endpoints are added and
+         * start scanning, and endpoints that are gone go dead (their scans stop, their index entries
+         * drop).
+         *
+         * A store is never rebuilt for a config change. Its name decides its folder and its identity, and
+         * a config change cannot change either - so there is nothing a change can do to a store except
+         * this.
+         */
+        updateSources(specs: BlobSourceSpec[]): void;
         /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
         rescanBase(): Promise<void>;
-        /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
+        /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes). */
         boundaryScanRemote(source: IArchives, config: {
             since: number;
             route?: [number, number];
@@ -3276,6 +3416,9 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         startLargeUpload(config?: {
             path?: string;
             lastModified?: number;
+            forceSetImmutable?: boolean;
+            noChecks?: boolean;
+            internal?: boolean;
         }): Promise<string>;
         appendLargeUpload(config: {
             id: string;
@@ -3285,65 +3428,99 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             id: string;
             path: string;
             lastModified?: number;
+            forceSetImmutable?: boolean;
+            noChecks?: boolean;
+            internal?: boolean;
         }): Promise<void>;
         cancelLargeUpload(config: {
             id: string;
         }): Promise<void>;
-        private stopped;
-        private index;
-        private mem;
-        private indexFileCount;
-        private indexByteCount;
-        private sourceFileCounts;
-        private sourceByteCounts;
-        private syncActivities;
-        private dirty;
-        private overlay;
-        private sourceStates;
-        private syncStarted;
-        private entries;
-        private sourcesList;
-        private slotSourcesListIndexes;
-        private slotRegistrations;
+        /** Bytes of read cache the disk may hold; see CommonConfig.readerDiskLimit (StoreSync enforces it). Read from the config in effect, so raising or removing the limit takes effect on the next eviction pass. */
+        get readerDiskLimit(): number | undefined;
+        /** The write time a new write has to beat, or 0 when we have never heard of the key. Counts DELETIONS too: a write older than the deletion that removed it must not bring it back. The index is authoritative even for a write still buffered in a delayed source, since the entry is recorded when the write is accepted rather than when it reaches storage. */
+        currentWriteTime(key: string): number;
         private isLive;
-        private registerSlot;
-        private sourcesListIndexOfSlot;
-        private slotForSourcesListIndex;
-        private getEntryHolder;
+        registerSlot(slot: number): Promise<void>;
+        /** The persistent sourcesListIndex of a slot, or undefined when the slot never got that far (a source removed before its registration resolved). */
+        slotSourcesListIndex(slot: number): number | undefined;
+        sourcesListIndexOfSlot(slot: number): number;
+        slotForSourcesListIndex(sourcesListIndex: number): number | undefined;
+        getEntryHolder(entry: IndexEntry): Promise<IArchives | undefined>;
         private loadIndex;
-        private countEntry;
-        private setIndexEntry;
-        private deleteIndexEntry;
-        private removeSource;
-        private flushIndex;
+        /** A file we hold. A deleted one is not one: it is a tombstone, and only getDeletedEntry knows about it. */
+        getIndexEntry(key: string): IndexEntry | undefined;
+        /** When a key was deleted, if it was. A deletion is an absence with a time attached - that time is what makes it propagate and what expires it. */
+        getDeletedEntry(key: string): {
+            writeTime: number;
+            changedAt: number;
+        } | undefined;
+        /** Every file we hold, for the passes that walk them all (listings, scans, reconciliation, eviction). Deletions are not in here - see deletedEntries. Live: deleting entries while iterating is expected here, and safe. */
+        indexEntries(): IterableIterator<[string, IndexEntry]>;
+        /** Every deletion we know of. A much smaller walk than the files, which is what makes expiring them cheap. */
+        deletedEntries(): IterableIterator<[string, {
+            writeTime: number;
+            changedAt: number;
+        }]>;
+        /** How many files we hold, deletions excluded. */
+        indexSize(): number;
+        /** Totals over the files we hold, broken down by the slot holding each (entries can name a source that is no longer configured, which counts towards the total but no slot). */
+        indexTotals(): {
+            fileCount: number;
+            byteCount: number;
+            slots: {
+                fileCount: number;
+                byteCount: number;
+            }[];
+        };
+        /** Records a file, as of its write time. Returns false, having changed nothing, when we already know something at least as new - the index cannot be made to go backwards, whichever path the write came in by. */
+        setIndexEntry(key: string, entry: {
+            writeTime: number;
+            size: number;
+            sourcesListIndex: number;
+        }): boolean;
+        /** Records a DELETION, as of its time: the key stops existing here, and the tombstone is what makes that fact propagate and reconcile like any other write. Same ordering rule as setIndexEntry. */
+        setIndexDeleted(key: string, writeTime: number): boolean;
+        /** Forgets a key entirely, tombstone included. NOT a deletion: it says nothing happened to the file, only that we no longer know anything about it - for an entry whose holder turned out not to have it, and for a tombstone old enough that everyone has heard. */
+        purgeIndexEntry(key: string): void;
+        /**
+         * Every write, however it is stamped, has to be one we are actually meant to hold - because the
+         * alternative is not a smaller problem, it is a silent one. A write that lands on a store that
+         * does not serve its route (or on a server that is not in the bucket's config at all) goes into a
+         * folder nothing scans and no peer reconciles: it succeeds, and then it is gone. The markers make
+         * the client re-read the routing config and retry, which is exactly the right outcome when the
+         * reason it aimed here is that its config was stale.
+         */
+        private assertWriteTarget;
+        /** Exactly why this store has no configuration entries - which of the three possible reasons it is, with the values that decided it, because "not configured" alone is undiagnosable. */
+        private unconfiguredDetail;
+        /**
+         * Whether a routing config may be written here. Two rules, and this is the one place either is
+         * applied - a config only ever enters the system through a write, so a config that got in is a
+         * config that passed, and reading one back never judges it again.
+         *
+         * The config has to be valid as a whole (see assertValidRemoteConfig), and it has to outrank what
+         * we are running: the same version means the same config, so re-writing it is harmless, but a
+         * lower one is an older config arriving late and must never undo a newer one.
+         */
+        private assertRoutingConfigWritable;
+        private assertFreshWriteTarget;
         private assertMutable;
         private assertInternalWriteAccepted;
-        private runSourceSync;
-        private isDeadIntermediate;
-        private scanSource;
-        private reconcileSource;
-        private updateScanIndex;
-        private pollChanges;
-        private copySourceFiles;
-        private waitForRequiredScans;
-        private checkMissingKey;
-        private getIndexEntry;
-        /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note fast writes still sitting in the overlay are invisible here; the caller re-finds them after our flush. */
+        /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note this reads the disk past any write delay, so a fast write still buffered in memory is invisible here; the caller re-finds it once it flushes. */
         private getInternal2;
         /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Only-take-latest still applies here. */
         private setInternal;
         private cacheRead;
         private setOrDelete;
-        private baseWriteWindowEnd;
+        /** The instant every delayed write must be on its source: the end of our own write window that contains now, minus the flush margin (so the next window's source finds the data on handoff). The LATEST end among covering windows - overlapping windows hand off at the last one. No window contains now (an inert store, or a moment between our windows) -> 0, i.e. nothing may be delayed at all. */
+        writeFlushDeadline(): number;
         private getWritableSources;
         private writeToSources;
         private getDiskSource;
-        private isRemoteSource;
-        private flushOverlay;
-        private evicting;
-        private enforceDiskLimit;
-        private cleanupTombstones;
+        /** Writes everything still held by a delayed source (see ArchivesDelayed). force also writes what isn't due yet - shutdown cannot leave writes in memory. */
+        private flushDelayedWrites;
     }
+    export {};
 
 }
 
@@ -3351,10 +3528,31 @@ declare module "sliftutils/storage/remoteStorage/bucketDisk" {
     /// <reference types="node" />
     /// <reference types="node" />
     import { RemoteConfig } from "../IArchives";
-    export declare function getBucketFolder(account: string, bucketName: string, route?: [number, number]): string;
-    export declare function readRoutingFile(folder: string): Promise<Buffer | undefined>;
+    /** A store's folder, from the only three things that identify it. The name is the config entry's name and nothing else: the same name is the same storage, whatever its window or route say, and a different name is different storage even for the same URL. Nothing about a folder changes when the routing does. */
+    export declare function getBucketFolder(name: string, account: string, bucketName: string): string;
+    export type StoreFolder = {
+        account: string;
+        name: string;
+        bucketName: string;
+        folder: string;
+    };
+    /** Every store this server holds for an account, found by walking the disk. */
+    export declare function listAccountStoreFolders(account: string): Promise<StoreFolder[]>;
+    /** Every store this server holds for ONE bucket - one per name it has ever been given. */
+    export declare function listBucketStoreFolders(account: string, bucketName: string): Promise<StoreFolder[]>;
+    export declare function readRoutingFile(folder: string): Promise<{
+        data: Buffer;
+        writeTime: number;
+    } | undefined>;
+    /** The bucket's routing config as this server holds it: the newest copy among its stores. Each store keeps its own, and they converge - so when they disagree, the one written most recently is the one that has heard the most. */
+    export declare function readNewestRoutingFile(account: string, bucketName: string): Promise<{
+        data: Buffer;
+        writeTime: number;
+        size: number;
+        name: string;
+    } | undefined>;
     export declare function readRoutingFromDisk(account: string, bucketName: string): Promise<RemoteConfig | undefined>;
-    /** The routing file lives ONLY in the plain (routeless) bucket folder - it is what DEFINES the per-route stores, so it cannot live inside any of them. Served directly for reads (the stores never hold it). */
+    /** What an anonymous URL read of the routing file gets: the same newest copy. */
     export declare function getRoutingFileResult(account: string, bucketName: string): Promise<{
         data: Buffer;
         writeTime: number;
@@ -3369,27 +3567,26 @@ declare module "sliftutils/storage/remoteStorage/bucketDisk" {
 
 }
 
-declare module "sliftutils/storage/remoteStorage/cliArgs" {
-    export declare function getArg(name: string): string | undefined;
+declare module "sliftutils/storage/remoteStorage/certTrustModal" {
+    export declare function showCertTrustModal(serverUrl: string): void;
 
 }
 
-declare module "sliftutils/storage/remoteStorage/createArchives" {
-    /// <reference types="node" />
-    /// <reference types="node" />
-    import { IArchives, RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, SetConfig } from "../IArchives";
-    import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
-    /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
-    export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
-    export declare function createApiArchives(source: SourceConfig): IArchives;
-    export type ArchivesChainOptions = {
-        /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
-        directConnect?: boolean;
+declare module "sliftutils/storage/remoteStorage/chainStartup" {
+    import { RemoteConfig, SourceConfig } from "../IArchives";
+    import { SourceWrapper } from "./sourceWrapper";
+    export declare const CONFIG_WRITE_RETRY_INTERVAL: number;
+    export declare const CONFIG_WRITE_REFRESH_INTERVAL: number;
+    export type ChainState = {
+        config: RemoteConfig;
+        sources: SourceWrapper[];
     };
-    export declare class ArchivesChain implements IArchives {
-        private options?;
-        private configured;
-        private activeConfig;
+    /** The chain's state and everything about HAVING one: init (with its retry), the config poll, availability rechecks, and the routing rewrite loop. The chain constructs one, asks it getState() on every call, and disposes it. */
+    export declare class ChainStateManager {
+        private config;
+        readonly configured: RemoteConfig;
+        /** The newest adopted config - what getDebugName and dispatch decisions read. Starts as the configured one and moves with every adoption. */
+        activeConfig: RemoteConfig;
         private statePromise;
         private latestState;
         private initRetryDelay;
@@ -3397,9 +3594,16 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         private pollTimer;
         private disposed;
         private unsubscribeRoutingPush;
-        constructor(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions | undefined);
-        getDebugName(): string;
-        private getState;
+        private routingRewriter;
+        constructor(config: {
+            configured: RemoteConfig;
+            debugName: () => string;
+            /** See ArchivesChainOptions.directConnect. */
+            directConnect?: boolean;
+        });
+        /** The newest adopted state, synchronously - undefined until the first init finishes. */
+        latest(): ChainState | undefined;
+        getState(): Promise<ChainState>;
         private init;
         /** Clientside, a config with public sources is served entirely over plain URL downloads - no API connection, no access grant, and no writing. directConnect opts out of that. */
         private isReadOnly;
@@ -3407,14 +3611,118 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         private buildSources;
         private startConfigPoll;
         private configRefreshInFlight;
-        private refreshActiveConfig;
+        refreshActiveConfig(): Promise<void>;
         private fetchLatestConfig;
         private checkForNewConfig;
         private adoptNewConfig;
         private lastAvailabilityRecheck;
         private availabilityRecheckInFlight;
-        private recheckAvailability;
+        /** Every source failed: re-contact all of them (routing re-read + connection re-attempt) and adopt whatever config comes back. Throttled, and deduplicated across concurrent callers. */
+        recheckAvailability(): Promise<void>;
         private recheckAvailabilityNow;
+        dispose(): void;
+    }
+    export type SourceProbe = {
+        probe: SourceWrapper;
+        sourceConfig: SourceConfig;
+        responded: boolean;
+        latency: number;
+        existing: RemoteConfig | undefined;
+        error: string;
+    };
+    /** One throwaway SourceWrapper per configured source, each asked for its stored routing config - which also measures first-contact latency, seeded into the real sources afterwards. The probes MUST be disposed (disposeProbes) once the caller is done with them. */
+    export declare function probeSources(configs: SourceConfig[], readOnly: boolean): Promise<SourceProbe[]>;
+    export declare function disposeProbes(probes: SourceProbe[]): void;
+    /**
+     * Which routing config the chain should RUN: the newest of ours and every stored one. needsWrite
+     * when ours is strictly the newest, meaning the stores have to be told about it. A stored config
+     * with our exact version but DIFFERENT content wins without a write, loudly: config updates must
+     * bump the version, or they are ignored - silently taking the changed one would make "what is the
+     * bucket running" depend on which process started last.
+     *
+     * Throws when no source answered at all: with nothing stored and nobody to write to, there is no
+     * config to run.
+     */
+    export declare function chooseStartupConfig(config: {
+        configured: RemoteConfig;
+        probes: SourceProbe[];
+        debugName: string;
+    }): {
+        active: RemoteConfig;
+        needsWrite: boolean;
+        existing: RemoteConfig | undefined;
+    };
+    /**
+     * Writes the given routing config to every configured store, one write per url+name: the write
+     * lands in the store the entry NAMES, so two entries sharing a URL but naming different stores are
+     * two separate deliveries - deduping by URL alone leaves the second store unconfigured forever. All
+     * in parallel, every failure tolerated (no-write-access included - the attempt classifies it,
+     * nothing pre-checks it): a down node must not stop the others from getting the config - they would
+     * then reject writes as unconfigured precisely BECAUSE it never arrived - and it must never stop
+     * the chain from starting. A store that missed it pulls it off its peers, and the rewrite loop
+     * tries again (see RoutingRewriteLoop).
+     */
+    export declare function writeRoutingToAllStores(config: {
+        configured: RemoteConfig;
+        sources: SourceWrapper[];
+        debugName: string;
+    }): Promise<{
+        failures: string[];
+        total: number;
+    }>;
+    /**
+     * The periodic re-write of the chain's in-code config: failures retried on the short interval - a
+     * store without the config rejects every write aimed at it, so this not landing is a big deal,
+     * logged on every attempt - and even success repeated hourly, in case a store lost it. The failure
+     * this exists for: a server whose trust was only granted AFTER startup, so the startup write was
+     * rejected and nothing else would ever retry it.
+     */
+    export declare class RoutingRewriteLoop {
+        private config;
+        constructor(config: {
+            configured: RemoteConfig;
+            debugName: () => string;
+            /** The chain's newest adopted state: what decides whether ours is still the config to write, and the sources it is written through. Undefined until the first init finishes. */
+            latest: () => {
+                config: RemoteConfig;
+                sources: SourceWrapper[];
+            } | undefined;
+        });
+        private timer;
+        private disposed;
+        /** (Re)arms the loop - called at the end of every init, with whether that init's write failed (which picks the short retry interval). */
+        start(failedAtStartup: boolean): void;
+        dispose(): void;
+        private schedule;
+        private rewrite;
+    }
+
+}
+
+declare module "sliftutils/storage/remoteStorage/cliArgs" {
+    export declare function getArg(name: string): string | undefined;
+    /** A valueless boolean flag: true when --name is present (with nothing, or a following flag). */
+    export declare function getFlag(name: string): boolean;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/createArchives" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { IArchives, RemoteConfig, RemoteConfigBase, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
+    import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+    /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
+    export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
+    /** A client for ONE source - see storeSources.ts. Re-exported here because a chain is built out of them. */
+    export { createApiArchives } from "./storeSources";
+    export type ArchivesChainOptions = {
+        /** Outside of node we default to read-only downloads over the public URLs (no API connection) when the config has public sources. Set this to connect to the API anyway - needed for writing, listing, and any other operation the plain URL form cannot serve. */
+        directConnect?: boolean;
+    };
+    export declare class ArchivesChain implements IArchives {
+        private state;
+        constructor(config: RemoteConfig | RemoteConfigBase, options?: ArchivesChainOptions);
+        getDebugName(): string;
         private run;
         private runPrimary;
         /** Races call against a size-based deadline. Uploads know their size upfront; gets are given SMART_TIMEOUT_PROBE to produce anything, and only then is the file's info fetched (from the same source, itself time-limited) to size the deadline - measured from the call's start, so a source that was slow before the probe doesn't get the full allowance again. Timed-out calls keep running in the background (they cannot be cancelled) but their eventual result is ignored. */
@@ -3468,15 +3776,15 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
         private setRoutingConfig;
         del(fileName: string, config?: DelConfig): Promise<void>;
+        /** See IArchives.move. When one node is the write target for BOTH paths, that node moves the file itself - the bytes never come through us - with the same wrong-window/route re-resolution as any write. When the paths route to different shards no single node holds both, so the move degrades to a copy through us plus a delete, CONFIRMED at the destination before the source is touched. No smart timeout on the node-side move: it can be a big file's worth of node-side work, which the upload-sized deadlines would misjudge. */
+        move(config: MoveFileConfig): Promise<void>;
         private getVariableShardTargets;
         /** The key setVariableShard would materialize for this VARIABLE_SHARD key (a value in the preferred shard's route range), without writing anything. */
         getShardKey(key: string): Promise<string>;
         private setVariableShard;
-        setLargeFile(config: {
-            path: string;
-            lastModified?: number;
-            getNextData(): Promise<Buffer | undefined>;
-        }): Promise<void>;
+        /** A large file is written exactly like a small one - same write node, same wrong-window/route re-resolution, same fallbacks - so a value's SIZE never decides its write semantics (set streams through here past LARGE_SET_THRESHOLD, and a file that grew past it must not suddenly lose the availability its caller asked for). The one difference: every attempt after the first has to rewind the stream, so a config without restartStream gets a single attempt. */
+        setLargeFile(config: SetLargeFileConfig): Promise<void>;
+        private setLargeFileOnce;
         getURL(path: string): Promise<string>;
         /** Every URL that could serve this path: public sources matching both the path's route and the current valid window. The first is the write node's (first matching source in config order, see runPrimary - the one guaranteed current); the rest are ranked fastest-first by measured latency. Empty when none qualify. */
         getURLs(path: string): Promise<string[]>;
@@ -3553,6 +3861,21 @@ declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
 
 }
 
+declare module "sliftutils/storage/remoteStorage/intermediateManagement" {
+    import { RemoteConfig } from "../IArchives";
+    /** Called every time a store applies a routing config to itself (see BlobStore's onRoutingApplied): arms the scans the config's upcoming window boundaries need. Each scan is scheduled once - the key includes the boundary it is for - so re-arming on every config application is harmless. */
+    export declare function scheduleBoundaryWork(account: string, bucketName: string, routing: RemoteConfig): void;
+    /** An operator's config knows nothing about a switchover that is in flight right now, so writing it as-is would cancel one mid-handover. The in-flight windows are put back into it first. */
+    export declare function reinjectIntermediates(current: RemoteConfig | undefined, incoming: RemoteConfig): RemoteConfig;
+    /** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
+    export declare const startIntermediateMaintenance: {
+        (): void;
+        reset(): void;
+        set(newValue: void): void;
+    };
+
+}
+
 declare module "sliftutils/storage/remoteStorage/intermediateSources" {
     import { RemoteConfig, SourceConfig } from "../IArchives";
     export declare const INTERMEDIATE_EXPIRE_GRACE: number;
@@ -3607,8 +3930,40 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
         bucketName: string;
     };
     export declare function replaceHostedUrlPort(url: string, port: number): string;
+    /**
+     * Puts a source into the shape the code expects. It does NOT judge it: this runs every time a config
+     * is READ, and a config that is already on disk has to keep working - a server that cannot parse its
+     * own routing file is a server that cannot serve, and it would stay that way forever. Anything
+     * missing or unusable is filled in with the safest equivalent instead, loudly where it matters.
+     *
+     * Judging happens on the way IN, in assertValidRemoteConfig.
+     */
     export declare function normalizeSource(source: RemoteConfigBase): SourceConfig;
+    /** Puts a whole config into the shape the code expects, without judging it - see normalizeSource, and see assertValidRemoteConfig for the judging. */
     export declare function normalizeRemoteConfig(config: RemoteConfig | RemoteConfigBase): RemoteConfig;
+    /**
+     * Whether a config may be WRITTEN. Everything here is a rule about the config as a whole, which is
+     * exactly why it cannot run on read: a config that is already stored somewhere has to keep being
+     * readable, or a server that once accepted a bad one could never start again. Rejecting it at the
+     * point it is introduced is what keeps a bad one from ever being stored in the first place.
+     */
+    export declare function assertValidRemoteConfig(config: RemoteConfig): void;
+    /**
+     * The identity of one of a store's SOURCE SLOTS - which is the endpoint it talks to, and not the same
+     * question as which store this is (that is CommonConfig.name). A switchover's alternate port is a
+     * distinct slot even though it names the same storage, because a slot holds a connection to a port.
+     *
+     * ONLY the type, the url, and the intermediate's alternate port are part of it: everything else is
+     * policy about how we USE the endpoint, and changing policy must never make a store believe it is
+     * looking at a NEW source - that would drop every index entry the old one held and rescan it from
+     * scratch, so the files it holds go missing from listings until the rescan finishes, for a flag flip.
+     *
+     * Built by hand rather than by serializing the config, so it cannot change just because the routing
+     * file was written with its keys in a different order.
+     */
+    export declare function sourceIdentity(sourceConfig: SourceConfig | undefined): string;
+    /** What an index entry records as the holder of its bytes (see ArchivesSource.url), so it must name the endpoint FOREVER. An intermediate is a switchover's temporary alternate port onto another source, and that port is gone for good once its window passes - so it is recorded as the source it was split out of, which holds the same bucket and outlives it. */
+    export declare function sourcePersistentUrl(sourceConfig: SourceConfig | undefined, folder: string): string;
     export declare function parseRoutingData(data: Buffer): RemoteConfig;
     export declare function serializeRemoteConfig(config: RemoteConfig): Buffer;
 
@@ -3640,7 +3995,7 @@ declare module "sliftutils/storage/remoteStorage/serverConfig" {
     }): Promise<void>;
     export declare function addExtraListenPort(port: number): void;
     export declare function removeExtraListenPort(port: number): void;
-    /** Whether address:port is this server process. The ONE self test - findSelfIndexes, createApiArchives, and SourceWrapper all consult it, so "is this me" cannot disagree between the routing plan and connection building: a URL that is us on an extra listen port must never become a network client to ourselves, which is how infinite self-request loops form. */
+    /** Whether address:port is this server process, including its extra listen ports (a deploy switchover's alternate port is still us). Used to tell which config entries are OUR copy of a bucket - the stores we run - as opposed to peers we synchronize with. Talking to ourselves is not one of the things it prevents: a source that happens to be us is reached over the API like any other. */
     export declare function isOwnAddress(address: string, port: number): boolean;
 
 }
@@ -3709,9 +4064,7 @@ declare module "sliftutils/storage/remoteStorage/sourcesList" {
         private appendQueue;
         private load;
         getUrl(sourcesListIndex: number): string | undefined;
-        /** For a sourcesListIndex beyond our in-memory list (another process appended since we read): re-reads the file, at most once per RELOAD_THROTTLE. Returning undefined can therefore mean "throttled", not "definitely absent" - never treat it as proof the index is bogus. */
         getUrlReloading(sourcesListIndex: number): Promise<string | undefined>;
-        /** The sourcesListIndex of the url, appending it if it is new. Appends are serialized within this process; before each append the file is re-read, so appends by other processes are picked up instead of duplicated. */
         ensure(url: string): Promise<number>;
     }
 
@@ -3836,6 +4189,13 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             lastModified?: number;
             internal?: boolean;
         }) => Promise<void>;
+        move: (config: {
+            account: string;
+            bucketName: string;
+            fromPath: string;
+            toPath: string;
+            sourceConfig: SourceConfig;
+        }) => Promise<void>;
         getInfo: (config: {
             account: string;
             bucketName: string;
@@ -3910,6 +4270,9 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             path: string;
             sourceConfig: SourceConfig;
             lastModified?: number;
+            forceSetImmutable?: boolean;
+            noChecks?: boolean;
+            internal?: boolean;
         }) => Promise<string>;
         uploadPart: (config: {
             uploadId: string;
@@ -3935,6 +4298,8 @@ declare module "sliftutils/storage/remoteStorage/storageServer" {
         url: string;
         folder: string;
         lowSpaceThresholdBytes?: number;
+        internal?: boolean;
+        selfSigned?: boolean;
     };
     export declare function hostStorageServer(config: HostStorageServerConfig): Promise<void>;
 
@@ -3948,31 +4313,18 @@ declare module "sliftutils/storage/remoteStorage/storageServerCli" {
 declare module "sliftutils/storage/remoteStorage/storageServerState" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IBucketStore } from "./blobStore";
-    import { RemoteConfig, HostedConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
+    import { BlobStore } from "./blobStore";
+    import { RemoteConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
     import { BucketDiskInfo } from "./bucketDisk";
-    import { SelfSummary } from "./storePlan";
-    export type LoadedStore = {
-        routeKey: string;
-        route?: [number, number];
-        entries: HostedConfig[];
-        folder: string;
-        store: IBucketStore;
-    };
-    export type BucketState = {
-        account: string;
-        bucketName: string;
-        routing: RemoteConfig;
-        routingJSON: string;
-        selfEntries: HostedConfig[];
-        self: SelfSummary | undefined;
-        stores: LoadedStore[];
-        structureKey: string;
-    };
-    /** The loaded bucket, loading it (which instantiates its stores and starts their synchronization) if needed. A bucket that does not exist on this server throws - callers never see undefined buckets. */
-    export declare function requireBucket(account: string, bucketName: string): Promise<BucketState>;
-    /** The store serving a request: the config entry the CLIENT selected, matched against the bucket's own entries by identity EXCLUDING the valid window (see sourceMatchKey). The selection never validates - the store's own window/route checks throw if the caller is stale - so honoring a window mismatch here is exactly right. Throws when nothing matches, listing what is available. */
-    export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): Promise<LoadedStore>;
+    import { BucketWriteStats } from "./accessStats";
+    export declare function getStore(account: string, bucketName: string, name: string): BlobStore;
+    /** The store serving a request: the one the client's selected entry NAMES. Account, name, and bucket ARE the folder, so this is a direct lookup, never a search of what exists - and a name this server has never seen is CREATED, never rejected, because asking for a name is the instruction to have that store (one name, one folder, one index; it configures itself once the routing config lands in it). Nothing else about the request is compared - not the window, not the route, not the flags - which is the whole point of naming it: a client a config version behind on some flag still reaches the right store. */
+    export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): BlobStore;
+    /** The stores of a bucket as the DISK records them (a bucket is nothing more than the store folders sharing its name), opened - so the ones that weren't running yet start synchronizing. Empty when the bucket does not exist here. */
+    export declare function getBucketStores(account: string, bucketName: string): Promise<{
+        name: string;
+        store: BlobStore;
+    }[]>;
     /** Internal (store-to-store) reads skip store selection entirely: the caller is another store whose index says this MACHINE holds the bytes - the persisted holder identity is just a URL, which cannot name a store. Whichever store's folder has the newest copy answers. */
     export declare function readBucketInternal(account: string, bucketName: string, config: {
         path: string;
@@ -3986,9 +4338,9 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
         writeTime: number;
         size: number;
     } | undefined>;
-    export declare function getBucketConfig(bucket: BucketState): ArchivesConfig;
-    export declare function bucketSyncStatus(bucket: BucketState): Promise<ArchivesSyncStatus>;
-    export declare function bucketIndexTotals(bucket: BucketState): Promise<{
+    export declare function getBucketArchivesConfig(account: string, bucketName: string): Promise<ArchivesConfig>;
+    export declare function bucketSyncStatus(account: string, bucketName: string): Promise<ArchivesSyncStatus>;
+    export declare function debugBucketIndexTotals(account: string, bucketName: string): Promise<{
         fileCount: number;
         byteCount: number;
         sources: {
@@ -3996,26 +4348,26 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
             fileCount: number;
             byteCount: number;
         }[];
-    } | undefined>;
+    }>;
     /** A cached IArchives for a persisted source identity: a routing URL (hosted/backblaze) or a disk folder path - the form BlobStore's sources list stores. Configuration (valid windows, routes) decides WHEN a source should be used; for reading bytes the index says a source holds, the URL alone is enough - even for sources no longer in any config. */
     export declare function resolveSourceArchives(url: string): IArchives;
-    export declare function getLoadedBucket(account: string, bucketName: string): Promise<BucketState | undefined>;
-    /** The routing-config write path - the ONE write that cannot go through a store (it is what CREATES the bucket and its stores). Serialized per bucket: concurrent config writes would race the version check. */
-    export declare function queueRoutingConfigWrite(account: string, bucketName: string, data: Buffer, config?: {
+    /**
+     * Writing the routing config is a write like any other: it goes into a store, and the store applies
+     * it to itself and lets its peers pull it. The only thing that happens here is picking WHICH store,
+     * because the writer names a source and a source names a store.
+     *
+     * In-flight switchover windows are re-injected first (see intermediateManagement): an operator's
+     * config knows nothing about a switchover that is happening right now, and writing it as-is would
+     * cancel it mid-flight.
+     */
+    export declare function writeRoutingConfig(account: string, bucketName: string, name: string, data: Buffer, config?: {
         lastModified?: number;
     }): Promise<void>;
-    /** Which buckets this process currently has loaded - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
+    /** Which buckets this process currently has active (some store of theirs was opened) - what a deploy successor asks its predecessor for, so it activates exactly the buckets that are actually in use. */
     export declare function getActiveBucketKeys(): {
         account: string;
         bucketName: string;
     }[];
-    export declare function rebuildAllLoadedBuckets(): Promise<void>;
-    /** Started by deployTakeover once we are actually a deploy successor listening on an alternate port. Until then there are no switchover windows to write or expire, so nothing polls. */
-    export declare const startIntermediateMaintenance: {
-        (): void;
-        reset(): void;
-        set(newValue: void): void;
-    };
     export type ServerBucketInfo = {
         bucketName: string;
         active: boolean;
@@ -4030,72 +4382,160 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     };
     export type ActiveBucketInfo = {
         folder: string;
-        /** The routing config the bucket is RUNNING on, straight from memory - including switchover windows written since it loaded */
-        routing: RemoteConfig;
-        /** Our own entries in that config, and their summarized current role (routes union + flags) */
-        selfEntries: HostedConfig[];
-        self?: SelfSummary;
+        /** The bucket's routing config, the newest copy among its stores. Absent when none of them has one yet. */
+        routing?: RemoteConfig;
         config: ArchivesConfig;
     };
-    /** The live in-memory state of ONE bucket, answered without touching the disk (no routing file read, no statfs, no stored write stats). Returns an error string when the bucket is not loaded here, which is the normal state for a bucket nothing has accessed since startup. */
-    export declare function getActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
-    /** Loads a bucket that exists on this server's disk into memory, which starts its synchronization and window timers, and returns its live state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-loaded buckets just return their state. */
+    /** The state of ONE active bucket. Returns an error string when the bucket is not active here, which is the normal state for a bucket nothing has accessed since startup. */
+    export declare function debugGetActiveBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
+    /** Loads every store of a bucket that exists on this server's disk into memory, which starts their synchronization and window timers, and returns the bucket's state. Nothing is written and no other server is contacted - unlike building an ArchivesChain for it, which would probe every source and could write the routing config. Already-active buckets just return their state. */
     export declare function activateBucket(account: string, bucketName: string): Promise<ActiveBucketInfo | string>;
-    export declare function listAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
-    export type BucketWriteStats = {
-        /** Every set call the bucket accepted */
-        originalWrites: number;
-        originalBytes: number;
-        /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
-        flushedWrites: number;
-        flushedBytes: number;
+    export declare function debugListAccountBuckets(account: string): Promise<ServerBucketInfo[]>;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storeConfig" {
+    import { HostedConfig } from "../IArchives";
+    export declare class StoreConfig {
+        readonly name: string;
+        constructor(name: string, entries: HostedConfig[]);
+        private entries;
+        /** The routing config changed. Same store either way: its name did not change, so neither did its folder, its index, or the data in it. */
+        /** No entries is a real state, not an error: a store exists as soon as its folder does, and it may never have heard of a configuration (see StorePolicy). */
+        update(entries: HostedConfig[]): void;
+        all(): HostedConfig[];
+        /**
+         * What this store is configured to be right now: the entry whose window contains this moment;
+         * failing that the next one due to start; failing that the last one to have ended.
+         *
+         * There is always an answer, and it matters that there is: a store between windows still holds
+         * data and still has to answer for it, so it needs a route and flags even when nothing is
+         * currently pointing writes at it. Which of the three cases produced the answer is deliberately
+         * not exposed - the valid window itself is what says whether writes belong here, and every write
+         * is checked against it separately.
+         */
+        current(): StorePolicy;
+    }
+    /** The parts of a config entry that describe what a store IS - as opposed to which entry said so. Kept separate because a store with no entries still has all of them. */
+    export type StorePolicy = {
+        validWindow: [number, number];
+        route?: [number, number];
+        public?: boolean;
+        immutable?: boolean;
+        fast?: boolean;
+        writeDelay?: number;
+        noFullSync?: boolean;
+        readerDiskLimit?: number;
     };
-    /** Zeroes the write statistics of every bucket in the account. */
-    export declare function clearAccountWriteStats(account: string): number;
-    export declare function getLocalArchives(account: string, bucketName: string, sourceConfig: SourceConfig): IArchives;
 
 }
 
 declare module "sliftutils/storage/remoteStorage/storePlan" {
     import { RemoteConfig, HostedConfig, SourceConfig } from "../IArchives";
+    /** Whether a config entry is THIS server's copy of this bucket - the same account and bucket, at an address this process answers on. */
+    export declare function isSelfSource(source: SourceConfig, account: string, bucketName: string): boolean;
     export declare function findSelfIndexes(routing: RemoteConfig, account: string, bucketName: string): number[];
     export declare function selectEntryAt(entries: HostedConfig[], time: number, route?: number): HostedConfig | undefined;
-    /** Our role in a bucket's routing config, summarized across ALL currently-valid self entries. Stored instead of a single representative HostedConfig, so nothing can accidentally use one entry's route or flags where the union is required - the standard config has the same URL twice: a routed write-shard entry plus an unrouted read-everything entry. */
-    export type SelfSummary = {
-        /** The union of the current entries' routes, with overlapping/adjacent ranges combined - which commonly collapses to a single full range, making matching trivial. */
-        routes: [number, number][];
-        public: boolean;
-        immutable: boolean;
-        noFullSync: boolean;
-        rawDisk: boolean;
-        readerDiskLimit?: number;
+    /** What one of our stores has to pull in at a valid-window boundary, so the writes that landed just before the handover are not missed. */
+    export type BoundaryHandover = {
+        name: string;
+        route: [number, number];
+        scanOwnDisk: boolean;
+        remotes: Map<number, [number, number]>;
     };
-    export type StoreSourceSpec = {
+    /**
+     * Who held each slice of our route in the window before windowStart, for every self entry whose
+     * window starts exactly then. This is the whole of "who do we take over from": a store taking over a
+     * route may be taking it from several previous owners at once (their shards need not line up with
+     * ours), and from itself for the parts it already held.
+     *
+     * A self entry is skipped when an EARLIER entry valid at the boundary already covers its whole route:
+     * config order is priority, so that entry is the write target and we are not the one taking over.
+     * Owners are then resolved in config order too, each claiming the part of our route still unclaimed -
+     * the same first-match-wins rule that picks a write target at any other moment.
+     *
+     * Pure: config in, plan out. Nothing here reads a store, a clock, or the network.
+     */
+    export declare function previousWindowOwners(config: RemoteConfig, windowStart: number, selfIndexes: number[]): BoundaryHandover[];
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storeSources" {
+    import { IArchives, SourceConfig } from "../IArchives";
+    /** The client for one configured source: backblaze, or a storage server - including this one. */
+    export declare function createApiArchives(source: SourceConfig): IArchives;
+    /** The ONE place a store's source is built. Every source a store synchronizes with is one of exactly two things: a configured peer, or the store's own disk folder (no sourceConfig). writeDelay wraps it so its writes are buffered in memory for that long (see ArchivesDelayed) - the whole of "fast writes", per source, decided here. */
+    export declare function createStoreSource(config: {
         sourceConfig?: SourceConfig;
-        validWindows: [number, number][];
-        route?: [number, number];
-        noFullSync?: boolean;
-    };
-    export type StorePlanStore = {
-        routeKey: string;
-        route?: [number, number];
-        entries: HostedConfig[];
-        rawDisk: boolean;
-        readerDiskLimit?: number;
-        sourceSpecs: StoreSourceSpec[];
-    };
-    export type StorePlan = {
-        selfEntries: HostedConfig[];
-        self: SelfSummary | undefined;
-        stores: StorePlanStore[];
-        structureKey: string;
-    };
-    export declare function computeStorePlan(account: string, bucketName: string, routing: RemoteConfig): StorePlan;
+        folder: string;
+        writeDelay?: number;
+    }): IArchives;
+    /** Applies a changed config to an ALREADY RUNNING source (same endpoint, see sourceIdentity - only policy moved). Sources that carry their config into every request MUST be updated in place, or they keep sending the old one: the server matches the config it is handed against its own entries, so a source left holding a stale config eventually stops resolving to a store at all. The write delay is policy too, so it moves here as well. */
+    export declare function applySourceConfig(source: IArchives, sourceConfig: SourceConfig | undefined, writeDelay?: number): void;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storeSync" {
+    import { IArchives, ArchivesSyncStatus, SyncActivity } from "../IArchives";
+    import type { BlobStore } from "./blobStore";
+    export declare class StoreSync {
+        private store;
+        private states;
+        private activities;
+        private evicting;
+        private lastAccess;
+        constructor(store: BlobStore);
+        /** Starts every live source's synchronization, plus the maintenance loops. Called once, by the store's init - the store's index must already be loaded, since scans write straight into it. */
+        start(): void;
+        /**
+         * Asks every peer for the routing config, and takes it if it is newer than ours. This is the whole
+         * of configuration propagation: it rides beside the scans rather than being part of them, because
+         * one small read is worth doing every few minutes while a full listing is not, and because a
+         * config we are missing is what stops everything else from being right.
+         *
+         * The copy is stored the same way a scan stores anything it pulls - an internal write into our own
+         * store - and the store notices that file landing and re-configures itself. Nothing here knows what
+         * a config means; it only knows this one file is worth asking for often.
+         */
+        private pollRoutingConfig;
+        /** Stops every source's loops (the store's own stop token stops the maintenance loops). */
+        stop(): void;
+        /** A slot the store just appended to its sources array: it starts from nothing, so it gets a full scan. */
+        addSource(slot: number): void;
+        /** The slot stays in the store's arrays forever (running loops hold slot numbers); it just goes dead - loops stop, and its index entries drop (other sources' scans re-find any copy that's still reachable through the new config). */
+        removeSource(slot: number): Promise<void>;
+        /** Whether a slot is still configured. Dead slots are never scanned, written, or read. */
+        isLive(slot: number): boolean;
+        getActivities(): SyncActivity[];
+        /** A key was just served, so it goes to the back of the eviction queue. */
+        noteAccess(key: string): void;
+        private entryUnchanged;
+        getStatus(): ArchivesSyncStatus;
+        /** Listings come straight from the index, so they must wait for our own base source's initial scan (which might lag minutes) before they are trustworthy. The base (local disk) is implicitly required - remote sources are not, they come and go. */
+        waitForRequiredScans(): Promise<void>;
+        /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
+        rescanBase(): Promise<void>;
+        /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
+        boundaryScanRemote(source: IArchives, config: {
+            since: number;
+            route?: [number, number];
+        }): Promise<void>;
+        private runSourceSync;
+        private scanSource;
+        private reconcileSource;
+        private updateScanIndex;
+        private pollChanges;
+        private copySourceFiles;
+        private enforceDiskLimit;
+        private cleanupTombstones;
+    }
 
 }
 
 declare module "sliftutils/storage/remoteStorage/validation" {
     export declare function assertValidName(value: string, kind: string): void;
+    /** A store's name (see CommonConfig.name), which also allows dots - a name is often a host or a version, and both read wrong without them. It is one path segment of the store's folder, so the two names that would mean a different folder entirely are rejected: everything else containing dots is just a name. */
+    export declare function assertValidSourceName(value: string): void;
     export declare function assertValidPath(path: string): void;
     /** Method decorator: validates the well-known fields of the method's single config-object argument - account/bucketName as names, path as a path - before the method runs. Fields the config doesn't have are skipped, so it applies to every API method uniformly. prefix is deliberately NOT validated: prefixes may be empty or end with "/", both invalid for paths. */
     export declare function assertValidArgs(target: unknown, key: string, descriptor: PropertyDescriptor): void;

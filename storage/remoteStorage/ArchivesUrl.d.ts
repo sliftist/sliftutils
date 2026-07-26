@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig } from "../IArchives";
+import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, FindConfig, GetConfig, GetInfoConfig, SetLargeFileConfig } from "../IArchives";
 export declare class ArchivesUrl implements IArchives {
     private base;
     constructor(base: string);
@@ -20,10 +20,7 @@ export declare class ArchivesUrl implements IArchives {
         lastModified?: number;
     }): Promise<string>;
     del(fileName: string): Promise<void>;
-    setLargeFile(config: {
-        path: string;
-        getNextData(): Promise<Buffer | undefined>;
-    }): Promise<void>;
+    setLargeFile(config: SetLargeFileConfig): Promise<void>;
     find(prefix: string, config?: FindConfig): Promise<string[]>;
     findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]>;
     getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]>;

@@ -19,6 +19,22 @@ const DISK_SPACE_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 // Below this fraction of the warn threshold, we start rejecting writes so the server itself doesn't tip the machine into instability. Reads/deletes still work so users can free space.
 const HARD_REJECT_FRACTION = 0.1;
 
+// This machine's LAN (internal) IPv4 - the address other machines on the same network reach us at. Used with --internal, where the ip-domain is based on the internal address instead of our public one.
+function getInternalIP(): string {
+    let candidates: string[] = [];
+    for (let addrs of Object.values(os.networkInterfaces())) {
+        for (let addr of addrs || []) {
+            if (addr.family !== "IPv4" || addr.internal) continue;
+            candidates.push(addr.address);
+        }
+    }
+    if (!candidates.length) {
+        throw new Error(`--internal was set, but no non-loopback IPv4 network interface was found to use as the internal address`);
+    }
+    // Prefer a private-range address (the actual LAN ip) over any other non-loopback interface
+    return candidates.find(ip => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip)) || candidates[0];
+}
+
 // The remote storage server, as a library function: consumers call hostStorageServer() from their own process to start hosting (or use the storageserver bin, see storageServerCli.ts). The grantAccess.js bootstrap (next to this file) is what the access page's shown SSH command points at.
 
 export type HostStorageServerConfig = {
@@ -28,6 +44,10 @@ export type HostStorageServerConfig = {
     folder: string;
     // When free space on the folder's drive drops below this many bytes, the server console.errors every 15 minutes. Below 10% of it, the server also rejects write operations (creating files, large uploads, new buckets) — reads, findInfo, and deletes still work so the user can free space. Default 25 GiB.
     lowSpaceThresholdBytes?: number;
+    // LAN-only mode: do NOT forward ports (no UPnP/NAT mapping), and the ip-domain must be based on this machine's INTERNAL ipv4 (its LAN address) instead of its external ip. For a server other machines only reach over the local network.
+    internal?: boolean;
+    // Serve a self-signed TLS cert signed by this machine's CA, instead of obtaining a real (ACME/Cloudflare) certificate. For a domain we don't control DNS for. Clients trust it by trusting our CA, or by visiting the server once and accepting the certificate in the browser.
+    selfSigned?: boolean;
 };
 
 function formatBytes(bytes: number): string {
@@ -70,11 +90,12 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
     let { url, folder } = config;
     let { address: domain, port } = parseStorageUrl(url);
     let rootDomain = domain.split(".").slice(-2).join(".");
-    let externalIP = (await getExternalIP()).trim();
+    // With --internal the ip-domain is based on our LAN address; otherwise on our external ip
+    let ip = config.internal ? getInternalIP() : (await getExternalIP()).trim();
     // The subdomain must be an ip domain: the domain's A record points at exactly one machine, so a dynamic name would let the same script run on two servers and silently fight over it. Encoding the IP makes that mistake fail loudly - the wrong machine's domain just doesn't match.
-    let allowedDomains = [`127-0-0-1.${rootDomain}`, `${externalIP.replaceAll(".", "-")}.${rootDomain}`];
+    let allowedDomains = [`127-0-0-1.${rootDomain}`, `${ip.replaceAll(".", "-")}.${rootDomain}`];
     if (!allowedDomains.includes(domain)) {
-        throw new Error(`The storage server domain is based on the machine's IP (the subdomain is the IP with dots replaced by dashes). Expected ${allowedDomains.join(" or ")}, was ${domain}. Your external IP is ${externalIP}.`);
+        throw new Error(`The storage server domain is based on the machine's ${config.internal ? "INTERNAL (LAN)" : "external"} IP (the subdomain is the IP with dots replaced by dashes). Expected ${allowedDomains.join(" or ")}, was ${domain}. This machine's ${config.internal ? "internal" : "external"} IP is ${ip}.`);
     }
     await fsp.mkdir(folder, { recursive: true });
     let lowSpaceThreshold = config.lowSpaceThresholdBytes ?? DEFAULT_LOW_SPACE_THRESHOLD_BYTES;
@@ -82,7 +103,7 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
         domain,
         port,
         rootDomain,
-        sshTarget: `${os.userInfo().username}@${externalIP}`,
+        sshTarget: `${os.userInfo().username}@${ip}`,
         serverCommand: `node ${getGrantAccessCliPath()} --url ${url}`,
         folder: path.resolve(folder),
     });
@@ -109,6 +130,9 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
         domain,
         port,
         setDNSRecord: true,
+        publicIp: ip,
+        internal: config.internal,
+        selfSigned: config.selfSigned,
         portFallback: {
             getAcquireDelay: getMainPortAcquireDelay,
             onPortInUse: async () => {

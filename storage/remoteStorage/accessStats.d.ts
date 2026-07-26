@@ -25,3 +25,15 @@ export declare function readAccessSummaries(config: {
     weightBySize?: boolean;
 }): SummaryEntry<AccessSummaryState>[];
 export declare function clearAccountAccessStats(account: string): void;
+export type BucketWriteStats = {
+    /** Every set call the bucket accepted */
+    originalWrites: number;
+    originalBytes: number;
+    /** What actually reached the sources. Fast writes coalesce repeated writes to the same key, so this is lower than the original counts (and is what the disk actually did). */
+    flushedWrites: number;
+    flushedBytes: number;
+};
+export declare function countBucketWrite(key: string, kind: "original" | "flushed", bytes: number): void;
+export declare function getBucketWriteStats(key: string): BucketWriteStats;
+/** Zeroes the write statistics of every bucket in the account. */
+export declare function debugClearAccountWriteStats(account: string): number;
