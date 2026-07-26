@@ -9,6 +9,8 @@ import { assertWritesAllowed } from "./serverConfig";
 import { assertValidSourceName } from "./validation";
 import { getBucketFolder, listAccountStoreFolders, listBucketStoreFolders, readRoutingFromDisk, getDiskInfo, BucketDiskInfo } from "./bucketDisk";
 import { scheduleBoundaryWork, reinjectIntermediates } from "./intermediateManagement";
+import { SocketFunction } from "socket-function/SocketFunction";
+import { StorageClientController } from "./storageClientController";
 import { isSelfSource } from "./storePlan";
 import { countBucketWrite, getBucketWriteStats, BucketWriteStats } from "./accessStats";
 
@@ -28,7 +30,7 @@ const stores = new Map<string, BlobStore>();
 // The opened stores of each `${account}/${bucketName}`, by name - which buckets are ACTIVE (something touched them), for deploy handoffs and the debug pages. Purely a registry of what getStore already made.
 const activeStores = new Map<string, Map<string, BlobStore>>();
 
-export function getStore(account: string, bucketName: string, name: string): BlobStore {
+export function getStore(account: string, bucketName: string, name: string, callerNodeId?: string): BlobStore {
     // The one place a name becomes a folder, so the one place it is validated (it can come straight off the wire)
     assertValidSourceName(name);
     let folder = getBucketFolder(name, account, bucketName);
@@ -44,6 +46,8 @@ export function getStore(account: string, bucketName: string, name: string): Blo
         resolveSourceUrl: resolveSourceArchives,
         // The store is the one that knows when a config landed, and a config with upcoming windows is what boundary scans are armed from
         onRoutingApplied: routing => scheduleBoundaryWork(account, bucketName, routing),
+        // The store was created by this caller's request, so the caller knows exactly what config it intended for this name - the store asks it when its own folder holds no configuration (see BlobStore.init)
+        requestRoutingConfig: callerNodeId && (async () => await StorageClientController.nodes[callerNodeId].getRoutingConfigForName({ account, bucketName, name })) || undefined,
     });
     stores.set(folder, store);
     let key = `${account}/${bucketName}`;
@@ -63,7 +67,12 @@ export function findBucketStore(account: string, bucketName: string, sourceConfi
     if (!sourceConfig) {
         throw new Error(`No remote source configuration was provided for bucket ${account}/${bucketName}: every request must say which configured source it selected`);
     }
-    return getStore(account, bucketName, sourceConfig.name);
+    // The caller's id, so a store this request CREATES can ask that caller for the config it intended (a store only ever exists because a config names it, and the requester holds that config)
+    let callerNodeId: string | undefined;
+    try {
+        callerNodeId = SocketFunction.getCaller()?.nodeId;
+    } catch { }
+    return getStore(account, bucketName, sourceConfig.name, callerNodeId);
 }
 
 /** The stores of a bucket as the DISK records them (a bucket is nothing more than the store folders sharing its name), opened - so the ones that weren't running yet start synchronizing. Empty when the bucket does not exist here. */

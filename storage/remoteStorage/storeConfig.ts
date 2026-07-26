@@ -17,6 +17,11 @@ export class StoreConfig {
     /** The routing config changed. Same store either way: its name did not change, so neither did its folder, its index, or the data in it. */
     /** No entries is a real state, not an error: a store exists as soon as its folder does, and it may never have heard of a configuration (see StorePolicy). */
     public update(entries: HostedConfig[]): void {
+        // Never go from configured back to UNCONFIGURED: keep the last configuration that worked. There is no point in emptying it - if this store was genuinely removed from the config, nobody will request it again, and the stale entries are not worth cleaning up (they are tiny, named stores are rarely removed, and a service restart clears them eventually). Keeping them is REQUIRED for the out-of-sync cases: a bad config that stops naming us would otherwise leave the store rejecting every write, including the ones that would let the configuration converge - it just won't update until a restart, and a restart can't complete against an out-of-date configuration, which is an infinite loop.
+        if (!entries.length && this.entries.length) {
+            console.warn(`Ignoring a routing config update that would leave store ${JSON.stringify(this.name)} with NO entries: keeping its current ${this.entries.length} entr${this.entries.length === 1 && "y" || "ies"} ${JSON.stringify(this.entries.map(x => ({ validWindow: x.validWindow, route: x.route })))}`);
+            return;
+        }
         let ordered = [...entries];
         sort(ordered, x => x.validWindow[0]);
         this.entries = ordered;

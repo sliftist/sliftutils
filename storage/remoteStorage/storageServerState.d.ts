@@ -4,7 +4,7 @@ import { BlobStore } from "./blobStore";
 import { RemoteConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
 import { BucketDiskInfo } from "./bucketDisk";
 import { BucketWriteStats } from "./accessStats";
-export declare function getStore(account: string, bucketName: string, name: string): BlobStore;
+export declare function getStore(account: string, bucketName: string, name: string, callerNodeId?: string): BlobStore;
 /** The store serving a request: the one the client's selected entry NAMES. Account, name, and bucket ARE the folder, so this is a direct lookup, never a search of what exists - and a name this server has never seen is CREATED, never rejected, because asking for a name is the instruction to have that store (one name, one folder, one index; it configures itself once the routing config lands in it). Nothing else about the request is compared - not the window, not the route, not the flags - which is the whole point of naming it: a client a config version behind on some flag still reaches the right store. */
 export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): BlobStore;
 /** The stores of a bucket as the DISK records them (a bucket is nothing more than the store folders sharing its name), opened - so the ones that weren't running yet start synchronizing. Empty when the bucket does not exist here. */

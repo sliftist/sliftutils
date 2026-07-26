@@ -6,7 +6,7 @@ import {
     windowsAcceptWrites, SyncActivity, FULL_ROUTE, FULL_VALID_WINDOW, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, STORAGE_NOT_CONFIGURED,
 } from "../IArchives";
 import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
-import { ROUTING_FILE, getRoute, routeContains, routeIntersection, parseRoutingData, assertValidRemoteConfig, getConfigVersion, sourceIdentity, sourcePersistentUrl } from "./remoteConfig";
+import { ROUTING_FILE, getRoute, routeContains, routeIntersection, parseRoutingData, serializeRemoteConfig, assertValidRemoteConfig, getConfigVersion, sourceIdentity, sourcePersistentUrl } from "./remoteConfig";
 import { selectEntryAt } from "./storePlan";
 import { sourceWriteDelay } from "./ArchivesDelayed";
 import { LogMap } from "../LogMap";
@@ -102,6 +102,8 @@ export class BlobStore {
             onIndexChanged?: (key: string) => void;
             /** Called every time this store applies a routing config to itself (startup, an operator's write, a peer's copy arriving) - the store is the one that knows when a config landed, and the server arms window-boundary scans from it. */
             onRoutingApplied?: (routing: RemoteConfig) => void;
+            /** Asks the client whose request created this store what routing config it intended for our name. Only used when init finds NO configuration in our folder: a store only ever exists because a config names it, so the requester has that config - asking for it lazily is the same information as passing the config on every call, without the per-call kilobytes. */
+            requestRoutingConfig?: () => Promise<RemoteConfig | undefined>;
             // Every accepted write ("original") and every write that actually reached the sources ("flushed"). Fast writes coalesce, so the two counts differ.
             onWriteCounted?: (kind: "original" | "flushed", bytes: number) => void;
             // Resolves a persisted source URL (see ArchivesSource.url) to a cached IArchives, so entries whose holder is no longer configured can still be read
@@ -130,6 +132,22 @@ export class BlobStore {
     public init = lazy(async () => {
         // Configure first: the config decides what the sources ARE, and everything below is per source. With no config at all that is just our own disk, which is enough to serve and to be written to.
         await this.applyRoutingConfig();
+        // No configuration in our folder at all - which happens when this store was just CREATED by a request, before any config write reached it. The requester knows exactly what config it intended for our name, so ask it.
+        if (!this.storeConfig.all().length && this.config?.requestRoutingConfig) {
+            try {
+                let provided = await this.config.requestRoutingConfig();
+                if (provided) {
+                    console.log(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration; the requesting client provided routing config version ${getConfigVersion(provided)} - adopting it`);
+                    // Straight onto the disk, not through set(): set waits for init, which is what is running right now
+                    await this.ownDisk.set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(provided)), { lastModified: Date.now() });
+                    await this.applyRoutingConfig();
+                } else {
+                    console.warn(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration, and the requesting client had no routing config naming it either - running unconfigured`);
+                }
+            } catch (e) {
+                console.error(`Asking the requesting client for the routing config of store ${JSON.stringify(this.storeName)} (folder ${this.folder}) failed - running unconfigured: ${(e as Error).stack ?? e}`);
+            }
+        }
         for (let i = 0; i < this.sources.length; i++) {
             await this.registerSlot(i);
         }

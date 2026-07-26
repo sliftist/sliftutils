@@ -3,7 +3,7 @@ import { RemoteConfig, SourceConfig } from "../IArchives";
 import { ROUTING_FILE, getConfigVersion, serializeRemoteConfig, normalizeRemoteConfig, normalizeSource } from "./remoteConfig";
 import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
 import { resolveIntermediateSources } from "./intermediateSources";
-import { onServerRoutingChanged } from "./storageClientController";
+import { onServerRoutingChanged, trackChainConfig } from "./storageClientController";
 
 // The LIFECYCLE of an ArchivesChain's state, and nothing else: initializing it (probing every configured source, deciding which routing config to run, writing ours out when it is the newest), the retry when initialization fails, the poll that adopts newer configs, the availability recheck, and the loop that keeps re-writing our config. None of this is request dispatch - the chain (createArchives.ts) asks the ChainStateManager for the current state and dispatches over it.
 
@@ -50,7 +50,11 @@ export class ChainStateManager {
         this.unsubscribeRoutingPush = onServerRoutingChanged(() => {
             void this.refreshActiveConfig().catch((e: Error) => console.error(`Config refresh failed for ${this.config.debugName()}: ${e.stack ?? e}`));
         });
+        // So a server can ask what config we intended for a store name (see StorageClientController.getRoutingConfigForName)
+        this.untrackConfig = trackChainConfig({ configured: config.configured, active: () => this.activeConfig });
     }
+
+    private untrackConfig: () => void;
 
     /** The newest adopted state, synchronously - undefined until the first init finishes. */
     public latest(): ChainState | undefined {
@@ -275,6 +279,7 @@ export class ChainStateManager {
 
     public dispose(): void {
         this.disposed = true;
+        this.untrackConfig();
         this.unsubscribeRoutingPush?.();
         if (this.pollTimer) {
             clearInterval(this.pollTimer);

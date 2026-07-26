@@ -28,7 +28,7 @@ const PRIMARY_RETRY_DELAY = 2 * 1000;
 const COVERING_RETRY_TIMEOUT = 30 * 1000;
 const COVERING_RETRY_DELAY = 5 * 1000;
 // Smart timeouts: an attempt gets this long to produce anything before we probe getInfo for the file's size (and the probe itself gets the same window)
-const SMART_TIMEOUT_PROBE = 10 * 1000;
+const SMART_TIMEOUT_PROBE = 60 * 1000;
 // Very generous assumed transfer rates - the resulting deadline exists to catch stuck sources, not slow ones
 const SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND = 1024 * 1024;
 const SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND = 512 * 1024;

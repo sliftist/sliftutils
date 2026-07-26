@@ -3296,6 +3296,8 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             onIndexChanged?: ((key: string) => void) | undefined;
             /** Called every time this store applies a routing config to itself (startup, an operator's write, a peer's copy arriving) - the store is the one that knows when a config landed, and the server arms window-boundary scans from it. */
             onRoutingApplied?: ((routing: RemoteConfig) => void) | undefined;
+            /** Asks the client whose request created this store what routing config it intended for our name. Only used when init finds NO configuration in our folder: a store only ever exists because a config names it, so the requester has that config - asking for it lazily is the same information as passing the config on every call, without the per-call kilobytes. */
+            requestRoutingConfig?: (() => Promise<RemoteConfig | undefined>) | undefined;
             onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
             resolveSourceUrl?: ((url: string) => IArchives) | undefined;
         } | undefined);
@@ -3601,6 +3603,7 @@ declare module "sliftutils/storage/remoteStorage/chainStartup" {
             /** See ArchivesChainOptions.directConnect. */
             directConnect?: boolean;
         });
+        private untrackConfig;
         /** The newest adopted state, synchronously - undefined until the first init finishes. */
         latest(): ChainState | undefined;
         getState(): Promise<ChainState>;
@@ -4071,11 +4074,25 @@ declare module "sliftutils/storage/remoteStorage/sourcesList" {
 }
 
 declare module "sliftutils/storage/remoteStorage/storageClientController" {
+    import { RemoteConfig } from "../IArchives";
     /** Subscribe to server-pushed routing change notifications. Returns the unsubscribe function. */
     export declare function onServerRoutingChanged(listener: () => void): () => void;
+    /** One chain's configs, as getRoutingConfigForName answers from them: the initial in-code config, and a getter for the synchronized one (adopted from the stored routing files, so it changes over time). */
+    type TrackedChainConfig = {
+        configured: RemoteConfig;
+        active: () => RemoteConfig;
+    };
+    /** Every chain tracks its configs here (see ChainStateManager), so a server can ask what config was intended for a store name. Returns the untrack function. */
+    export declare function trackChainConfig(entry: TrackedChainConfig): () => void;
     export declare const StorageClientController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
         routingConfigChanged: () => Promise<void>;
+        getRoutingConfigForName: (config: {
+            account: string;
+            bucketName: string;
+            name: string;
+        }) => Promise<RemoteConfig | undefined>;
     }>;
+    export {};
 
 }
 
@@ -4317,7 +4334,7 @@ declare module "sliftutils/storage/remoteStorage/storageServerState" {
     import { RemoteConfig, SourceConfig, IArchives, ArchivesConfig, ArchivesSyncStatus } from "../IArchives";
     import { BucketDiskInfo } from "./bucketDisk";
     import { BucketWriteStats } from "./accessStats";
-    export declare function getStore(account: string, bucketName: string, name: string): BlobStore;
+    export declare function getStore(account: string, bucketName: string, name: string, callerNodeId?: string): BlobStore;
     /** The store serving a request: the one the client's selected entry NAMES. Account, name, and bucket ARE the folder, so this is a direct lookup, never a search of what exists - and a name this server has never seen is CREATED, never rejected, because asking for a name is the instruction to have that store (one name, one folder, one index; it configures itself once the routing config lands in it). Nothing else about the request is compared - not the window, not the route, not the flags - which is the whole point of naming it: a client a config version behind on some flag still reaches the right store. */
     export declare function findBucketStore(account: string, bucketName: string, sourceConfig: SourceConfig | undefined): BlobStore;
     /** The stores of a bucket as the DISK records them (a bucket is nothing more than the store folders sharing its name), opened - so the ones that weren't running yet start synchronizing. Empty when the bucket does not exist here. */

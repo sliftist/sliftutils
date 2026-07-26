@@ -59,6 +59,8 @@ export declare class BlobStore {
         onIndexChanged?: ((key: string) => void) | undefined;
         /** Called every time this store applies a routing config to itself (startup, an operator's write, a peer's copy arriving) - the store is the one that knows when a config landed, and the server arms window-boundary scans from it. */
         onRoutingApplied?: ((routing: RemoteConfig) => void) | undefined;
+        /** Asks the client whose request created this store what routing config it intended for our name. Only used when init finds NO configuration in our folder: a store only ever exists because a config names it, so the requester has that config - asking for it lazily is the same information as passing the config on every call, without the per-call kilobytes. */
+        requestRoutingConfig?: (() => Promise<RemoteConfig | undefined>) | undefined;
         onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
         resolveSourceUrl?: ((url: string) => IArchives) | undefined;
     } | undefined);

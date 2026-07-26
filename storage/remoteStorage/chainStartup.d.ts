@@ -26,6 +26,7 @@ export declare class ChainStateManager {
         /** See ArchivesChainOptions.directConnect. */
         directConnect?: boolean;
     });
+    private untrackConfig;
     /** The newest adopted state, synchronously - undefined until the first init finishes. */
     latest(): ChainState | undefined;
     getState(): Promise<ChainState>;
