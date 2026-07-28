@@ -44,6 +44,8 @@ const SYNC_FAILURE_DELAY = 1000 * 15;
 // A full listing that comes back EMPTY - or under half of what we know the source holds - is treated as the other end being briefly broken, not as the truth: it is retried this many times, this far apart, before being believed. Believing a wrongly-shrunken listing purges every index entry the source held, which is how sync progress "goes backwards".
 const SUSPICIOUS_SCAN_RETRIES = 3;
 const SUSPICIOUS_SCAN_RETRY_DELAY = 1000 * 60;
+// A source whose every window ended this long ago (and has none in the future) can never receive writes again - the window gates them, deletions included. Scanning such a source can only re-ingest history it will never be told to delete, which after tombstone expiry IS resurrection - so it is not scanned at all. The grace covers handoff stragglers around a window's end.
+const SCAN_STALE_WINDOW_GRACE = 1000 * 60 * 60;
 
 type SourceState = {
     supportsChangesAfter: boolean;
@@ -287,6 +289,12 @@ export class StoreSync {
 
     // ── per-source loops ──
 
+    // Slot 0 is exempt: our own disk answers for every window this store EVER held, and scanning it is what keeps the index honest about them. Read live each call - updateSources moves the windows on running slots, so a source goes stale (or comes back) while its loops run.
+    private windowsAllowScanning(sourceIndex: number): boolean {
+        if (sourceIndex === 0) return true;
+        return this.store.sources[sourceIndex].validWindows.some(w => w[1] > Date.now() - SCAN_STALE_WINDOW_GRACE);
+    }
+
     private async startSourceSyncLoops(sourceIndex: number): Promise<void> {
         await this.store.registerSlot(sourceIndex);
         let sourceObj = this.store.sources[sourceIndex];
@@ -302,7 +310,23 @@ export class StoreSync {
             state.initialScan.resolve(undefined);
             return;
         }
-        while (!this.store.stopped.stop && !state.stopped.stop) {
+        // Checked per tick, never decided once: the windows move on running slots (see updateSources), so a source goes stale mid-life and can come back if a config extends them. Logged only on each transition into staleness.
+        let loggedStale = false;
+        let skipStale = () => {
+            if (this.windowsAllowScanning(sourceIndex)) {
+                loggedStale = false;
+                return false;
+            }
+            state.scanComplete = true;
+            state.initialScan.resolve(undefined);
+            if (!loggedStale) {
+                loggedStale = true;
+                logSyncEvent({ event: "scanSkippedStaleWindows", store: this.store.folder, source: source.getDebugName(), validWindows: this.store.sources[sourceIndex].validWindows.map(w => [new Date(w[0]).toISOString(), new Date(w[1]).toISOString()]), graceMs: SCAN_STALE_WINDOW_GRACE });
+            }
+            return true;
+        };
+        // An already-stale source skips getConfig entirely: its endpoint is often long gone, and retrying that every 30s forever is noise about a source we would not scan anyway (if its windows are later extended, the full-round poll below picks it up - just without change polling until a restart)
+        while (!skipStale() && !this.store.stopped.stop && !state.stopped.stop) {
             try {
                 let config = await source.getConfig();
                 state.supportsChangesAfter = !!config.supportsChangesAfter;
@@ -318,6 +342,7 @@ export class StoreSync {
         // Both loops below run one at a time: a change-poll tick landing mid full round would otherwise start a second copy pass over the same pending list, downloading everything twice
         let serial = runInSerial(async (fnc: () => Promise<void>) => await fnc());
         await runInfinitePollCallAtStart(pollInterval, () => serial(async () => {
+            if (skipStale()) return;
             while (!this.store.stopped.stop && !state.stopped.stop) {
                 try {
                     await this.syncSource(sourceIndex)("push");
@@ -334,6 +359,7 @@ export class StoreSync {
         }), state.stopped);
         if (state.supportsChangesAfter) {
             runInfinitePoll(CHANGES_POLL_INTERVAL, () => serial(async () => {
+                if (skipStale()) return;
                 // A scan that has not succeeded yet is retried HERE, before anything else - polling changes and copying against a never-scanned source would run on arbitrarily stale information
                 if (!state.scanSucceeded) {
                     await this.syncSource(sourceIndex)("push");

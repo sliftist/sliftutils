@@ -44,6 +44,7 @@ export declare class StoreSync {
         since: number;
         route?: [number, number];
     }): Promise<void>;
+    private windowsAllowScanning;
     private startSourceSyncLoops;
     private pullSource;
     private pushSource;
