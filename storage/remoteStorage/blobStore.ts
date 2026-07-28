@@ -152,7 +152,7 @@ export class BlobStore {
                 if (provided) {
                     console.log(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration; the requesting client provided routing config version ${getConfigVersion(provided)} - adopting it`);
                     // Straight onto the disk, not through set(): set waits for init, which is what is running right now
-                    await this.ownDisk.set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(provided)), { lastModified: Date.now() });
+                    await this.ownDisk.set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(provided)), { lastModified: Math.floor(Date.now()) });
                     await this.applyRoutingConfig();
                 } else {
                     logStorageWarn(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration, and the requesting client had no routing config naming it either - running unconfigured`);
@@ -374,10 +374,10 @@ export class BlobStore {
     public async set(config: { path: string; data: Buffer; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean; undelete?: boolean }): Promise<void> {
         let { path: key, data } = config;
         if (!data.length) {
-            throw new Error(`set was called with an empty buffer for ${JSON.stringify(key)} (store ${this.folder}): an empty file IS a deletion in this system and would read back as missing - call del instead`);
+            throw new Error(`Empty write refused: set was called with an empty buffer for ${JSON.stringify(key)} (store ${this.folder}): an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
         await this.init();
-        let writeTime = config.lastModified || Date.now();
+        let writeTime = Math.floor(config.lastModified || Date.now());
         let route = getRoute(key);
         // The routing file defines the windows/routes, so they can't possibly apply to it (and it never flows through validation) - but it has a rule of its own, which is ours to enforce because the file is ours
         if (key === ROUTING_FILE) {
@@ -448,7 +448,7 @@ export class BlobStore {
         }
         let result = await this.get2({ path: config.fromPath });
         if (!result || !result.data.length) {
-            throw new Error(`Cannot move ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)}: the source file does not exist (store ${this.folder})`);
+            throw new Error(`Move source does not exist. Cannot move ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)} (store ${this.folder})`);
         }
         await this.set({ path: config.toPath, data: result.data });
         await this.del({ path: config.fromPath });
@@ -648,7 +648,7 @@ export class BlobStore {
         await this.init();
         let key = config?.path;
         if (key) {
-            let writeTime = config?.lastModified || Date.now();
+            let writeTime = Math.floor(config?.lastModified || Date.now());
             let route = getRoute(key);
             if (key !== ROUTING_FILE) {
                 this.assertWriteTarget(key, route, config?.lastModified);
@@ -742,7 +742,7 @@ export class BlobStore {
     public sourcesListIndexOfSlot(slot: number): number {
         let index = this.slotSourcesListIndexes[slot];
         if (index === undefined) {
-            throw new Error(`Source slot ${slot} (${this.sources[slot]?.url}) has no registered sourcesListIndex yet (store ${this.folder})`);
+            throw new Error(`Source slot is not registered yet. Slot ${slot} (${this.sources[slot]?.url}) has no sourcesListIndex (store ${this.folder})`);
         }
         return index;
     }
@@ -848,7 +848,7 @@ export class BlobStore {
                 console.log(`Undelete of ${JSON.stringify(key)} (store ${this.folder}) has nothing to restore here - this node may never have held the file`);
                 return;
             }
-            throw new Error(`Cannot undelete ${JSON.stringify(key)} (store ${this.folder}): it has no marked deletion to restore - it was never deleted here${this.getDeletedEntry(key) && ", or its deletion history was already dropped (a plain tombstone remains, but the bytes are gone)" || ""}`);
+            throw new Error(`Undelete failed - nothing to restore. Cannot undelete ${JSON.stringify(key)} (store ${this.folder}): it has no marked deletion to restore - it was never deleted here${this.getDeletedEntry(key) && ", or its deletion history was already dropped (a plain tombstone remains, but the bytes are gone)" || ""}`);
         }
         console.log(`Undeleted ${JSON.stringify(key)} (store ${this.folder}): the index entry (${marked?.size} bytes, deleted ${marked && new Date(marked.deleteTime).toISOString()}) is live again as of ${new Date(writeTime).toISOString()} - the bytes never left the disk`);
         logMutation({ op: "undelete", folder: this.folder, store: this.storeName, path: key, size: marked?.size, writeTime, internal });
@@ -932,7 +932,7 @@ export class BlobStore {
         if (!this.storeConfig.all().length) {
             let detail = this.unconfiguredDetail();
             logWrongTargetRejection(`Rejecting write of ${JSON.stringify(key)}: ${detail}`);
-            throw new Error(`${STORAGE_NOT_CONFIGURED} Cannot write ${JSON.stringify(key)}: ${detail} Data written to a store with no configuration entry would never be scanned or reconciled, so accepting it would silently lose it. Re-resolve the currently valid source and retry - or, if this store is genuinely meant to take this write, write the bucket's routing config with an entry naming it on this server.`);
+            throw new Error(`${STORAGE_NOT_CONFIGURED} Write rejected: this store has no configuration. Cannot write ${JSON.stringify(key)}: ${detail} Data written to a store with no configuration entry would never be scanned or reconciled, so accepting it would silently lose it. Re-resolve the currently valid source and retry - or, if this store is genuinely meant to take this write, write the bucket's routing config with an entry naming it on this server.`);
         }
         if (!lastModified) {
             this.assertFreshWriteTarget(key, Date.now(), route);
@@ -941,7 +941,7 @@ export class BlobStore {
         // A stamped write picked its own time, so no window can judge it (that is the whole point of a synchronized write) - but the ROUTE is not a matter of timing, and a stamped write to the wrong shard is exactly as invisible as a fresh one
         if (this.storeConfig.all().some(x => routeContains(x.route, route))) return;
         logWrongTargetRejection(`Rejecting stamped write of ${JSON.stringify(key)} (store ${this.folder}): route ${route} is outside every route we serve ${JSON.stringify(this.storeConfig.all().map(x => x.route || FULL_ROUTE))}`);
-        throw new Error(`${STORAGE_WRONG_ROUTE} This store does not handle route ${route} (key ${JSON.stringify(key)}, our routes: ${JSON.stringify(this.storeConfig.all().map(x => x.route || FULL_ROUTE))}, store ${this.folder}). Re-resolve the source for this key and retry.`);
+        throw new Error(`${STORAGE_WRONG_ROUTE} Write rejected: wrong route for this store. Route ${route} (key ${JSON.stringify(key)}, our routes: ${JSON.stringify(this.storeConfig.all().map(x => x.route || FULL_ROUTE))}, store ${this.folder}). Re-resolve the source for this key and retry.`);
     }
 
     /** Exactly why this store has no configuration entries - which of the three possible reasons it is, with the values that decided it, because "not configured" alone is undiagnosable. */
@@ -974,7 +974,7 @@ export class BlobStore {
         let incoming = getConfigVersion(routing);
         let current = this.routingVersion();
         if (incoming >= current) return;
-        throw new Error(`Refusing to write ${ROUTING_FILE} to store ${this.folder}: its version (${incoming}) is older than the one this store is running (${current}). Increment the version to update it.`);
+        throw new Error(`Routing config write refused - the version is not newer. Refusing to write ${ROUTING_FILE} to store ${this.folder}: its version (${incoming}) is older than the one this store is running (${current}). Increment the version to update it.`);
     }
 
     // A fresh (unstamped) write must land on the node the config currently points at: the markers tell the client its config is stale, so it re-resolves and retries against the right node instead of us silently accepting data we were never meant to hold.
@@ -982,11 +982,11 @@ export class BlobStore {
         let timeValid = this.storeConfig.all().filter(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1]);
         if (!timeValid.length) {
             logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(key)} (store ${this.folder}): writeTime ${writeTime} (${new Date(writeTime).toISOString()}) is outside all our valid windows ${JSON.stringify(this.storeConfig.all().map(x => x.validWindow))} (a switchover moved the write target)`);
-            throw new Error(`${STORAGE_WRONG_VALID_WINDOW} Cannot write ${JSON.stringify(key)}: its write time ${writeTime} (${new Date(writeTime).toISOString()}) is outside every valid window of store ${JSON.stringify(this.storeName)} (windows: ${JSON.stringify(this.storeConfig.all().map(x => x.validWindow))}, folder ${this.folder}) - a switchover moved the write target. Re-resolve the currently valid source and retry.`);
+            throw new Error(`${STORAGE_WRONG_VALID_WINDOW} Write rejected: write time is outside our valid windows. Cannot write ${JSON.stringify(key)}: its write time ${writeTime} (${new Date(writeTime).toISOString()}) is outside every valid window of store ${JSON.stringify(this.storeName)} (windows: ${JSON.stringify(this.storeConfig.all().map(x => x.validWindow))}, folder ${this.folder}) - a switchover moved the write target. Re-resolve the currently valid source and retry.`);
         }
         if (!timeValid.some(x => routeContains(x.route, route))) {
             logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(key)} (store ${this.folder}): route ${route} is outside our routes ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))} at writeTime ${writeTime} (the client's shard config is stale)`);
-            throw new Error(`${STORAGE_WRONG_ROUTE} This store does not handle route ${route} (key ${JSON.stringify(key)}, our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}, store ${this.folder}). Re-resolve the source for this key and retry.`);
+            throw new Error(`${STORAGE_WRONG_ROUTE} Write rejected: wrong route for this store. Route ${route} (key ${JSON.stringify(key)}, our routes at this time: ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))}, store ${this.folder}). Re-resolve the source for this key and retry.`);
         }
     }
 
@@ -995,7 +995,7 @@ export class BlobStore {
         let self = selectEntryAt(this.storeConfig.all(), writeTime, getRoute(key));
         if (!self?.immutable) return;
         if (await this.getInfo({ path: key })) {
-            throw new Error(`This store is immutable (at write time ${writeTime}) and ${JSON.stringify(key)} already exists, so it cannot be written to (store ${this.folder})`);
+            throw new Error(`Write rejected - immutable store and the file already exists. At write time ${writeTime}, ${JSON.stringify(key)} already exists (store ${this.folder})`);
         }
     }
 
@@ -1004,7 +1004,7 @@ export class BlobStore {
         if (!this.storeConfig.all().length) return;
         let covered = this.storeConfig.all().some(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1] && routeContains(x.route, route));
         if (!covered) {
-            throw new Error(`Internal write of ${JSON.stringify(key)} rejected: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this store is configured for: ${JSON.stringify(this.storeConfig.all().map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))} (store ${this.folder})`);
+            throw new Error(`Internal write rejected - outside every configured window/route. Writing ${JSON.stringify(key)}: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this store is configured for: ${JSON.stringify(this.storeConfig.all().map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))} (store ${this.folder})`);
         }
     }
 
@@ -1057,7 +1057,7 @@ export class BlobStore {
             if (lastModified < await this.currentWriteTime(key)) return;
         }
         // Fast writes are not handled here: a source that was configured with a write delay buffers them itself (see ArchivesDelayed), so this write lands in memory and returns, exactly as it would have. The index is updated either way, so the write is immediately visible to readers of this store.
-        await this.writeToSources(key, data, lastModified || Date.now());
+        await this.writeToSources(key, data, Math.floor(lastModified || Date.now()));
     }
 
     /** The instant every delayed write must be on its source: the end of our own write window that contains now, minus the flush margin (so the next window's source finds the data on handoff). The LATEST end among covering windows - overlapping windows hand off at the last one. No window contains now (an inert store, or a moment between our windows) -> 0, i.e. nothing may be delayed at all. */

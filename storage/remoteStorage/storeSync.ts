@@ -1,7 +1,7 @@
 import { runInfinitePoll, delay, runInfinitePollCallAtStart, runInSerial } from "socket-function/src/batching";
 import { cache } from "socket-function/src/caching";
 import { timeInMinute, sort, promiseObj } from "socket-function/src/misc";
-import { formatNumber, formatTime } from "socket-function/src/formatting/format";
+import { formatNumber, formatTime, formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import {
     IArchives, ArchiveFileInfo, ArchivesSyncStatus, SyncActivity, FULL_ROUTE,
     windowsAcceptWrites,
@@ -263,12 +263,12 @@ export class StoreSync {
                 // Undefined is two cases (see copyArchiveFile): our own disk already holding something newer is the boundary scan working as intended (our writes since the boundary outrank the neighbor's), only a genuinely unreadable file is worth a warning
                 let local = await this.store.sources[0].source.getInfo(file.path);
                 if (local && local.writeTime > file.createTime) {
-                    logSyncEvent({ event: "boundaryScanLocalNewer", store: this.store.folder, source: source.getDebugName(), path: file.path, theirWriteTime: new Date(file.createTime).toISOString(), theirSize: file.size, localWriteTime: new Date(local.writeTime).toISOString(), localSize: local.size });
+                    logSyncEvent({ event: "boundaryScanLocalNewer", store: this.store.folder, source: source.getDebugName(), path: file.path, theirWriteTime: formatDateTimeDetailed(file.createTime), theirSize: file.size, localWriteTime: formatDateTimeDetailed(local.writeTime), localSize: local.size });
                     this.store.setIndexEntry(file.path, { writeTime: local.writeTime, size: local.size, sourcesListIndex: this.store.sourcesListIndexOfSlot(0) });
                     tally.unchanged++;
                     continue;
                 }
-                console.warn(`Boundary scan could not copy ${file.path} from ${source.getDebugName()} (store ${this.store.folder}): its change feed listed it (${file.size} bytes, writeTime ${new Date(file.createTime).toISOString()}) but the read found nothing`);
+                console.warn(`Boundary scan could not copy ${file.path} from ${source.getDebugName()} (store ${this.store.folder}): its change feed listed it (${file.size} bytes, writeTime ${formatDateTimeDetailed(file.createTime)}) but the read found nothing`);
                 continue;
             }
             this.store.noteSyncTransfer("sync get", file.path, copied.size);
@@ -321,7 +321,7 @@ export class StoreSync {
             state.initialScan.resolve(undefined);
             if (!loggedStale) {
                 loggedStale = true;
-                logSyncEvent({ event: "scanSkippedStaleWindows", store: this.store.folder, source: source.getDebugName(), validWindows: this.store.sources[sourceIndex].validWindows.map(w => [new Date(w[0]).toISOString(), new Date(w[1]).toISOString()]), pastReadDurationMs: PAST_READ_DURATION });
+                logSyncEvent({ event: "scanSkippedStaleWindows", store: this.store.folder, source: source.getDebugName(), validWindows: this.store.sources[sourceIndex].validWindows.map(w => [formatDateTimeDetailed(w[0]), formatDateTimeDetailed(w[1])]), pastReadDurationMs: PAST_READ_DURATION });
             }
             return true;
         };
@@ -500,10 +500,10 @@ export class StoreSync {
                     let theirs = await source.getInfo(key);
                     if (theirs && theirs.writeTime > writeTime) {
                         this.store.setIndexEntry(key, { writeTime: theirs.writeTime, size: theirs.size, sourcesListIndex: targetSourcesListIndex });
-                        logSyncEvent({ event: "pushFoundNewerOnSource", store: this.store.folder, source: source.getDebugName(), path: key, ourWriteTime: new Date(writeTime).toISOString(), theirWriteTime: new Date(theirs.writeTime).toISOString(), ourSize: entry.size, theirSize: theirs.size });
+                        logSyncEvent({ event: "pushFoundNewerOnSource", store: this.store.folder, source: source.getDebugName(), path: key, ourWriteTime: formatDateTimeDetailed(writeTime), theirWriteTime: formatDateTimeDetailed(theirs.writeTime), ourSize: entry.size, theirSize: theirs.size });
                         continue;
                     }
-                    logSyncEvent({ event: "pushCopyUnavailable", store: this.store.folder, source: source.getDebugName(), path: key, holder: holder.getDebugName(), expectedSize: entry.size, expectedWriteTime: new Date(writeTime).toISOString(), sourceHas: theirs && `${theirs.size} bytes at ${new Date(theirs.writeTime).toISOString()}` || "nothing" });
+                    logSyncEvent({ event: "pushCopyUnavailable", store: this.store.folder, source: source.getDebugName(), path: key, holder: holder.getDebugName(), expectedSize: entry.size, expectedWriteTime: formatDateTimeDetailed(writeTime), sourceHas: theirs && `${theirs.size} bytes at ${formatDateTimeDetailed(theirs.writeTime)}` || "nothing" });
                     continue;
                 }
                 this.store.noteSyncTransfer("sync set", key, copied.size);
@@ -628,7 +628,7 @@ export class StoreSync {
             if (local) {
                 // The local copy can be NEWER than the entry (which is exactly why copyArchiveFile refuses to overwrite it - see its destination check), so the repoint keeps the newer of the two times rather than rolling the index back
                 this.store.setIndexEntry(key, { writeTime: Math.max(entry.writeTime, local.writeTime), size: local.size, sourcesListIndex: this.store.sourcesListIndexOfSlot(0) });
-                logSyncEvent({ ...base, resolution: "repointed to our local copy", localSize: local.size, localWriteTime: new Date(local.writeTime).toISOString() });
+                logSyncEvent({ ...base, resolution: "repointed to our local copy", localSize: local.size, localWriteTime: formatDateTimeDetailed(local.writeTime) });
                 return;
             }
             if (this.store.currentWriteTime(key) <= entry.writeTime) {

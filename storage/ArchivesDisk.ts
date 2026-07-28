@@ -163,8 +163,8 @@ export class ArchivesDisk implements IArchives {
         await this.handles.run(filePath, async () => {
             if (lastModified) {
                 let existing = await statOrUndefined(filePath);
-                // An older write never overwrites a newer one (see IArchives.set)
-                if (existing && lastModified < existing.mtimeMs) return;
+                // An older write never overwrites a newer one (see IArchives.set). Both sides floored: sub-millisecond mtime digits are storage artifacts, not ordering (see get2)
+                if (existing && Math.floor(lastModified) < Math.floor(existing.mtimeMs)) return;
             }
             await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
             let handle = await this.handles.getHandle(filePath, fs.constants.O_RDWR | fs.constants.O_CREAT);
@@ -237,13 +237,14 @@ export class ArchivesDisk implements IArchives {
             if (!size && !config?.includeTombstones) return undefined;
             let start = range && Math.min(range.start, size) || 0;
             let end = range && Math.min(range.end, size) || size;
-            if (end <= start) return { data: Buffer.alloc(0), writeTime: stats.mtimeMs, size };
+            // mtimeMs is floored everywhere this disk reports a time: it carries fractional milliseconds (kernel-stamped files have nanosecond mtimes), but utimes round-trips only whole ones - so a fractional time handed to the rest of the system could never be reproduced by propagation, and every copy of the file would compare "older" than the original forever
+            if (end <= start) return { data: Buffer.alloc(0), writeTime: Math.floor(stats.mtimeMs), size };
             let buffer = Buffer.alloc(end - start);
             let { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
             if (bytesRead !== buffer.length) {
                 throw new Error(`Expected ${buffer.length} bytes at ${filePath}:${start}, read ${bytesRead}`);
             }
-            return { data: buffer, writeTime: stats.mtimeMs, size };
+            return { data: buffer, writeTime: Math.floor(stats.mtimeMs), size };
         });
     }
 
@@ -254,7 +255,7 @@ export class ArchivesDisk implements IArchives {
             let stats = await statOrUndefined(filePath);
             if (!stats || !stats.isFile()) return undefined;
             if (!stats.size && !config?.includeTombstones) return undefined;
-            return { writeTime: stats.mtimeMs, size: stats.size };
+            return { writeTime: Math.floor(stats.mtimeMs), size: stats.size };
         });
     }
 
@@ -295,7 +296,7 @@ export class ArchivesDisk implements IArchives {
             let stats = await statOrUndefined(path.join(this.filesDir, relPath));
             // Deleted while we were walking
             if (!stats) continue;
-            infos.set(relPath, { path: relPath, createTime: stats.mtimeMs, size: stats.size });
+            infos.set(relPath, { path: relPath, createTime: Math.floor(stats.mtimeMs), size: stats.size });
         }
     }
 
@@ -353,7 +354,7 @@ export class ArchivesDisk implements IArchives {
             if (lastModified) {
                 // An older write never overwrites a newer one (see IArchives.set) - re-checked HERE, not just when the upload started, because a large upload streams for minutes and that window is exactly when a newer write lands
                 let existing = await statOrUndefined(filePath);
-                if (existing && lastModified < existing.mtimeMs) {
+                if (existing && Math.floor(lastModified) < Math.floor(existing.mtimeMs)) {
                     await fs.promises.rm(tmpPath, { force: true });
                     return;
                 }

@@ -186,7 +186,7 @@ export class SourceWrapper {
             // No public URL form - let the API call throw its own error (which includes the access instructions for hosted sources)
             return await run(this.api);
         }
-        throw new Error(`Source ${this.config.url} has no API access and no public URL form (public: false)`);
+        throw new Error(`Source has no API access and no public URL form (public: false): ${this.config.url}`);
     }
 
     public async readRoutingConfig(): Promise<RemoteConfig | undefined> {
@@ -271,11 +271,11 @@ export class SourceWrapper {
     /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */
     public async write<T>(run: (archives: IArchives) => Promise<T>): Promise<T> {
         if (this.writeBlocked) {
-            throw new Error(this.writeBlocked);
+            throw new Error(`Writes are blocked on this source: ${this.writeBlocked}`);
         }
         let api = this.api;
         if (!api) {
-            throw new Error(`Source ${this.config.url} has no API access, so it cannot accept writes`);
+            throw new Error(`Source has no API access, so it cannot accept writes: ${this.config.url}`);
         }
         let result = await run(api);
         this.accessCache = { hasAccess: true, time: Date.now() };

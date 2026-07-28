@@ -122,7 +122,7 @@ async function requireAccess(account: string): Promise<string> {
     let trusted = await trust.get(`${account}|${machineId}`);
     if (!trusted) {
         let { domain, port } = getStorageServerConfig();
-        throw new Error(`${STORAGE_ACCESS_DENIED} Machine ${machineId} has no access to account ${JSON.stringify(account)}. Visit https://${domain}:${port}/${account} for access instructions.`);
+        throw new Error(`${STORAGE_ACCESS_DENIED} Machine has no access to this account. Machine ${machineId}, account ${JSON.stringify(account)}. Visit https://${domain}:${port}/${account} for access instructions.`);
     }
     return machineId;
 }
@@ -155,7 +155,7 @@ class RemoteStorageControllerBase {
         }
         let machineId = getCommonName(token.certPem).split(".")[0];
         if (!verifyMachineIdForPublicKey({ machineId, publicKey: getPublicIdentifier(token.certPem) })) {
-            throw new Error(`Certificate common name ${JSON.stringify(getCommonName(token.certPem))} does not match its public key`);
+            throw new Error(`Certificate common name does not match its public key: ${JSON.stringify(getCommonName(token.certPem))}`);
         }
         sessions.set(caller.nodeId, machineId);
         while (sessions.size > MAX_SESSIONS) {
@@ -232,7 +232,7 @@ class RemoteStorageControllerBase {
             for (let request of await requests.get(ip) || []) {
                 if (request.requestId !== requestId) continue;
                 if (!isAdmin(callerMachineId) && !await trust.get(`${request.account}|${callerMachineId}`)) {
-                    throw new Error(`${STORAGE_ACCESS_DENIED} Machine ${callerMachineId} has no access to account ${JSON.stringify(request.account)}`);
+                    throw new Error(`${STORAGE_ACCESS_DENIED} Machine has no access to this account. Machine ${callerMachineId}, account ${JSON.stringify(request.account)}`);
                 }
                 let record: TrustRecord = {
                     account: request.account,
@@ -468,7 +468,7 @@ class RemoteStorageControllerBase {
         await Promise.all(bucketStores.map(x => x.store.init()));
         let policies = bucketStores.map(x => ({ store: x.store, policy: x.store.storeConfig.current() }));
         if (!policies.some(x => x.policy.public)) {
-            throw new Error(`Bucket ${account}/${bucketName} is not public, so its files cannot be read over plain URLs`);
+            throw new Error(`Bucket is not public, so its files cannot be read over plain URLs: ${account}/${bucketName}`);
         }
         // Anonymous URL reads carry no source selection - the file's route picks the store, and a route no store here covers is simply not found (the routing file itself lives outside every store)
         let httpStore: BlobStore | undefined;

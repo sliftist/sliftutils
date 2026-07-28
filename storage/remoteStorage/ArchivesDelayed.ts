@@ -59,7 +59,7 @@ export class ArchivesDelayed implements IArchives {
 
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
         if (!data.length) {
-            throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+            throw new Error(`Empty write refused: set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
         return await this.buffer(fileName, data, config?.lastModified, config);
     }
@@ -70,7 +70,7 @@ export class ArchivesDelayed implements IArchives {
 
     // The shared engine of set and del - an empty buffer is exactly a deletion here
     private async buffer(fileName: string, data: Buffer, lastModified: number | undefined, config?: SetConfig): Promise<string> {
-        let writeTime = lastModified || Date.now();
+        let writeTime = Math.floor(lastModified || Date.now());
         let existing = this.pending.get(fileName);
         // An older write never overwrites a newer one (see IArchives.set) - including against a write still sitting here
         if (existing && writeTime < existing.writeTime) return fileName;
@@ -204,7 +204,7 @@ export class ArchivesDelayed implements IArchives {
     }
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
         if (!this.inner.getSyncStatus) {
-            throw new Error(`${this.inner.getDebugName()} does not support getSyncStatus`);
+            throw new Error(`getSyncStatus is not supported: ${this.inner.getDebugName()} does not implement it`);
         }
         return await this.inner.getSyncStatus();
     }

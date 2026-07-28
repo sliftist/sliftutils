@@ -71,7 +71,7 @@ export class ArchivesRemote implements IArchives {
     /** The config travels with every request (the server matches it against its own entries to pick the store), so a config change has to land here - otherwise we keep asking for a source description the server no longer recognizes. Only ever called with a config for the SAME endpoint (see sourceIdentity), so the connection, account, and bucket cannot change under us. */
     public updateSourceConfig(sourceConfig: SourceConfig): void {
         if (sourceConfig.url !== this.config.url) {
-            throw new Error(`updateSourceConfig must stay on the same endpoint, got ${JSON.stringify(sourceConfig.url)} for ${this.getDebugName()} (${JSON.stringify(this.config.url)})`);
+            throw new Error(`updateSourceConfig changed endpoints. It must stay on the same endpoint, got ${JSON.stringify(sourceConfig.url)} for ${this.getDebugName()} (${JSON.stringify(this.config.url)})`);
         }
         this.config.sourceConfig = sourceConfig;
     }
@@ -160,7 +160,7 @@ export class ArchivesRemote implements IArchives {
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
         if (!data.length) {
-            throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+            throw new Error(`Empty write refused: set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
         if (data.length > LARGE_SET_THRESHOLD) {
             // One giant message would exceed the wire limit and lag every other client sharing this connection - stream it instead. The config travels with it, so crossing the threshold changes only HOW the bytes move, never what the write means.

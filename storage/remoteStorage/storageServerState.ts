@@ -90,7 +90,7 @@ export async function getBucketStores(account: string, bucketName: string): Prom
 async function requireBucketStores(account: string, bucketName: string): Promise<{ name: string; store: BlobStore }[]> {
     let list = await getBucketStores(account, bucketName);
     if (!list.length) {
-        throw new Error(`Bucket ${account}/${bucketName} does not exist on this server. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
+        throw new Error(`Bucket does not exist on this server: ${account}/${bucketName}. Write its routing config to ${JSON.stringify(ROUTING_FILE)} to create it.`);
     }
     return list;
 }

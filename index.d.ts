@@ -2213,6 +2213,7 @@ declare module "sliftutils/storage/IArchives" {
         routes?: [number, number][];
     };
     export type SetConfig = {
+        /** The write time to stamp (see IArchives.set). FLOORED to whole milliseconds by every implementation - the disk can't store fractional milliseconds anyway (utimes round-trips whole ms), so a fractional stamp could never be reproduced by propagation and would compare "newer" than its own copies forever. */
         lastModified?: number;
         /** Makes the write acceptable on immutable targets: an existing path is simply kept (immutability wins - nothing is overwritten) instead of the write throwing. Requires lastModified. Synchronization MUST pass this on every push - a plain set throws on immutable targets, which would abort reconciliation whenever one source in a chain is immutable. */
         forceSetImmutable?: boolean;
@@ -2772,7 +2773,7 @@ declare module "sliftutils/storage/TransactionFile" {
         entries(): IterableIterator<[string, LogEntry<T>]>;
         /** The tombstones, which is a much smaller walk than the values - so expiring them, or listing what was deleted since some time, costs what it should. */
         deletedEntries(): IterableIterator<[string, LogTombstone<T>]>;
-        /** Stores a value as of `time`. Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
+        /** Stores a value as of `time` (floored to whole milliseconds - see applySet). Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
         set(key: string, value: T, time: number): boolean;
         /** Deletes as of `time`, keeping the tombstone. A key that had a live value keeps it in the tombstone as MARKED for deletion (readable and restorable until dropValue). Returns false when something at least as new is already here. */
         delete(key: string, time: number): boolean;

@@ -19,7 +19,7 @@ import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageCon
 import { SourceWrapper } from "./sourceWrapper";
 import { ChainState, ChainStateManager } from "./chainStartup";
 import { LogFileInfo, decodeLogFile, createLogSearcher } from "../StreamingLogs";
-import { formatTime } from "socket-function/src/formatting/format";
+import { formatTime, formatDateTimeDetailed } from "socket-function/src/formatting/format";
 
 // How many extra full passes over the sources fallback dispatch makes when EVERY source in a pass failed, before the operation throws (see GetConfig.retries) - most requests shouldn't fail at all, so a couple of blanket retries buys availability for almost nothing
 const DEFAULT_FALLBACK_RETRIES = 3;
@@ -212,7 +212,7 @@ export class ArchivesChain implements IArchives {
             let target = state.sources.find(x => configWindowCurrent(x.config) && (config.route === undefined || routeContains(x.config.route, config.route)));
             try {
                 if (!target) {
-                    throw new Error(`No source is the ${config.write && "write target" || "primary read source"} for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""} (every source is outside its valid window or outside the key's route)`);
+                    throw new Error(`No valid source covers this request. No source is the ${config.write && "write target" || "primary read source"} for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""} (every source is outside its valid window or outside the key's route)`);
                 }
                 const primary = target;
                 return await this.applySmartTimeout(config.timeout, primary, () => {
@@ -266,7 +266,7 @@ export class ArchivesChain implements IArchives {
             let result = await Promise.race([callPromise.then(value => ({ value })), delay(allowed).then(() => undefined)]);
             if (result) return result.value;
             abandon();
-            throw new Error(`${SMART_TIMEOUT_MARKER} ${timeout.label || `Upload of ${timeout.uploadBytes} bytes`} to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_PROBE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
+            throw new Error(`${SMART_TIMEOUT_MARKER} Upload timed out. ${timeout.label || `Upload of ${timeout.uploadBytes} bytes`} to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_PROBE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
         }
         const path = timeout.path;
         if (path === undefined) return await callPromise;
@@ -284,7 +284,7 @@ export class ArchivesChain implements IArchives {
         }
         if (!info) {
             abandon();
-            throw new Error(`${SMART_TIMEOUT_MARKER} Read of ${JSON.stringify(path)} from ${source.getDebugName()} timed out: no result after ${Date.now() - start}ms, and getInfo ${probeError && `failed (${probeError})` || `could not answer within ${SMART_TIMEOUT_PROBE}ms either`}`);
+            throw new Error(`${SMART_TIMEOUT_MARKER} Read timed out with no size probe. Read of ${JSON.stringify(path)} from ${source.getDebugName()}: no result after ${Date.now() - start}ms, and getInfo ${probeError && `failed (${probeError})` || `could not answer within ${SMART_TIMEOUT_PROBE}ms either`}`);
         }
         let allowed = Math.max(SMART_TIMEOUT_PROBE, info.size / SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND * 1000);
         let remaining = start + allowed - Date.now();
@@ -293,7 +293,7 @@ export class ArchivesChain implements IArchives {
             if (second) return second.value;
         }
         abandon();
-        throw new Error(`${SMART_TIMEOUT_MARKER} Read of ${JSON.stringify(path)} (${info.size} bytes) from ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms from the call's start, at an assumed ${SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND} bytes/s)`);
+        throw new Error(`${SMART_TIMEOUT_MARKER} Read timed out. Read of ${JSON.stringify(path)} (${info.size} bytes) from ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms from the call's start, at an assumed ${SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND} bytes/s)`);
     }
 
     private lastConfigRefresh = 0;
@@ -517,7 +517,7 @@ export class ArchivesChain implements IArchives {
     public async getSyncStatus(): Promise<ArchivesSyncStatus> {
         let statuses = await this.runOnCovering(`The sync status check`, async archives => {
             if (!archives.getSyncStatus) {
-                throw new Error(`${archives.getDebugName()} does not support getSyncStatus`);
+                throw new Error(`getSyncStatus is not supported: ${archives.getDebugName()} does not implement it`);
             }
             return await archives.getSyncStatus();
         });
@@ -544,7 +544,7 @@ export class ArchivesChain implements IArchives {
 
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
         if (!data.length) {
-            throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
+            throw new Error(`Empty write refused: set was called with an empty buffer for ${JSON.stringify(fileName)}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
         if (fileName === ROUTING_FILE) {
             return await this.setRoutingConfig(data, config);
@@ -565,7 +565,7 @@ export class ArchivesChain implements IArchives {
         // Checked before the first node is written to, not just by each node as it arrives: every server would reject it anyway, and finding that out one node at a time is how a config write ends up half-applied
         assertValidRemoteConfig(parseRoutingData(data));
         let state = await this.state.getState();
-        let writeTime = config?.lastModified || Date.now();
+        let writeTime = Math.floor(config?.lastModified || Date.now());
         let written: string[] = [];
         let errors: string[] = [];
         // One write per STORE, not per server: the write lands in the store the entry NAMES, so two entries sharing a URL but naming different stores are two separate deliveries - deduping by URL alone leaves the second store unconfigured forever
@@ -590,7 +590,7 @@ export class ArchivesChain implements IArchives {
         }));
         await this.state.refreshActiveConfig();
         if (errors.length) {
-            throw new Error(`Storage routing config write for ${this.getDebugName()} failed on ${errors.length} of ${targets.length} stores (succeeded on: ${written.join(", ") || "none"}): ${errors.join(" | ")}`);
+            throw new Error(`Routing config write failed on some stores. For ${this.getDebugName()}: failed on ${errors.length} of ${targets.length} stores (succeeded on: ${written.join(", ") || "none"}): ${errors.join(" | ")}`);
         }
         return ROUTING_FILE;
     }
@@ -618,7 +618,7 @@ export class ArchivesChain implements IArchives {
         if (target && routeContains(target.config.route, toRoute)) {
             await this.request({ write: true, route: fromRoute }, async archives => {
                 if (!archives.move) {
-                    throw new Error(`${archives.getDebugName()} does not support move (moving ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)})`);
+                    throw new Error(`Move is not supported by this source: ${archives.getDebugName()} (moving ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)})`);
                 }
                 await archives.move(config);
             });
@@ -630,13 +630,13 @@ export class ArchivesChain implements IArchives {
             // Undefined is two cases (see copyArchiveFile) - asking the source which one keeps the error honest
             let sourceInfo = await this.getInfo(config.fromPath);
             if (sourceInfo) {
-                throw new Error(`Cannot move ${JSON.stringify(config.fromPath)} (${sourceInfo.size} bytes at ${new Date(sourceInfo.writeTime).toISOString()}) to ${JSON.stringify(config.toPath)}: the destination already has a newer file, and the copy was refused rather than roll it back (${this.getDebugName()}) - the source is left untouched`);
+                throw new Error(`Move refused - a newer file exists at the destination. Cannot move ${JSON.stringify(config.fromPath)} (${sourceInfo.size} bytes at ${formatDateTimeDetailed(sourceInfo.writeTime)}) to ${JSON.stringify(config.toPath)}: the copy was refused rather than roll it back (${this.getDebugName()}) - the source is left untouched`);
             }
-            throw new Error(`Cannot move ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)}: the source file does not exist on ${this.getDebugName()}`);
+            throw new Error(`Move source does not exist. Cannot move ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)}: not found on ${this.getDebugName()}`);
         }
         let confirmed = await this.getInfo(config.toPath);
         if (!confirmed) {
-            throw new Error(`Not deleting ${JSON.stringify(config.fromPath)} after copying it to ${JSON.stringify(config.toPath)}: the destination does not report it (${this.getDebugName()}) - the file is left at the source`);
+            throw new Error(`Move copy could not be confirmed - the source is kept. Not deleting ${JSON.stringify(config.fromPath)} after copying it to ${JSON.stringify(config.toPath)}: the destination does not report it (${this.getDebugName()})`);
         }
         await this.del(config.fromPath);
     }

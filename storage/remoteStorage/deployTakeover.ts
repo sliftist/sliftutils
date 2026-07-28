@@ -101,7 +101,7 @@ export async function detectDeployTakeover(): Promise<DeployTakeover> {
 
 export function setAltPort(port: number): void {
     if (!takeover) {
-        throw new Error(`An alternate port (${port}) was taken without a detected deploy takeover - detectDeployTakeover must run first`);
+        throw new Error(`Alternate port taken without a detected deploy takeover: port ${port} - detectDeployTakeover must run first`);
     }
     takeover.altPort = port;
     // Needs to be enough after our startup time that the previous node has time to see it's going to be shut down and flush (and so we have time to start up), and enough before the kill time that nodes have time to notice we exist and prepare to connect to us - halfway between now and the kill time satisfies both

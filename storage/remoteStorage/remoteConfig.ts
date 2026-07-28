@@ -253,7 +253,7 @@ export function assertValidRemoteConfig(config: RemoteConfig): void {
             let b = sources[j];
             if (storeIdentity(a) !== storeIdentity(b)) continue;
             if (a.validWindow[0] < b.validWindow[1] && b.validWindow[0] < a.validWindow[1]) {
-                throw new Error(`The name ${JSON.stringify(a.name)} is reused with multiple source configurations at the same time:\n    ${JSON.stringify(a)}\n    ${JSON.stringify(b)}\nA name is one store - one folder, one index - so it can only be configured one way at a time. Give them non-overlapping valid windows, or different names if they are meant to be different storage.`);
+                throw new Error(`Store name reused with conflicting configurations. The name ${JSON.stringify(a.name)} is used by multiple sources at the same time:\n    ${JSON.stringify(a)}\n    ${JSON.stringify(b)}\nA name is one store - one folder, one index - so it can only be configured one way at a time. Give them non-overlapping valid windows, or different names if they are meant to be different storage.`);
             }
         }
     }

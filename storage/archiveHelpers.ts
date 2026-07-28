@@ -1,5 +1,6 @@
 // Type-only: IArchives.ts re-exports our functions, so a value import back at it would be a require cycle
 import type { IArchives } from "./IArchives";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import { logStorageError } from "./remoteStorage/storageLogs";
 
 // Cross-archive file operations built ON TOP of IArchives (copy, move) - helpers over the interface, not part of it, so they live beside it rather than in it.
@@ -25,11 +26,12 @@ export async function copyArchiveFile(config: {
     if (!info) return undefined;
     let size = info.size;
     // internal (synchronization between replicas of the same key) preserves the source's write time, so ordering survives propagation. A plain copy is a NEW write and is stamped now: the source's old stamp would make it LOSE to any newer write or tombstone at the destination, silently - move a file back to a folder it was deleted from and the copy is dropped, then the caller deletes the source, and the file is gone entirely.
-    let writeTime = config.internal && info.writeTime || Date.now();
+    let writeTime = Math.floor(config.internal && info.writeTime || Date.now());
     // A destination that already holds a NEWER file must not be overwritten with our older one - and the destination's own only-take-latest would drop the write SILENTLY, leaving the caller believing the copy happened. Refusing here, loudly, is what turns "the remote has something we missed" from a masked bug into a log line the caller can act on.
     let destInfo = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
-    if (destInfo && destInfo.writeTime > writeTime) {
-        logStorageError(`Refusing to copy ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: the destination already has a NEWER file (ours: ${size} bytes at ${new Date(writeTime).toISOString()}, theirs: ${destInfo.size} bytes at ${new Date(destInfo.writeTime).toISOString()}) - copying would roll it back`);
+    // Compared at whole-millisecond precision, here and at the confirm below: disk mtimes carry fractional milliseconds, but utimes round-trips only whole ones, so sub-millisecond differences are storage artifacts of the SAME time, not ordering
+    if (destInfo && Math.floor(destInfo.writeTime) > Math.floor(writeTime)) {
+        logStorageError(`Copy refused - a newer file exists at the destination. Refusing to copy ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: ours ${size} bytes at ${formatDateTimeDetailed(writeTime)}, theirs ${destInfo.size} bytes at ${formatDateTimeDetailed(destInfo.writeTime)} - copying would roll it back`);
         return undefined;
     }
     let copiedSize: number;
@@ -57,7 +59,7 @@ export async function copyArchiveFile(config: {
                 let end = Math.min(offset + LARGE_COPY_CHUNK, totalSize);
                 let data = await from.get(path, { range: { start: offset, end }, internal: config.internal, noFallbacks: config.noFallbacks });
                 if (!data || !data.length) {
-                    throw new Error(`Ranged read of ${JSON.stringify(path)} from ${from.getDebugName()} returned ${data && data.length || "nothing"} at ${offset}-${end} (expected ${end - offset} bytes of a ${totalSize} byte file - it changed or vanished mid-copy)`);
+                    throw new Error(`Ranged read returned nothing mid-copy. Reading ${JSON.stringify(path)} from ${from.getDebugName()} returned ${data && data.length || "nothing"} at ${offset}-${end} (expected ${end - offset} bytes of a ${totalSize} byte file - it changed or vanished mid-copy)`);
                 }
                 offset += data.length;
                 return data;
@@ -67,8 +69,8 @@ export async function copyArchiveFile(config: {
     }
     // Every backend drops a superseded write SILENTLY (its only-take-latest is the last line of defense against races the up-front check can't see), so a returned set is not proof the copy landed - only the destination reporting the file at OUR time or newer is. Newer also counts as landed: the destination is at least as new as what we pushed (and b2 always stamps its own, later, upload time).
     let confirmed = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
-    if (!confirmed || confirmed.writeTime < writeTime) {
-        logStorageError(`Copy of ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""} did not land: we wrote ${copiedSize} bytes at ${new Date(writeTime).toISOString()}, but the destination reports ${confirmed && `${confirmed.size} bytes at ${new Date(confirmed.writeTime).toISOString()}` || "nothing"} - it dropped the write (a newer write or deletion won the race)`);
+    if (!confirmed || Math.floor(confirmed.writeTime) < Math.floor(writeTime)) {
+        logStorageError(`Copy was silently dropped by the destination. Copy of ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: our copy was ${copiedSize} bytes at ${formatDateTimeDetailed(writeTime)}, but the destination reports ${confirmed && `${confirmed.size} bytes at ${formatDateTimeDetailed(confirmed.writeTime)}` || "nothing"} (a newer write or deletion won the race)`);
         return undefined;
     }
     return { writeTime, size: copiedSize };
@@ -105,13 +107,13 @@ export async function moveArchiveFile(config: {
         // Undefined is two cases (see copyArchiveFile) - asking the source which one keeps the error honest
         let sourceInfo = await from.getInfo(path, { noFallbacks: config.noFallbacks });
         if (sourceInfo) {
-            throw new Error(`Cannot move ${JSON.stringify(path)} (${sourceInfo.size} bytes at ${new Date(sourceInfo.writeTime).toISOString()}) from ${from.getDebugName()}: ${to.getDebugName()} already has a newer file at ${JSON.stringify(toPath)}, and the copy was refused rather than roll it back - the source is left untouched`);
+            throw new Error(`Move refused - a newer file exists at the destination. Cannot move ${JSON.stringify(path)} (${sourceInfo.size} bytes at ${formatDateTimeDetailed(sourceInfo.writeTime)}) from ${from.getDebugName()}: ${to.getDebugName()} holds something newer at ${JSON.stringify(toPath)}, and the copy was refused rather than roll it back - the source is left untouched`);
         }
-        throw new Error(`Cannot move ${JSON.stringify(path)}: ${from.getDebugName()} does not have it`);
+        throw new Error(`Move source does not exist. Cannot move ${JSON.stringify(path)}: ${from.getDebugName()} does not have it`);
     }
     let confirmed = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
     if (!confirmed) {
-        throw new Error(`Not deleting ${JSON.stringify(path)} from ${from.getDebugName()} after copying it: ${to.getDebugName()} does not report ${JSON.stringify(toPath)} (the copy claimed to succeed, so something is wrong - the file is left at the source)`);
+        throw new Error(`Move copy could not be confirmed - the source is kept. Not deleting ${JSON.stringify(path)} from ${from.getDebugName()} after copying it: ${to.getDebugName()} does not report ${JSON.stringify(toPath)} (the copy claimed to succeed, so something is wrong)`);
     }
     await from.del(path);
 }

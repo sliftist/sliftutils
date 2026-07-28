@@ -342,7 +342,7 @@ export function chooseStartupConfig(config: { configured: RemoteConfig; probes: 
     let { configured, probes, debugName } = config;
     let found = probes.find(x => x.responded);
     if (!found) {
-        throw new Error(`Cannot initialize storage for ${debugName}: no source answered. ${probes.map(x => x.error).join(" | ")}`);
+        throw new Error(`Storage initialization failed - no source answered. For ${debugName}: ${probes.map(x => x.error).join(" | ")}`);
     }
     let existing = found.existing;
     let active = configured;
@@ -391,7 +391,7 @@ export function chooseStartupConfig(config: { configured: RemoteConfig; probes: 
 export async function writeRoutingToAllStores(config: { configured: RemoteConfig; sources: SourceWrapper[]; debugName: string }): Promise<{ failures: string[]; total: number }> {
     let { configured, sources, debugName } = config;
     let routingData = serializeRemoteConfig(configured);
-    let routingWriteTime = Date.now();
+    let routingWriteTime = Math.floor(Date.now());
     let targets: SourceWrapper[] = [];
     let seen = new Set<string>();
     for (let source of sources) {
