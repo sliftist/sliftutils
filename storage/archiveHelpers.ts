@@ -8,13 +8,15 @@ import { logStorageError } from "./remoteStorage/storageLogs";
 const LARGE_COPY_THRESHOLD = 64 * 1024 * 1024;
 const LARGE_COPY_CHUNK = 32 * 1024 * 1024;
 
-/** Copies one file between two archives. The source's CURRENT size and write time always come from getInfo right here - callers never supply them, because a stale size turns into ranged reads of a file that has changed (failing forever), and a stale write time re-orders history. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. Returns the copied file's info, and undefined for every way the copy did NOT land: the source doesn't have the file, the destination already had a NEWER file (refused up front rather than roll it back), or the destination silently dropped the write (its own only-take-latest won a race we lost - caught by confirming with getInfo afterward). The refused/dropped cases are logged as errors; a caller that treats undefined as "missing at the source" must getInfo the destination to learn the actual latest value. */
+/** Copies one file between two archives. The source's CURRENT size and write time always come from getInfo right here - callers never supply them, because a stale size turns into ranged reads of a file that has changed (failing forever), and a stale write time re-orders history. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. Returns the copied file's info, and undefined for every way the copy did NOT land: the source doesn't have the file, and with preserveWriteTime the two guarded cases - the destination already held something NEWER (refused up front rather than roll it back), or the destination silently dropped the write (its own only-take-latest won a race we lost - caught by confirming with getInfo afterward). The refused/dropped cases are logged as errors; a caller that treats undefined as "missing at the source" must getInfo the destination to learn the actual latest value. */
 export async function copyArchiveFile(config: {
     from: IArchives;
     to: IArchives;
     path: string;
     /** The path at the destination - defaults to path (the common case: the same key moving between two archives). */
     toPath?: string;
+    /** Stamps the destination with the SOURCE's write time instead of now, and turns on the ordering guards around it (the newer-destination refusal up front, and the getInfo confirm after). ONLY for synchronization between replicas of the same key, where the higher write time must win and ordering must survive propagation - never for a user-triggered copy: a plain copy is a NEW write, and the source's old stamp would make it LOSE to any newer write or tombstone at the destination, silently (move a file back to a folder it was deleted from and the copy is dropped, then the caller deletes the source, and the file is gone entirely). */
+    preserveWriteTime?: boolean;
     forceSetImmutable?: boolean;
     noChecks?: boolean;
     internal?: boolean;
@@ -25,14 +27,15 @@ export async function copyArchiveFile(config: {
     let info = await from.getInfo(path, { noFallbacks: config.noFallbacks });
     if (!info) return undefined;
     let size = info.size;
-    // internal (synchronization between replicas of the same key) preserves the source's write time, so ordering survives propagation. A plain copy is a NEW write and is stamped now: the source's old stamp would make it LOSE to any newer write or tombstone at the destination, silently - move a file back to a folder it was deleted from and the copy is dropped, then the caller deletes the source, and the file is gone entirely.
-    let writeTime = Math.floor(config.internal && info.writeTime || Date.now());
-    // A destination that already holds a NEWER file must not be overwritten with our older one - and the destination's own only-take-latest would drop the write SILENTLY, leaving the caller believing the copy happened. Refusing here, loudly, is what turns "the remote has something we missed" from a masked bug into a log line the caller can act on.
-    let destInfo = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
-    // Compared at whole-millisecond precision, here and at the confirm below: disk mtimes carry fractional milliseconds, but utimes round-trips only whole ones, so sub-millisecond differences are storage artifacts of the SAME time, not ordering
-    if (destInfo && Math.floor(destInfo.writeTime) > Math.floor(writeTime)) {
-        logStorageError(`Copy refused - a newer file exists at the destination. Refusing to copy ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: ours ${size} bytes at ${formatDateTimeDetailed(writeTime)}, theirs ${destInfo.size} bytes at ${formatDateTimeDetailed(destInfo.writeTime)} - copying would roll it back`);
-        return undefined;
+    let writeTime = Math.round(config.preserveWriteTime && info.writeTime || Date.now());
+    if (config.preserveWriteTime) {
+        // A destination that already holds a NEWER file must not be overwritten with our older one - and the destination's own only-take-latest would drop the write SILENTLY, leaving the caller believing the copy happened. Refusing here, loudly, is what turns "the remote has something we missed" from a masked bug into a log line the caller can act on. (A fresh-stamped copy needs no such guard - nothing at the destination can be newer than now - so plain copies skip the round trip.)
+        let destInfo = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
+        // Compared at whole-millisecond precision (ROUNDED, matching ArchivesDisk - see its get2), here and at the confirm below: disk mtimes carry fractional milliseconds, but utimes round-trips only whole ones, so sub-millisecond differences are storage artifacts of the SAME time, not ordering
+        if (destInfo && Math.round(destInfo.writeTime) > Math.round(writeTime)) {
+            logStorageError(`Copy refused - a newer file exists at the destination. Refusing to copy ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: ours ${size} bytes at ${formatDateTimeDetailed(writeTime)}, theirs ${destInfo.size} bytes at ${formatDateTimeDetailed(destInfo.writeTime)} - copying would roll it back`);
+            return undefined;
+        }
     }
     let copiedSize: number;
     if (size <= LARGE_COPY_THRESHOLD) {
@@ -67,11 +70,13 @@ export async function copyArchiveFile(config: {
         });
         copiedSize = totalSize;
     }
-    // Every backend drops a superseded write SILENTLY (its only-take-latest is the last line of defense against races the up-front check can't see), so a returned set is not proof the copy landed - only the destination reporting the file at OUR time or newer is. Newer also counts as landed: the destination is at least as new as what we pushed (and b2 always stamps its own, later, upload time).
-    let confirmed = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
-    if (!confirmed || Math.floor(confirmed.writeTime) < Math.floor(writeTime)) {
-        logStorageError(`Copy was silently dropped by the destination. Copy of ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: our copy was ${copiedSize} bytes at ${formatDateTimeDetailed(writeTime)}, but the destination reports ${confirmed && `${confirmed.size} bytes at ${formatDateTimeDetailed(confirmed.writeTime)}` || "nothing"} (a newer write or deletion won the race)`);
-        return undefined;
+    if (config.preserveWriteTime) {
+        // Every backend drops a superseded write SILENTLY (its only-take-latest is the last line of defense against races the up-front check can't see), so a returned set is not proof the copy landed - only the destination reporting the file at OUR time or newer is. Newer also counts as landed: the destination is at least as new as what we pushed (and b2 always stamps its own, later, upload time). Only for preserved stamps: a fresh stamp cannot lose the race, and moveArchiveFile does its own confirm before deleting anything.
+        let confirmed = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
+        if (!confirmed || Math.round(confirmed.writeTime) < Math.round(writeTime)) {
+            logStorageError(`Copy was silently dropped by the destination. Copy of ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: our copy was ${copiedSize} bytes at ${formatDateTimeDetailed(writeTime)}, but the destination reports ${confirmed && `${confirmed.size} bytes at ${formatDateTimeDetailed(confirmed.writeTime)}` || "nothing"} (a newer write or deletion won the race)`);
+            return undefined;
+        }
     }
     return { writeTime, size: copiedSize };
 }

@@ -70,7 +70,7 @@ export class ArchivesDelayed implements IArchives {
 
     // The shared engine of set and del - an empty buffer is exactly a deletion here
     private async buffer(fileName: string, data: Buffer, lastModified: number | undefined, config?: SetConfig): Promise<string> {
-        let writeTime = Math.floor(lastModified || Date.now());
+        let writeTime = Math.round(lastModified || Date.now());
         let existing = this.pending.get(fileName);
         // An older write never overwrites a newer one (see IArchives.set) - including against a write still sitting here
         if (existing && writeTime < existing.writeTime) return fileName;

@@ -51,8 +51,8 @@ export async function readRoutingFile(folder: string): Promise<{ data: Buffer; w
     try {
         let data = await fs.promises.readFile(filePath);
         let stats = await fs.promises.stat(filePath);
-        // Floored like every time ArchivesDisk reports - sub-millisecond mtime digits can't round-trip through utimes, so they are noise, not ordering
-        return { data, writeTime: Math.floor(stats.mtimeMs) };
+        // Rounded like every time ArchivesDisk reports (see its get2) - sub-millisecond mtime digits can't round-trip through utimes, so they are noise, not ordering
+        return { data, writeTime: Math.round(stats.mtimeMs) };
     } catch (e) {
         if ((e as { code?: string }).code === "ENOENT") return undefined;
         throw e;

@@ -392,7 +392,7 @@ export function chooseStartupConfig(config: { configured: RemoteConfig; probes: 
 export async function writeRoutingToAllStores(config: { configured: RemoteConfig; sources: SourceWrapper[]; debugName: string }): Promise<{ failures: string[]; total: number }> {
     let { configured, sources, debugName } = config;
     let routingData = serializeRemoteConfig(configured);
-    let routingWriteTime = Math.floor(Date.now());
+    let routingWriteTime = Math.round(Date.now());
     let targets: SourceWrapper[] = [];
     let seen = new Set<string>();
     for (let source of sources) {

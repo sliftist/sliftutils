@@ -565,7 +565,7 @@ export class ArchivesChain implements IArchives {
         // Checked before the first node is written to, not just by each node as it arrives: every server would reject it anyway, and finding that out one node at a time is how a config write ends up half-applied
         assertValidRemoteConfig(parseRoutingData(data));
         let state = await this.state.getState();
-        let writeTime = Math.floor(config?.lastModified || Date.now());
+        let writeTime = Math.round(config?.lastModified || Date.now());
         let written: string[] = [];
         let errors: string[] = [];
         // One write per STORE, not per server: the write lands in the store the entry NAMES, so two entries sharing a URL but naming different stores are two separate deliveries - deduping by URL alone leaves the second store unconfigured forever

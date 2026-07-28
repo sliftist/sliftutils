@@ -258,7 +258,7 @@ export class StoreSync {
                 tally.tombstone++;
                 continue;
             }
-            let copied = await copyArchiveFile({ from: source, to: this.store.sources[0].source, path: file.path, forceSetImmutable: true, noChecks: true, internal: true });
+            let copied = await copyArchiveFile({ from: source, to: this.store.sources[0].source, path: file.path, preserveWriteTime: true, forceSetImmutable: true, noChecks: true, internal: true });
             if (!copied) {
                 // Undefined is two cases (see copyArchiveFile): our own disk already holding something newer is the boundary scan working as intended (our writes since the boundary outrank the neighbor's), only a genuinely unreadable file is worth a warning
                 let local = await this.store.sources[0].source.getInfo(file.path);
@@ -494,7 +494,7 @@ export class StoreSync {
                 }
                 let holder = await this.store.getEntryHolder(entry);
                 if (!holder) continue;
-                let copied = await copyArchiveFile({ from: holder, to: source, path: key, forceSetImmutable: true, noChecks: true, internal: true });
+                let copied = await copyArchiveFile({ from: holder, to: source, path: key, preserveWriteTime: true, forceSetImmutable: true, noChecks: true, internal: true });
                 if (!copied) {
                     // Undefined is two cases (see copyArchiveFile). The source having a NEWER file than our index (the listing we pushed from was stale) is adopted exactly the way the pull direction adopts a listing entry - and pushing our stale copy stops. Otherwise the HOLDER could not produce the file, which the next round's pull re-resolves; either way, silence here was the bug.
                     let theirs = await source.getInfo(key);
@@ -648,7 +648,7 @@ export class StoreSync {
                     if (index >= pending.length) return;
                     let { key, entry } = pending[index];
                     try {
-                        let copied = await copyArchiveFile({ from: source, to: this.store.sources[0].source, path: key, forceSetImmutable: true, noChecks: true, internal: true });
+                        let copied = await copyArchiveFile({ from: source, to: this.store.sources[0].source, path: key, preserveWriteTime: true, forceSetImmutable: true, noChecks: true, internal: true });
                         if (copied) {
                             copiedFiles++;
                             copiedBytes += copied.size;

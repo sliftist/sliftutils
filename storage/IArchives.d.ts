@@ -118,7 +118,7 @@ export type ChangesAfterConfig = {
     routes?: [number, number][];
 };
 export type SetConfig = {
-    /** The write time to stamp (see IArchives.set). FLOORED to whole milliseconds by every implementation - the disk can't store fractional milliseconds anyway (utimes round-trips whole ms), so a fractional stamp could never be reproduced by propagation and would compare "newer" than its own copies forever. */
+    /** The write time to stamp (see IArchives.set). ROUNDED to whole milliseconds by every implementation - the disk can't store fractional milliseconds anyway (utimes round-trips whole ms), so a fractional stamp could never be reproduced by propagation and would compare "newer" than its own copies forever. Rounded rather than floored because utimes goes through a seconds double and can read back a hair below the stamped millisecond (see ArchivesDisk.get2). */
     lastModified?: number;
     /** Makes the write acceptable on immutable targets: an existing path is simply kept (immutability wins - nothing is overwritten) instead of the write throwing. Requires lastModified. Synchronization MUST pass this on every push - a plain set throws on immutable targets, which would abort reconciliation whenever one source in a chain is immutable. */
     forceSetImmutable?: boolean;

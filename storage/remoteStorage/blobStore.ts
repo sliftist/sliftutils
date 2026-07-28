@@ -153,7 +153,7 @@ export class BlobStore {
                 if (provided) {
                     console.log(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration; the requesting client provided routing config version ${getConfigVersion(provided)} - adopting it`);
                     // Straight onto the disk, not through set(): set waits for init, which is what is running right now
-                    await this.ownDisk.set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(provided)), { lastModified: Math.floor(Date.now()) });
+                    await this.ownDisk.set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(provided)), { lastModified: Math.round(Date.now()) });
                     await this.applyRoutingConfig();
                 } else {
                     logStorageWarn(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration, and the requesting client had no routing config naming it either - running unconfigured`);
@@ -378,7 +378,7 @@ export class BlobStore {
             throw new Error(`Empty write refused: set was called with an empty buffer for ${JSON.stringify(key)} (store ${this.folder}): an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
         await this.init();
-        let writeTime = Math.floor(config.lastModified || Date.now());
+        let writeTime = Math.round(config.lastModified || Date.now());
         let route = getRoute(key);
         // The routing file defines the windows/routes, so they can't possibly apply to it (and it never flows through validation) - but it has a rule of its own, which is ours to enforce because the file is ours
         if (key === ROUTING_FILE) {
@@ -649,7 +649,7 @@ export class BlobStore {
         await this.init();
         let key = config?.path;
         if (key) {
-            let writeTime = Math.floor(config?.lastModified || Date.now());
+            let writeTime = Math.round(config?.lastModified || Date.now());
             let route = getRoute(key);
             if (key !== ROUTING_FILE) {
                 this.assertWriteTarget(key, route, config?.lastModified);
@@ -1058,7 +1058,7 @@ export class BlobStore {
             if (lastModified < await this.currentWriteTime(key)) return;
         }
         // Fast writes are not handled here: a source that was configured with a write delay buffers them itself (see ArchivesDelayed), so this write lands in memory and returns, exactly as it would have. The index is updated either way, so the write is immediately visible to readers of this store.
-        await this.writeToSources(key, data, Math.floor(lastModified || Date.now()));
+        await this.writeToSources(key, data, Math.round(lastModified || Date.now()));
     }
 
     /** The instant every delayed write must be on its source: the end of our own write window that contains now, minus the flush margin (so the next window's source finds the data on handoff). The LATEST end among covering windows - overlapping windows hand off at the last one. No window contains now (an inert store, or a moment between our windows) -> 0, i.e. nothing may be delayed at all. */

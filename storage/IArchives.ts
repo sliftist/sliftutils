@@ -158,7 +158,7 @@ export type ChangesAfterConfig = {
 };
 
 export type SetConfig = {
-    /** The write time to stamp (see IArchives.set). FLOORED to whole milliseconds by every implementation - the disk can't store fractional milliseconds anyway (utimes round-trips whole ms), so a fractional stamp could never be reproduced by propagation and would compare "newer" than its own copies forever. */
+    /** The write time to stamp (see IArchives.set). ROUNDED to whole milliseconds by every implementation - the disk can't store fractional milliseconds anyway (utimes round-trips whole ms), so a fractional stamp could never be reproduced by propagation and would compare "newer" than its own copies forever. Rounded rather than floored because utimes goes through a seconds double and can read back a hair below the stamped millisecond (see ArchivesDisk.get2). */
     lastModified?: number;
     /** Makes the write acceptable on immutable targets: an existing path is simply kept (immutability wins - nothing is overwritten) instead of the write throwing. Requires lastModified. Synchronization MUST pass this on every push - a plain set throws on immutable targets, which would abort reconciliation whenever one source in a chain is immutable. */
     forceSetImmutable?: boolean;
@@ -182,7 +182,7 @@ export type SetLargeFileConfig = SetConfig & {
     restartStream?(): Promise<void> | void;
 };
 
-// createTime is a misnomer kept for compatibility — it is really the LAST-WRITE time, same as getInfo's writeTime. Neither Backblaze nor our remote storage tracks a distinct creation date: each write stamps a fresh timestamp on the current version, so both fields are just "when the bytes served by get() were most recently written". Always WHOLE milliseconds: write times are floored at every producer (see SetConfig.lastModified).
+// createTime is a misnomer kept for compatibility — it is really the LAST-WRITE time, same as getInfo's writeTime. Neither Backblaze nor our remote storage tracks a distinct creation date: each write stamps a fresh timestamp on the current version, so both fields are just "when the bytes served by get() were most recently written". Always WHOLE milliseconds: write times are rounded at every producer (see SetConfig.lastModified).
 export type ArchiveFileInfo = { path: string; createTime: number; size: number };
 
 // An in-progress background synchronization task (see ArchivesConfig.syncing)

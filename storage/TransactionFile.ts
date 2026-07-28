@@ -119,9 +119,9 @@ export class TransactionFile<T> {
         return this.deleted.entries();
     }
 
-    /** Stores a value as of `time` (floored to whole milliseconds - see applySet). Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
+    /** Stores a value as of `time` (rounded to whole milliseconds - see applySet). Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
     public set(key: string, value: T, time: number): boolean {
-        time = Math.floor(time);
+        time = Math.round(time);
         if (!this.applySet(key, value, time, Date.now())) return false;
         this.append({ k: key, t: time, v: value });
         return true;
@@ -129,7 +129,7 @@ export class TransactionFile<T> {
 
     /** Deletes as of `time`, keeping the tombstone. A key that had a live value keeps it in the tombstone as MARKED for deletion (readable and restorable until dropValue). Returns false when something at least as new is already here. */
     public delete(key: string, time: number): boolean {
-        time = Math.floor(time);
+        time = Math.round(time);
         let live = this.values.get(key);
         if (!this.applyDelete(key, time, Date.now(), live?.value, live?.time)) return false;
         if (live) {
@@ -142,7 +142,7 @@ export class TransactionFile<T> {
 
     /** Undoes a marked deletion: the kept value becomes live again, as of `time` (a fresh time, so the restore outranks the deletion everywhere it propagated). Returns false when there is no marked value to restore, or something at least as new is already here. */
     public unmark(key: string, time: number): boolean {
-        time = Math.floor(time);
+        time = Math.round(time);
         let tombstone = this.deleted.get(key);
         if (!tombstone || tombstone.value === undefined) return false;
         if (!this.applySet(key, tombstone.value, time, Date.now())) return false;
@@ -163,13 +163,13 @@ export class TransactionFile<T> {
         let had = this.values.delete(key);
         had = this.deleted.delete(key) || had;
         if (!had) return;
-        this.append({ k: key, t: Math.floor(Date.now()), p: 1 });
+        this.append({ k: key, t: Math.round(Date.now()), p: 1 });
     }
 
-    // Times are floored to whole milliseconds on every path into the maps (load replays through here too, so fractional times persisted by older code heal on startup). Disk mtimes carry fractional milliseconds but utimes round-trips only whole ones, so a fractional time can never be reproduced by propagation - every copy of the value would compare "older" than the original forever, and the same write would be re-pushed and re-copied every round.
+    // Times are ROUNDED to whole milliseconds on every path into the maps (load replays through here too, so fractional times persisted by older code heal on startup). Disk mtimes carry fractional milliseconds but utimes round-trips only whole ones, so a fractional time can never be reproduced by propagation - every copy of the value would compare "older" than the original forever, and the same write would be re-pushed and re-copied every round. Round rather than floor, to match ArchivesDisk (see its get2): utimes goes through a seconds double and can land a hair below the stamped millisecond.
     private applySet(key: string, value: T, time: number, changedAt: number): boolean {
-        time = Math.floor(time);
-        changedAt = Math.floor(changedAt);
+        time = Math.round(time);
+        changedAt = Math.round(changedAt);
         if (time < this.timeOf(key)) return false;
         this.deleted.delete(key);
         this.values.set(key, { value, time, changedAt });
@@ -177,10 +177,10 @@ export class TransactionFile<T> {
     }
 
     private applyDelete(key: string, time: number, changedAt: number, value?: T, valueTime?: number): boolean {
-        time = Math.floor(time);
-        changedAt = Math.floor(changedAt);
+        time = Math.round(time);
+        changedAt = Math.round(changedAt);
         if (valueTime !== undefined) {
-            valueTime = Math.floor(valueTime);
+            valueTime = Math.round(valueTime);
         }
         if (time < this.timeOf(key)) return false;
         this.values.delete(key);

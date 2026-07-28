@@ -39,7 +39,7 @@ export declare class TransactionFile<T> {
     entries(): IterableIterator<[string, LogEntry<T>]>;
     /** The tombstones, which is a much smaller walk than the values - so expiring them, or listing what was deleted since some time, costs what it should. */
     deletedEntries(): IterableIterator<[string, LogTombstone<T>]>;
-    /** Stores a value as of `time` (floored to whole milliseconds - see applySet). Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
+    /** Stores a value as of `time` (rounded to whole milliseconds - see applySet). Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
     set(key: string, value: T, time: number): boolean;
     /** Deletes as of `time`, keeping the tombstone. A key that had a live value keeps it in the tombstone as MARKED for deletion (readable and restorable until dropValue). Returns false when something at least as new is already here. */
     delete(key: string, time: number): boolean;
