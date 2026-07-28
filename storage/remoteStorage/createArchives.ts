@@ -475,7 +475,7 @@ export class ArchivesChain implements IArchives {
             if (Date.now() >= deadline) {
                 throw error;
             }
-            console.error(`${error.message}. Retrying in ${COVERING_RETRY_DELAY / 1000}s (giving up at ${new Date(deadline).toISOString()}).`);
+            console.error(`${error.message}. Retrying in ${COVERING_RETRY_DELAY / 1000}s (giving up at ${formatDateTimeDetailed(deadline)}).`);
             void this.state.recheckAvailability();
             await delay(COVERING_RETRY_DELAY);
         }
@@ -500,7 +500,7 @@ export class ArchivesChain implements IArchives {
         return merged;
     }
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        let results = await this.runOnCovering(`The changes listing since ${new Date(config.time).toISOString()}`, archives => archives.getChangesAfter2(config));
+        let results = await this.runOnCovering(`The changes listing since ${formatDateTimeDetailed(config.time)}`, archives => archives.getChangesAfter2(config));
         let byPath = new Map<string, ArchiveFileInfo>();
         for (let list of results) {
             for (let file of list) {
@@ -577,7 +577,7 @@ export class ArchivesChain implements IArchives {
             seen.add(key);
             targets.push(source);
         }
-        console.log(`Writing storage routing config for ${this.getDebugName()} to all ${targets.length} stores (write time ${new Date(writeTime).toISOString()}): ${data.toString("utf8").slice(0, 2000)}`);
+        console.log(`Writing storage routing config for ${this.getDebugName()} to all ${targets.length} stores (write time ${formatDateTimeDetailed(writeTime)}): ${data.toString("utf8").slice(0, 2000)}`);
         await Promise.all(targets.map(async source => {
             let label = `${source.config.url} (store ${JSON.stringify(source.config.name)})`;
             try {

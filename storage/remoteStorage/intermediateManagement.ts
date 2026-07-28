@@ -1,4 +1,5 @@
 import { lazy } from "socket-function/src/caching";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { RemoteConfig, SourceConfig, HostedConfig } from "../IArchives";
 import { ROUTING_FILE, getConfigVersion, serializeRemoteConfig, parseRoutingData, parseHostedUrl, replaceHostedUrlPort } from "./remoteConfig";
@@ -78,7 +79,7 @@ export function scheduleBoundaryWork(account: string, bucketName: string, routin
 /** Collects the writes that landed on the previous window's owners just before a boundary, into the store that has just taken over. Who owned what is worked out purely from the config (see previousWindowOwners); this only does the pulling. The config is read off the disk at FIRE time, not captured when the scan was armed - it may have changed in between, and the newest copy is the one the handover actually happened under. */
 async function runBoundaryScan(account: string, bucketName: string, windowStart: number, offset: number, offsetLabel?: string): Promise<void> {
     let key = `${account}/${bucketName}`;
-    let label = `bucket ${key}, window starting ${new Date(windowStart).toISOString()}, offset ${offsetLabel || `${offset / 1000}s`}`;
+    let label = `bucket ${key}, window starting ${formatDateTimeDetailed(windowStart)}, offset ${offsetLabel || `${offset / 1000}s`}`;
     if (boundaryScansRunning.has(key)) {
         console.log(`Skipping boundary scan (${label}): the previous boundary scan is still running`);
         return;
@@ -220,7 +221,7 @@ async function maintainIntermediates(): Promise<void> {
             alreadyCorrect.push(key);
             continue;
         }
-        await writeOwnRoutingConfig({ account, bucketName, storeName: newest.name, current: routing, updated: injected, reason: `we are a deploy successor: writes route to our alternate port ${takeover.altPort} from ${new Date(takeover.start).toISOString()} until our predecessor is killed at ${new Date(takeover.end).toISOString()}` });
+        await writeOwnRoutingConfig({ account, bucketName, storeName: newest.name, current: routing, updated: injected, reason: `we are a deploy successor: writes route to our alternate port ${takeover.altPort} from ${formatDateTimeDetailed(takeover.start)} until our predecessor is killed at ${formatDateTimeDetailed(takeover.end)}` });
         written.push(key);
     }
     if (!takeover) return;

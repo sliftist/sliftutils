@@ -3,6 +3,7 @@ import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { sort, binarySearchBasic } from "socket-function/src/misc";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import { IArchives, ArchiveFileInfo, ArchivesConfig, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, assertValidLastModified } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
@@ -119,7 +120,7 @@ export class ArchivesDisk implements IArchives {
             // The mtime advances on every append, so an active upload (even another process's) always looks fresh
             let stats = await statOrUndefined(uploadPath);
             if (!stats || stats.mtimeMs > cutoff) continue;
-            console.log(`Deleting abandoned upload temp file ${uploadPath} (last written ${new Date(stats.mtimeMs).toISOString()})`);
+            console.log(`Deleting abandoned upload temp file ${uploadPath} (last written ${formatDateTimeDetailed(stats.mtimeMs)})`);
             await fs.promises.unlink(uploadPath);
         }
     });

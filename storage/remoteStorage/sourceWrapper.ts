@@ -1,4 +1,5 @@
 import { isNode, sort } from "socket-function/src/misc";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import { delay } from "socket-function/src/batching";
 import { getSecret } from "../../misc/getSecret";
 import { IArchives, SourceConfig, RemoteConfig } from "../IArchives";
@@ -92,8 +93,8 @@ export class SourceWrapper {
         }
         let [start, end] = this.config.validWindow;
         if (start !== 0 || end !== Number.MAX_SAFE_INTEGER) {
-            let startText = start === 0 && "0" || new Date(start).toISOString();
-            let endText = end === Number.MAX_SAFE_INTEGER && "forever" || new Date(end).toISOString();
+            let startText = start === 0 && "0" || formatDateTimeDetailed(start);
+            let endText = end === Number.MAX_SAFE_INTEGER && "forever" || formatDateTimeDetailed(end);
             parts.push(`validWindow [${startText}, ${endText}]`);
         }
         return `source ${this.config.url}${parts.length && ` (${parts.join(", ")})` || ""}`;
@@ -121,7 +122,7 @@ export class SourceWrapper {
         if (this.disposed || this.isConnected()) return;
         let now = Date.now();
         if (now >= this.cooldownUntil && this.isConnectionProblemWorthReporting()) {
-            console.error(`Cannot connect to storage ${this.getDebugName()}; skipping it until ${new Date(now + SOURCE_FAILURE_COOLDOWN).toISOString()} (now ${new Date(now).toISOString()}) unless no other source can serve the request`);
+            console.error(`Cannot connect to storage ${this.getDebugName()}; skipping it until ${formatDateTimeDetailed(now + SOURCE_FAILURE_COOLDOWN)} (now ${formatDateTimeDetailed(now)}) unless no other source can serve the request`);
             // In a browser this is often an untrusted (self-signed) certificate the user hasn't accepted yet - offer them the trust flow (a no-op in Node, and shown at most once per server)
             showCertTrustModal(this.config.url);
         }

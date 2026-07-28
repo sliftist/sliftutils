@@ -611,7 +611,7 @@ export class StoreSync {
             let etaText = "unknown (no bytes transferred yet)";
             if (bytesPerSecond > 0) {
                 let remainingMs = remainingBytes / bytesPerSecond * 1000;
-                etaText = `${formatTime(remainingMs)} remaining, completing around ${new Date(Date.now() + remainingMs).toISOString()}`;
+                etaText = `${formatTime(remainingMs)} remaining, completing around ${formatDateTimeDetailed(Date.now() + remainingMs)}`;
             }
             console.warn(`Delta sync from ${source.getDebugName()} (store ${this.store.folder}) has been running for ${formatTime(elapsed)}: ${doneFiles}/${pending.length} files (${(doneFiles / pending.length * 100).toFixed(1)}%), ${formatNumber(doneBytes)}B/${formatNumber(totalBytes)}B (${(totalBytes && doneBytes / totalBytes * 100 || 100).toFixed(1)}%), ${formatNumber(bytesPerSecond)}B/s. Estimated ${etaText}.`);
         }, FULL_SYNC_SLOW_ERROR_INTERVAL);

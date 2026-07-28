@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { startIntermediateMaintenance } from "./intermediateManagement";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 
 const PARAMETERS_TIMELINE_FILE_REGEX = /^(\d+)-parameters\.json$/;
 const DEPLOY_DETECT_RETRY_DELAY = 5 * 1000;
@@ -28,7 +29,7 @@ type DeployTakeover = {
 let takeover: DeployTakeover | undefined;
 
 function iso(time: number): string {
-    return new Date(time).toISOString();
+    return formatDateTimeDetailed(time);
 }
 
 function logPrefix(): string {

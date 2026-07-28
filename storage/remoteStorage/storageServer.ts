@@ -5,6 +5,7 @@ import path from "path";
 import fsp from "fs/promises";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { getExternalIP } from "socket-function/src/networking";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import { RequireController } from "socket-function/require/RequireController";
 import { hostServer } from "../../misc/https/hostServer";
 import { RemoteStorageController } from "./storageController";
@@ -144,7 +145,7 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
                 setAltPort(listeningPort);
                 let listenEnd = getAltPortListenEnd();
                 let timer = setTimeout(() => {
-                    console.log(`Alternate port ${listeningPort} reached its end of life at ${new Date(listenEnd).toISOString()}; it no longer counts as one of our addresses (the socket itself stays bound, as the main-port relay forwards into it)`);
+                    console.log(`Alternate port ${listeningPort} reached its end of life at ${formatDateTimeDetailed(listenEnd)}; it no longer counts as one of our addresses (the socket itself stays bound, as the main-port relay forwards into it)`);
                     removeExtraListenPort(listeningPort);
                 }, Math.max(0, listenEnd - Date.now()));
                 (timer as { unref?: () => void }).unref?.();

@@ -1,4 +1,5 @@
 import { isNode } from "socket-function/src/misc";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import { RemoteConfig, SourceConfig } from "../IArchives";
 import { ROUTING_FILE, getConfigVersion, serializeRemoteConfig, normalizeRemoteConfig, normalizeSource } from "./remoteConfig";
 import { SourceWrapper, RETRY_START_DELAY, RETRY_MAX_DELAY, RETRY_GROWTH } from "./sourceWrapper";
@@ -204,7 +205,7 @@ export class ChainStateManager {
 
     private async adoptNewConfig(state: ChainState, latest: RemoteConfig): Promise<void> {
         if (JSON.stringify(latest) === JSON.stringify(state.config)) return;
-        let received = new Date().toISOString();
+        let received = formatDateTimeDetailed(Date.now());
         let onlyIntermediatesChanged = JSON.stringify(resolveIntermediateSources(latest)) === JSON.stringify(resolveIntermediateSources(state.config));
         if (onlyIntermediatesChanged) {
             console.log(`Storage routing switchover windows changed (version ${getConfigVersion(state.config)} -> ${getConfigVersion(latest)}), received ${received}, rebuilding sources. New config: ${JSON.stringify(latest)}`);
@@ -400,7 +401,7 @@ export async function writeRoutingToAllStores(config: { configured: RemoteConfig
         seen.add(key);
         targets.push(source);
     }
-    console.log(`Writing routing config version ${getConfigVersion(configured)} for ${debugName} to all ${targets.length} stores (write time ${new Date(routingWriteTime).toISOString()}): ${targets.map(x => `${x.config.url} (store ${JSON.stringify(x.config.name)})`).join(", ")}`);
+    console.log(`Writing routing config version ${getConfigVersion(configured)} for ${debugName} to all ${targets.length} stores (write time ${formatDateTimeDetailed(routingWriteTime)}): ${targets.map(x => `${x.config.url} (store ${JSON.stringify(x.config.name)})`).join(", ")}`);
     let failures: string[] = [];
     await Promise.all(targets.map(async source => {
         try {

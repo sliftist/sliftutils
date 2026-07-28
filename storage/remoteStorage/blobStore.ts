@@ -1,6 +1,7 @@
 import path from "path";
 import { lazy } from "socket-function/src/caching";
 import { timeInMinute, sort } from "socket-function/src/misc";
+import { formatDateTimeDetailed } from "socket-function/src/formatting/format";
 import {
     IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, ChangesAfterConfig, FindConfig, HostedConfig, RemoteConfig, SourceConfig, assertValidLastModified,
     windowsAcceptWrites, SyncActivity, FULL_ROUTE, FULL_VALID_WINDOW, STORAGE_WRONG_VALID_WINDOW, STORAGE_WRONG_ROUTE, STORAGE_NOT_CONFIGURED,
@@ -850,7 +851,7 @@ export class BlobStore {
             }
             throw new Error(`Undelete failed - nothing to restore. Cannot undelete ${JSON.stringify(key)} (store ${this.folder}): it has no marked deletion to restore - it was never deleted here${this.getDeletedEntry(key) && ", or its deletion history was already dropped (a plain tombstone remains, but the bytes are gone)" || ""}`);
         }
-        console.log(`Undeleted ${JSON.stringify(key)} (store ${this.folder}): the index entry (${marked?.size} bytes, deleted ${marked && new Date(marked.deleteTime).toISOString()}) is live again as of ${new Date(writeTime).toISOString()} - the bytes never left the disk`);
+        console.log(`Undeleted ${JSON.stringify(key)} (store ${this.folder}): the index entry (${marked?.size} bytes, deleted ${marked && formatDateTimeDetailed(marked.deleteTime)}) is live again as of ${formatDateTimeDetailed(writeTime)} - the bytes never left the disk`);
         logMutation({ op: "undelete", folder: this.folder, store: this.storeName, path: key, size: marked?.size, writeTime, internal });
         this.config?.onIndexChanged?.(key);
         if (internal) return;
@@ -981,8 +982,8 @@ export class BlobStore {
     private assertFreshWriteTarget(key: string, writeTime: number, route: number): void {
         let timeValid = this.storeConfig.all().filter(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1]);
         if (!timeValid.length) {
-            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(key)} (store ${this.folder}): writeTime ${writeTime} (${new Date(writeTime).toISOString()}) is outside all our valid windows ${JSON.stringify(this.storeConfig.all().map(x => x.validWindow))} (a switchover moved the write target)`);
-            throw new Error(`${STORAGE_WRONG_VALID_WINDOW} Write rejected: write time is outside our valid windows. Cannot write ${JSON.stringify(key)}: its write time ${writeTime} (${new Date(writeTime).toISOString()}) is outside every valid window of store ${JSON.stringify(this.storeName)} (windows: ${JSON.stringify(this.storeConfig.all().map(x => x.validWindow))}, folder ${this.folder}) - a switchover moved the write target. Re-resolve the currently valid source and retry.`);
+            logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(key)} (store ${this.folder}): writeTime ${writeTime} (${formatDateTimeDetailed(writeTime)}) is outside all our valid windows ${JSON.stringify(this.storeConfig.all().map(x => x.validWindow))} (a switchover moved the write target)`);
+            throw new Error(`${STORAGE_WRONG_VALID_WINDOW} Write rejected: write time is outside our valid windows. Cannot write ${JSON.stringify(key)}: its write time ${writeTime} (${formatDateTimeDetailed(writeTime)}) is outside every valid window of store ${JSON.stringify(this.storeName)} (windows: ${JSON.stringify(this.storeConfig.all().map(x => x.validWindow))}, folder ${this.folder}) - a switchover moved the write target. Re-resolve the currently valid source and retry.`);
         }
         if (!timeValid.some(x => routeContains(x.route, route))) {
             logWrongTargetRejection(`Rejecting fresh write of ${JSON.stringify(key)} (store ${this.folder}): route ${route} is outside our routes ${JSON.stringify(timeValid.map(x => x.route || FULL_ROUTE))} at writeTime ${writeTime} (the client's shard config is stale)`);
@@ -1004,7 +1005,7 @@ export class BlobStore {
         if (!this.storeConfig.all().length) return;
         let covered = this.storeConfig.all().some(x => writeTime >= x.validWindow[0] && writeTime < x.validWindow[1] && routeContains(x.route, route));
         if (!covered) {
-            throw new Error(`Internal write rejected - outside every configured window/route. Writing ${JSON.stringify(key)}: writeTime ${writeTime} (${new Date(writeTime).toISOString()}) at route ${route} is outside every window/route this store is configured for: ${JSON.stringify(this.storeConfig.all().map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))} (store ${this.folder})`);
+            throw new Error(`Internal write rejected - outside every configured window/route. Writing ${JSON.stringify(key)}: writeTime ${writeTime} (${formatDateTimeDetailed(writeTime)}) at route ${route} is outside every window/route this store is configured for: ${JSON.stringify(this.storeConfig.all().map(x => ({ validWindow: x.validWindow, route: x.route || FULL_ROUTE })))} (store ${this.folder})`);
         }
     }
 
