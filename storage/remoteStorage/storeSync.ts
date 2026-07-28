@@ -44,8 +44,8 @@ const SYNC_FAILURE_DELAY = 1000 * 15;
 // A full listing that comes back EMPTY - or under half of what we know the source holds - is treated as the other end being briefly broken, not as the truth: it is retried this many times, this far apart, before being believed. Believing a wrongly-shrunken listing purges every index entry the source held, which is how sync progress "goes backwards".
 const SUSPICIOUS_SCAN_RETRIES = 3;
 const SUSPICIOUS_SCAN_RETRY_DELAY = 1000 * 60;
-// A source whose every window ended this long ago (and has none in the future) can never receive writes again - the window gates them, deletions included. Scanning such a source can only re-ingest history it will never be told to delete, which after tombstone expiry IS resurrection - so it is not scanned at all. The grace covers handoff stragglers around a window's end.
-const SCAN_STALE_WINDOW_GRACE = 1000 * 60 * 60;
+// How long past the end of a source's last window we are still willing to read (scan) it. We can't read from a source that's too old, because our tombstones only last so long (TOMBSTONE_EXPIRY): a source whose windows are all past never receives deletions (the window gates writes, deletions included), so it never knew about our tombstones - and if we read it after a tombstone expires, it can resurrect a dead value. While we DO read it, our own tombstone is what refutes its stale listings, so this duration must stay far below TOMBSTONE_EXPIRY.
+const PAST_READ_DURATION = 1000 * 60 * 60;
 
 type SourceState = {
     supportsChangesAfter: boolean;
@@ -292,7 +292,7 @@ export class StoreSync {
     // Slot 0 is exempt: our own disk answers for every window this store EVER held, and scanning it is what keeps the index honest about them. Read live each call - updateSources moves the windows on running slots, so a source goes stale (or comes back) while its loops run.
     private windowsAllowScanning(sourceIndex: number): boolean {
         if (sourceIndex === 0) return true;
-        return this.store.sources[sourceIndex].validWindows.some(w => w[1] > Date.now() - SCAN_STALE_WINDOW_GRACE);
+        return this.store.sources[sourceIndex].validWindows.some(w => w[1] > Date.now() - PAST_READ_DURATION);
     }
 
     private async startSourceSyncLoops(sourceIndex: number): Promise<void> {
@@ -321,7 +321,7 @@ export class StoreSync {
             state.initialScan.resolve(undefined);
             if (!loggedStale) {
                 loggedStale = true;
-                logSyncEvent({ event: "scanSkippedStaleWindows", store: this.store.folder, source: source.getDebugName(), validWindows: this.store.sources[sourceIndex].validWindows.map(w => [new Date(w[0]).toISOString(), new Date(w[1]).toISOString()]), graceMs: SCAN_STALE_WINDOW_GRACE });
+                logSyncEvent({ event: "scanSkippedStaleWindows", store: this.store.folder, source: source.getDebugName(), validWindows: this.store.sources[sourceIndex].validWindows.map(w => [new Date(w[0]).toISOString(), new Date(w[1]).toISOString()]), pastReadDurationMs: PAST_READ_DURATION });
             }
             return true;
         };
