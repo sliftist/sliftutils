@@ -304,7 +304,7 @@ export declare class BlobStore {
     private assertFreshWriteTarget;
     private assertMutable;
     private assertInternalWriteAccepted;
-    /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note this reads the disk past any write delay, so a fast write still buffered in memory is invisible here; the caller re-finds it once it flushes. */
+    /** Internal (store-to-store) read: never goes to OTHER sources - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form - but the INDEX still gates, because it is the source of truth: a marked deletion keeps its bytes on disk as history (see writeToSources), so the disk alone would happily serve a DELETED file as live. Index says live -> the disk provides the bytes (past any write delay, so a fast write still buffered in memory is invisible here; the caller re-finds it once it flushes). Index says deleted -> the tombstone is the answer, never the disk. No window or route checks. */
     private getInternal2;
     /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Only-take-latest still applies here. */
     private setInternal;

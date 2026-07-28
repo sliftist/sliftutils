@@ -240,7 +240,7 @@ export class StoreSync {
     public async boundaryScanRemote(source: IArchives, config: { since: number; route?: [number, number] }): Promise<void> {
         let scanStart = Date.now();
         logSyncEvent({ event: "boundaryScanStart", store: this.store.folder, source: source.getDebugName(), since: config.since, route: config.route || FULL_ROUTE });
-        let changes = await source.getChangesAfter2({ time: config.since, routes: config.route && [config.route] || undefined });
+        let changes = await source.getChangesAfter2({ time: config.since, routes: config.route && [config.route] || undefined, internal: true });
         let tally = newScanTally();
         for (let file of changes) {
             if (file.path === ROUTING_FILE) {
@@ -387,7 +387,7 @@ export class StoreSync {
         try {
             let attempts = 0;
             while (true) {
-                files = await source.findInfo("");
+                files = await source.findInfo("", { internal: true });
                 if (this.store.stopped.stop || state.stopped.stop) break;
                 // What we believe the source has: whichever is larger of its previous listing and the index entries naming it as holder. Files do not just vanish - a listing far below this means the other end is briefly broken, and believing it would purge everything it held.
                 let held = 0;
@@ -557,7 +557,7 @@ export class StoreSync {
         let { source, route } = this.store.sources[sourceIndex];
         let state = this.states[sourceIndex];
         let pollStart = Date.now();
-        let changes = await source.getChangesAfter2({ time: state.changesAfterTime, routes: route && [route] || undefined });
+        let changes = await source.getChangesAfter2({ time: state.changesAfterTime, routes: route && [route] || undefined, internal: true });
         let tally = newScanTally();
         for (let file of changes) {
             tally[this.updateScanIndex(sourceIndex, file)]++;

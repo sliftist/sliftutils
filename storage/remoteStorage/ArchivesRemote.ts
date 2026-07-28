@@ -180,13 +180,13 @@ export class ArchivesRemote implements IArchives {
         return await this.call(() => this.controller.getInfo({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, includeTombstones: config?.includeTombstones }));
     }
     public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
-        return await this.call(() => this.controller.findInfo({ account: this.account, bucketName: this.bucketName, prefix, sourceConfig: this.config.sourceConfig, shallow: config?.shallow, type: config?.type, includeMarked: config?.includeMarked }));
+        return await this.call(() => this.controller.findInfo({ account: this.account, bucketName: this.bucketName, prefix, sourceConfig: this.config.sourceConfig, shallow: config?.shallow, type: config?.type, includeMarked: config?.includeMarked, internal: config?.internal }));
     }
     public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         return (await this.findInfo(prefix, config)).map(x => x.path);
     }
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        return await this.call(() => this.controller.getChangesAfter2({ account: this.account, bucketName: this.bucketName, sourceConfig: this.config.sourceConfig, time: config.time, routes: config.routes }));
+        return await this.call(() => this.controller.getChangesAfter2({ account: this.account, bucketName: this.bucketName, sourceConfig: this.config.sourceConfig, time: config.time, routes: config.routes, internal: config.internal }));
     }
     public async getConfig(): Promise<ArchivesConfig> {
         return await this.call(() => this.controller.getArchivesConfig({ account: this.account, bucketName: this.bucketName }));

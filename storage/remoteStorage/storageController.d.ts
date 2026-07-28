@@ -139,6 +139,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         sourceConfig: SourceConfig;
         time: number;
         routes?: [number, number][];
+        internal?: boolean;
     }) => Promise<ArchiveFileInfo[]>;
     getArchivesConfig: (config: {
         account: string;

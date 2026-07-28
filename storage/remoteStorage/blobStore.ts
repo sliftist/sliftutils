@@ -476,6 +476,8 @@ export class BlobStore {
         // Deletions are not in here at all, which is what a listing wants: an empty file IS a missing file
         for (let [key, entry] of this.indexEntries()) {
             if (!key.startsWith(prefix)) continue;
+            // See FindConfig.internal: an entry held by one of our OTHER sources cannot be served to a peer's internal read, so it must not be listed to one either
+            if (config.internal && this.slotForSourcesListIndex(entry.sourcesListIndex) !== 0) continue;
             infos.set(key, { path: key, createTime: entry.writeTime, size: entry.size });
         }
         if (config.includeMarked) {
@@ -499,6 +501,8 @@ export class BlobStore {
         for (let [key, entry] of this.indexEntries()) {
             if (entry.changedAt <= config.time) continue;
             if (!inRoutes(key)) continue;
+            // See ChangesAfterConfig.internal (deletions below are always reported - they are index-only)
+            if (config.internal && this.slotForSourcesListIndex(entry.sourcesListIndex) !== 0) continue;
             files.push({ path: key, createTime: entry.writeTime, size: entry.size });
         }
         for (let [key, tombstone] of this.deletedEntries()) {
@@ -1009,18 +1013,20 @@ export class BlobStore {
         }
     }
 
-    /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note this reads the disk past any write delay, so a fast write still buffered in memory is invisible here; the caller re-finds it once it flushes. */
+    /** Internal (store-to-store) read: never goes to OTHER sources - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form - but the INDEX still gates, because it is the source of truth: a marked deletion keeps its bytes on disk as history (see writeToSources), so the disk alone would happily serve a DELETED file as live. Index says live -> the disk provides the bytes (past any write delay, so a fast write still buffered in memory is invisible here; the caller re-finds it once it flushes). Index says deleted -> the tombstone is the answer, never the disk. No window or route checks. */
     private async getInternal2(config: { path: string; range?: { start: number; end: number }; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         await this.init();
-        // includeTombstones forwards to the disk: a flag-caller (a peer store's synchronization) needs to see our deletions, not just our content. A tombstone deleted from disk entirely only lives in our index, so fall back to that.
-        let result = await this.getDiskSource().disk.get2(config.path, { range: config.range, includeTombstones: config.includeTombstones });
-        if (!result || !result.data) {
+        let key = config.path;
+        if (!this.getIndexEntry(key)) {
+            // Deleted, or never here: a flag-caller (a peer store's synchronization) needs to see our deletions, not just our content
             if (config.includeTombstones) {
-                let deleted = this.getDeletedEntry(config.path);
+                let deleted = this.getDeletedEntry(key);
                 if (deleted) return { data: Buffer.alloc(0), writeTime: deleted.writeTime, size: 0 };
             }
             return undefined;
         }
+        let result = await this.getDiskSource().disk.get2(key, { range: config.range });
+        if (!result || !result.data) return undefined;
         return { data: result.data, writeTime: result.writeTime, size: result.size };
     }
 

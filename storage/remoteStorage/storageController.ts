@@ -336,7 +336,7 @@ class RemoteStorageControllerBase {
     }
     @assertValidArgs
     @trackAccessCall("getChangesAfter")
-    async getChangesAfter2(config: { account: string; bucketName: string; sourceConfig: SourceConfig; time: number; routes?: [number, number][] }): Promise<ArchiveFileInfo[]> {
+    async getChangesAfter2(config: { account: string; bucketName: string; sourceConfig: SourceConfig; time: number; routes?: [number, number][]; internal?: boolean }): Promise<ArchiveFileInfo[]> {
         return await withStore(config, store => store.getChangesAfter2(config));
     }
     @assertValidArgs

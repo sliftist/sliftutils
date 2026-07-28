@@ -71,7 +71,7 @@ export type GetConfig = {
     };
     /** Read ONLY from the primary source - the one writes would target - instead of falling back across the redundant sources. Use this when you want your reads and writes to be somewhat atomic: there will still be issues with the round trip, but without it you could talk to a completely different node and get a much older value. Most reads aren't followed by a write though, so for most cases it's better to get a value than to have to wait (or even throw) when the primary node is not available. */
     noFallbacks?: boolean;
-    /** Store-to-store call: the serving node answers purely from its own disk, completely short-circuiting its index holders - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). No window or route checks on reads: if the bytes are on its disk, the caller may have them. */
+    /** Store-to-store call: the serving node never consults its OTHER sources - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). That is the flag's ENTIRE meaning: no fallbacks, nothing else. The read is otherwise fully correct - the node's index still gates it (a key its index says is deleted answers as deleted, never as the history bytes still sitting on its disk). No window or route checks on reads. */
     internal?: boolean;
     /** Also return size-0 results (tombstones - an empty file IS a missing file) instead of treating them as absent. Off by default, matching getInfo's flag of the same name. Synchronization passes this so a DELETED file (with its write time) is distinguishable from a file that never existed. */
     includeTombstones?: boolean;
@@ -89,6 +89,8 @@ export type FindConfig = {
     includeMarked?: boolean;
     /** Listings normally come ONLY from the authoritative sources (the same nodes writes go to - read-your-writes). With fallbacks, a failing shard's routes are covered by the next source holding them (e.g. a wide read replica) instead of the call failing - high availability at the cost of possibly missing just-written data. Single-source archives ignore the flag. */
     fallbacks?: boolean;
+    /** Store-to-store listing: only entries whose bytes the node ITSELF holds - never entries its index redirects to its own other sources. A peer reads with GetConfig.internal (which never chases those redirects), so listing a redirect would just make the peer flag the file missing, purge it, re-list it, and loop forever; the peer hears about such files from the source actually holding them instead. */
+    internal?: boolean;
 };
 export type DelConfig = {
     /** Stamps the deletion (its tombstone) with this write time instead of now. Synchronization passes the ORIGINAL deletion time, so deletion ordering survives propagation exactly like any other write's ordering. */
@@ -116,6 +118,8 @@ export type ChangesAfterConfig = {
     time: number;
     /** Only keys routing into one of these [start, end) ranges. Only scanning passes this - it lets a store syncing a partial shard ask for just its slice. */
     routes?: [number, number][];
+    /** See FindConfig.internal - the change feed is a listing too, and redirect entries fail a peer's internal reads the same way. Deletions are always reported (they are index-only, there are no bytes to hold). */
+    internal?: boolean;
 };
 export type SetConfig = {
     /** The write time to stamp (see IArchives.set). ROUNDED to whole milliseconds by every implementation - the disk can't store fractional milliseconds anyway (utimes round-trips whole ms), so a fractional stamp could never be reproduced by propagation and would compare "newer" than its own copies forever. Rounded rather than floored because utimes goes through a seconds double and can read back a hair below the stamped millisecond (see ArchivesDisk.get2). */

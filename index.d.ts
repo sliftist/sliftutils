@@ -2166,7 +2166,7 @@ declare module "sliftutils/storage/IArchives" {
         };
         /** Read ONLY from the primary source - the one writes would target - instead of falling back across the redundant sources. Use this when you want your reads and writes to be somewhat atomic: there will still be issues with the round trip, but without it you could talk to a completely different node and get a much older value. Most reads aren't followed by a write though, so for most cases it's better to get a value than to have to wait (or even throw) when the primary node is not available. */
         noFallbacks?: boolean;
-        /** Store-to-store call: the serving node answers purely from its own disk, completely short-circuiting its index holders - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). No window or route checks on reads: if the bytes are on its disk, the caller may have them. */
+        /** Store-to-store call: the serving node never consults its OTHER sources - chasing its own remote holders while answering another store is how infinite get loops between stores form (A asks B, B's index points back at A, ...). That is the flag's ENTIRE meaning: no fallbacks, nothing else. The read is otherwise fully correct - the node's index still gates it (a key its index says is deleted answers as deleted, never as the history bytes still sitting on its disk). No window or route checks on reads. */
         internal?: boolean;
         /** Also return size-0 results (tombstones - an empty file IS a missing file) instead of treating them as absent. Off by default, matching getInfo's flag of the same name. Synchronization passes this so a DELETED file (with its write time) is distinguishable from a file that never existed. */
         includeTombstones?: boolean;
@@ -2184,6 +2184,8 @@ declare module "sliftutils/storage/IArchives" {
         includeMarked?: boolean;
         /** Listings normally come ONLY from the authoritative sources (the same nodes writes go to - read-your-writes). With fallbacks, a failing shard's routes are covered by the next source holding them (e.g. a wide read replica) instead of the call failing - high availability at the cost of possibly missing just-written data. Single-source archives ignore the flag. */
         fallbacks?: boolean;
+        /** Store-to-store listing: only entries whose bytes the node ITSELF holds - never entries its index redirects to its own other sources. A peer reads with GetConfig.internal (which never chases those redirects), so listing a redirect would just make the peer flag the file missing, purge it, re-list it, and loop forever; the peer hears about such files from the source actually holding them instead. */
+        internal?: boolean;
     };
     export type DelConfig = {
         /** Stamps the deletion (its tombstone) with this write time instead of now. Synchronization passes the ORIGINAL deletion time, so deletion ordering survives propagation exactly like any other write's ordering. */
@@ -2211,6 +2213,8 @@ declare module "sliftutils/storage/IArchives" {
         time: number;
         /** Only keys routing into one of these [start, end) ranges. Only scanning passes this - it lets a store syncing a partial shard ask for just its slice. */
         routes?: [number, number][];
+        /** See FindConfig.internal - the change feed is a listing too, and redirect entries fail a peer's internal reads the same way. Deletions are always reported (they are index-only, there are no bytes to hold). */
+        internal?: boolean;
     };
     export type SetConfig = {
         /** The write time to stamp (see IArchives.set). ROUNDED to whole milliseconds by every implementation - the disk can't store fractional milliseconds anyway (utimes round-trips whole ms), so a fractional stamp could never be reproduced by propagation and would compare "newer" than its own copies forever. Rounded rather than floored because utimes goes through a seconds double and can read back a hair below the stamped millisecond (see ArchivesDisk.get2). */
@@ -3715,7 +3719,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         private assertFreshWriteTarget;
         private assertMutable;
         private assertInternalWriteAccepted;
-        /** Internal (store-to-store) read: purely the local disk, completely short-circuiting the index and holder resolution - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form. No window or route checks: if the bytes are on our disk, the caller may have them. Note this reads the disk past any write delay, so a fast write still buffered in memory is invisible here; the caller re-finds it once it flushes. */
+        /** Internal (store-to-store) read: never goes to OTHER sources - the caller is another store, and chasing OUR remote holders while answering it is how infinite get loops between stores form - but the INDEX still gates, because it is the source of truth: a marked deletion keeps its bytes on disk as history (see writeToSources), so the disk alone would happily serve a DELETED file as live. Index says live -> the disk provides the bytes (past any write delay, so a fast write still buffered in memory is invisible here; the caller re-finds it once it flushes). Index says deleted -> the tombstone is the answer, never the disk. No window or route checks. */
         private getInternal2;
         /** Internal (store-to-store) write: the local disk plus our index, with NO downstream fan-out - the pushing store owns propagation, and fanning its pushes back out is how write loops between stores form. Only-take-latest still applies here. */
         private setInternal;
@@ -4484,6 +4488,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             sourceConfig: SourceConfig;
             time: number;
             routes?: [number, number][];
+            internal?: boolean;
         }) => Promise<ArchiveFileInfo[]>;
         getArchivesConfig: (config: {
             account: string;
