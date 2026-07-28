@@ -12,7 +12,8 @@ import { scheduleBoundaryWork, reinjectIntermediates } from "./intermediateManag
 import { SocketFunction } from "socket-function/SocketFunction";
 import { StorageClientController } from "./storageClientController";
 import { isSelfSource } from "./storePlan";
-import { countBucketWrite, getBucketWriteStats, BucketWriteStats } from "./accessStats";
+import { countBucketWrite, getBucketWriteStats, trackAccess, BucketWriteStats } from "./accessStats";
+import { logMutation } from "./storageLogs";
 
 /**
  * What this server HAS: the stores, by name (getStore) - made once, self-configuring from there -
@@ -43,6 +44,11 @@ export function getStore(account: string, bucketName: string, name: string, call
         createSource: config => createStoreSource({ sourceConfig: config.sourceConfig, folder, writeDelay: config.writeDelay }),
         applySource: (source, sourceConfig, writeDelay) => applySourceConfig(source, sourceConfig, writeDelay),
         onWriteCounted: (kind, bytes) => countBucketWrite(`${account}/${bucketName}`, kind, bytes),
+        onSyncTransfer: (operation, path, bytes) => {
+            trackAccess({ account, operation, path: `${bucketName}/${path}`, size: bytes });
+            // Every synchronization write is logged per file, exactly like client mutations - the log is the full account of what moved
+            logMutation({ op: operation, account, bucketName, store: name, path, size: bytes });
+        },
         resolveSourceUrl: resolveSourceArchives,
         // The store is the one that knows when a config landed, and a config with upcoming windows is what boundary scans are armed from
         onRoutingApplied: routing => scheduleBoundaryWork(account, bucketName, routing),
@@ -104,6 +110,7 @@ export async function readBucketInternal(account: string, bucketName: string, co
 
 function aggregateArchivesConfig(bucketStores: BlobStore[], routing: RemoteConfig | undefined): ArchivesConfig {
     let index = { fileCount: 0, byteCount: 0 };
+    let markedIndex: { fileCount: number; byteCount: number; oldestDeleteTime?: number } = { fileCount: 0, byteCount: 0 };
     let indexSources: { debugName: string; fileCount: number; byteCount: number }[] = [];
     let syncing: SyncActivity[] = [];
     let readerDiskLimit: number | undefined;
@@ -111,6 +118,11 @@ function aggregateArchivesConfig(bucketStores: BlobStore[], routing: RemoteConfi
         let progress = store.getSyncProgress();
         index.fileCount += progress.index.fileCount;
         index.byteCount += progress.index.byteCount;
+        markedIndex.fileCount += progress.marked.fileCount;
+        markedIndex.byteCount += progress.marked.byteCount;
+        if (progress.marked.oldestDeleteTime !== undefined && (markedIndex.oldestDeleteTime === undefined || progress.marked.oldestDeleteTime < markedIndex.oldestDeleteTime)) {
+            markedIndex.oldestDeleteTime = progress.marked.oldestDeleteTime;
+        }
         indexSources.push(...progress.sources);
         syncing.push(...progress.syncing);
         readerDiskLimit = readerDiskLimit || progress.readerDiskLimit;
@@ -120,6 +132,7 @@ function aggregateArchivesConfig(bucketStores: BlobStore[], routing: RemoteConfi
         supportsChangesAfter: true,
         remoteConfig: routing,
         index,
+        markedIndex,
         indexSources,
         readerDiskLimit,
         syncing,
@@ -182,7 +195,9 @@ export async function writeRoutingConfig(account: string, bucketName: string, na
     let incoming = parseRoutingData(data);
     let current = await readRoutingFromDisk(account, bucketName);
     let stored = reinjectIntermediates(current, incoming);
-    await store.set({ path: ROUTING_FILE, data: Buffer.from(serializeRemoteConfig(stored)), lastModified: config?.lastModified });
+    let storedData = Buffer.from(serializeRemoteConfig(stored));
+    await store.set({ path: ROUTING_FILE, data: storedData, lastModified: config?.lastModified });
+    logMutation({ op: "routingConfig", account, bucketName, store: name, path: ROUTING_FILE, size: storedData.length, writeTime: config?.lastModified });
     broadcastRoutingChanged();
 }
 

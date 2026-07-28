@@ -629,7 +629,10 @@ export class ArchivesBackblaze implements IArchives {
                 }
             }
 
-            throw err;
+            // EVERYTHING else retries too (bounded by `retries`): backblaze fails a small fraction of requests with ever-new error shapes, and aborting a multi-part upload (or a full sync) on one unmatched error costs the whole transfer. A genuinely permanent error just pays the few retry delays before surfacing.
+            console.warn(`[${context}] Unrecognized error, retrying in 5s (${retries} left): ${err.message}`);
+            await delay(5000);
+            return this.apiRetryLogic(context, fnc, retries - 1);
         }
     }
 

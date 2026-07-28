@@ -9,11 +9,12 @@ import { ArchivesDisk, applyFindInfoShape } from "../ArchivesDisk";
 import { ROUTING_FILE, getRoute, routeContains, routeIntersection, parseRoutingData, serializeRemoteConfig, assertValidRemoteConfig, getConfigVersion, sourceIdentity, sourcePersistentUrl } from "./remoteConfig";
 import { selectEntryAt } from "./storePlan";
 import { sourceWriteDelay } from "./ArchivesDelayed";
-import { LogMap } from "../LogMap";
+import { TransactionFile } from "../TransactionFile";
 import { SourcesList } from "./sourcesList";
 import { StoreSync } from "./storeSync";
 import { StoreConfig } from "./storeConfig";
 import { asDelayed, unwrapDelayed } from "./ArchivesDelayed";
+import { logMutation, logStorageError, logStorageWarn } from "./storageLogs";
 
 // The storage engine of the remote storage server. Data lives in synchronization sources (at minimum an ArchivesDisk, the local disk); BlobStore keeps an index of every file (path, last modified time, size, and which source currently holds the data) in a BulkDatabase2, and answers every read from it (see ArchivesSource in IArchives.ts). Keeping that index in agreement with the sources is StoreSync's job, not this file's; what lives here is the index itself, reads, writes, and the validation a write has to pass.
 
@@ -22,9 +23,19 @@ export const WINDOW_END_FLUSH_MARGIN = timeInMinute * 5;
 const WRONG_TARGET_LOG_THROTTLE = 60 * 1000;
 // Marks an upload id that never reached the disk, so it can never collide with one ArchivesDisk handed out
 const DISCARDED_UPLOAD_PREFIX = "discarded_";
+// set refuses empty buffers, and an undelete carries no data - this single ignored byte satisfies the wire
+const UNDELETE_PLACEHOLDER = Buffer.from([1]);
+
+// Deletion history: deleted files keep their bytes on disk (marked in the index) until the history outgrows max(HISTORY_MIN_BYTES, live bytes * history factor) - see StoreSync.enforceHistoryLimit
+export const HISTORY_MIN_BYTES = 10 * 1024 * 1024 * 1024;
+const HISTORY_FACTOR = 1;
+/** The multiple of a store's live bytes its deletion history may grow to. Async so it can later become dynamic and user-configurable; for now it is a constant. */
+export async function getHistoryFactor(): Promise<number> {
+    return HISTORY_FACTOR;
+}
 
 
-/** What we store about a file. Its times are not in here: the index keeps those for every key, deleted ones included (see LogMap). */
+/** What we store about a file. Its times are not in here: the index keeps those for every key, deleted ones included (see TransactionFile). */
 type IndexValue = {
     size: number;
     // Which synchronization source currently holds the data: the line number of the source's URL in the store's append-only sources list (see SourcesList) - NOT a position in the in-memory sources array, which changes between runs
@@ -61,7 +72,7 @@ let lastWrongTargetLog = 0;
 function logWrongTargetRejection(message: string): void {
     if (Date.now() - lastWrongTargetLog < WRONG_TARGET_LOG_THROTTLE) return;
     lastWrongTargetLog = Date.now();
-    console.log(message);
+    logStorageError(message);
 }
 
 // The bucket store, and the only one: every bucket a server holds is served by these, one per store name in its routing config. Its sources are plain IArchives - the first is always the store's own disk folder, the rest are the configured peers (see createStoreSource) - so "no synchronization" is simply a store with no peers, not a different kind of store.
@@ -81,8 +92,8 @@ export class BlobStore {
     // Per slot: the persistent sourcesListIndex of that slot's URL, filled by registerSlot before the slot's sync runs
     private slotSourcesListIndexes: number[] = [];
     private slotRegistrations: Promise<void>[] = [];
-    // Every file we know of, in memory, with an append-only log of the changes behind it (see LogMap). A new file name each time the entry format changes generation: the previous ones cannot be read, and a scan rebuilds the index anyway, so they are simply never read again.
-    private index: LogMap<IndexValue>;
+    // Every file we know of, in memory, with an append-only log of the changes behind it (see TransactionFile). A new file name each time the entry format changes generation: the previous ones cannot be read, and a scan rebuilds the index anyway, so they are simply never read again.
+    private index: TransactionFile<IndexValue>;
     /** Keeping the index in agreement with the sources: scanning, pulling, pushing, and the maintenance that follows from holding an index (disk-limit eviction, tombstone expiry). It reads and writes this store's index and sources - it does not own them. */
     public sync: StoreSync;
 
@@ -106,12 +117,14 @@ export class BlobStore {
             requestRoutingConfig?: () => Promise<RemoteConfig | undefined>;
             // Every accepted write ("original") and every write that actually reached the sources ("flushed"). Fast writes coalesce, so the two counts differ.
             onWriteCounted?: (kind: "original" | "flushed", bytes: number) => void;
+            /** A synchronization transfer: "sync get" is bytes pulled off a source (the backblaze download bill), "sync set" is bytes pushed to one. Injected because sync traffic never passes through the API controller, so nothing else can count it. */
+            onSyncTransfer?: (operation: "sync get" | "sync set", path: string, bytes: number) => void;
             // Resolves a persisted source URL (see ArchivesSource.url) to a cached IArchives, so entries whose holder is no longer configured can still be read
             resolveSourceUrl?: (url: string) => IArchives;
         }
     ) {
         this.sourcesList = new SourcesList(path.join(folder, "index", "sourcesList.txt"));
-        this.index = new LogMap<IndexValue>(path.join(folder, "index", "blobIndex3.log"));
+        this.index = new TransactionFile<IndexValue>(path.join(folder, "index", "blobIndex3.log"));
         this.sync = new StoreSync(this);
         this.storeConfig = new StoreConfig(storeName, []);
         this.ownDisk = new ArchivesDisk(folder);
@@ -142,10 +155,10 @@ export class BlobStore {
                     await this.ownDisk.set(ROUTING_FILE, Buffer.from(serializeRemoteConfig(provided)), { lastModified: Date.now() });
                     await this.applyRoutingConfig();
                 } else {
-                    console.warn(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration, and the requesting client had no routing config naming it either - running unconfigured`);
+                    logStorageWarn(`Store ${JSON.stringify(this.storeName)} (folder ${this.folder}) initialized with no configuration, and the requesting client had no routing config naming it either - running unconfigured`);
                 }
             } catch (e) {
-                console.error(`Asking the requesting client for the routing config of store ${JSON.stringify(this.storeName)} (folder ${this.folder}) failed - running unconfigured: ${(e as Error).stack ?? e}`);
+                logStorageError(`Asking the requesting client for the routing config of store ${JSON.stringify(this.storeName)} (folder ${this.folder}) failed - running unconfigured: ${(e as Error).stack ?? e}`);
             }
         }
         for (let i = 0; i < this.sources.length; i++) {
@@ -179,7 +192,7 @@ export class BlobStore {
             peers.push(source);
         }
         if (routing && !entries.length) {
-            console.warn(`The routing config in store ${this.folder} (version ${getConfigVersion(routing)}) does not name this store (${JSON.stringify(this.storeName)}) as one of ours, so it stays a disk-only store`);
+            logStorageWarn(`The routing config in store ${this.folder} (version ${getConfigVersion(routing)}) does not name this store (${JSON.stringify(this.storeName)}) as one of ours, so it stays a disk-only store`);
         }
         let previousVersion = this.appliedRoutingVersion;
         let newVersion = routing && getConfigVersion(routing) || -1;
@@ -202,7 +215,7 @@ export class BlobStore {
         try {
             return parseRoutingData(data);
         } catch (e) {
-            console.error(`Ignoring the routing config in store ${this.folder}: it could not be parsed (${(e as Error).message})`);
+            logStorageError(`Ignoring the routing config in store ${this.folder}: it could not be parsed: ${(e as Error).stack ?? e}`);
             return undefined;
         }
     }
@@ -217,7 +230,7 @@ export class BlobStore {
     public reapplyRoutingConfig(): void {
         let next = this.routingApplies.then(() => this.applyRoutingConfig());
         this.routingApplies = next.catch(() => { });
-        void next.catch((e: Error) => console.error(`Applying the routing config in store ${this.folder} failed: ${e.stack ?? e}`));
+        void next.catch((e: Error) => logStorageError(`Applying the routing config in store ${this.folder} failed: ${e.stack ?? e}`));
     }
 
     // Our own disk first (always), then every peer whose route overlaps ours - the sources this store synchronizes with, as its own config describes them
@@ -272,7 +285,7 @@ export class BlobStore {
         await this.index.flush();
     }
 
-    public async get2(config: { path: string; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    public async get2(config: { path: string; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean; includeMarked?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         if (config.internal) {
             return await this.getInternal2(config);
         }
@@ -281,6 +294,12 @@ export class BlobStore {
         let range = config.range;
         // Not in the index means it does not exist here: the index IS the answer, and scanning heals it on its own schedule. An entry whose holder is no longer in the source list is still valid - getEntryHolder resolves the persisted URL directly, and get2's fallback loop covers a holder that is gone entirely.
         let entry = this.getIndexEntry(key);
+        // A marked deletion still has its bytes, and the kept value says where - so an includeMarked read is a normal read through the marked entry (it just must not RE-INDEX anything: see the markedRead guards below)
+        let markedRead = false;
+        if (!entry && config.includeMarked) {
+            entry = this.getMarkedEntry(key);
+            markedRead = !!entry;
+        }
         if (!entry) {
             if (!config.includeTombstones) return undefined;
             // A deletion has no bytes - the tombstone IS the answer, so a flag-caller gets its time with empty data
@@ -308,8 +327,8 @@ export class BlobStore {
             }
         }
         if (result) {
-            // Ranged reads can't populate a cache (they're partial)
-            if (this.slotForSourcesListIndex(entry.sourcesListIndex) !== 0 && !range) {
+            // Ranged reads can't populate a cache (they're partial), and a marked read must not re-index anything - caching would resurrect the deleted key as live
+            if (!markedRead && this.slotForSourcesListIndex(entry.sourcesListIndex) !== 0 && !range) {
                 await this.cacheRead(key, result);
             }
             return result;
@@ -334,7 +353,10 @@ export class BlobStore {
                 continue;
             }
             if (!fallback) continue;
-            await this.cacheRead(key, fallback);
+            // A marked read must not re-index anything - caching would resurrect the deleted key as live
+            if (!markedRead) {
+                await this.cacheRead(key, fallback);
+            }
             let data = fallback.data;
             if (range) {
                 data = data.subarray(Math.min(range.start, data.length), Math.min(range.end, data.length));
@@ -342,12 +364,14 @@ export class BlobStore {
             return { data, writeTime: fallback.writeTime, size: fallback.size };
         }
         if (holderError) throw holderError;
-        // The holder answered "not there" and no other source has it either: the entry was stale. Forgotten rather than deleted - nothing happened to this file, we were simply wrong about holding it, and saying otherwise would push a deletion out to everyone else.
-        this.purgeIndexEntry(key);
+        // The holder answered "not there" and no other source has it either: the entry was stale. Forgotten rather than deleted - nothing happened to this file, we were simply wrong about holding it, and saying otherwise would push a deletion out to everyone else. (Never for a marked read: purging would erase the deletion's tombstone.)
+        if (!markedRead) {
+            this.purgeIndexEntry(key);
+        }
         return undefined;
     }
 
-    public async set(config: { path: string; data: Buffer; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void> {
+    public async set(config: { path: string; data: Buffer; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean; undelete?: boolean }): Promise<void> {
         let { path: key, data } = config;
         if (!data.length) {
             throw new Error(`set was called with an empty buffer for ${JSON.stringify(key)} (store ${this.folder}): an empty file IS a deletion in this system and would read back as missing - call del instead`);
@@ -360,6 +384,13 @@ export class BlobStore {
             this.assertRoutingConfigWritable(data);
         } else {
             this.assertWriteTarget(key, route, config.lastModified);
+        }
+        if (config.undelete) {
+            if (key === ROUTING_FILE) {
+                throw new Error(`The routing config ${JSON.stringify(ROUTING_FILE)} cannot be undeleted (it cannot be deleted in the first place)`);
+            }
+            await this.undeleteKey(key, writeTime, config.internal);
+            return;
         }
         if (key !== ROUTING_FILE && this.storeConfig.all().length) {
             if (config.forceSetImmutable) {
@@ -421,6 +452,7 @@ export class BlobStore {
         }
         await this.set({ path: config.toPath, data: result.data });
         await this.del({ path: config.fromPath });
+        logMutation({ op: "move", folder: this.folder, store: this.storeName, path: config.fromPath, toPath: config.toPath, size: result.data.length });
     }
 
     public async getInfo(config: { path: string; includeTombstones?: boolean }): Promise<{ writeTime: number; size: number } | undefined> {
@@ -444,6 +476,13 @@ export class BlobStore {
         for (let [key, entry] of this.indexEntries()) {
             if (!key.startsWith(prefix)) continue;
             infos.set(key, { path: key, createTime: entry.writeTime, size: entry.size });
+        }
+        if (config.includeMarked) {
+            // A key is live OR marked, never both, so this cannot collide with the loop above
+            for (let [key, entry] of this.markedEntries()) {
+                if (!key.startsWith(prefix)) continue;
+                infos.set(key, { path: key, createTime: entry.writeTime, size: entry.size });
+            }
         }
         let files = applyFindInfoShape(Array.from(infos.values()), prefix, { shallow: config.shallow, type: config.type });
         sort(files, x => x.path);
@@ -478,6 +517,7 @@ export class BlobStore {
     /** The index's totals plus any in-progress background synchronization. */
     public getSyncProgress(): {
         index: { fileCount: number; byteCount: number };
+        marked: { fileCount: number; byteCount: number; oldestDeleteTime?: number };
         sources: { debugName: string; fileCount: number; byteCount: number }[];
         readerDiskLimit?: number;
         syncing: SyncActivity[];
@@ -485,6 +525,7 @@ export class BlobStore {
         let totals = this.namedIndexTotals();
         return {
             index: { fileCount: totals.fileCount, byteCount: totals.byteCount },
+            marked: this.markedTotals(),
             sources: totals.sources,
             readerDiskLimit: this.readerDiskLimit,
             syncing: this.sync.getActivities(),
@@ -586,7 +627,7 @@ export class BlobStore {
         for (let i = 1; i < originalLength; i++) {
             if (!this.isLive(i) || matched.has(i)) continue;
             // The slot is dead the moment this returns; dropping the index entries it held is the part that reads the index, so it finishes in the background
-            void this.sync.removeSource(i).catch((e: Error) => console.error(`Removing sync source ${this.sources[i].source.getDebugName()} (store ${this.folder}) failed: ${e.stack ?? e}`));
+            void this.sync.removeSource(i).catch((e: Error) => logStorageError(`Removing sync source ${this.sources[i].source.getDebugName()} (store ${this.folder}) failed: ${e.stack ?? e}`));
         }
     }
 
@@ -637,9 +678,9 @@ export class BlobStore {
         }
         return await this.getDiskSource().disk.startLargeUpload();
     }
-    public async appendLargeUpload(config: { id: string; data: Buffer }): Promise<void> {
+    public async appendLargeUpload(config: { id: string; data: Buffer; offset?: number }): Promise<void> {
         if (this.discardedUploads.has(config.id)) return;
-        await this.getDiskSource().disk.appendLargeUpload(config.id, config.data);
+        await this.getDiskSource().disk.appendLargeUpload(config.id, config.data, config.offset);
     }
     public async finishLargeUpload(config: { id: string; path: string; lastModified?: number; forceSetImmutable?: boolean; noChecks?: boolean; internal?: boolean }): Promise<void> {
         if (this.discardedUploads.delete(config.id)) return;
@@ -656,6 +697,7 @@ export class BlobStore {
         let info = await disk.getInfo(config.path);
         if (info) {
             this.setIndexEntry(config.path, { writeTime: info.writeTime, size: info.size, sourcesListIndex: this.sourcesListIndexOfSlot(sourceIndex) });
+            logMutation({ op: "setLarge", folder: this.folder, store: this.storeName, path: config.path, size: info.size, writeTime: info.writeTime, internal: config.internal });
         }
     }
     public async cancelLargeUpload(config: { id: string }): Promise<void> {
@@ -760,6 +802,72 @@ export class BlobStore {
         }
     }
 
+    /** A file MARKED for deletion: its kept index value plus when it was deleted. Undefined when the key is live, never existed, or its history was already dropped. */
+    public getMarkedEntry(key: string): (IndexEntry & { deleteTime: number }) | undefined {
+        let tombstone = this.index.getDeleted(key);
+        if (!tombstone || tombstone.value === undefined) return undefined;
+        return { ...tombstone.value, writeTime: tombstone.valueTime || tombstone.time, changedAt: tombstone.changedAt, deleteTime: tombstone.time };
+    }
+
+    /** Every file marked for deletion - the deletion history, walked by retention and by includeMarked listings. */
+    public *markedEntries(): IterableIterator<[string, IndexEntry & { deleteTime: number }]> {
+        for (let [key, tombstone] of this.index.deletedEntries()) {
+            if (tombstone.value === undefined) continue;
+            yield [key, { ...tombstone.value, writeTime: tombstone.valueTime || tombstone.time, changedAt: tombstone.changedAt, deleteTime: tombstone.time }];
+        }
+    }
+
+    /** The deletion history's totals: how many marked files, their bytes, and the delete time of the OLDEST one - which is how far back the history reaches. */
+    public markedTotals(): { fileCount: number; byteCount: number; oldestDeleteTime?: number } {
+        let fileCount = 0;
+        let byteCount = 0;
+        let oldestDeleteTime: number | undefined;
+        for (let [, entry] of this.markedEntries()) {
+            fileCount++;
+            byteCount += entry.size;
+            if (oldestDeleteTime === undefined || entry.deleteTime < oldestDeleteTime) {
+                oldestDeleteTime = entry.deleteTime;
+            }
+        }
+        return { fileCount, byteCount, oldestDeleteTime };
+    }
+
+    /** Physically removes a marked file's bytes from our disk and drops its kept value, leaving a plain tombstone that ages out normally - retention calling time on the oldest history. */
+    public async dropMarkedHistory(key: string): Promise<void> {
+        await this.ownDisk.del(key);
+        this.index.dropValue(key);
+    }
+
+    /** See SetConfig.undelete: flips a marked deletion back to live (fresh write time, so the restore outranks the deletion everywhere it propagated) - the bytes never left the disk, so reads just work again. Internal restores are a peer's propagation and tolerate having nothing to restore (this node may never have held the file); a caller's restore throws instead. */
+    private async undeleteKey(key: string, writeTime: number, internal: boolean | undefined): Promise<void> {
+        let marked = this.getMarkedEntry(key);
+        if (!this.index.unmark(key, writeTime)) {
+            // Already live: undelete is idempotent (retries and peer propagation both re-send it)
+            if (this.getIndexEntry(key)) return;
+            if (internal) {
+                console.log(`Undelete of ${JSON.stringify(key)} (store ${this.folder}) has nothing to restore here - this node may never have held the file`);
+                return;
+            }
+            throw new Error(`Cannot undelete ${JSON.stringify(key)} (store ${this.folder}): it has no marked deletion to restore - it was never deleted here${this.getDeletedEntry(key) && ", or its deletion history was already dropped (a plain tombstone remains, but the bytes are gone)" || ""}`);
+        }
+        console.log(`Undeleted ${JSON.stringify(key)} (store ${this.folder}): the index entry (${marked?.size} bytes, deleted ${marked && new Date(marked.deleteTime).toISOString()}) is live again as of ${new Date(writeTime).toISOString()} - the bytes never left the disk`);
+        logMutation({ op: "undelete", folder: this.folder, store: this.storeName, path: key, size: marked?.size, writeTime, internal });
+        this.config?.onIndexChanged?.(key);
+        if (internal) return;
+        // Peers marked their own copies when the deletion propagated, so the restore propagates the same way. Straight past any write delay - a buffered undelete could be read back as its placeholder byte.
+        let route = getRoute(key);
+        for (let i of this.getWritableSources()) {
+            if (i === 0) continue;
+            if (!routeContains(this.sources[i].route, route)) continue;
+            // Only our own servers understand the flag - a raw source (backblaze) would store the placeholder byte as the file. Their older copy is re-pushed by reconciliation instead.
+            if (this.sources[i].sourceConfig?.type !== "remote") continue;
+            let push = unwrapDelayed(this.sources[i].source).set(key, UNDELETE_PLACEHOLDER, { lastModified: writeTime, undelete: true, noChecks: true, internal: true });
+            void push.catch((e: Error) => {
+                logStorageError(`Background undelete of ${key} on sync source ${this.sources[i].source.getDebugName()} (store ${this.folder}) failed (its scan of us re-finds the file anyway): ${e.stack ?? e}`);
+            });
+        }
+    }
+
     /** How many files we hold, deletions excluded. */
     public indexSize(): number {
         return this.index.size;
@@ -802,6 +910,12 @@ export class BlobStore {
     /** Forgets a key entirely, tombstone included. NOT a deletion: it says nothing happened to the file, only that we no longer know anything about it - for an entry whose holder turned out not to have it, and for a tombstone old enough that everyone has heard. */
     public purgeIndexEntry(key: string): void {
         this.index.purge(key);
+    }
+
+    /** Counts a synchronization transfer in the server's access statistics (see getStore's wiring): "sync get" for bytes pulled off a source, "sync set" for bytes pushed to one. */
+    public noteSyncTransfer(operation: "sync get" | "sync set", path: string, bytes: number): void {
+        logMutation({ op: operation, folder: this.folder, store: this.storeName, path, size: bytes });
+        this.config?.onSyncTransfer?.(operation, path, bytes);
     }
 
     // ── validation (from this store's own routing entries) ──
@@ -915,19 +1029,22 @@ export class BlobStore {
         assertValidLastModified(config.lastModified);
         if (config.lastModified < await this.currentWriteTime(key)) return;
         if (data.length === 0) {
-            // A deletion stores nothing on our own source - the tombstone is the whole of it
-            await this.sources[0].source.del(key);
+            // The bytes stay on our disk as deletion history (see writeToSources) - the marked index entry is the whole of the deletion
             this.setIndexDeleted(key, config.lastModified);
+            logMutation({ op: "del", folder: this.folder, store: this.storeName, path: key, writeTime: config.lastModified, internal: true });
             return;
         }
         await this.sources[0].source.set(key, data, { lastModified: config.lastModified, forceSetImmutable: true, noChecks: true });
         this.setIndexEntry(key, { writeTime: config.lastModified, size: data.length, sourcesListIndex: this.sourcesListIndexOfSlot(0) });
+        logMutation({ op: "set", folder: this.folder, store: this.storeName, path: key, size: data.length, writeTime: config.lastModified, internal: true });
     }
 
     // The read's bytes came from a remote source, so write them onto our own base source (the local disk), which becomes the entry's new holder - reads only pay the remote fetch once
     private async cacheRead(key: string, result: { data: Buffer; writeTime: number }): Promise<void> {
         await this.sources[0].source.set(key, result.data, { lastModified: result.writeTime, forceSetImmutable: true, noChecks: true });
         this.setIndexEntry(key, { writeTime: result.writeTime, size: result.data.length, sourcesListIndex: this.sourcesListIndexOfSlot(0) });
+        // A down-cache pulls the bytes off a source exactly like synchronization does, so it counts (and logs) the same way
+        this.noteSyncTransfer("sync get", key, result.data.length);
     }
 
     // The shared engine of set and del: an empty buffer is exactly a deletion here, which is why the empty-buffer rejection lives in set (the public API), not in this machinery
@@ -978,15 +1095,19 @@ export class BlobStore {
         }
         // Only our own (first) source blocks the write. Downstream sources are written in the background: a down downstream source must not fail or stall writes, and reconciliation re-sends anything they missed once they come back.
         if (data.length === 0) {
-            // A deletion stores nothing on our own source - the tombstone is the whole of it
-            await this.sources[first].source.del(key);
+            // The bytes STAY on our disk, as deletion history: the index marks the key deleted (keeping its value - see TransactionFile.delete), reads stop finding it, and the retention pass physically removes the oldest history once it outgrows its budget (see StoreSync.enforceHistoryLimit). The marked index entry is the whole of the local deletion.
             this.setIndexDeleted(key, writeTime);
         } else {
             await this.sources[first].source.set(key, data, { lastModified: writeTime, noChecks: true });
             this.setIndexEntry(key, { writeTime, size: data.length, sourcesListIndex: this.sourcesListIndexOfSlot(first) });
         }
+        logMutation({ op: data.length === 0 && "del" || "set", folder: this.folder, store: this.storeName, path: key, size: data.length, writeTime });
         if (isRouting) return;
         let route = getRoute(key);
+        // Deletions did not consume the first slot (nothing is written anywhere locally), so it receives the propagated deletion like the rest - except slot 0, our own disk, whose bytes ARE the history being kept
+        if (data.length === 0 && first !== 0) {
+            writable.unshift(first);
+        }
         for (let i of writable) {
             if (!routeContains(this.sources[i].route, route)) continue;
             // Deletions travel as del carrying the original write time (never as empty sets - set rejects empty buffers). Backblaze materializes such dels as real empty files, so its listings still show the deletion for other stores to scan in as a tombstone.
@@ -997,7 +1118,7 @@ export class BlobStore {
                 push = this.sources[i].source.set(key, data, { lastModified: writeTime, forceSetImmutable: true, noChecks: true, internal: true });
             }
             void push.catch((e: Error) => {
-                console.error(`Background write of ${key} to sync source ${this.sources[i].source.getDebugName()} failed: ${e.stack ?? e}`);
+                logStorageError(`Background write of ${key} to sync source ${this.sources[i].source.getDebugName()} (store ${this.folder}) failed: ${e.stack ?? e}`);
             });
         }
     }

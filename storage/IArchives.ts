@@ -110,11 +110,19 @@ export type GetConfig = {
     internal?: boolean;
     /** Also return size-0 results (tombstones - an empty file IS a missing file) instead of treating them as absent. Off by default, matching getInfo's flag of the same name. Synchronization passes this so a DELETED file (with its write time) is distinguishable from a file that never existed. */
     includeTombstones?: boolean;
+    /** Reads files that are MARKED for deletion (deleted, but with their bytes still in the deletion history - see SetConfig.undelete for restoring them). The actual content comes back, unlike includeTombstones, which only reports that a deletion happened. */
+    includeMarked?: boolean;
+    /** Read from EXACTLY this source - its config url, as ArchivesChain.getFileSources lists them - with no fallback to any other. For comparing the copies different sources hold (combine with internal to read only that server's own disk, skipping its holder resolution). Multi-source archives only; throws when no configured source has the url. */
+    sourceUrl?: string;
+    /** How many extra times the WHOLE operation is retried after every source in a pass failed - any error counts (the wrong-window/route markers still get their config re-resolve first). Only applies to fallback dispatch (multi-source, not noFallbacks), where it defaults to 3; the noFallbacks/write-node path already retries on its own deadline. Multi-part uploads additionally retry per part regardless of this. */
+    retries?: number;
 };
 
 export type FindConfig = {
     shallow?: boolean;
     type?: "files" | "folders";
+    /** Also list files MARKED for deletion (see GetConfig.includeMarked). */
+    includeMarked?: boolean;
     /** Listings normally come ONLY from the authoritative sources (the same nodes writes go to - read-your-writes). With fallbacks, a failing shard's routes are covered by the next source holding them (e.g. a wide read replica) instead of the call failing - high availability at the cost of possibly missing just-written data. Single-source archives ignore the flag. */
     fallbacks?: boolean;
 };
@@ -128,6 +136,8 @@ export type DelConfig = {
     noChecks?: boolean;
     /** See SetConfig.fallbacks. */
     fallbacks?: boolean;
+    /** See GetConfig.retries. */
+    retries?: number;
 };
 
 export type GetInfoConfig = {
@@ -135,6 +145,10 @@ export type GetInfoConfig = {
     includeTombstones?: boolean;
     /** See GetConfig.noFallbacks: answer ONLY from the primary source (the one writes would target) instead of falling back across the redundant sources. */
     noFallbacks?: boolean;
+    /** See GetConfig.retries. */
+    retries?: number;
+    /** See GetConfig.sourceUrl: answer from EXACTLY this source. */
+    sourceUrl?: string;
 };
 
 export type ChangesAfterConfig = {
@@ -153,6 +167,10 @@ export type SetConfig = {
     internal?: boolean;
     /** Writes normally go ONLY to the write node (the first current-window source covering the key), retrying it even while it is down - consistent, but unavailable when that node is. With fallbacks, the write node is still tried first, but on failure the write lands on the next current-window source covering the key (synchronization moves it to the write node later) - availability at the cost of reads possibly missing the write until it propagates. Single-source archives ignore the flag. */
     fallbacks?: boolean;
+    /** See GetConfig.retries. */
+    retries?: number;
+    /** The set is not a write at all: it RESTORES a file marked for deletion, flipping its index entry back to live (with a fresh write time, so the restore outranks the deletion everywhere it propagated) - the bytes never left the disk, so reads just work again. The data buffer is ignored (a 1-byte placeholder satisfies the empty-buffer rule); use IArchives.undelete rather than passing this yourself. Throws when the key has no marked deletion to restore (its history was dropped, or it was never deleted). */
+    undelete?: boolean;
 };
 
 /** setLargeFile's config: a SetConfig (it IS a set - the same immutability, ordering, internal, and fallbacks rules apply) plus the stream carrying the bytes. */
@@ -185,6 +203,8 @@ export type ArchivesConfig = {
     remoteConfig?: RemoteConfig;
     // Live index totals (tombstones excluded), kept up to date in memory on every mutation and recomputed on load - so any drift heals on restart
     index?: { fileCount: number; byteCount: number };
+    /** Files MARKED for deletion (deleted, bytes still kept as history - see SetConfig.undelete): how many, how big, and the delete time of the oldest one - which is how far back the deletion history reaches. */
+    markedIndex?: { fileCount: number; byteCount: number; oldestDeleteTime?: number };
     // The same totals broken down by which source currently holds each file's bytes (the first entry is the server's own disk)
     indexSources?: { debugName: string; fileCount: number; byteCount: number }[];
     // The server's configured readerDiskLimit, when it runs as a bounded read cache
@@ -314,6 +334,8 @@ export interface IArchives {
     del(fileName: string, config?: DelConfig): Promise<void>;
     /** Moves a file to a new path within THIS archives, backend-side where the backend can (backblaze copies server-side, disk renames, the storage server relocates node-side) - the bytes never travel through the caller. The destination is stamped with a FRESH write time, even when the underlying operation (a rename) would preserve the old one, so the moved file cannot immediately lose to something newer sitting at its new path (e.g. the tombstone of an earlier deletion there); the source is then deleted, exactly like del. THROWS when the source file does not exist. Optional - callers go through moveArchiveFile (archiveHelpers.ts), which falls back to copy + confirm + delete. */
     move?(config: MoveFileConfig): Promise<void>;
+    /** Restores a deleted file whose bytes are still in the deletion history (see SetConfig.undelete, which this rides on). Only index-backed stores keep a deletion history, so only they support this. THROWS when there is nothing to restore. */
+    undelete?(fileName: string): Promise<void>;
     /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. The rest of the config is a plain SetConfig and means exactly what it means on set (that is what makes a large set behave like a small one instead of quietly losing immutability, ordering, internal, or fallbacks semantics as the file crosses the threshold); backends that stamp their own times (backblaze) accept and ignore lastModified. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
     setLargeFile(config: SetLargeFileConfig): Promise<void>;
     /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. Size-0 entries (tombstones) report undefined unless config.includeTombstones. */

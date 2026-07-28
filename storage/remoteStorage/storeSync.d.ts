@@ -37,17 +37,20 @@ export declare class StoreSync {
     waitForRequiredScans(): Promise<void>;
     /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
     rescanBase(): Promise<void>;
+    /** One synchronization round of a source: the PULL direction always (its listing, applied to our index), and with "push" the push direction too (what our index says the source is missing, written to it). Push is an argument rather than a separate call because it cannot run without the pull's listing - the index alone cannot say what the source already holds. Listings unblock (initialScan) between the halves, so they never wait behind a push. Only one round per SOURCE runs at a time (cache keys the serializer by source index). */
+    private syncSource;
     /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
     boundaryScanRemote(source: IArchives, config: {
         since: number;
         route?: [number, number];
     }): Promise<void>;
-    private runSourceSync;
-    private scanSource;
-    private reconcileSource;
+    private startSourceSyncLoops;
+    private pullSource;
+    private pushSource;
     private updateScanIndex;
     private pollChanges;
     private copySourceFiles;
     private enforceDiskLimit;
     private cleanupTombstones;
+    private enforceHistoryLimit;
 }

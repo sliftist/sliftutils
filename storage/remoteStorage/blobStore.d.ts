@@ -4,7 +4,10 @@ import { IArchives, ArchiveFileInfo, ArchivesSource, ArchivesSyncStatus, Changes
 import { StoreSync } from "./storeSync";
 import { StoreConfig } from "./storeConfig";
 export declare const WINDOW_END_FLUSH_MARGIN: number;
-/** What we store about a file. Its times are not in here: the index keeps those for every key, deleted ones included (see LogMap). */
+export declare const HISTORY_MIN_BYTES: number;
+/** The multiple of a store's live bytes its deletion history may grow to. Async so it can later become dynamic and user-configurable; for now it is a constant. */
+export declare function getHistoryFactor(): Promise<number>;
+/** What we store about a file. Its times are not in here: the index keeps those for every key, deleted ones included (see TransactionFile). */
 type IndexValue = {
     size: number;
     sourcesListIndex: number;
@@ -62,6 +65,8 @@ export declare class BlobStore {
         /** Asks the client whose request created this store what routing config it intended for our name. Only used when init finds NO configuration in our folder: a store only ever exists because a config names it, so the requester has that config - asking for it lazily is the same information as passing the config on every call, without the per-call kilobytes. */
         requestRoutingConfig?: (() => Promise<RemoteConfig | undefined>) | undefined;
         onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
+        /** A synchronization transfer: "sync get" is bytes pulled off a source (the backblaze download bill), "sync set" is bytes pushed to one. Injected because sync traffic never passes through the API controller, so nothing else can count it. */
+        onSyncTransfer?: ((operation: "sync get" | "sync set", path: string, bytes: number) => void) | undefined;
         resolveSourceUrl?: ((url: string) => IArchives) | undefined;
     } | undefined);
     /** This store's folder, unwrapped: the same bytes slot 0 serves, but reached without its write delay. Used for the two things that cannot go through a buffered source - reading our own routing config before we have any sources, and streaming a large upload that must not sit in memory. */
@@ -100,6 +105,7 @@ export declare class BlobStore {
         };
         internal?: boolean;
         includeTombstones?: boolean;
+        includeMarked?: boolean;
     }): Promise<{
         data: Buffer;
         writeTime: number;
@@ -111,6 +117,7 @@ export declare class BlobStore {
         lastModified?: number;
         forceSetImmutable?: boolean;
         internal?: boolean;
+        undelete?: boolean;
     }): Promise<void>;
     del(config: {
         path: string;
@@ -139,6 +146,11 @@ export declare class BlobStore {
         index: {
             fileCount: number;
             byteCount: number;
+        };
+        marked: {
+            fileCount: number;
+            byteCount: number;
+            oldestDeleteTime?: number;
         };
         sources: {
             debugName: string;
@@ -188,6 +200,7 @@ export declare class BlobStore {
     appendLargeUpload(config: {
         id: string;
         data: Buffer;
+        offset?: number;
     }): Promise<void>;
     finishLargeUpload(config: {
         id: string;
@@ -226,6 +239,24 @@ export declare class BlobStore {
         writeTime: number;
         changedAt: number;
     }]>;
+    /** A file MARKED for deletion: its kept index value plus when it was deleted. Undefined when the key is live, never existed, or its history was already dropped. */
+    getMarkedEntry(key: string): (IndexEntry & {
+        deleteTime: number;
+    }) | undefined;
+    /** Every file marked for deletion - the deletion history, walked by retention and by includeMarked listings. */
+    markedEntries(): IterableIterator<[string, IndexEntry & {
+        deleteTime: number;
+    }]>;
+    /** The deletion history's totals: how many marked files, their bytes, and the delete time of the OLDEST one - which is how far back the history reaches. */
+    markedTotals(): {
+        fileCount: number;
+        byteCount: number;
+        oldestDeleteTime?: number;
+    };
+    /** Physically removes a marked file's bytes from our disk and drops its kept value, leaving a plain tombstone that ages out normally - retention calling time on the oldest history. */
+    dropMarkedHistory(key: string): Promise<void>;
+    /** See SetConfig.undelete: flips a marked deletion back to live (fresh write time, so the restore outranks the deletion everywhere it propagated) - the bytes never left the disk, so reads just work again. Internal restores are a peer's propagation and tolerate having nothing to restore (this node may never have held the file); a caller's restore throws instead. */
+    private undeleteKey;
     /** How many files we hold, deletions excluded. */
     indexSize(): number;
     /** Totals over the files we hold, broken down by the slot holding each (entries can name a source that is no longer configured, which counts towards the total but no slot). */
@@ -247,6 +278,8 @@ export declare class BlobStore {
     setIndexDeleted(key: string, writeTime: number): boolean;
     /** Forgets a key entirely, tombstone included. NOT a deletion: it says nothing happened to the file, only that we no longer know anything about it - for an entry whose holder turned out not to have it, and for a tombstone old enough that everyone has heard. */
     purgeIndexEntry(key: string): void;
+    /** Counts a synchronization transfer in the server's access statistics (see getStore's wiring): "sync get" for bytes pulled off a source, "sync set" for bytes pushed to one. */
+    noteSyncTransfer(operation: "sync get" | "sync set", path: string, bytes: number): void;
     /**
      * Every write, however it is stamped, has to be one we are actually meant to hold - because the
      * alternative is not a smaller problem, it is a silent one. A write that lands on a store that

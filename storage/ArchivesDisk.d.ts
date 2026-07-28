@@ -37,7 +37,8 @@ export declare class ArchivesDisk implements IArchives {
     private collectFiles;
     setLargeFile(config: SetLargeFileConfig): Promise<void>;
     startLargeUpload(): Promise<string>;
-    appendLargeUpload(id: string, data: Buffer): Promise<void>;
+    /** offset makes the write POSITIONAL instead of appending: a retried part lands exactly where the failed attempt would have, so part retries are idempotent. One upload must use either appends or offsets throughout, never both - the cached handle keeps its first flags, and O_APPEND ignores the position argument. */
+    appendLargeUpload(id: string, data: Buffer, offset?: number): Promise<void>;
     finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
     cancelLargeUpload(id: string): Promise<void>;
     getURL(path: string): Promise<string>;

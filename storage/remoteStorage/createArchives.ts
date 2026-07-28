@@ -18,8 +18,12 @@ import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
 import { RemoteStorageController, STORAGE_NOT_AUTHENTICATED } from "./storageController";
 import { SourceWrapper } from "./sourceWrapper";
 import { ChainState, ChainStateManager } from "./chainStartup";
+import { LogFileInfo, decodeLogFile, createLogSearcher } from "../StreamingLogs";
 import { formatTime } from "socket-function/src/formatting/format";
 
+// How many extra full passes over the sources fallback dispatch makes when EVERY source in a pass failed, before the operation throws (see GetConfig.retries) - most requests shouldn't fail at all, so a couple of blanket retries buys availability for almost nothing
+const DEFAULT_FALLBACK_RETRIES = 3;
+const FALLBACK_RETRY_DELAY = 2 * 1000;
 const WRONG_TARGET_BOUNDARY_WINDOW = 30 * 1000;
 const WRONG_TARGET_BOUNDARY_RETRY_DELAY = 15 * 1000;
 const CONFIG_REFRESH_THROTTLE = 30 * 1000;
@@ -103,15 +107,20 @@ export class ArchivesChain implements IArchives {
     }
 
     // The ONE dispatch for every operation: no fallbacks (all writes by default, and noFallbacks reads) -> the primary node only, via runPrimary; everything else -> the shared fallback loop, trying sources in config order (or latency order for fast reads) and only moving on when one fails. Writes in the loop differ from reads only in calling source.write.
-    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fallbacks?: boolean; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
+    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fallbacks?: boolean; retries?: number; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         if (config.fast && config.noFallbacks) {
             throw new Error(`fast and noFallbacks are mutually exclusive for ${this.getDebugName()}: noFallbacks only considers one source (the write node), so there is no order to speed up`);
         }
         if (config.noFallbacks || config.write && !config.fallbacks) {
             return await this.runPrimary(config, run);
         }
+        let retries = config.retries;
+        if (retries === undefined) {
+            retries = DEFAULT_FALLBACK_RETRIES;
+        }
         let recheckedAvailability = false;
         let retriedWrongTarget = false;
+        let retriedPasses = 0;
         while (true) {
             let errors: string[] = [];
             let candidates = state.sources.filter(source =>
@@ -176,7 +185,16 @@ export class ArchivesChain implements IArchives {
                 state = await this.state.getState();
                 continue;
             }
-            throw new Error(`All sources failed for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""}: ${errors.join(" | ") || "no sources available"}`);
+            // Blanket retry of the whole pass, ANY error (see GetConfig.retries): most requests shouldn't fail at all, so retrying the rare failure - whatever it was - buys availability for almost nothing
+            if (retriedPasses < retries) {
+                retriedPasses++;
+                console.warn(`Every source failed for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""}; retrying the whole pass in ${FALLBACK_RETRY_DELAY / 1000}s (retry ${retriedPasses} of ${retries})`);
+                await delay(FALLBACK_RETRY_DELAY);
+                await this.state.recheckAvailability();
+                state = await this.state.getState();
+                continue;
+            }
+            throw new Error(`All sources failed for ${this.getDebugName()}${config.route !== undefined && ` (route ${config.route})` || ""} (after ${retriedPasses} retr${retriedPasses === 1 && "y" || "ies"}): ${errors.join(" | ") || "no sources available"}`);
         }
     }
 
@@ -296,7 +314,7 @@ export class ArchivesChain implements IArchives {
         await this.state.refreshActiveConfig();
     }
 
-    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fallbacks?: boolean; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
+    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fallbacks?: boolean; retries?: number; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let state = await this.state.getState();
         return await this.run(state, config, run);
     }
@@ -314,13 +332,34 @@ export class ArchivesChain implements IArchives {
         return undefined;
     }
 
+    /** The sources that can serve a file right now, in dispatch order - the first is the write node, the one a plain read asks first. Each entry's url is what GetConfig.sourceUrl / GetInfoConfig.sourceUrl accept, so listing these and then reading with sourceUrl compares the copies the sources actually hold. */
+    public async getFileSources(fileName: string): Promise<SourceConfig[]> {
+        let state = await this.state.getState();
+        let route = getRoute(fileName);
+        return state.sources.filter(x => routeContains(x.config.route, route) && configWindowCurrent(x.config)).map(x => x.config);
+    }
+
+    // The one exact source a sourceUrl read means, no fallback of any kind - asking for a SPECIFIC source's copy and getting another's would defeat the point
+    private async runOnSource<T>(sourceUrl: string, run: (archives: IArchives) => Promise<T>): Promise<T> {
+        let state = await this.state.getState();
+        let source = state.sources.find(x => x.config.url === sourceUrl);
+        if (!source) {
+            throw new Error(`No configured source has the url ${JSON.stringify(sourceUrl)} for ${this.getDebugName()} (sources: ${state.sources.map(x => x.config.url).join(", ")})`);
+        }
+        return await source.read(run);
+    }
+
     public async get(fileName: string, config?: GetConfig): Promise<Buffer | undefined> {
         let result = await this.get2(fileName, config);
         return result && result.data || undefined;
     }
     /** get2, but trying sources in latency order (fastest first) instead of config order. While this is much faster, it might miss immediate writes: the write node is no longer tried first, so a lagging replica may answer with a slightly older value. Exclusive with noFallbacks (which only considers one source - the write node - so there is no order to speed up); passing both throws. */
     public async getFast(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
-        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, fast: true, timeout: { path: fileName } }, async (archives, url) => {
+        if (config?.sourceUrl) {
+            // A specific source leaves nothing for the latency ordering to decide
+            return await this.get2(fileName, config);
+        }
+        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, retries: config?.retries, fast: true, timeout: { path: fileName } }, async (archives, url) => {
             let result = await archives.get2(fileName, config);
             // Empty data is a tombstone, not content - see get2
             if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
@@ -329,7 +368,15 @@ export class ArchivesChain implements IArchives {
     }
     /** Always resolves with a url - the authority that answered. A value that doesn't exist is still an answer FROM a server, so it comes back as { url } with no data (never plain undefined); errors from every source throw instead. */
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
-        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, timeout: { path: fileName } }, async (archives, url) => {
+        const sourceUrl = config?.sourceUrl;
+        if (sourceUrl) {
+            return await this.runOnSource(sourceUrl, async archives => {
+                let result = await archives.get2(fileName, config);
+                if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url: sourceUrl };
+                return { data: result.data, writeTime: result.writeTime, size: result.size, url: sourceUrl };
+            });
+        }
+        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, retries: config?.retries, timeout: { path: fileName } }, async (archives, url) => {
             let result = await archives.get2(fileName, config);
             // Empty data is a tombstone, not content (unless the caller asked for tombstones) - a ranged read of a REAL file can legitimately be empty though (range past EOF), which the total size distinguishes
             if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
@@ -337,7 +384,14 @@ export class ArchivesChain implements IArchives {
         });
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url: string } | undefined> {
-        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks }, async (archives, url) => {
+        const sourceUrl = config?.sourceUrl;
+        if (sourceUrl) {
+            return await this.runOnSource(sourceUrl, async archives => {
+                let result = await archives.getInfo(fileName, config);
+                return result && { ...result, url: sourceUrl } || undefined;
+            });
+        }
+        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, retries: config?.retries }, async (archives, url) => {
             let result = await archives.getInfo(fileName, config);
             return result && { ...result, url } || undefined;
         });
@@ -503,7 +557,7 @@ export class ArchivesChain implements IArchives {
             await this.setLargeFile({ path: fileName, ...config, ...bufferChunkStream(data) });
             return fileName;
         }
-        await this.request({ write: true, fallbacks: config?.fallbacks, route: getRoute(fileName), timeout: { uploadBytes: data.length, label: `Upload of ${JSON.stringify(fileName)} (${data.length} bytes)` } }, archives => archives.set(fileName, data, config));
+        await this.request({ write: true, fallbacks: config?.fallbacks, retries: config?.retries, route: getRoute(fileName), timeout: { uploadBytes: data.length, label: `Upload of ${JSON.stringify(fileName)} (${data.length} bytes)` } }, archives => archives.set(fileName, data, config));
         return fileName;
     }
 
@@ -541,7 +595,14 @@ export class ArchivesChain implements IArchives {
         return ROUTING_FILE;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
-        await this.request({ write: true, fallbacks: config?.fallbacks, route: getRoute(fileName), timeout: { uploadBytes: 0, label: `Deletion of ${JSON.stringify(fileName)}` } }, archives => archives.del(fileName, config));
+        await this.request({ write: true, fallbacks: config?.fallbacks, retries: config?.retries, route: getRoute(fileName), timeout: { uploadBytes: 0, label: `Deletion of ${JSON.stringify(fileName)}` } }, archives => archives.del(fileName, config));
+    }
+
+    /** See IArchives.undelete: restores a file marked for deletion, dispatched to the write node as SetConfig.undelete (the write node propagates the restore to its peers itself). */
+    public async undelete(fileName: string): Promise<void> {
+        // set refuses empty buffers, and an undelete carries no data - the byte is ignored
+        let placeholder = Buffer.from([1]);
+        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: placeholder.length, label: `Undelete of ${JSON.stringify(fileName)}` } }, archives => archives.set(fileName, placeholder, { undelete: true }));
     }
 
     /** See IArchives.move. When one node is the write target for BOTH paths, that node moves the file itself - the bytes never come through us - with the same wrong-window/route re-resolution as any write. When the paths route to different shards no single node holds both, so the move degrades to a copy through us plus a delete, CONFIRMED at the destination before the source is touched. No smart timeout on the node-side move: it can be a big file's worth of node-side work, which the upload-sized deadlines would misjudge. */
@@ -566,6 +627,11 @@ export class ArchivesChain implements IArchives {
         // Inline rather than moveArchiveFile, which - given one archives that implements move - would just call back into this method
         let copied = await copyArchiveFile({ from: this, to: this, path: config.fromPath, toPath: config.toPath });
         if (!copied) {
+            // Undefined is two cases (see copyArchiveFile) - asking the source which one keeps the error honest
+            let sourceInfo = await this.getInfo(config.fromPath);
+            if (sourceInfo) {
+                throw new Error(`Cannot move ${JSON.stringify(config.fromPath)} (${sourceInfo.size} bytes at ${new Date(sourceInfo.writeTime).toISOString()}) to ${JSON.stringify(config.toPath)}: the destination already has a newer file, and the copy was refused rather than roll it back (${this.getDebugName()}) - the source is left untouched`);
+            }
             throw new Error(`Cannot move ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)}: the source file does not exist on ${this.getDebugName()}`);
         }
         let confirmed = await this.getInfo(config.toPath);
@@ -661,7 +727,7 @@ export class ArchivesChain implements IArchives {
             return;
         }
         let attempt = 0;
-        await this.request({ write: true, fallbacks: config.fallbacks, route }, async archives => {
+        await this.request({ write: true, fallbacks: config.fallbacks, retries: config.retries, route }, async archives => {
             attempt++;
             // The previous attempt consumed some (or all) of the stream, and this source needs the file from its first byte
             if (attempt > 1) await restartStream();
@@ -790,6 +856,46 @@ export async function activateServerBucket(config: { url: string; account: strin
 /** Zeroes the write statistics listServerBuckets reports, for every bucket in the account. */
 export async function clearServerWriteStats(config: { url: string; account: string }): Promise<{ clearedBuckets: number }> {
     return await callServer(config.url, controller => controller.clearWriteStats({ account: config.account }));
+}
+
+/** The operation-log files ONE storage server holds (every server logs only its own operations - see listAllServerLogFiles for the whole fleet). The names carry pid/thread/time-range/entry-count metadata; see LogFileInfo. */
+export async function listServerLogFiles(config: { url: string; account: string }): Promise<LogFileInfo[]> {
+    return await callServer(config.url, controller => controller.listLogFiles({ account: config.account }));
+}
+
+/** Every server's log files at once, one entry per url - a server that cannot answer reports its error instead of failing the rest. */
+export async function listAllServerLogFiles(config: { urls: string[]; account: string }): Promise<{ url: string; files?: LogFileInfo[]; error?: string }[]> {
+    return await Promise.all(config.urls.map(async url => {
+        try {
+            return { url, files: await listServerLogFiles({ url, account: config.account }) };
+        } catch (e) {
+            return { url, error: String((e as Error).stack ?? e) };
+        }
+    }));
+}
+
+/** Downloads the named log files off one server and decodes them into the logged objects (the wire always carries them LZ4-compressed - live files are compressed in memory server-side). */
+export async function getServerLogs(config: { url: string; account: string; names: string[] }): Promise<{ name: string; entries: unknown[] }[]> {
+    return await callServer(config.url, async controller => {
+        let results: { name: string; entries: unknown[] }[] = [];
+        for (let name of config.names) {
+            let data = await controller.getLogFile({ account: config.account, name });
+            results.push({ name, entries: decodeLogFile(Buffer.from(data)) });
+        }
+        return results;
+    });
+}
+
+/** getServerLogs, but SEARCHED instead of fully decoded: the raw JSON text is substring-matched (every search string must appear in a statement - see createLogSearcher), and only the matching statements are decoded into objects. Far cheaper than decoding whole files to look for one path or caller. */
+export async function searchServerLogs(config: { url: string; account: string; names: string[]; searches: string[] }): Promise<{ name: string; entries: unknown[] }[]> {
+    return await callServer(config.url, async controller => {
+        let results: { name: string; entries: unknown[] }[] = [];
+        for (let name of config.names) {
+            let data = await controller.getLogFile({ account: config.account, name });
+            results.push({ name, entries: createLogSearcher(Buffer.from(data))(config.searches) });
+        }
+        return results;
+    });
 }
 
 export async function getBucketInfo(config: { url: string }): Promise<ArchivesConfig> {

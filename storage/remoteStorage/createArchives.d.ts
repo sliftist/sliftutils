@@ -1,7 +1,8 @@
 /// <reference types="node" />
 /// <reference types="node" />
-import { IArchives, RemoteConfig, RemoteConfigBase, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
+import { IArchives, RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
 import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+import { LogFileInfo } from "../StreamingLogs";
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
 /** A client for ONE source - see storeSources.ts. Re-exported here because a chain is built out of them. */
@@ -26,6 +27,9 @@ export declare class ArchivesChain implements IArchives {
         machineId: string;
         ip: string;
     } | undefined>;
+    /** The sources that can serve a file right now, in dispatch order - the first is the write node, the one a plain read asks first. Each entry's url is what GetConfig.sourceUrl / GetInfoConfig.sourceUrl accept, so listing these and then reading with sourceUrl compares the copies the sources actually hold. */
+    getFileSources(fileName: string): Promise<SourceConfig[]>;
+    private runOnSource;
     get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
     /** get2, but trying sources in latency order (fastest first) instead of config order. While this is much faster, it might miss immediate writes: the write node is no longer tried first, so a lagging replica may answer with a slightly older value. Exclusive with noFallbacks (which only considers one source - the write node - so there is no order to speed up); passing both throws. */
     getFast(fileName: string, config?: GetConfig): Promise<{
@@ -67,6 +71,8 @@ export declare class ArchivesChain implements IArchives {
     set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
     private setRoutingConfig;
     del(fileName: string, config?: DelConfig): Promise<void>;
+    /** See IArchives.undelete: restores a file marked for deletion, dispatched to the write node as SetConfig.undelete (the write node propagates the restore to its peers itself). */
+    undelete(fileName: string): Promise<void>;
     /** See IArchives.move. When one node is the write target for BOTH paths, that node moves the file itself - the bytes never come through us - with the same wrong-window/route re-resolution as any write. When the paths route to different shards no single node holds both, so the move degrades to a copy through us plus a delete, CONFIRMED at the destination before the source is touched. No smart timeout on the node-side move: it can be a big file's worth of node-side work, which the upload-sized deadlines would misjudge. */
     move(config: MoveFileConfig): Promise<void>;
     private getVariableShardTargets;
@@ -117,6 +123,39 @@ export declare function clearServerWriteStats(config: {
 }): Promise<{
     clearedBuckets: number;
 }>;
+/** The operation-log files ONE storage server holds (every server logs only its own operations - see listAllServerLogFiles for the whole fleet). The names carry pid/thread/time-range/entry-count metadata; see LogFileInfo. */
+export declare function listServerLogFiles(config: {
+    url: string;
+    account: string;
+}): Promise<LogFileInfo[]>;
+/** Every server's log files at once, one entry per url - a server that cannot answer reports its error instead of failing the rest. */
+export declare function listAllServerLogFiles(config: {
+    urls: string[];
+    account: string;
+}): Promise<{
+    url: string;
+    files?: LogFileInfo[];
+    error?: string;
+}[]>;
+/** Downloads the named log files off one server and decodes them into the logged objects (the wire always carries them LZ4-compressed - live files are compressed in memory server-side). */
+export declare function getServerLogs(config: {
+    url: string;
+    account: string;
+    names: string[];
+}): Promise<{
+    name: string;
+    entries: unknown[];
+}[]>;
+/** getServerLogs, but SEARCHED instead of fully decoded: the raw JSON text is substring-matched (every search string must appear in a statement - see createLogSearcher), and only the matching statements are decoded into objects. Far cheaper than decoding whole files to look for one path or caller. */
+export declare function searchServerLogs(config: {
+    url: string;
+    account: string;
+    names: string[];
+    searches: string[];
+}): Promise<{
+    name: string;
+    entries: unknown[];
+}[]>;
 export declare function getBucketInfo(config: {
     url: string;
 }): Promise<ArchivesConfig>;

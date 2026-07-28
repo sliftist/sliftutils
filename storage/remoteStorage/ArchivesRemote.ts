@@ -13,6 +13,9 @@ import {
 
 const ACCESS_RETRY_DELAY = 1000 * 30;
 const LARGE_FILE_PART_SIZE = 8 * 1024 * 1024;
+// One failed part must not fail a whole large upload: parts are written at explicit offsets (see uploadPart), so a re-sent part is idempotent and can simply be tried again
+const LARGE_FILE_PART_RETRIES = 3;
+const LARGE_FILE_PART_RETRY_DELAY = 1000 * 5;
 
 export type ArchivesRemoteConfig = {
     // The bucket's routing URL, which addresses the server, account, and bucket in one:
@@ -152,7 +155,7 @@ export class ArchivesRemote implements IArchives {
         return result && result.data || undefined;
     }
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
-        let result = await this.call(() => this.controller.get2({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, range: config?.range, internal: config?.internal, includeTombstones: config?.includeTombstones }));
+        let result = await this.call(() => this.controller.get2({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, range: config?.range, internal: config?.internal, includeTombstones: config?.includeTombstones, includeMarked: config?.includeMarked }));
         return result && { data: Buffer.from(result.data), writeTime: result.writeTime, size: result.size } || undefined;
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
@@ -164,7 +167,7 @@ export class ArchivesRemote implements IArchives {
             await this.setLargeFile({ path: fileName, ...config, ...bufferChunkStream(data) });
             return fileName;
         }
-        await this.call(() => this.controller.set({ account: this.account, bucketName: this.bucketName, path: fileName, data, sourceConfig: this.config.sourceConfig, lastModified: config?.lastModified, forceSetImmutable: config?.forceSetImmutable, internal: config?.internal }));
+        await this.call(() => this.controller.set({ account: this.account, bucketName: this.bucketName, path: fileName, data, sourceConfig: this.config.sourceConfig, lastModified: config?.lastModified, forceSetImmutable: config?.forceSetImmutable, internal: config?.internal, undelete: config?.undelete }));
         return fileName;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
@@ -177,7 +180,7 @@ export class ArchivesRemote implements IArchives {
         return await this.call(() => this.controller.getInfo({ account: this.account, bucketName: this.bucketName, path: fileName, sourceConfig: this.config.sourceConfig, includeTombstones: config?.includeTombstones }));
     }
     public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
-        return await this.call(() => this.controller.findInfo({ account: this.account, bucketName: this.bucketName, prefix, sourceConfig: this.config.sourceConfig, shallow: config?.shallow, type: config?.type }));
+        return await this.call(() => this.controller.findInfo({ account: this.account, bucketName: this.bucketName, prefix, sourceConfig: this.config.sourceConfig, shallow: config?.shallow, type: config?.type, includeMarked: config?.includeMarked }));
     }
     public async find(prefix: string, config?: FindConfig): Promise<string[]> {
         return (await this.findInfo(prefix, config)).map(x => x.path);
@@ -207,11 +210,27 @@ export class ArchivesRemote implements IArchives {
             internal: config.internal,
         });
         try {
+            // The upload's absolute position: every part carries its offset, so the server writes it positionally and a retried part lands on the same bytes instead of appending twice
+            let uploadOffset = 0;
             while (true) {
                 let data = await config.getNextData();
                 if (!data) break;
-                for (let offset = 0; offset < data.length; offset += LARGE_FILE_PART_SIZE) {
-                    await this.controller.uploadPart({ uploadId, data: data.subarray(offset, offset + LARGE_FILE_PART_SIZE) });
+                for (let chunkStart = 0; chunkStart < data.length; chunkStart += LARGE_FILE_PART_SIZE) {
+                    let part = data.subarray(chunkStart, chunkStart + LARGE_FILE_PART_SIZE);
+                    let partOffset = uploadOffset;
+                    uploadOffset += part.length;
+                    let attempt = 0;
+                    while (true) {
+                        try {
+                            await this.controller.uploadPart({ uploadId, data: part, offset: partOffset });
+                            break;
+                        } catch (e) {
+                            attempt++;
+                            if (attempt > LARGE_FILE_PART_RETRIES) throw e;
+                            console.warn(`Part at offset ${partOffset} (${part.length} bytes) of ${JSON.stringify(config.path)} to ${this.getDebugName()} failed (attempt ${attempt} of ${LARGE_FILE_PART_RETRIES + 1}), retrying in ${LARGE_FILE_PART_RETRY_DELAY / 1000}s: ${(e as Error).stack ?? e}`);
+                            await delay(LARGE_FILE_PART_RETRY_DELAY);
+                        }
+                    }
                 }
             }
             await this.controller.finishLargeFile({ uploadId });

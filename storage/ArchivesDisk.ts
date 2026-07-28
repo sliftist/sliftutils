@@ -133,7 +133,7 @@ export class ArchivesDisk implements IArchives {
     }
 
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        // No native change feed - a full listing filtered in memory (see the scanning note in BlobStore.scanSource for why the listing itself takes no filters)
+        // No native change feed - a full listing filtered in memory (see the scanning note in StoreSync.pullSource for why the listing itself takes no filters)
         return filterChanges(await this.findInfo(""), config);
     }
 
@@ -322,13 +322,19 @@ export class ArchivesDisk implements IArchives {
         this.largeUploads.set(id, { tmpPath: path.join(this.uploadsDir, `upload_${id}.tmp`) });
         return id;
     }
-    public async appendLargeUpload(id: string, data: Buffer): Promise<void> {
+    /** offset makes the write POSITIONAL instead of appending: a retried part lands exactly where the failed attempt would have, so part retries are idempotent. One upload must use either appends or offsets throughout, never both - the cached handle keeps its first flags, and O_APPEND ignores the position argument. */
+    public async appendLargeUpload(id: string, data: Buffer, offset?: number): Promise<void> {
         let upload = this.largeUploads.get(id);
         if (!upload) throw new Error(`Unknown large upload ${id}`);
         const tmpPath = upload.tmpPath;
         await this.handles.run(tmpPath, async () => {
-            let handle = await this.handles.getHandle(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND);
-            await handle.write(data, 0, data.length);
+            if (offset === undefined) {
+                let handle = await this.handles.getHandle(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND);
+                await handle.write(data, 0, data.length);
+                return;
+            }
+            let handle = await this.handles.getHandle(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT);
+            await handle.write(data, 0, data.length, offset);
         });
     }
     public async finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void> {
@@ -344,6 +350,14 @@ export class ArchivesDisk implements IArchives {
         await this.handles.run(filePath, async () => {
             // Close any cached handle to the file we're replacing, so later reads reopen the new file
             await this.handles.closeNow(filePath);
+            if (lastModified) {
+                // An older write never overwrites a newer one (see IArchives.set) - re-checked HERE, not just when the upload started, because a large upload streams for minutes and that window is exactly when a newer write lands
+                let existing = await statOrUndefined(filePath);
+                if (existing && lastModified < existing.mtimeMs) {
+                    await fs.promises.rm(tmpPath, { force: true });
+                    return;
+                }
+            }
             await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
             try {
                 await fs.promises.rename(tmpPath, filePath);

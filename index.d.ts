@@ -910,7 +910,8 @@ declare module "sliftutils/storage/ArchivesDisk" {
         private collectFiles;
         setLargeFile(config: SetLargeFileConfig): Promise<void>;
         startLargeUpload(): Promise<string>;
-        appendLargeUpload(id: string, data: Buffer): Promise<void>;
+        /** offset makes the write POSITIONAL instead of appending: a retried part lands exactly where the failed attempt would have, so part retries are idempotent. One upload must use either appends or offsets throughout, never both - the cached handle keeps its first flags, and O_APPEND ignores the position argument. */
+        appendLargeUpload(id: string, data: Buffer, offset?: number): Promise<void>;
         finishLargeUpload(id: string, key: string, lastModified?: number): Promise<void>;
         cancelLargeUpload(id: string): Promise<void>;
         getURL(path: string): Promise<string>;
@@ -2169,10 +2170,18 @@ declare module "sliftutils/storage/IArchives" {
         internal?: boolean;
         /** Also return size-0 results (tombstones - an empty file IS a missing file) instead of treating them as absent. Off by default, matching getInfo's flag of the same name. Synchronization passes this so a DELETED file (with its write time) is distinguishable from a file that never existed. */
         includeTombstones?: boolean;
+        /** Reads files that are MARKED for deletion (deleted, but with their bytes still in the deletion history - see SetConfig.undelete for restoring them). The actual content comes back, unlike includeTombstones, which only reports that a deletion happened. */
+        includeMarked?: boolean;
+        /** Read from EXACTLY this source - its config url, as ArchivesChain.getFileSources lists them - with no fallback to any other. For comparing the copies different sources hold (combine with internal to read only that server's own disk, skipping its holder resolution). Multi-source archives only; throws when no configured source has the url. */
+        sourceUrl?: string;
+        /** How many extra times the WHOLE operation is retried after every source in a pass failed - any error counts (the wrong-window/route markers still get their config re-resolve first). Only applies to fallback dispatch (multi-source, not noFallbacks), where it defaults to 3; the noFallbacks/write-node path already retries on its own deadline. Multi-part uploads additionally retry per part regardless of this. */
+        retries?: number;
     };
     export type FindConfig = {
         shallow?: boolean;
         type?: "files" | "folders";
+        /** Also list files MARKED for deletion (see GetConfig.includeMarked). */
+        includeMarked?: boolean;
         /** Listings normally come ONLY from the authoritative sources (the same nodes writes go to - read-your-writes). With fallbacks, a failing shard's routes are covered by the next source holding them (e.g. a wide read replica) instead of the call failing - high availability at the cost of possibly missing just-written data. Single-source archives ignore the flag. */
         fallbacks?: boolean;
     };
@@ -2185,12 +2194,18 @@ declare module "sliftutils/storage/IArchives" {
         noChecks?: boolean;
         /** See SetConfig.fallbacks. */
         fallbacks?: boolean;
+        /** See GetConfig.retries. */
+        retries?: number;
     };
     export type GetInfoConfig = {
         /** Also report size-0 entries (tombstones - an empty file IS a missing file). Off by default, so a deleted key reports undefined, matching get. Synchronization-style callers pass this when they need a deletion's write time (e.g. to compare it against a write they are about to make). */
         includeTombstones?: boolean;
         /** See GetConfig.noFallbacks: answer ONLY from the primary source (the one writes would target) instead of falling back across the redundant sources. */
         noFallbacks?: boolean;
+        /** See GetConfig.retries. */
+        retries?: number;
+        /** See GetConfig.sourceUrl: answer from EXACTLY this source. */
+        sourceUrl?: string;
     };
     export type ChangesAfterConfig = {
         time: number;
@@ -2207,6 +2222,10 @@ declare module "sliftutils/storage/IArchives" {
         internal?: boolean;
         /** Writes normally go ONLY to the write node (the first current-window source covering the key), retrying it even while it is down - consistent, but unavailable when that node is. With fallbacks, the write node is still tried first, but on failure the write lands on the next current-window source covering the key (synchronization moves it to the write node later) - availability at the cost of reads possibly missing the write until it propagates. Single-source archives ignore the flag. */
         fallbacks?: boolean;
+        /** See GetConfig.retries. */
+        retries?: number;
+        /** The set is not a write at all: it RESTORES a file marked for deletion, flipping its index entry back to live (with a fresh write time, so the restore outranks the deletion everywhere it propagated) - the bytes never left the disk, so reads just work again. The data buffer is ignored (a 1-byte placeholder satisfies the empty-buffer rule); use IArchives.undelete rather than passing this yourself. Throws when the key has no marked deletion to restore (its history was dropped, or it was never deleted). */
+        undelete?: boolean;
     };
     /** setLargeFile's config: a SetConfig (it IS a set - the same immutability, ordering, internal, and fallbacks rules apply) plus the stream carrying the bytes. */
     export type SetLargeFileConfig = SetConfig & {
@@ -2235,6 +2254,12 @@ declare module "sliftutils/storage/IArchives" {
         index?: {
             fileCount: number;
             byteCount: number;
+        };
+        /** Files MARKED for deletion (deleted, bytes still kept as history - see SetConfig.undelete): how many, how big, and the delete time of the oldest one - which is how far back the deletion history reaches. */
+        markedIndex?: {
+            fileCount: number;
+            byteCount: number;
+            oldestDeleteTime?: number;
         };
         indexSources?: {
             debugName: string;
@@ -2330,6 +2355,8 @@ declare module "sliftutils/storage/IArchives" {
         del(fileName: string, config?: DelConfig): Promise<void>;
         /** Moves a file to a new path within THIS archives, backend-side where the backend can (backblaze copies server-side, disk renames, the storage server relocates node-side) - the bytes never travel through the caller. The destination is stamped with a FRESH write time, even when the underlying operation (a rename) would preserve the old one, so the moved file cannot immediately lose to something newer sitting at its new path (e.g. the tombstone of an earlier deletion there); the source is then deleted, exactly like del. THROWS when the source file does not exist. Optional - callers go through moveArchiveFile (archiveHelpers.ts), which falls back to copy + confirm + delete. */
         move?(config: MoveFileConfig): Promise<void>;
+        /** Restores a deleted file whose bytes are still in the deletion history (see SetConfig.undelete, which this rides on). Only index-backed stores keep a deletion history, so only they support this. THROWS when there is nothing to restore. */
+        undelete?(fileName: string): Promise<void>;
         /** Streams a file too large to hold in memory. getNextData returns undefined when done. This only needs to be called when you CANNOT materialize the entire file in memory - if you can, just call set: above LARGE_SET_THRESHOLD it streams through setLargeFile internally, keeping the client responsive and not overwhelming the server. The rest of the config is a plain SetConfig and means exactly what it means on set (that is what makes a large set behave like a small one instead of quietly losing immutability, ordering, internal, or fallbacks semantics as the file crosses the threshold); backends that stamp their own times (backblaze) accept and ignore lastModified. THROWS when the stream produces no data at all - same rule as set: an empty file IS a deletion and would read back as missing. */
         setLargeFile(config: SetLargeFileConfig): Promise<void>;
         /** writeTime is the last-write time — see ArchiveFileInfo.createTime, which is the same value. url as in get2. Size-0 entries (tombstones) report undefined unless config.includeTombstones. */
@@ -2456,7 +2483,7 @@ declare module "sliftutils/storage/LogMap" {
         time: number;
         changedAt: number;
     };
-    export declare class LogMap<T> {
+    export declare class TransactionFile<T> {
         private filePath;
         constructor(filePath: string);
         private values;
@@ -2622,6 +2649,153 @@ declare module "sliftutils/storage/StorageObservableAsync" {
 
 }
 
+declare module "sliftutils/storage/StreamingLogs" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    /** Everything a log file's NAME says about it (plus its on-disk size). Times bound the entries roughly: from is when its process started writing it, to is when it was compressed. */
+    export type LogFileInfo = {
+        name: string;
+        /** Bytes on disk (compressed bytes for compressed files) */
+        size: number;
+        pid: number;
+        processStartTime: number;
+        threadId: string;
+        /** When the process started writing this file */
+        startTime: number;
+        /** When the file was compressed - absent while it is still being streamed to */
+        endTime?: number;
+        /** How many entries it holds - only counted at compression, so absent on live files */
+        entryCount?: number;
+        compressed: boolean;
+        /** Whether the writing process is still alive (always false for compressed files) */
+        active: boolean;
+    };
+    /**
+     * A searcher over one log file (as readFileCompressed returns it - always LZ4) that never decodes
+     * the whole thing: JSON escapes line breaks inside strings, so the only ACTUAL line breaks in the
+     * file are the separators between log statements - a plain substring search over the raw text,
+     * bounded out to the surrounding line breaks, finds exactly the matching statements, and only THOSE
+     * are decoded and returned as objects. Every search string must appear in a statement's raw JSON for
+     * it to match (so search for values as they are encoded - e.g. quoted).
+     */
+    export declare function createLogSearcher(data: Buffer): (searches: string[]) => unknown[];
+    /** Decodes a log file's bytes (as readFileCompressed returns them - always LZ4) back into the logged objects. A torn final line (the writer crashed mid-append) is skipped. */
+    export declare function decodeLogFile(data: Buffer): unknown[];
+    export declare class StreamingLogs {
+        private config;
+        constructor(config: {
+            folder: string;
+            /** Included in every file name - see misc/https/certs.ts getOwnThreadId. Processes without one write "none". */
+            threadId?: string;
+            maxFileBytes?: number;
+            totalLimitBytes?: number;
+        });
+        private processStartTime;
+        private threadId;
+        private pending;
+        private flushTimer;
+        private maintenanceTimer;
+        private writeChain;
+        private currentPath;
+        private currentBytes;
+        private disposed;
+        /** Queues one entry (anything JSON-serializable). Never throws - logging must not take down the caller. */
+        log(entry: unknown): void;
+        private scheduleFlush;
+        flush(): Promise<void>;
+        private writePending;
+        /**
+         * Compresses one finished log file: LZ4 into a temp SUBFOLDER (never a temp name in the log
+         * folder itself - a crashed write must not leave a corrupt file where the maintenance scans are),
+         * renamed into place (same drive, so the rename is atomic), verified, and only THEN is the
+         * original deleted - at no point is the data in fewer than one complete file.
+         */
+        private compressFile;
+        listFiles(): Promise<LogFileInfo[]>;
+        /** One file's bytes, ALWAYS LZ4-compressed: compressed files are sent as-is, a still-streaming file is flushed and compressed in memory (smaller over the network; decodeLogFile handles both identically). */
+        readFileCompressed(name: string): Promise<Buffer>;
+        private scheduleMaintenance;
+        /**
+         * Shared upkeep of the folder - every process using it runs this, so nothing depends on any one
+         * process surviving: dead processes' uncompressed files are compressed for them; duplicate
+         * compressions of one stream (two maintainers racing) are resolved by keeping the OLDEST copy;
+         * an uncompressed original whose compression already exists is deleted (its compressor died
+         * between rename and unlink); and the folder's total size is brought under its budget by
+         * deleting the oldest files.
+         */
+        runMaintenance(): Promise<void>;
+        private enforceTotalLimit;
+        dispose(): void;
+    }
+
+}
+
+declare module "sliftutils/storage/TransactionFile" {
+    /** A live value: what was stored, when it was written (the caller's ordering), and when we last changed it (ours). */
+    export type LogEntry<T> = {
+        value: T;
+        time: number;
+        changedAt: number;
+    };
+    /** A deleted key: when it was deleted, and when we learned. When the key had a live value at deletion time it is MARKED rather than gone - the value (and its original write time) rides along, so the underlying data can still be read and the deletion can be undone (see unmark) until the history is dropped (see dropValue). */
+    export type LogTombstone<T> = {
+        time: number;
+        changedAt: number;
+        value?: T;
+        valueTime?: number;
+    };
+    export declare class TransactionFile<T> {
+        private filePath;
+        constructor(filePath: string);
+        private values;
+        private deleted;
+        private logRecords;
+        private pending;
+        private flushTimer;
+        private writeChain;
+        /** Reads the log and replays it into memory. Every other method assumes this has finished. */
+        load: {
+            (): Promise<void>;
+            reset(): void;
+            set(newValue: Promise<void>): void;
+        };
+        /** The live value, or undefined when the key does not exist here (deleted included - a deletion is an absence, see getDeleted for its time). */
+        get(key: string): LogEntry<T> | undefined;
+        /** When the key was deleted, if it was (value included when the deletion is still marked - see LogTombstone). Absent both here and in get means we have never heard of it. */
+        getDeleted(key: string): LogTombstone<T> | undefined;
+        /** The time the key last changed either way, or 0 if we have never heard of it - what a new write has to beat. */
+        timeOf(key: string): number;
+        /** O(1), and counts only what exists. */
+        get size(): number;
+        get deletedSize(): number;
+        /** Live values only. Live, in insertion order - deleting during iteration is safe (JS skips entries removed before they are reached), which is what the passes that walk everything and prune as they go rely on. */
+        entries(): IterableIterator<[string, LogEntry<T>]>;
+        /** The tombstones, which is a much smaller walk than the values - so expiring them, or listing what was deleted since some time, costs what it should. */
+        deletedEntries(): IterableIterator<[string, LogTombstone<T>]>;
+        /** Stores a value as of `time`. Returns false when something at least as new is already here, in which case nothing changed - an out-of-order write is not an error, it is just late. */
+        set(key: string, value: T, time: number): boolean;
+        /** Deletes as of `time`, keeping the tombstone. A key that had a live value keeps it in the tombstone as MARKED for deletion (readable and restorable until dropValue). Returns false when something at least as new is already here. */
+        delete(key: string, time: number): boolean;
+        /** Undoes a marked deletion: the kept value becomes live again, as of `time` (a fresh time, so the restore outranks the deletion everywhere it propagated). Returns false when there is no marked value to restore, or something at least as new is already here. */
+        unmark(key: string, time: number): boolean;
+        /** Drops a marked deletion's kept value (its history has been physically removed), leaving a plain tombstone with the same delete time. */
+        dropValue(key: string): void;
+        /** Forgets the key entirely, tombstone included - for a tombstone old enough that nobody needs to hear about the deletion any more, and for an entry that turned out never to have existed. Not a deletion: it leaves nothing behind to propagate. */
+        purge(key: string): void;
+        private applySet;
+        private applyDelete;
+        private append;
+        private scheduleFlush;
+        /** Writes everything pending (rewriting the log first if it has grown too far past what it describes). */
+        flush(): Promise<void>;
+        private directory;
+        private write;
+        private appendPending;
+        private compact;
+    }
+
+}
+
 declare module "sliftutils/storage/TransactionStorage" {
     /// <reference types="node" />
     /// <reference types="node" />
@@ -2681,16 +2855,13 @@ declare module "sliftutils/storage/TransactionStorage" {
 
 declare module "sliftutils/storage/archiveHelpers" {
     import type { IArchives } from "./IArchives";
-    /** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. Returns the copied file's info, or undefined when the source doesn't have the file. */
+    /** Copies one file between two archives. The source's CURRENT size and write time always come from getInfo right here - callers never supply them, because a stale size turns into ranged reads of a file that has changed (failing forever), and a stale write time re-orders history. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. Returns the copied file's info, and undefined for every way the copy did NOT land: the source doesn't have the file, the destination already had a NEWER file (refused up front rather than roll it back), or the destination silently dropped the write (its own only-take-latest won a race we lost - caught by confirming with getInfo afterward). The refused/dropped cases are logged as errors; a caller that treats undefined as "missing at the source" must getInfo the destination to learn the actual latest value. */
     export declare function copyArchiveFile(config: {
         from: IArchives;
         to: IArchives;
         path: string;
         /** The path at the destination - defaults to path (the common case: the same key moving between two archives). */
         toPath?: string;
-        size?: number;
-        /** Stamps the destination write with this time INSTEAD of now - which makes the copy lose (silently) to anything newer at the destination, tombstones included. That is exactly right for synchronization, which copies the same key between replicas and must preserve its ordering, and exactly wrong for anything else - so omit it unless the destination is another copy of the same key. */
-        writeTime?: number;
         forceSetImmutable?: boolean;
         noChecks?: boolean;
         internal?: boolean;
@@ -3241,7 +3412,10 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
     import { StoreSync } from "./storeSync";
     import { StoreConfig } from "./storeConfig";
     export declare const WINDOW_END_FLUSH_MARGIN: number;
-    /** What we store about a file. Its times are not in here: the index keeps those for every key, deleted ones included (see LogMap). */
+    export declare const HISTORY_MIN_BYTES: number;
+    /** The multiple of a store's live bytes its deletion history may grow to. Async so it can later become dynamic and user-configurable; for now it is a constant. */
+    export declare function getHistoryFactor(): Promise<number>;
+    /** What we store about a file. Its times are not in here: the index keeps those for every key, deleted ones included (see TransactionFile). */
     type IndexValue = {
         size: number;
         sourcesListIndex: number;
@@ -3299,6 +3473,8 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             /** Asks the client whose request created this store what routing config it intended for our name. Only used when init finds NO configuration in our folder: a store only ever exists because a config names it, so the requester has that config - asking for it lazily is the same information as passing the config on every call, without the per-call kilobytes. */
             requestRoutingConfig?: (() => Promise<RemoteConfig | undefined>) | undefined;
             onWriteCounted?: ((kind: "original" | "flushed", bytes: number) => void) | undefined;
+            /** A synchronization transfer: "sync get" is bytes pulled off a source (the backblaze download bill), "sync set" is bytes pushed to one. Injected because sync traffic never passes through the API controller, so nothing else can count it. */
+            onSyncTransfer?: ((operation: "sync get" | "sync set", path: string, bytes: number) => void) | undefined;
             resolveSourceUrl?: ((url: string) => IArchives) | undefined;
         } | undefined);
         /** This store's folder, unwrapped: the same bytes slot 0 serves, but reached without its write delay. Used for the two things that cannot go through a buffered source - reading our own routing config before we have any sources, and streaming a large upload that must not sit in memory. */
@@ -3337,6 +3513,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             };
             internal?: boolean;
             includeTombstones?: boolean;
+            includeMarked?: boolean;
         }): Promise<{
             data: Buffer;
             writeTime: number;
@@ -3348,6 +3525,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             lastModified?: number;
             forceSetImmutable?: boolean;
             internal?: boolean;
+            undelete?: boolean;
         }): Promise<void>;
         del(config: {
             path: string;
@@ -3376,6 +3554,11 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             index: {
                 fileCount: number;
                 byteCount: number;
+            };
+            marked: {
+                fileCount: number;
+                byteCount: number;
+                oldestDeleteTime?: number;
             };
             sources: {
                 debugName: string;
@@ -3425,6 +3608,7 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         appendLargeUpload(config: {
             id: string;
             data: Buffer;
+            offset?: number;
         }): Promise<void>;
         finishLargeUpload(config: {
             id: string;
@@ -3463,6 +3647,24 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
             writeTime: number;
             changedAt: number;
         }]>;
+        /** A file MARKED for deletion: its kept index value plus when it was deleted. Undefined when the key is live, never existed, or its history was already dropped. */
+        getMarkedEntry(key: string): (IndexEntry & {
+            deleteTime: number;
+        }) | undefined;
+        /** Every file marked for deletion - the deletion history, walked by retention and by includeMarked listings. */
+        markedEntries(): IterableIterator<[string, IndexEntry & {
+            deleteTime: number;
+        }]>;
+        /** The deletion history's totals: how many marked files, their bytes, and the delete time of the OLDEST one - which is how far back the history reaches. */
+        markedTotals(): {
+            fileCount: number;
+            byteCount: number;
+            oldestDeleteTime?: number;
+        };
+        /** Physically removes a marked file's bytes from our disk and drops its kept value, leaving a plain tombstone that ages out normally - retention calling time on the oldest history. */
+        dropMarkedHistory(key: string): Promise<void>;
+        /** See SetConfig.undelete: flips a marked deletion back to live (fresh write time, so the restore outranks the deletion everywhere it propagated) - the bytes never left the disk, so reads just work again. Internal restores are a peer's propagation and tolerate having nothing to restore (this node may never have held the file); a caller's restore throws instead. */
+        private undeleteKey;
         /** How many files we hold, deletions excluded. */
         indexSize(): number;
         /** Totals over the files we hold, broken down by the slot holding each (entries can name a source that is no longer configured, which counts towards the total but no slot). */
@@ -3484,6 +3686,8 @@ declare module "sliftutils/storage/remoteStorage/blobStore" {
         setIndexDeleted(key: string, writeTime: number): boolean;
         /** Forgets a key entirely, tombstone included. NOT a deletion: it says nothing happened to the file, only that we no longer know anything about it - for an entry whose holder turned out not to have it, and for a tombstone old enough that everyone has heard. */
         purgeIndexEntry(key: string): void;
+        /** Counts a synchronization transfer in the server's access statistics (see getStore's wiring): "sync get" for bytes pulled off a source, "sync set" for bytes pushed to one. */
+        noteSyncTransfer(operation: "sync get" | "sync set", path: string, bytes: number): void;
         /**
          * Every write, however it is stamped, has to be one we are actually meant to hold - because the
          * alternative is not a smaller problem, it is a silent one. A write that lands on a store that
@@ -3712,8 +3916,9 @@ declare module "sliftutils/storage/remoteStorage/cliArgs" {
 declare module "sliftutils/storage/remoteStorage/createArchives" {
     /// <reference types="node" />
     /// <reference types="node" />
-    import { IArchives, RemoteConfig, RemoteConfigBase, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
+    import { IArchives, RemoteConfig, RemoteConfigBase, SourceConfig, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig } from "../IArchives";
     import { ServerBucketInfo, ActiveBucketInfo } from "./storageServerState";
+    import { LogFileInfo } from "../StreamingLogs";
     /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
     export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
     /** A client for ONE source - see storeSources.ts. Re-exported here because a chain is built out of them. */
@@ -3738,6 +3943,9 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
             machineId: string;
             ip: string;
         } | undefined>;
+        /** The sources that can serve a file right now, in dispatch order - the first is the write node, the one a plain read asks first. Each entry's url is what GetConfig.sourceUrl / GetInfoConfig.sourceUrl accept, so listing these and then reading with sourceUrl compares the copies the sources actually hold. */
+        getFileSources(fileName: string): Promise<SourceConfig[]>;
+        private runOnSource;
         get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
         /** get2, but trying sources in latency order (fastest first) instead of config order. While this is much faster, it might miss immediate writes: the write node is no longer tried first, so a lagging replica may answer with a slightly older value. Exclusive with noFallbacks (which only considers one source - the write node - so there is no order to speed up); passing both throws. */
         getFast(fileName: string, config?: GetConfig): Promise<{
@@ -3779,6 +3987,8 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         set(fileName: string, data: Buffer, config?: SetConfig): Promise<string>;
         private setRoutingConfig;
         del(fileName: string, config?: DelConfig): Promise<void>;
+        /** See IArchives.undelete: restores a file marked for deletion, dispatched to the write node as SetConfig.undelete (the write node propagates the restore to its peers itself). */
+        undelete(fileName: string): Promise<void>;
         /** See IArchives.move. When one node is the write target for BOTH paths, that node moves the file itself - the bytes never come through us - with the same wrong-window/route re-resolution as any write. When the paths route to different shards no single node holds both, so the move degrades to a copy through us plus a delete, CONFIRMED at the destination before the source is touched. No smart timeout on the node-side move: it can be a big file's worth of node-side work, which the upload-sized deadlines would misjudge. */
         move(config: MoveFileConfig): Promise<void>;
         private getVariableShardTargets;
@@ -3829,6 +4039,39 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
     }): Promise<{
         clearedBuckets: number;
     }>;
+    /** The operation-log files ONE storage server holds (every server logs only its own operations - see listAllServerLogFiles for the whole fleet). The names carry pid/thread/time-range/entry-count metadata; see LogFileInfo. */
+    export declare function listServerLogFiles(config: {
+        url: string;
+        account: string;
+    }): Promise<LogFileInfo[]>;
+    /** Every server's log files at once, one entry per url - a server that cannot answer reports its error instead of failing the rest. */
+    export declare function listAllServerLogFiles(config: {
+        urls: string[];
+        account: string;
+    }): Promise<{
+        url: string;
+        files?: LogFileInfo[];
+        error?: string;
+    }[]>;
+    /** Downloads the named log files off one server and decodes them into the logged objects (the wire always carries them LZ4-compressed - live files are compressed in memory server-side). */
+    export declare function getServerLogs(config: {
+        url: string;
+        account: string;
+        names: string[];
+    }): Promise<{
+        name: string;
+        entries: unknown[];
+    }[]>;
+    /** getServerLogs, but SEARCHED instead of fully decoded: the raw JSON text is substring-matched (every search string must appear in a statement - see createLogSearcher), and only the matching statements are decoded into objects. Far cheaper than decoding whole files to look for one path or caller. */
+    export declare function searchServerLogs(config: {
+        url: string;
+        account: string;
+        names: string[];
+        searches: string[];
+    }): Promise<{
+        name: string;
+        entries: unknown[];
+    }[]>;
     export declare function getBucketInfo(config: {
         url: string;
     }): Promise<ArchivesConfig>;
@@ -4102,6 +4345,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
     import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig } from "../IArchives";
     import { ActiveBucketInfo, ServerBucketInfo } from "./storageServerState";
     import { AccessTotals, AccessSummaryState } from "./accessStats";
+    import { LogFileInfo } from "../StreamingLogs";
     import type { SummaryEntry } from "../../treeSummary";
     export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
     export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
@@ -4183,6 +4427,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             };
             internal?: boolean;
             includeTombstones?: boolean;
+            includeMarked?: boolean;
         }) => Promise<{
             data: Buffer;
             writeTime: number;
@@ -4197,6 +4442,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             lastModified?: number;
             forceSetImmutable?: boolean;
             internal?: boolean;
+            undelete?: boolean;
         }) => Promise<void>;
         del: (config: {
             account: string;
@@ -4281,6 +4527,13 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             account: string;
             bucketName: string;
         }) => Promise<ArchivesSyncStatus>;
+        listLogFiles: (config: {
+            account: string;
+        }) => Promise<LogFileInfo[]>;
+        getLogFile: (config: {
+            account: string;
+            name: string;
+        }) => Promise<Buffer>;
         startLargeFile: (config: {
             account: string;
             bucketName: string;
@@ -4294,6 +4547,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
         uploadPart: (config: {
             uploadId: string;
             data: Buffer;
+            offset?: number;
         }) => Promise<void>;
         finishLargeFile: (config: {
             uploadId: string;
@@ -4306,6 +4560,43 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             cacheTime?: number;
         }) => Promise<Buffer>;
     }>;
+
+}
+
+declare module "sliftutils/storage/remoteStorage/storageLogs" {
+    /// <reference types="node" />
+    /// <reference types="node" />
+    import { LogFileInfo } from "../StreamingLogs";
+    export declare const LOGS_FOLDER_NAME = "logs";
+    /** One mutation the server performed: set/del/move/undelete/setLarge/routingConfig, plus the per-file synchronization writes ("sync get"/"sync set"). Sizes and times, never the data. internal marks writes pushed by a peer's synchronization rather than a client. Logged DELIBERATELY at two layers: the controller (which knows the account/bucket and the caller) AND BlobStore itself (which knows the folder, and sees the writes that never pass through the controller) - the redundancy is the point, because a write that only one layer saw is exactly the kind of masked issue these logs exist to expose. Stream-only - one entry per write is exactly what the console does NOT need. */
+    export declare function logMutation(entry: {
+        op: string;
+        account?: string;
+        bucketName?: string;
+        store?: string;
+        folder?: string;
+        path: string;
+        toPath?: string;
+        size?: number;
+        writeTime?: number;
+        callerId?: string;
+        internal?: boolean;
+    }): void;
+    /** A synchronization key point: scans and full syncs starting/finishing, reconciles, boundary scans - what an operator greps for to see whether the fleet is converging. Also printed to the console. */
+    export declare function logSyncEvent(entry: {
+        event: string;
+        store: string;
+        source?: string;
+        [key: string]: unknown;
+    }): void;
+    /** One console.error is all an error takes (console.error and console.warn are HOOKED to feed the stream) - this just guarantees the hook is installed first, for very-early callers. */
+    export declare function logStorageError(message: string): void;
+    /** logStorageError at warn level: guarantees the console.warn hook is installed before warning, so warnings from before the first logged mutation still reach the stream. */
+    export declare function logStorageWarn(message: string): void;
+    /** The log files this server holds - see StreamingLogs.listFiles. Empty on processes with no storage folder. */
+    export declare function listStorageLogFiles(): Promise<LogFileInfo[]>;
+    /** One log file's bytes, always LZ4-compressed - see StreamingLogs.readFileCompressed (decode with decodeLogFile). */
+    export declare function readStorageLogFile(name: string): Promise<Buffer>;
 
 }
 
@@ -4532,19 +4823,22 @@ declare module "sliftutils/storage/remoteStorage/storeSync" {
         waitForRequiredScans(): Promise<void>;
         /** Rescans our own disk's metadata into the index - used around valid window handoffs, where another process wrote files to the shared folder that our index hasn't seen. */
         rescanBase(): Promise<void>;
+        /** One synchronization round of a source: the PULL direction always (its listing, applied to our index), and with "push" the push direction too (what our index says the source is missing, written to it). Push is an argument rather than a separate call because it cannot run without the pull's listing - the index alone cannot say what the source already holds. Listings unblock (initialScan) between the halves, so they never wait behind a push. Only one round per SOURCE runs at a time (cache keys the serializer by source index). */
+        private syncSource;
         /** A boundary scan of the node that owned (part of) our route in the valid window before ours, when that node is different storage (a disk rescan can't see its writes): just its changes since the boundary neighborhood, with matching values pulled onto our own disk. */
         boundaryScanRemote(source: IArchives, config: {
             since: number;
             route?: [number, number];
         }): Promise<void>;
-        private runSourceSync;
-        private scanSource;
-        private reconcileSource;
+        private startSourceSyncLoops;
+        private pullSource;
+        private pushSource;
         private updateScanIndex;
         private pollChanges;
         private copySourceFiles;
         private enforceDiskLimit;
         private cleanupTombstones;
+        private enforceHistoryLimit;
     }
 
 }

@@ -20,6 +20,8 @@ import { BlobStore } from "./blobStore";
 import { getRoutingFileResult } from "./bucketDisk";
 import { StorageClientController } from "./storageClientController";
 import { trackAccess, trackAccessCall, getAccessTotals, readAccessSummaries, clearAccountAccessStats, AccessTotals, AccessSummaryState } from "./accessStats";
+import { logMutation, listStorageLogFiles, readStorageLogFile } from "./storageLogs";
+import { LogFileInfo } from "../StreamingLogs";
 import { assertValidName, assertValidPath, assertValidArgs } from "./validation";
 import type { SummaryEntry } from "../../treeSummary";
 
@@ -275,7 +277,7 @@ class RemoteStorageControllerBase {
 
     @assertValidArgs
     @trackAccessCall("get")
-    async get2(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+    async get2(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; range?: { start: number; end: number }; internal?: boolean; includeTombstones?: boolean; includeMarked?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
         if (config.path === ROUTING_FILE) {
             // The routing file lives outside every store and even outside the bucket (it is what CREATES it), so it is read straight off the disk - absent means undefined, exactly like any file read
             return await getRoutingFileResult(config.account, config.bucketName);
@@ -287,8 +289,9 @@ class RemoteStorageControllerBase {
     }
     @assertValidArgs
     @trackAccessCall("set")
-    async set(config: { account: string; bucketName: string; path: string; data: Buffer; sourceConfig: SourceConfig; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean }): Promise<void> {
+    async set(config: { account: string; bucketName: string; path: string; data: Buffer; sourceConfig: SourceConfig; lastModified?: number; forceSetImmutable?: boolean; internal?: boolean; undelete?: boolean }): Promise<void> {
         assertWritesAllowed();
+        let caller = callerId();
         // Copied because the wire hands us a plain Uint8Array view, not a real Buffer
         let data = Buffer.from(config.data);
         if (config.path === ROUTING_FILE) {
@@ -296,21 +299,26 @@ class RemoteStorageControllerBase {
             return await writeRoutingConfig(config.account, config.bucketName, config.sourceConfig.name, data, config);
         }
         await withStore(config, store => store.set({ ...config, data }));
+        logMutation({ op: config.undelete && "undelete" || "set", account: config.account, bucketName: config.bucketName, store: config.sourceConfig.name, path: config.path, size: data.length, writeTime: config.lastModified, callerId: caller, internal: config.internal });
     }
     @assertValidArgs
     @trackAccessCall("del")
     async del(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; lastModified?: number; internal?: boolean }): Promise<void> {
         assertWritesAllowed();
+        let caller = callerId();
         await withStore(config, store => store.del(config));
+        logMutation({ op: "del", account: config.account, bucketName: config.bucketName, store: config.sourceConfig.name, path: config.path, writeTime: config.lastModified, callerId: caller, internal: config.internal });
     }
     @assertValidArgs
     @trackAccessCall("move")
     async move(config: { account: string; bucketName: string; fromPath: string; toPath: string; sourceConfig: SourceConfig }): Promise<void> {
         assertWritesAllowed();
+        let caller = callerId();
         // assertValidArgs only knows the well-known `path` field, so the two paths of a move are validated here
         assertValidPath(config.fromPath);
         assertValidPath(config.toPath);
         await withStore(config, store => store.move(config));
+        logMutation({ op: "move", account: config.account, bucketName: config.bucketName, store: config.sourceConfig.name, path: config.fromPath, toPath: config.toPath, callerId: caller });
     }
     @assertValidArgs
     @trackAccessCall("getInfo")
@@ -380,6 +388,17 @@ class RemoteStorageControllerBase {
         return await bucketSyncStatus(config.account, config.bucketName);
     }
 
+    /** The operation-log files THIS server holds (every server logs its own operations - ask each one; see listAllServerLogFiles in createArchives). */
+    @assertValidArgs
+    async listLogFiles(config: { account: string }): Promise<LogFileInfo[]> {
+        return await listStorageLogFiles();
+    }
+    /** One log file's bytes, always LZ4-compressed (a live file is flushed and compressed in memory before sending). Decode with decodeLogFile. */
+    @assertValidArgs
+    async getLogFile(config: { account: string; name: string }): Promise<Buffer> {
+        return await readStorageLogFile(config.name);
+    }
+
     @assertValidArgs
     async startLargeFile(config: { account: string; bucketName: string; path: string; sourceConfig: SourceConfig; lastModified?: number; forceSetImmutable?: boolean; noChecks?: boolean; internal?: boolean }): Promise<string> {
         assertWritesAllowed();
@@ -391,19 +410,24 @@ class RemoteStorageControllerBase {
         largeUploadInfo.set(id, { ...write, account: config.account, bucketName: config.bucketName, storeName: config.sourceConfig.name });
         return id;
     }
-    async uploadPart(config: { uploadId: string; data: Buffer }): Promise<void> {
+    /** offset makes the part write positional (see ArchivesDisk.appendLargeUpload), which is what lets the client RETRY a failed part - a re-sent part lands on the same bytes instead of appending twice. */
+    async uploadPart(config: { uploadId: string; data: Buffer; offset?: number }): Promise<void> {
         assertWritesAllowed();
         let info = largeUploadInfo.get(config.uploadId);
         if (!info) throw new Error(`Unknown large upload ${config.uploadId}`);
         trackAccess({ account: info.account, operation: "uploadPart", path: `${info.bucketName}/${info.path}`, size: config.data.length });
-        await getStore(info.account, info.bucketName, info.storeName).appendLargeUpload({ id: config.uploadId, data: Buffer.from(config.data) });
+        await getStore(info.account, info.bucketName, info.storeName).appendLargeUpload({ id: config.uploadId, data: Buffer.from(config.data), offset: config.offset });
     }
     async finishLargeFile(config: { uploadId: string }): Promise<void> {
         assertWritesAllowed();
         let info = largeUploadInfo.get(config.uploadId);
         if (!info) throw new Error(`Unknown large upload ${config.uploadId}`);
         largeUploadInfo.delete(config.uploadId);
-        await getStore(info.account, info.bucketName, info.storeName).finishLargeUpload({ id: config.uploadId, path: info.path, lastModified: info.lastModified, forceSetImmutable: info.forceSetImmutable, noChecks: info.noChecks, internal: info.internal });
+        let caller = callerId();
+        let store = getStore(info.account, info.bucketName, info.storeName);
+        await store.finishLargeUpload({ id: config.uploadId, path: info.path, lastModified: info.lastModified, forceSetImmutable: info.forceSetImmutable, noChecks: info.noChecks, internal: info.internal });
+        let written = await store.getInfo({ path: info.path });
+        logMutation({ op: "setLarge", account: info.account, bucketName: info.bucketName, store: info.storeName, path: info.path, size: written?.size, writeTime: written?.writeTime, callerId: caller });
     }
     /** Best-effort cleanup: an unknown upload has nothing left to cancel. */
     async cancelLargeFile(config: { uploadId: string }): Promise<void> {
@@ -526,6 +550,15 @@ async function withStore<T>(config: { account: string; bucketName: string; sourc
     return await fn(findBucketStore(config.account, config.bucketName, config.sourceConfig));
 }
 
+// The caller's node id for the mutation log - read synchronously at method entry (the call context does not survive awaits), and tolerant of there being none (local calls)
+function callerId(): string | undefined {
+    try {
+        return SocketFunction.getCaller()?.nodeId;
+    } catch {
+        return undefined;
+    }
+}
+
 const largeUploadInfo = new Map<string, { account: string; bucketName: string; path: string; lastModified?: number; forceSetImmutable?: boolean; noChecks?: boolean; internal?: boolean; storeName: string }>();
 
 const accountAccess: SocketFunctionHook = async (context) => {
@@ -576,6 +609,8 @@ export const RemoteStorageController = SocketFunction.register(
         getAccessStats: { hooks: [accountAccess] },
         getAccessSummaries: { hooks: [accountAccess] },
         getSyncStatus: { hooks: [accountAccess] },
+        listLogFiles: { hooks: [accountAccess] },
+        getLogFile: { hooks: [accountAccess] },
         startLargeFile: { hooks: [accountAccess] },
         uploadPart: { hooks: [uploadAccess] },
         finishLargeFile: { hooks: [uploadAccess] },

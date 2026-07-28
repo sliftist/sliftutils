@@ -15,25 +15,32 @@ const FLUSH_DELAY = 500;
 
 /** A live value: what was stored, when it was written (the caller's ordering), and when we last changed it (ours). */
 export type LogEntry<T> = { value: T; time: number; changedAt: number };
-/** A deleted key: when it was deleted, and when we learned. The value is gone; the time is the point of a tombstone. */
-export type LogTombstone = { time: number; changedAt: number };
+/** A deleted key: when it was deleted, and when we learned. When the key had a live value at deletion time it is MARKED rather than gone - the value (and its original write time) rides along, so the underlying data can still be read and the deletion can be undone (see unmark) until the history is dropped (see dropValue). */
+export type LogTombstone<T> = { time: number; changedAt: number; value?: T; valueTime?: number };
 
-// One line of the log. JSON.stringify escapes newlines inside keys and values, so a record can never contain the separator.
+// One line of the log, with single-letter field names because there is one record per set/delete/purge ever made and the field names are most of a record's overhead. JSON.stringify escapes newlines inside keys and values, so a record can never contain the separator.
 type LogRecord<T> = {
+    // key
     k: string;
-    // The caller's time for this change - what ordering is decided by
+    // time, lastModified time of the file, or the delete time, or the purge time
     t: number;
-    // A set carries the value; a delete carries d; a purge carries p (forget the key entirely, tombstone included)
+    // value
     v?: T;
+    // deleted, the file on disk is deleted, preserved when we compact
     d?: 1;
+    // marked for deletion: deleted, but the value (v) and its original write time (w) are kept, so the data is still readable and restorable. Preserved when we compact.
+    m?: 1;
+    // writeTime, the original write time of a marked-for-deletion value (t is the DELETE time on those records)
+    w?: number;
+    // purged, the file on disk is deleted, not preserved when we compact
     p?: 1;
 };
 
-export class LogMap<T> {
+export class TransactionFile<T> {
     constructor(private filePath: string) { }
 
     private values = new Map<string, LogEntry<T>>();
-    private deleted = new Map<string, LogTombstone>();
+    private deleted = new Map<string, LogTombstone<T>>();
     // Records the log holds (written plus pending) - what compaction is decided against, NOT the number of keys
     private logRecords = 0;
     private pending: string[] = [];
@@ -67,6 +74,8 @@ export class LogMap<T> {
             if (record.p) {
                 this.values.delete(record.k);
                 this.deleted.delete(record.k);
+            } else if (record.m) {
+                this.applyDelete(record.k, record.t, record.t, record.v, record.w);
             } else if (record.d) {
                 this.applyDelete(record.k, record.t, record.t);
             } else if (record.v !== undefined) {
@@ -83,8 +92,8 @@ export class LogMap<T> {
     public get(key: string): LogEntry<T> | undefined {
         return this.values.get(key);
     }
-    /** When the key was deleted, if it was. Absent both here and in get means we have never heard of it. */
-    public getDeleted(key: string): LogTombstone | undefined {
+    /** When the key was deleted, if it was (value included when the deletion is still marked - see LogTombstone). Absent both here and in get means we have never heard of it. */
+    public getDeleted(key: string): LogTombstone<T> | undefined {
         return this.deleted.get(key);
     }
     /** The time the key last changed either way, or 0 if we have never heard of it - what a new write has to beat. */
@@ -106,7 +115,7 @@ export class LogMap<T> {
         return this.values.entries();
     }
     /** The tombstones, which is a much smaller walk than the values - so expiring them, or listing what was deleted since some time, costs what it should. */
-    public deletedEntries(): IterableIterator<[string, LogTombstone]> {
+    public deletedEntries(): IterableIterator<[string, LogTombstone<T>]> {
         return this.deleted.entries();
     }
 
@@ -117,11 +126,33 @@ export class LogMap<T> {
         return true;
     }
 
-    /** Deletes as of `time`, keeping the tombstone. Returns false when something at least as new is already here. */
+    /** Deletes as of `time`, keeping the tombstone. A key that had a live value keeps it in the tombstone as MARKED for deletion (readable and restorable until dropValue). Returns false when something at least as new is already here. */
     public delete(key: string, time: number): boolean {
-        if (!this.applyDelete(key, time, Date.now())) return false;
-        this.append({ k: key, t: time, d: 1 });
+        let live = this.values.get(key);
+        if (!this.applyDelete(key, time, Date.now(), live?.value, live?.time)) return false;
+        if (live) {
+            this.append({ k: key, t: time, m: 1, v: live.value, w: live.time });
+        } else {
+            this.append({ k: key, t: time, d: 1 });
+        }
         return true;
+    }
+
+    /** Undoes a marked deletion: the kept value becomes live again, as of `time` (a fresh time, so the restore outranks the deletion everywhere it propagated). Returns false when there is no marked value to restore, or something at least as new is already here. */
+    public unmark(key: string, time: number): boolean {
+        let tombstone = this.deleted.get(key);
+        if (!tombstone || tombstone.value === undefined) return false;
+        if (!this.applySet(key, tombstone.value, time, Date.now())) return false;
+        this.append({ k: key, t: time, v: tombstone.value });
+        return true;
+    }
+
+    /** Drops a marked deletion's kept value (its history has been physically removed), leaving a plain tombstone with the same delete time. */
+    public dropValue(key: string): void {
+        let tombstone = this.deleted.get(key);
+        if (!tombstone || tombstone.value === undefined) return;
+        this.deleted.set(key, { time: tombstone.time, changedAt: Date.now() });
+        this.append({ k: key, t: tombstone.time, d: 1 });
     }
 
     /** Forgets the key entirely, tombstone included - for a tombstone old enough that nobody needs to hear about the deletion any more, and for an entry that turned out never to have existed. Not a deletion: it leaves nothing behind to propagate. */
@@ -139,10 +170,10 @@ export class LogMap<T> {
         return true;
     }
 
-    private applyDelete(key: string, time: number, changedAt: number): boolean {
+    private applyDelete(key: string, time: number, changedAt: number, value?: T, valueTime?: number): boolean {
         if (time < this.timeOf(key)) return false;
         this.values.delete(key);
-        this.deleted.set(key, { time, changedAt });
+        this.deleted.set(key, { time, changedAt, value, valueTime });
         return true;
     }
 
@@ -203,7 +234,11 @@ export class LogMap<T> {
             records.push(JSON.stringify({ k: key, t: entry.time, v: entry.value } satisfies LogRecord<T>));
         }
         for (let [key, tombstone] of this.deleted) {
-            records.push(JSON.stringify({ k: key, t: tombstone.time, d: 1 } satisfies LogRecord<T>));
+            if (tombstone.value !== undefined) {
+                records.push(JSON.stringify({ k: key, t: tombstone.time, m: 1, v: tombstone.value, w: tombstone.valueTime } satisfies LogRecord<T>));
+            } else {
+                records.push(JSON.stringify({ k: key, t: tombstone.time, d: 1 } satisfies LogRecord<T>));
+            }
         }
         // Cleared with the snapshot: every pending record is already reflected in the maps, so the snapshot contains it. Anything appended from here on is NOT in the snapshot, and lands in the new log after the rename.
         this.pending = [];

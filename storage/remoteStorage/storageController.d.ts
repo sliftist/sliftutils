@@ -3,6 +3,7 @@
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig } from "../IArchives";
 import { ActiveBucketInfo, ServerBucketInfo } from "./storageServerState";
 import { AccessTotals, AccessSummaryState } from "./accessStats";
+import { LogFileInfo } from "../StreamingLogs";
 import type { SummaryEntry } from "../../treeSummary";
 export declare const REMOTE_STORAGE_CLASS_GUID = "RemoteStorageController-b7e42a91";
 export declare const STORAGE_AUTH_PURPOSE = "remoteStorage-auth-1";
@@ -84,6 +85,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         };
         internal?: boolean;
         includeTombstones?: boolean;
+        includeMarked?: boolean;
     }) => Promise<{
         data: Buffer;
         writeTime: number;
@@ -98,6 +100,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         lastModified?: number;
         forceSetImmutable?: boolean;
         internal?: boolean;
+        undelete?: boolean;
     }) => Promise<void>;
     del: (config: {
         account: string;
@@ -182,6 +185,13 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         account: string;
         bucketName: string;
     }) => Promise<ArchivesSyncStatus>;
+    listLogFiles: (config: {
+        account: string;
+    }) => Promise<LogFileInfo[]>;
+    getLogFile: (config: {
+        account: string;
+        name: string;
+    }) => Promise<Buffer>;
     startLargeFile: (config: {
         account: string;
         bucketName: string;
@@ -195,6 +205,7 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
     uploadPart: (config: {
         uploadId: string;
         data: Buffer;
+        offset?: number;
     }) => Promise<void>;
     finishLargeFile: (config: {
         uploadId: string;

@@ -1,14 +1,11 @@
 import type { IArchives } from "./IArchives";
-/** Copies one file between two archives. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. Returns the copied file's info, or undefined when the source doesn't have the file. */
+/** Copies one file between two archives. The source's CURRENT size and write time always come from getInfo right here - callers never supply them, because a stale size turns into ranged reads of a file that has changed (failing forever), and a stale write time re-orders history. Small files go as a single get2+set; past LARGE_COPY_THRESHOLD the copy streams through setLargeFile in LARGE_COPY_CHUNK ranged reads, so the whole file is never in memory. Returns the copied file's info, and undefined for every way the copy did NOT land: the source doesn't have the file, the destination already had a NEWER file (refused up front rather than roll it back), or the destination silently dropped the write (its own only-take-latest won a race we lost - caught by confirming with getInfo afterward). The refused/dropped cases are logged as errors; a caller that treats undefined as "missing at the source" must getInfo the destination to learn the actual latest value. */
 export declare function copyArchiveFile(config: {
     from: IArchives;
     to: IArchives;
     path: string;
     /** The path at the destination - defaults to path (the common case: the same key moving between two archives). */
     toPath?: string;
-    size?: number;
-    /** Stamps the destination write with this time INSTEAD of now - which makes the copy lose (silently) to anything newer at the destination, tombstones included. That is exactly right for synchronization, which copies the same key between replicas and must preserve its ordering, and exactly wrong for anything else - so omit it unless the destination is another copy of the same key. */
-    writeTime?: number;
     forceSetImmutable?: boolean;
     noChecks?: boolean;
     internal?: boolean;
