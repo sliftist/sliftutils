@@ -269,8 +269,21 @@ export class SourceWrapper {
         return median;
     }
 
+    /** writeBlocked from missing backblaze credentials is re-checked on every write attempt: the secret load can fail TRANSIENTLY (early startup, a file-read hiccup), and one failed load must never permanently stop this process from writing to the bucket. The other writeBlocked reasons (read-only mode, browsers) are static properties of the process, so there is nothing to re-check. */
+    public async recheckWriteBlocked(): Promise<void> {
+        if (!this.writeBlocked || this.api || this.disposed) return;
+        if (this.config.type !== "backblaze") return;
+        if (!await hasBackblazeCreds()) return;
+        this.api = new ArchivesBackblaze({ bucketName: parseBackblazeUrl(this.config.url).bucketName, public: this.config.public, immutable: this.config.immutable, allowedOrigins: this.config.allowedOrigins });
+        console.log(`Backblaze credentials are now available for ${this.getDebugName()}, unblocking writes (was blocked: ${this.writeBlocked})`);
+        this.writeBlocked = undefined;
+    }
+
     /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */
     public async write<T>(run: (archives: IArchives) => Promise<T>): Promise<T> {
+        if (this.writeBlocked) {
+            await this.recheckWriteBlocked();
+        }
         if (this.writeBlocked) {
             throw new Error(`Writes are blocked on this source: ${this.writeBlocked}`);
         }

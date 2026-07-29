@@ -213,12 +213,8 @@ export class BlobStore {
     private async readRoutingConfig(): Promise<RemoteConfig | undefined> {
         let data = await this.ownDisk.get(ROUTING_FILE);
         if (!data || !data.length) return undefined;
-        try {
-            return parseRoutingData(data);
-        } catch (e) {
-            logStorageError(`Ignoring the routing config in store ${this.folder}: it could not be parsed: ${(e as Error).stack ?? e}`);
-            return undefined;
-        }
+        // Unparseable reads as "no config" (parseRoutingData logs it) - a store must never be unable to start because its own routing file is torn
+        return parseRoutingData(data);
     }
 
     /** The version of the routing config this store is running, so a copy found on a peer is only taken when it is genuinely newer. -1 means it has none. */
@@ -975,6 +971,9 @@ export class BlobStore {
      */
     private assertRoutingConfigWritable(data: Buffer): void {
         let routing = parseRoutingData(data);
+        if (!routing) {
+            throw new Error(`Routing config write rejected - not a parseable config. Refusing to write ${ROUTING_FILE} to store ${this.folder}: the data is not a valid { version?, sources: [...] } JSON config (${data.length} bytes)`);
+        }
         assertValidRemoteConfig(routing);
         let incoming = getConfigVersion(routing);
         let current = this.routingVersion();

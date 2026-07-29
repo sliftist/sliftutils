@@ -188,11 +188,9 @@ async function maintainIntermediates(): Promise<void> {
         let key = `${account}/${bucketName}`;
         let newest = await readNewestRoutingFile(account, bucketName);
         if (!newest) continue;
-        let routing: RemoteConfig;
-        try {
-            routing = parseRoutingData(newest.data);
-        } catch (e) {
-            console.error(`Skipping switchover maintenance for bucket ${key}: its routing config could not be parsed (${(e as Error).message})`);
+        let routing = parseRoutingData(newest.data);
+        if (!routing) {
+            console.error(`Skipping switchover maintenance for bucket ${key}: its routing config could not be parsed`);
             continue;
         }
         let expired = expireIntermediateSources(routing, Date.now());

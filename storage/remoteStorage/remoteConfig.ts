@@ -288,16 +288,19 @@ function storeIdentity(source: SourceConfig): string {
     return `${source.intermediate || source.url}|${source.name}`;
 }
 
-export function parseRoutingData(data: Buffer): RemoteConfig {
+/** Reads a stored routing config. NEVER throws: this runs on every READ of a stored config, and a torn/corrupt file must not brick the paths that would fix it - above all writeRoutingConfig, where throwing while reading the OLD config blocks the write of the NEW one forever. Unreadable data is logged and read as undefined - the same as the file not existing. Judging a config on its way IN is the writer's job (see assertValidRemoteConfig at the write entry points), where rejecting bad data with a throw is correct. */
+export function parseRoutingData(data: Buffer): RemoteConfig | undefined {
     let text = data.toString();
     let parsed: RemoteConfig;
     try {
         parsed = JSON.parse(text) as RemoteConfig;
     } catch (e) {
-        throw new Error(`Routing config is not valid JSON (${String(e)}). Data: ${text.slice(0, 500)}`);
+        console.error(`Ignoring a stored routing config - it is not valid JSON (${String(e)}). Data: ${JSON.stringify(text).slice(0, 500)}`);
+        return undefined;
     }
     if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.sources)) {
-        throw new Error(`Routing config must be { version?, sources: [...] }, was ${text.slice(0, 500)}`);
+        console.error(`Ignoring a stored routing config - it must be { version?, sources: [...] }, was ${text.slice(0, 500)}`);
+        return undefined;
     }
     return normalizeRemoteConfig(parsed);
 }

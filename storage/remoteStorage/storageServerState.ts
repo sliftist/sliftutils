@@ -193,6 +193,9 @@ export async function writeRoutingConfig(account: string, bucketName: string, na
     assertWritesAllowed();
     let store = getStore(account, bucketName, name);
     let incoming = parseRoutingData(data);
+    if (!incoming) {
+        throw new Error(`Routing config write rejected - not a parseable config. The data written for ${account}/${bucketName} (store ${JSON.stringify(name)}) is not a valid { version?, sources: [...] } JSON config (${data.length} bytes)`);
+    }
     let current = await readRoutingFromDisk(account, bucketName);
     let stored = reinjectIntermediates(current, incoming);
     let storedData = Buffer.from(serializeRemoteConfig(stored));

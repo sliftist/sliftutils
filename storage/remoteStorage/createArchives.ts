@@ -563,7 +563,11 @@ export class ArchivesChain implements IArchives {
 
     private async setRoutingConfig(data: Buffer, config?: { lastModified?: number }): Promise<string> {
         // Checked before the first node is written to, not just by each node as it arrives: every server would reject it anyway, and finding that out one node at a time is how a config write ends up half-applied
-        assertValidRemoteConfig(parseRoutingData(data));
+        let parsedConfig = parseRoutingData(data);
+        if (!parsedConfig) {
+            throw new Error(`Routing config write rejected - not a parseable config. The data is not a valid { version?, sources: [...] } JSON config (${data.length} bytes, for ${this.getDebugName()})`);
+        }
+        assertValidRemoteConfig(parsedConfig);
         let state = await this.state.getState();
         let writeTime = Math.round(config?.lastModified || Date.now());
         let written: string[] = [];

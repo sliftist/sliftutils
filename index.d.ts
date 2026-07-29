@@ -4217,7 +4217,8 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
     export declare function sourceIdentity(sourceConfig: SourceConfig | undefined): string;
     /** What an index entry records as the holder of its bytes (see ArchivesSource.url), so it must name the endpoint FOREVER. An intermediate is a switchover's temporary alternate port onto another source, and that port is gone for good once its window passes - so it is recorded as the source it was split out of, which holds the same bucket and outlives it. */
     export declare function sourcePersistentUrl(sourceConfig: SourceConfig | undefined, folder: string): string;
-    export declare function parseRoutingData(data: Buffer): RemoteConfig;
+    /** Reads a stored routing config. NEVER throws: this runs on every READ of a stored config, and a torn/corrupt file must not brick the paths that would fix it - above all writeRoutingConfig, where throwing while reading the OLD config blocks the write of the NEW one forever. Unreadable data is logged and read as undefined - the same as the file not existing. Judging a config on its way IN is the writer's job (see assertValidRemoteConfig at the write entry points), where rejecting bad data with a throw is correct. */
+    export declare function parseRoutingData(data: Buffer): RemoteConfig | undefined;
     export declare function serializeRemoteConfig(config: RemoteConfig): Buffer;
 
 }
@@ -4299,6 +4300,8 @@ declare module "sliftutils/storage/remoteStorage/sourceWrapper" {
         seedLatency(ms: number): void;
         /** Median of the recent pings (API or URL-form, whichever this source measures), plus DISCONNECTED_LATENCY_PENALTY while the source is disconnected - so a down source still sorts and can still be picked, just after every connected one. Sources with no measurements yet sort last (Infinity), except our own in-process server, which is the best possible target (0). */
         getLatency(): number;
+        /** writeBlocked from missing backblaze credentials is re-checked on every write attempt: the secret load can fail TRANSIENTLY (early startup, a file-read hiccup), and one failed load must never permanently stop this process from writing to the bucket. The other writeBlocked reasons (read-only mode, browsers) are static properties of the process, so there is nothing to re-check. */
+        recheckWriteBlocked(): Promise<void>;
         /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */
         write<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;
         dispose(): void;

@@ -60,5 +60,6 @@ export declare function assertValidRemoteConfig(config: RemoteConfig): void;
 export declare function sourceIdentity(sourceConfig: SourceConfig | undefined): string;
 /** What an index entry records as the holder of its bytes (see ArchivesSource.url), so it must name the endpoint FOREVER. An intermediate is a switchover's temporary alternate port onto another source, and that port is gone for good once its window passes - so it is recorded as the source it was split out of, which holds the same bucket and outlives it. */
 export declare function sourcePersistentUrl(sourceConfig: SourceConfig | undefined, folder: string): string;
-export declare function parseRoutingData(data: Buffer): RemoteConfig;
+/** Reads a stored routing config. NEVER throws: this runs on every READ of a stored config, and a torn/corrupt file must not brick the paths that would fix it - above all writeRoutingConfig, where throwing while reading the OLD config blocks the write of the NEW one forever. Unreadable data is logged and read as undefined - the same as the file not existing. Judging a config on its way IN is the writer's job (see assertValidRemoteConfig at the write entry points), where rejecting bad data with a throw is correct. */
+export declare function parseRoutingData(data: Buffer): RemoteConfig | undefined;
 export declare function serializeRemoteConfig(config: RemoteConfig): Buffer;

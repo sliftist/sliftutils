@@ -127,7 +127,9 @@ export class StoreSync {
             try {
                 let theirs = await source.get2(ROUTING_FILE, { internal: true });
                 if (!theirs || !theirs.data || !theirs.data.length) continue;
-                let version = getConfigVersion(parseRoutingData(theirs.data));
+                let theirRouting = parseRoutingData(theirs.data);
+                if (!theirRouting) continue;
+                let version = getConfigVersion(theirRouting);
                 if (version <= this.store.routingVersion()) continue;
                 console.log(`Routing config version ${version} found on ${source.getDebugName()} (we have ${this.store.routingVersion()}, store ${this.store.folder}): taking it`);
                 // Stamped NOW, not with their write time: configs are ordered by version, and this one is newer by that ordering. Their file can easily be older by write time (ours was rewritten locally more recently), and the store's only-take-the-latest rule would then drop it - leaving us finding the same newer version on every poll and never adopting it.

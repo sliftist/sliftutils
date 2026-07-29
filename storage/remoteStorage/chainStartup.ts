@@ -394,14 +394,23 @@ export async function writeRoutingToAllStores(config: { configured: RemoteConfig
     let routingData = serializeRemoteConfig(configured);
     let routingWriteTime = Math.round(Date.now());
     let targets: SourceWrapper[] = [];
+    let skipped: SourceWrapper[] = [];
     let seen = new Set<string>();
     for (let source of sources) {
         let key = `${source.config.url}|${source.config.name}`;
         if (seen.has(key)) continue;
         seen.add(key);
+        // writeBlocked is a capability of this process (read-only mode, a browser, no backblaze credentials) - not connectivity, so skipping is not a pre-check race. Counting these as failures put the retry loop on its 5-minute cadence FOREVER over writes this process cannot make; the stores get the config from the writers that can (servers, node clients, peers pulling it from each other). The recheck first: the backblaze-credentials block can be a TRANSIENT secret-load failure at startup, and skipping on the stale verdict would otherwise make it permanent (see SourceWrapper.recheckWriteBlocked).
+        if (source.writeBlocked) {
+            await source.recheckWriteBlocked();
+        }
+        if (source.writeBlocked || !source.api) {
+            skipped.push(source);
+            continue;
+        }
         targets.push(source);
     }
-    console.log(`Writing routing config version ${getConfigVersion(configured)} for ${debugName} to all ${targets.length} stores (write time ${formatDateTimeDetailed(routingWriteTime)}): ${targets.map(x => `${x.config.url} (store ${JSON.stringify(x.config.name)})`).join(", ")}`);
+    console.log(`Writing routing config version ${getConfigVersion(configured)} for ${debugName} to all ${targets.length} writable stores (write time ${formatDateTimeDetailed(routingWriteTime)}): ${targets.map(x => `${x.config.url} (store ${JSON.stringify(x.config.name)})`).join(", ") || "none"}${skipped.length && `. Skipping ${skipped.length} not writable from this process: ${skipped.map(x => `${x.config.url} (store ${JSON.stringify(x.config.name)}, ${x.writeBlocked || "no API access"})`).join(", ")}` || ""}`);
     let failures: string[] = [];
     await Promise.all(targets.map(async source => {
         try {

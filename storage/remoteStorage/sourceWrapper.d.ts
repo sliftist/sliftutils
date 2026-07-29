@@ -43,6 +43,8 @@ export declare class SourceWrapper {
     seedLatency(ms: number): void;
     /** Median of the recent pings (API or URL-form, whichever this source measures), plus DISCONNECTED_LATENCY_PENALTY while the source is disconnected - so a down source still sorts and can still be picked, just after every connected one. Sources with no measurements yet sort last (Infinity), except our own in-process server, which is the best possible target (0). */
     getLatency(): number;
+    /** writeBlocked from missing backblaze credentials is re-checked on every write attempt: the secret load can fail TRANSIENTLY (early startup, a file-read hiccup), and one failed load must never permanently stop this process from writing to the bucket. The other writeBlocked reasons (read-only mode, browsers) are static properties of the process, so there is nothing to re-check. */
+    recheckWriteBlocked(): Promise<void>;
     /** Writes always go through the API, so a permission error throws to the caller on every write (and access granted in the meantime is picked up automatically). */
     write<T>(run: (archives: IArchives) => Promise<T>): Promise<T>;
     dispose(): void;
