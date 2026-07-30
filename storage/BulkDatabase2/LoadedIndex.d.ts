@@ -10,6 +10,7 @@ export type BulkFileInfo = {
 export type StreamFileInfo = {
     fileName: string;
     timestamp: number;
+    ownerId?: string;
 };
 export type StreamReaderCacheEntry = {
     readSize: number;

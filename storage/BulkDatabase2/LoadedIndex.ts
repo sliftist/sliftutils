@@ -9,7 +9,8 @@ import { blue, red } from "socket-function/src/formatting/logColors";
 const BULK_ROOT_FOLDER = "bulkDatabases2";
 
 export type BulkFileInfo = { fileName: string; level: number; timestamp: number };
-export type StreamFileInfo = { fileName: string; timestamp: number };
+// ownerId is the writer that may still be appending to this file; undefined for legacy names that predate the stamp (nothing appends to those anymore).
+export type StreamFileInfo = { fileName: string; timestamp: number; ownerId?: string };
 export type StreamReaderCacheEntry = { readSize: number; parsedPos: number; entries: StreamEntry[] };
 
 export class MissingFileError extends Error { }

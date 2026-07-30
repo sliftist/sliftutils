@@ -6,9 +6,9 @@ export declare const bulkDatabase2Timing: {
     mergeSpacingMs: number;
     firstMergeTriggerFiles: number;
     firstMergeTriggerRangeMs: number;
-    streamFoldTriggerRows: number;
     streamFoldTriggerBytes: number;
     streamFileMaxBytes: number;
+    liveWriterProbeMs: number;
     streamFoldHardLimitBytes: number;
     writeFlushMaxDelayMs: number;
     fileSetPollIntervalMs: number;
@@ -58,7 +58,6 @@ export declare class BulkDatabaseBase<T extends {
     private currentStreamFileBytes;
     private mergeInFlight;
     private lastMergeSkipLogMs;
-    private streamRowsOnDisk;
     private streamBytesOnDisk;
     private fileSetPollTimer;
     private rebuildPromise;
@@ -78,6 +77,7 @@ export declare class BulkDatabaseBase<T extends {
     };
     isRemote(): Promise<boolean>;
     private streamNeedsFold;
+    private findAbandonedStreams;
     private automaticCompactionAllowed;
     isKeyWatched(key: string): boolean;
     private ensureIndex;

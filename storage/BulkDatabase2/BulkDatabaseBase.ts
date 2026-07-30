@@ -16,7 +16,7 @@ import { blockCache, encodeCompressedBlocks } from "./blockCache";
 import { formatNumber, formatTime } from "socket-function/src/formatting/format";
 import { blue, magenta } from "socket-function/src/formatting/logColors";
 import { STREAM_EXTENSION, frameDeletes, frameRows, streamReaderFromEntries } from "./streamLog";
-import { broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, connect as syncConnect, isSyncSupported, RemoteWrite } from "./syncClient";
+import { broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, connect as syncConnect, isSyncSupported, queryLiveWriters, registerWriterId, RemoteWrite } from "./syncClient";
 import { DELETED } from "./WriteOverlay";
 import { MergeLockInfo, peekMergeFileLock, peekMergeLock, releaseMergeFileLock, releaseMergeLock, startMergeFileLockHeartbeat, tryAcquireMergeFileLock, tryAcquireMergeLock } from "./mergeLock";
 import { markerExclusions, processDeleteMarkers, readDeleteMarkers, writeDeleteMarker } from "./mergeMarkers";
@@ -57,9 +57,10 @@ export const bulkDatabase2Timing = {
     mergeSpacingMs: 5 * 60 * 1000,
     firstMergeTriggerFiles: 20,
     firstMergeTriggerRangeMs: 3 * 24 * 60 * 60 * 1000,
-    streamFoldTriggerRows: 100,
     streamFoldTriggerBytes: 64 * 1024 * 1024,
     streamFileMaxBytes: 50 * 1024 * 1024,
+    // How long to wait for peers to answer a stream-owner liveness probe. Runs inside a merge pass, which already waits 15s for the file lock, so a second here costs nothing.
+    liveWriterProbeMs: 1000,
     streamFoldHardLimitBytes: 768 * 1024 * 1024,
     // 0 = flush every write (Node — append is real and cheap); browser ramps to 15s to avoid rewriting the whole stream file per write.
     writeFlushMaxDelayMs: isNode() ? 0 : 15 * 1000,
@@ -120,8 +121,11 @@ export type MergeAttemptResult = {
 let networkCompactionEnabled = false;
 
 let fileNameCounter = 0;
-// Per-process ID so two writers picking the same timestamp + counter never collide on a name.
+// Per-process ID so two writers picking the same timestamp + counter never collide on a name. Also stamped into our stream file names and answered over the sync channel, so a peer can tell whether the writer of a given stream file is still running.
 const writerId = Math.random().toString(36).slice(2, 10);
+registerWriterId(writerId);
+// Reserved owner for the tombstone-carry file a merge emits. Nothing ever appends to it, but it must NOT read as abandoned: folding it would emit another carry file, which would read as abandoned in turn, and the pass would fold forever.
+const MERGE_OUTPUT_OWNER = "merged";
 function nextCounter(): number { return ++fileNameCounter; }
 
 let lastFileTime = 0;
@@ -135,13 +139,19 @@ function newFileName(timestamp: number): string {
     return `0_${timestamp}_${writerId}_${nextCounter()}${FILE_EXTENSION}`;
 }
 
+// Accept old 3-part (stream_timestamp_random) and new 4-part (stream_timestamp_ownerId_counter) shapes. A 3-part name carries no owner, so it can never be matched to a live writer — which is what we want: no build that produces those names is still appending to them.
 function parseStreamFileName(fileName: string): StreamFileInfo | undefined {
     if (!fileName.endsWith(STREAM_EXTENSION)) return undefined;
     const parts = fileName.slice(0, -STREAM_EXTENSION.length).split("_");
-    if (parts.length !== 3 || parts[0] !== "stream") return undefined;
+    if (parts[0] !== "stream") return undefined;
+    if (parts.length !== 3 && parts.length !== 4) return undefined;
     const timestamp = parseInt(parts[1], 10);
     if (!Number.isFinite(timestamp)) return undefined;
-    return { fileName, timestamp };
+    return { fileName, timestamp, ownerId: parts.length === 4 && parts[2] || undefined };
+}
+
+function newStreamFileName(ownerId: string): string {
+    return `stream_${Date.now()}_${ownerId}_${nextCounter()}${STREAM_EXTENSION}`;
 }
 
 // Accept old 3-part (level_timestamp_counter) and new 4-part (level_timestamp_writerId_counter) shapes.
@@ -229,7 +239,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
     private subCaches: SubReaderCaches = { bulk: new Map(), stream: new Map() };
 
-    private pendingAppends: { framed: Buffer; rows: number }[] = [];
+    private pendingAppends: Buffer[] = [];
     private flushTimer: ReturnType<typeof setTimeout> | undefined;
     private flushChain: Promise<void> = Promise.resolve();
     private currentFlushDelay = 0;
@@ -241,8 +251,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     // In-process re-entry guard: if a merge is running, additional triggers (visibility timer, writes, tryMergeNow calls) return immediately instead of queueing. Keeps the visibility-timer firings from stacking behind a long merge.
     private mergeInFlight = false;
     private lastMergeSkipLogMs = 0;
-    // Running counters of stream-tier rows + bytes on disk. Seeded from each LoadedIndex build, then incremented per flush so the fold-trigger checks current data without an extra directory listing.
-    private streamRowsOnDisk = 0;
+    // Running counter of stream-tier bytes on disk. Seeded from each LoadedIndex build, then incremented per flush so the fold-trigger checks current data without an extra directory listing.
     private streamBytesOnDisk = 0;
 
     private fileSetPollTimer: ReturnType<typeof setInterval> | undefined;
@@ -298,9 +307,34 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return !!(await this.storage()).isRemote;
     }
 
+    // Uncompacted stream bytes have to be read and decoded in full by every reader on every index build, so size alone decides — a fold is worth it even if those bytes are one enormous row.
     private streamNeedsFold(): boolean {
-        return this.streamRowsOnDisk >= bulkDatabase2Timing.streamFoldTriggerRows
-            && this.streamBytesOnDisk > bulkDatabase2Timing.streamFoldTriggerBytes;
+        return this.streamBytesOnDisk > bulkDatabase2Timing.streamFoldTriggerBytes;
+    }
+
+    // Stream files nobody can still be appending to, split by who owned them:
+    //   retirable - a fold may delete these the moment it has consumed them, instead of waiting out streamSealAgeMs. Includes our own sealed files and merge-carry output.
+    //   ownerGone - nobody is left to fold these (a closed tab's leftovers, or a legacy name with no owner stamp), and until one is folded every reader has to decode all of it just to build the index. Worth folding at any size. Our own files are deliberately NOT in here: Pass 1 seals ours on every tick, so counting them would fold on every tick; the streamFileMaxBytes rollover and the streamFoldTriggerBytes gate cover ours instead.
+    //
+    // Foreign owners are probed over the sync channel. In Node there is no channel, so we cannot know - every foreign owner is assumed alive and the streamSealAgeMs rule stands.
+    private async findAbandonedStreams(streamFiles: StreamFileInfo[]): Promise<{ retirable: Set<string>; ownerGone: Set<string> }> {
+        const retirable = new Set<string>();
+        const ownerGone = new Set<string>();
+        const hasForeignOwner = streamFiles.some(f => f.ownerId && f.ownerId !== writerId && f.ownerId !== MERGE_OUTPUT_OWNER);
+        const live = hasForeignOwner && await queryLiveWriters(this.name, bulkDatabase2Timing.liveWriterProbeMs) || undefined;
+        for (const f of streamFiles) {
+            if (f.ownerId === MERGE_OUTPUT_OWNER) { retirable.add(f.fileName); continue; }
+            // streamFileName is the only "we will append here again" signal - once it moves on, getStreamFileName opens a fresh file and this one is final.
+            if (f.ownerId === writerId) {
+                if (f.fileName !== this.streamFileName) retirable.add(f.fileName);
+                continue;
+            }
+            if (!f.ownerId || live && !live.has(f.ownerId)) {
+                retirable.add(f.fileName);
+                ownerGone.add(f.fileName);
+            }
+        }
+        return { retirable, ownerGone };
     }
 
     private async automaticCompactionAllowed(): Promise<boolean> {
@@ -356,7 +390,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
         });
         const oldIndex = this.reader.index;
         this.reader.setIndex(newIndex, { dropStaleFallback: this.rebuildOptions.dropStaleFallback });
-        this.streamRowsOnDisk = newIndex.streamRowsOnDisk;
         this.streamBytesOnDisk = newIndex.streamBytesOnDisk;
         if (oldIndex) {
             for (const f of oldIndex.fileSet) {
@@ -437,7 +470,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             for (const { time, row } of stamped) this.reader.applyWrite(row.key as string, row, time);
         });
         for (const { time, row } of stamped) syncBroadcast(this.name, { key: row.key as string, time, value: row });
-        await this.streamAppend(framed, stamped.length);
+        await this.streamAppend(framed);
         void this.maybeMerge({ onlyIfStreamHeavy: true });
     }
 
@@ -453,13 +486,13 @@ export class BulkDatabaseBase<T extends { key: string }> {
             for (const { time, key } of stamped) this.reader.applyDelete(key, time);
         });
         for (const { time, key } of stamped) syncBroadcast(this.name, { key, time, deleted: true });
-        await this.streamAppend(frameDeletes(stamped), stamped.length);
+        await this.streamAppend(frameDeletes(stamped));
         void this.maybeMerge({ onlyIfStreamHeavy: true });
     }
 
     // Coalesce stream appends on a ramping per-collection schedule (the browser rewrites the whole file per append). The first write after a lull flushes immediately so a single edit-then-close is saved at once; sustained writes ramp toward writeFlushMaxDelayMs.
-    private async streamAppend(framed: Buffer, rows: number): Promise<void> {
-        this.pendingAppends.push({ framed, rows });
+    private async streamAppend(framed: Buffer): Promise<void> {
+        this.pendingAppends.push(framed);
         const max = bulkDatabase2Timing.writeFlushMaxDelayMs;
         const now = Date.now();
         if (max <= 0 || this.currentFlushDelay <= 0 || now - this.lastWriteTime > max) {
@@ -490,7 +523,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     private async doFlush(): Promise<void> {
         if (!this.pendingAppends.length) return;
         const batch = this.pendingAppends.slice();
-        const combined = Buffer.concat(batch.map(p => p.framed));
+        const combined = Buffer.concat(batch);
         const storage = await this.storage();
         const fileName = this.getStreamFileName();
         if (fileName !== this.currentStreamFileName) {
@@ -502,7 +535,6 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // New entries appended during the await are after `batch` — removing the front is exactly the flushed set.
         this.pendingAppends.splice(0, batch.length);
         this.streamBytesOnDisk += combined.length;
-        for (const p of batch) this.streamRowsOnDisk += p.rows;
         this.currentStreamFileBytes += combined.length;
         if (this.currentStreamFileBytes >= bulkDatabase2Timing.streamFileMaxBytes) {
             this.streamFileName = undefined;
@@ -519,7 +551,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
             if (info && Date.now() - info.timestamp >= bulkDatabase2Timing.streamSealAgeMs) this.streamFileName = undefined;
         }
         if (!this.streamFileName) {
-            this.streamFileName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
+            this.streamFileName = newStreamFileName(writerId);
         }
         return this.streamFileName;
     }
@@ -772,9 +804,18 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const ordered = orderStreamEntries(streamData.entries);
         const streamReader = ordered.length ? streamReaderFromEntries(ordered, 0).reader : undefined;
 
+        // An abandoned stream that yielded no entries (zero bytes, or nothing but torn bytes) holds no data and has no writer left. Retire it here: the merge below never lists it as a used source, so the normal retirement path would skip it and it would re-trigger the abandoned-stream fold on every pass. replacedBy is empty because nothing supersedes it - the marker hides it from reads immediately and processMarkers deletes it once aged.
+        const { retirable: retirableStreams } = await this.findAbandonedStreams(streamFiles);
+        const contributingStreams = new Set(streamData.entries.map(e => e.fileName));
+        const emptyAbandoned = streamFiles.filter(f => retirableStreams.has(f.fileName) && !contributingStreams.has(f.fileName)).map(f => f.fileName);
+        if (emptyAbandoned.length) await writeDeleteMarker(storage, { deleteFiles: emptyAbandoned, replacedBy: [] });
+
         const readers = streamReader ? [streamReader, ...bulkReaders] : bulkReaders;
         const readerNames = streamReader ? ["(streams)", ...consumedBulk.map(f => f.fileName)] : consumedBulk.map(f => f.fileName);
-        if (!readers.length) return false;
+        if (!readers.length) {
+            if (emptyAbandoned.length) await this.triggerRebuild();
+            return emptyAbandoned.length > 0;
+        }
 
         const inputs = [
             ...await Promise.all(consumedBulk.map(async f => ({ name: f.fileName, size: (await storage.getInfo(f.fileName).catch(() => undefined))?.size ?? 0 }))),
@@ -816,7 +857,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         const carriedDeletes = includesOldest ? 0 : mergeResult.carriedDeletes.size;
         const outNames = [...newNames];
         if (carriedDeletes) {
-            const carryName = `stream_${Date.now()}_${Math.random().toString(36).slice(2, 10)}${STREAM_EXTENSION}`;
+            const carryName = newStreamFileName(MERGE_OUTPUT_OWNER);
             await storage.set(carryName, frameDeletes([...mergeResult.carriedDeletes].map(([key, time]) => ({ time, key }))));
             outNames.push(carryName);
         }
@@ -835,6 +876,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         // A stream may still be appended to after we read it (the writer hasn't sealed/moved on); only retire streams canDeleteStream clears — the rest stay live and a later merge re-folds them once sealed. Bulk files are immutable, so a used one is always safe to retire.
         const deletableStreams: string[] = [];
         for (const f of usedStreamFiles) {
+            if (retirableStreams.has(f.fileName)) { deletableStreams.push(f.fileName); continue; }
             if (await this.canDeleteStream(f, Date.now(), streamData.sizes, forceDeleteStreams)) deletableStreams.push(f.fileName);
         }
         const deleteFiles = [...usedConsumedBulk.map(f => f.fileName), ...deletableStreams];
@@ -909,10 +951,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
                 const [size, header] = await Promise.all([this.fileLogicalSize(f.fileName), this.readBulkHeader(f.fileName)]);
                 return { kind: "bulk" as const, file: f, bytes: size ?? 0, time: header?.maxTime || f.timestamp };
             }));
+            const { retirable, ownerGone } = await this.findAbandonedStreams(streamFiles);
             const streamMeta: { kind: "stream"; file: StreamFileInfo; bytes: number; time: number }[] = [];
             for (const f of streamFiles) {
                 const aged = Date.now() - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs;
-                if (!foldRecentStreams && !aged) continue;
+                if (!foldRecentStreams && !aged && !retirable.has(f.fileName)) continue;
                 let bytes = 0;
                 try { const info = await (await this.storage()).getInfo(f.fileName); bytes = info?.size ?? 0; } catch { bytes = 0; }
                 streamMeta.push({ kind: "stream", file: f, bytes, time: f.timestamp });
@@ -928,9 +971,12 @@ export class BulkDatabaseBase<T extends { key: string }> {
             const span = recent.length ? recent[0].time - recent[recent.length - 1].time : 0;
             const recentStreamBytes = recent.reduce((a, it) => a + (it.kind === "stream" ? it.bytes : 0), 0);
             const heavyStream = recentStreamBytes > bulkDatabase2Timing.streamFoldTriggerBytes;
+            // A stream whose writer is gone will never grow and nothing else will ever fold it, so fold it at any size - even one row. Zero-byte ones are skipped: they carry no data to fold, and mergeFileSetInner retires them directly.
+            const hasAbandonedStream = recent.some(it => it.kind === "stream" && it.bytes > 0 && ownerGone.has(it.file.fileName));
             const triggered =
                 recent.length >= 2 && (recent.length > bulkDatabase2Timing.firstMergeTriggerFiles || span > bulkDatabase2Timing.firstMergeTriggerRangeMs)
-                || heavyStream;
+                || heavyStream
+                || hasAbandonedStream;
             if (triggered) {
                 const rb = recent.filter(i => i.kind === "bulk").map(i => (i.file as BulkFileInfo));
                 const rs = recent.filter(i => i.kind === "stream").map(i => (i.file as StreamFileInfo));
