@@ -939,12 +939,36 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
         }
 
-        // Pass 1: consolidate recent. Only seal when cross-tab sync can fold recent streams — in Node canDeleteStream needs them aged anyway, so sealing would just fragment streams every pass.
+        // Seal before both the stream-tier fold and Pass 1, so our own current file is final and can be folded in this same pass. Only seal when cross-tab sync can fold recent streams — in Node canDeleteStream needs them aged anyway, so sealing would just fragment streams every pass.
         const foldRecentStreams = isSyncSupported();
         if (foldRecentStreams) {
             syncBroadcastSeal(this.name);
             this.streamFileName = undefined;
         }
+
+        // Stream-tier fold: the ENTIRE stream tier is parsed into memory and held there (subCaches.stream keeps every decoded entry) just to build the index, so it is the biggest single lever on our heap — a fold turns it into a bulk file we only read an index of. Whenever the foldable part of the tier passes streamFoldTriggerBytes, fold exactly that and nothing else: no bulk files are dragged in, so the work is proportional to the memory reclaimed.
+        //
+        // Pass 1 cannot be relied on for this. Its trigger measures only the streams that fall inside `recent` (the newest files up to FIRST_MERGE_BYTES = 128MB), so a single large recent bulk file can fill that window and hide an arbitrarily large stream tier behind it — leaving hundreds of MB decoded in memory with nothing but the 768MB hard limit to catch it.
+        {
+            const { streamFiles } = await this.listFiles();
+            if (streamFiles.length) {
+                const storage = await this.storage();
+                const { retirable } = await this.findAbandonedStreams(streamFiles);
+                // Only fold what we can also retire. Folding a stream a live foreign owner may still append to would copy it into bulk without removing it, so the bytes would stay in memory and just get re-folded next pass; that owner rolls its own file over at streamFileMaxBytes instead.
+                // Aged past streamSealAgeMs counts as retirable too (canDeleteStream's own first rule): no writer appends past the seal age, and this is the only thing that frees the tier in Node, where liveness cannot be probed at all.
+                // Merge-carry files are excluded: they hold nothing but tombstones, so folding one alone just rewrites it into another carry file, forever.
+                const foldable = streamFiles.filter(f => f.ownerId !== MERGE_OUTPUT_OWNER
+                    && (retirable.has(f.fileName) || Date.now() - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs));
+                const foldableSizes = await Promise.all(foldable.map(async f => { try { return (await storage.getInfo(f.fileName))?.size ?? 0; } catch { return 0; } }));
+                const foldableBytes = foldableSizes.reduce((a, b) => a + b, 0);
+                if (foldableBytes > bulkDatabase2Timing.streamFoldTriggerBytes) {
+                    const held = streamFiles.length - foldable.length;
+                    console.log(`${blue(this.name)} ${magenta("fold")} stream tier: ${fmtBytes(foldableBytes)} foldable across ${foldable.length} file(s) over ${fmtBytes(bulkDatabase2Timing.streamFoldTriggerBytes)}${held && `, ${held} left to their owners` || ""} - folding streams only`);
+                    if (!await runMerge([], foldable)) return merged;
+                }
+            }
+        }
+
         {
             const { bulkFiles, streamFiles } = await this.listFiles();
             const bulkMeta = await Promise.all(bulkFiles.map(async f => {
