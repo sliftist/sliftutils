@@ -11,7 +11,12 @@ import { LZ4 } from "socket-function/src/lz4/LZ4";
 // Per-block compression mainly helps slow storage (HDD): fewer bytes off disk per block, at the cost of a fast in-memory LZ4 decompress.
 
 const BLOCK_SIZE = 256 * 1024;
-const MAX_BLOCKS = Math.floor((512 * 1024 * 1024) / BLOCK_SIZE);
+// 128MB per context. This cache exists per browsing context (each tab, each
+// worker), so a generous cap multiplies fast — at 512MB, three same-process
+// tabs could pin 1.5GB of block data, and the resulting GC pressure visibly
+// janks video playback. 128MB still holds ~500 hot blocks per context; misses
+// just re-read from local disk, which is cheap.
+const MAX_BLOCKS = Math.floor((128 * 1024 * 1024) / BLOCK_SIZE);
 const MIN_COMPRESSION_RATIO = 2;
 
 const EMPTY = Buffer.alloc(0) as Buffer;
