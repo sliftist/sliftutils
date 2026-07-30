@@ -1097,9 +1097,9 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         mergeSpacingMs: number;
         firstMergeTriggerFiles: number;
         firstMergeTriggerRangeMs: number;
-        streamFoldTriggerRows: number;
         streamFoldTriggerBytes: number;
         streamFileMaxBytes: number;
+        liveWriterProbeMs: number;
         streamFoldHardLimitBytes: number;
         writeFlushMaxDelayMs: number;
         fileSetPollIntervalMs: number;
@@ -1149,7 +1149,6 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private currentStreamFileBytes;
         private mergeInFlight;
         private lastMergeSkipLogMs;
-        private streamRowsOnDisk;
         private streamBytesOnDisk;
         private fileSetPollTimer;
         private rebuildPromise;
@@ -1169,6 +1168,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         };
         isRemote(): Promise<boolean>;
         private streamNeedsFold;
+        private findAbandonedStreams;
         private automaticCompactionAllowed;
         isKeyWatched(key: string): boolean;
         private ensureIndex;
@@ -1521,6 +1521,7 @@ declare module "sliftutils/storage/BulkDatabase2/LoadedIndex" {
     export type StreamFileInfo = {
         fileName: string;
         timestamp: number;
+        ownerId?: string;
     };
     export type StreamReaderCacheEntry = {
         readSize: number;
@@ -1772,9 +1773,11 @@ declare module "sliftutils/storage/BulkDatabase2/syncClient" {
         deleted?: boolean;
         value?: unknown;
     };
+    export declare function registerWriterId(id: string): void;
     export declare function isSyncSupported(): boolean;
     export declare function connect(collection: string, onWrite: (write: RemoteWrite) => void, onSeal?: () => void): Promise<RemoteWrite[]>;
     export declare function broadcast(collection: string, write: RemoteWrite): void;
+    export declare function queryLiveWriters(collection: string, timeoutMs: number): Promise<Set<string> | undefined>;
     export declare function broadcastSeal(collection: string): void;
 
 }
