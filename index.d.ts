@@ -921,9 +921,9 @@ declare module "sliftutils/storage/ArchivesDisk" {
 }
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
-    import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing, MergeAttemptResult } from "./BulkDatabaseBase";
+    import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing, MergeAttemptResult, CompactionPlan } from "./BulkDatabaseBase";
     export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-    export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing, MergeAttemptResult, MergeSkipReason } from "./BulkDatabaseBase";
+    export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing, MergeAttemptResult, MergeSkipReason, CompactionPlan, CompactionStep, CompactionStepKind, CompactionTrigger } from "./BulkDatabaseBase";
     /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
     export type BulkColumnInfo = {
         column: string;
@@ -1040,6 +1040,18 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
          */
         getFileInfo(): Promise<BulkFileInfoListing>;
         /**
+         * Every compaction the files on disk currently call for, without performing any of them. This is the
+         * same plan the background merge pass builds and then executes, so it says exactly what the database
+         * is about to do, to which files, and (via `startTime`) when.
+         *
+         * A step that isn't `ready` is still listed with its `triggers`, so you can see how close it is: each
+         * trigger carries the current `value`, the `threshold` that sets the step off, and their `fraction`.
+         *
+         * Not free: working out the dedup steps walks the key list of every combined file, so this is O(total
+         * keys). Fine to call when showing collection status, not something to poll on a short timer.
+         */
+        planCompaction(): Promise<CompactionPlan>;
+        /**
          * Consolidate on-disk files. Optional to call; the database also does this in the background.
          * Returns whether anything was merged, or (via skipReason) why the pass never ran — another merge
          * in flight, another tab/process holding the merge lock (with who holds it and when the lock
@@ -1090,6 +1102,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabase2" {
 
 declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     import type { FileStorage } from "../FileFolderAPI";
+    import { BulkFileInfo, StreamFileInfo } from "./LoadedIndex";
     export declare const BULK_ROOT_FOLDER = "bulkDatabases2";
     export declare const bulkDatabase2Timing: {
         streamSealAgeMs: number;
@@ -1124,6 +1137,46 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         skipReason?: MergeSkipReason;
         lockHolderId?: string;
         lockExpiresInMs?: number;
+    };
+    /** One threshold a compaction step is measured against. `value` is where the collection stands now and `threshold` is what sets the step off, so `fraction` (value/threshold) reads as how close it is - 1 or more means met. Deliberately not clamped, so an overdue step reads as how far past due it is. */
+    export type CompactionTrigger = {
+        name: string;
+        value: number;
+        threshold: number;
+        fraction: number;
+        met: boolean;
+        /** How to render value/threshold. "fraction" values are 0..1. */
+        unit: "bytes" | "count" | "fraction";
+    };
+    /** streamHardLimit and streamFold are phase 1 (stream -> bulk), looseCombine is phase 2 (loose bulk -> combined bulk), dedupAll and dedupKeyGroup are phase 3. */
+    export type CompactionStepKind = "streamHardLimit" | "streamFold" | "looseCombine" | "dedupAll" | "dedupKeyGroup";
+    export type CompactionStep = {
+        phase: 1 | 2 | 3;
+        kind: CompactionStepKind;
+        /** Whether this step runs on the next pass. Authoritative: on top of `requires` it accounts for inputs the step needs beyond its thresholds (e.g. two files to combine), so it can be false even with every trigger met. */
+        ready: boolean;
+        /** Whether every trigger has to be met for this step, or just one of them. */
+        requires: "any" | "all";
+        triggers: CompactionTrigger[];
+        /** When this step's merge starts, given merges are spaced mergeSpacingMs apart. Only set when ready. */
+        startTime?: number;
+        /** The files this step consumes, as of when the plan was made. */
+        bulkFiles: BulkFileInfo[];
+        streamFiles: StreamFileInfo[];
+        /** Total size of those inputs. */
+        bytes: number;
+        /** dedupKeyGroup only - the key range the step rewrites. */
+        keyRange?: {
+            lo: string;
+            hi: string;
+        };
+    };
+    /** Every compaction the current file set calls for, in the order a merge pass runs them, plus how close each not-yet-ready one is to its thresholds. */
+    export type CompactionPlan = {
+        collection: string;
+        /** When the plan was computed; every startTime is measured from here. */
+        time: number;
+        steps: CompactionStep[];
     };
     export declare class BulkDatabaseBase<T extends {
         key: string;
@@ -1213,8 +1266,18 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private canDeleteStream;
         private mergeSpacingDelay;
         private splitBulkTier;
+        private analyzeDuplicates;
+        private filesForKeyRange;
+        /**
+         * Every compaction the files on disk currently call for, without performing any of them. A merge pass
+         * builds exactly this and then runs the steps whose `ready` is true, so the plan is precisely what the
+         * database is about to do — and a step that isn't ready still reports its `triggers`, so a caller can
+         * see how close it is (50MB of stream data out of the 64MB that would fold it, and so on).
+         *
+         * O(total keys): the phase 3 steps need every combined file's key list walked.
+         */
+        planCompaction(): Promise<CompactionPlan>;
         private testMergeINTERNAL_DO_NOT_CALL;
-        private findDuplicateGroups;
         getSingleField<C extends keyof T>(key: string, column: C): Promise<T[C] | undefined>;
         getSingleFieldObj<C extends keyof T>(key: string, column: C): Promise<{
             key: string;

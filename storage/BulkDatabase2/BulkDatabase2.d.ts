@@ -1,6 +1,6 @@
-import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing, MergeAttemptResult } from "./BulkDatabaseBase";
+import { BulkDatabaseBase, ReactiveDeps, BulkDatabase2Config, BulkFileInfoListing, MergeAttemptResult, CompactionPlan } from "./BulkDatabaseBase";
 export { BulkDatabaseBase, noopReactiveDeps, bulkDatabase2Timing } from "./BulkDatabaseBase";
-export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing, MergeAttemptResult, MergeSkipReason } from "./BulkDatabaseBase";
+export type { ReactiveDeps, StorageFactory, BulkDatabase2Config, BulkFileDetails, BulkFileEntry, BulkFileInfoListing, MergeAttemptResult, MergeSkipReason, CompactionPlan, CompactionStep, CompactionStepKind, CompactionTrigger } from "./BulkDatabaseBase";
 /** Per-column on-disk size info, as reported by getColumnInfo/getReaderInfo. */
 export type BulkColumnInfo = {
     column: string;
@@ -116,6 +116,18 @@ export interface IBulkDatabase2<T extends {
      * size/fragmentation and deciding whether to call tryMergeNow()/compact().
      */
     getFileInfo(): Promise<BulkFileInfoListing>;
+    /**
+     * Every compaction the files on disk currently call for, without performing any of them. This is the
+     * same plan the background merge pass builds and then executes, so it says exactly what the database
+     * is about to do, to which files, and (via `startTime`) when.
+     *
+     * A step that isn't `ready` is still listed with its `triggers`, so you can see how close it is: each
+     * trigger carries the current `value`, the `threshold` that sets the step off, and their `fraction`.
+     *
+     * Not free: working out the dedup steps walks the key list of every combined file, so this is O(total
+     * keys). Fine to call when showing collection status, not something to poll on a short timer.
+     */
+    planCompaction(): Promise<CompactionPlan>;
     /**
      * Consolidate on-disk files. Optional to call; the database also does this in the background.
      * Returns whether anything was merged, or (via skipReason) why the pass never ran — another merge
