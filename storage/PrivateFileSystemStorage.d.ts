@@ -8,6 +8,7 @@ export declare class PrivateFileSystemStorage implements IStorageRaw {
     private ensureInitialized;
     private directoryExists;
     private getDirectoryHandle;
+    private resolveKey;
     private getFileHandle;
     private fileExists;
     get(key: string): Promise<Buffer | undefined>;

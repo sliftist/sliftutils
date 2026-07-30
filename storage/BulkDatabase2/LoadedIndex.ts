@@ -174,8 +174,9 @@ export class LoadedIndex<T extends { key: string }> {
                 this.baseColumnsLoading.delete(column);
                 onLoaded();
             } catch (e) {
+                // No scheduled retry exists: clearing the loading flag makes the NEXT read re-attempt the load, and until one happens the value stays missing/stale
                 this.baseColumnsLoading.delete(column);
-                console.warn(`${this.name}.getColumnSync(${JSON.stringify(column)}) load failed, will retry: ${(e as Error).message}`);
+                console.error(`${this.name}.getColumnSync(${JSON.stringify(column)}) load failed (the next read re-attempts it): ${(e as Error).stack ?? e}`);
             }
         })();
     }
@@ -193,7 +194,7 @@ export class LoadedIndex<T extends { key: string }> {
                 onLoaded();
             } catch (e) {
                 this.baseFieldsLoading.delete(ck);
-                console.warn(`${this.name}.getSingleFieldSync(${JSON.stringify(key)}, ${JSON.stringify(column)}) load failed, will retry: ${(e as Error).message}`);
+                console.error(`${this.name}.getSingleFieldSync(${JSON.stringify(key)}, ${JSON.stringify(column)}) load failed (the next read re-attempts it): ${(e as Error).stack ?? e}`);
             }
         })();
     }

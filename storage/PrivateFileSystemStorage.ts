@@ -67,30 +67,37 @@ export class PrivateFileSystemStorage implements IStorageRaw {
         return currentHandle;
     }
 
+    // Keys may contain "/" (nested paths). OPFS handles reject separators in names, so we
+    // walk/create the intermediate directories and return the leaf directory + file name.
+    private async resolveKey(key: string, create: boolean): Promise<{ dir: FileSystemDirectoryHandle; name: string }> {
+        let dir = await this.getDirectoryHandle(create);
+        const parts = key.split("/").filter(part => part.length > 0);
+        const name = parts.pop();
+        if (!name) {
+            throw new Error(`Invalid empty key: ${JSON.stringify(key)}`);
+        }
+        for (const part of parts) {
+            dir = await dir.getDirectoryHandle(part, { create });
+        }
+        return { dir, name };
+    }
+
     private async getFileHandle(key: string, create: boolean = false): Promise<FileSystemFileHandle | undefined> {
         await this.ensureInitialized();
+        if (create) {
+            const { dir, name } = await this.resolveKey(key, true);
+            return await dir.getFileHandle(name, { create: true });
+        }
         try {
-            const dirHandle = await this.getDirectoryHandle(create);
-            return await dirHandle.getFileHandle(key, { create });
+            const { dir, name } = await this.resolveKey(key, false);
+            return await dir.getFileHandle(name);
         } catch (error) {
             return undefined;
         }
     }
 
     private async fileExists(key: string): Promise<boolean> {
-        await this.ensureInitialized();
-        try {
-            // First check if directory exists
-            if (!(await this.directoryExists())) {
-                return false;
-            }
-
-            const dirHandle = await this.getDirectoryHandle(false);
-            await dirHandle.getFileHandle(key);
-            return true;
-        } catch (error) {
-            return false;
-        }
+        return !!(await this.getFileHandle(key, false));
     }
 
     public async get(key: string): Promise<Buffer | undefined> {
@@ -126,18 +133,12 @@ export class PrivateFileSystemStorage implements IStorageRaw {
     }
 
     public async set(key: string, value: Buffer): Promise<void> {
-        try {
-            const fileHandle = await this.getFileHandle(key, true);
-            if (!fileHandle) {
-                throw new Error(`Failed to create file handle for key: ${key}`);
-            }
-
-            const writable = await fileHandle.createWritable();
-            await writable.write(value);
-            await writable.close();
-        } catch (error) {
-            throw new Error(`Failed to write file ${key}: ${error}`);
-        }
+        await this.ensureInitialized();
+        const { dir, name } = await this.resolveKey(key, true);
+        const fileHandle = await dir.getFileHandle(name, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(value);
+        await writable.close();
     }
 
     public async append(key: string, value: Buffer): Promise<void> {
@@ -157,10 +158,8 @@ export class PrivateFileSystemStorage implements IStorageRaw {
             return; // File doesn't exist, nothing to remove
         }
 
-        try {
-            const dirHandle = await this.getDirectoryHandle(false);
-            await dirHandle.removeEntry(key);
-        } catch { }
+        const { dir, name } = await this.resolveKey(key, false);
+        await dir.removeEntry(name);
     }
 
     public async getKeys(): Promise<string[]> {
@@ -169,24 +168,20 @@ export class PrivateFileSystemStorage implements IStorageRaw {
             return [];
         }
 
-        try {
-            const dirHandle = await this.getDirectoryHandle(false);
-            const keys: string[] = [];
-
+        const dirHandle = await this.getDirectoryHandle(false);
+        const keys: string[] = [];
+        const walk = async (dir: FileSystemDirectoryHandle, prefix: string) => {
             // Use the async iterator protocol for FileSystemDirectoryHandle
-            for await (const [name, handle] of (dirHandle as any).entries()) {
+            for await (const [name, handle] of (dir as any).entries()) {
                 if (handle.kind === "file") {
-                    keys.push(name);
+                    keys.push(prefix + name);
+                } else if (handle.kind === "directory") {
+                    await walk(handle, prefix + name + "/");
                 }
             }
-
-            return keys.sort();
-        } catch (error) {
-            if (error instanceof Error && error.message.includes("Directory not found")) {
-                return [];
-            }
-            throw new Error(`Failed to list files: ${error}`);
-        }
+        };
+        await walk(dirHandle, "");
+        return keys.sort();
     }
     public async getInfo(key: string): Promise<undefined | {
         size: number;

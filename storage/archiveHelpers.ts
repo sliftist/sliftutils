@@ -29,11 +29,13 @@ export async function copyArchiveFile(config: {
     let size = info.size;
     let writeTime = Math.round(config.preserveWriteTime && info.writeTime || Date.now());
     if (config.preserveWriteTime) {
-        // A destination that already holds a NEWER file must not be overwritten with our older one - and the destination's own only-take-latest would drop the write SILENTLY, leaving the caller believing the copy happened. Refusing here, loudly, is what turns "the remote has something we missed" from a masked bug into a log line the caller can act on. (A fresh-stamped copy needs no such guard - nothing at the destination can be newer than now - so plain copies skip the round trip.)
-        let destInfo = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
+        // A destination that already holds something NEWER (a file OR a deletion - includeTombstones, so a tombstone is visible instead of reading as absence) must not be overwritten with our older copy - and the destination's own only-take-latest would drop the write SILENTLY, leaving the caller believing the copy happened. Refusing here, loudly, is what turns "the remote has something we missed" from a masked bug into a log line the caller can act on. (A fresh-stamped copy needs no such guard - nothing at the destination can be newer than now - so plain copies skip the round trip.)
+        let destInfo = await to.getInfo(toPath, { noFallbacks: config.noFallbacks, includeTombstones: true });
         // Compared at whole-millisecond precision (ROUNDED, matching ArchivesDisk - see its get2), here and at the confirm below: disk mtimes carry fractional milliseconds, but utimes round-trips only whole ones, so sub-millisecond differences are storage artifacts of the SAME time, not ordering
         if (destInfo && Math.round(destInfo.writeTime) > Math.round(writeTime)) {
-            logStorageError(`Copy refused - a newer file exists at the destination. Refusing to copy ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: ours ${size} bytes at ${formatDateTimeDetailed(writeTime)}, theirs ${destInfo.size} bytes at ${formatDateTimeDetailed(destInfo.writeTime)} - copying would roll it back`);
+            // Size 0 IS a deletion, everywhere in this system - a live file can never be empty
+            let theirs = destInfo.size === 0 && `a deletion at ${formatDateTimeDetailed(destInfo.writeTime)}` || `${destInfo.size} bytes at ${formatDateTimeDetailed(destInfo.writeTime)}`;
+            logStorageError(`Copy refused - ${destInfo.size === 0 && "a newer deletion exists at the destination" || "a newer file exists at the destination"}. Refusing to copy ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: ours ${size} bytes at ${formatDateTimeDetailed(writeTime)}, theirs ${theirs} - copying would roll it back`);
             return undefined;
         }
     }
@@ -71,10 +73,20 @@ export async function copyArchiveFile(config: {
         copiedSize = totalSize;
     }
     if (config.preserveWriteTime) {
-        // Every backend drops a superseded write SILENTLY (its only-take-latest is the last line of defense against races the up-front check can't see), so a returned set is not proof the copy landed - only the destination reporting the file at OUR time or newer is. Newer also counts as landed: the destination is at least as new as what we pushed (and b2 always stamps its own, later, upload time). Only for preserved stamps: a fresh stamp cannot lose the race, and moveArchiveFile does its own confirm before deleting anything.
-        let confirmed = await to.getInfo(toPath, { noFallbacks: config.noFallbacks });
-        if (!confirmed || Math.round(confirmed.writeTime) < Math.round(writeTime)) {
-            logStorageError(`Copy was silently dropped by the destination. Copy of ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: our copy was ${copiedSize} bytes at ${formatDateTimeDetailed(writeTime)}, but the destination reports ${confirmed && `${confirmed.size} bytes at ${formatDateTimeDetailed(confirmed.writeTime)}` || "nothing"} (a newer write or deletion won the race)`);
+        // Every backend drops a superseded write SILENTLY (its only-take-latest is the last line of defense against races the up-front check can't see), so a returned set is not proof the copy landed - only the destination reporting the file at OUR time or newer is. Newer also counts as landed: the destination is at least as new as what we pushed (and b2 always stamps its own, later, upload time). Only for preserved stamps: a fresh stamp cannot lose the race, and moveArchiveFile does its own confirm before deleting anything. includeTombstones so the four failure cases are distinguishable instead of a tombstone reading as "nothing".
+        let confirmed = await to.getInfo(toPath, { noFallbacks: config.noFallbacks, includeTombstones: true });
+        let landed = confirmed && confirmed.size !== 0 && Math.round(confirmed.writeTime) >= Math.round(writeTime);
+        if (!landed) {
+            let detail = `Copy of ${JSON.stringify(path)} from ${from.getDebugName()} to ${to.getDebugName()}${toPath !== path && ` (as ${JSON.stringify(toPath)})` || ""}: ours was ${copiedSize} bytes at ${formatDateTimeDetailed(writeTime)}`;
+            if (!confirmed) {
+                logStorageError(`Copy dropped - the destination does not know the file at all. ${detail}, and the destination reports neither a file nor a deletion for it`);
+            } else if (confirmed.size === 0 && Math.round(confirmed.writeTime) >= Math.round(writeTime)) {
+                logStorageError(`Copy dropped - a newer deletion won. ${detail}, but the destination has a deletion at ${formatDateTimeDetailed(confirmed.writeTime)}`);
+            } else if (confirmed.size === 0) {
+                logStorageError(`Copy dropped - an OLDER deletion survived our write, so the set did not take. ${detail}, but the destination still has a deletion at ${formatDateTimeDetailed(confirmed.writeTime)}`);
+            } else {
+                logStorageError(`Copy dropped - an OLDER write survived ours, so the set did not take. ${detail}, but the destination still has ${confirmed.size} bytes at ${formatDateTimeDetailed(confirmed.writeTime)}`);
+            }
             return undefined;
         }
     }
