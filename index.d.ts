@@ -2580,6 +2580,7 @@ declare module "sliftutils/storage/PrivateFileSystemStorage" {
         private ensureInitialized;
         private directoryExists;
         private getDirectoryHandle;
+        private resolveKey;
         private getFileHandle;
         private fileExists;
         get(key: string): Promise<Buffer | undefined>;
