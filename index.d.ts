@@ -1095,8 +1095,8 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         streamSealAgeMs: number;
         visibleMergeIntervalMs: number;
         mergeSpacingMs: number;
-        firstMergeTriggerFiles: number;
-        firstMergeTriggerRangeMs: number;
+        looseBulkTriggerBytes: number;
+        looseBulkTriggerFiles: number;
         streamFoldTriggerBytes: number;
         streamFileMaxBytes: number;
         liveWriterProbeMs: number;
@@ -1212,6 +1212,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
         private mergeFileSetInner;
         private canDeleteStream;
         private mergeSpacingDelay;
+        private splitBulkTier;
         private testMergeINTERNAL_DO_NOT_CALL;
         private findDuplicateGroups;
         getSingleField<C extends keyof T>(key: string, column: C): Promise<T[C] | undefined>;

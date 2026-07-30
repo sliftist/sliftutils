@@ -40,10 +40,9 @@ const ROLLOVER_BYTES = 5 * 1024 * 1024;
 const MEMORY_WATCHDOG_INTERVAL_MS = 60 * 1000;
 const STALE_DELETE_MS = 24 * 60 * 60 * 1000;
 const MAX_INDEX_RELOAD_ATTEMPTS = 3;
-const FIRST_MERGE_BYTES = TARGET_FILE_BYTES / 2;
 const KEY_GROUP_BYTES = 800 * 1024 * 1024;
 const DUP_THRESHOLD = 0.4;
-// Whole-tier dedup short-circuit (after Pass 1): when the bulk tier is over this size AND the overall key duplication fraction is over this threshold, fold every bulk file in one merge instead of the per-key-group walk (which spaces merges 5 min apart — 16 h for 200 groups).
+// Whole-tier dedup short-circuit (start of phase 3): when the combined tier is over this size AND the overall key duplication fraction is over this threshold, fold every combined file in one merge instead of the per-key-group walk (which spaces merges 5 min apart — 16 h for 200 groups).
 const DEDUP_TRIGGER_BYTES = 512 * 1024 * 1024;
 const DEDUP_TRIGGER_FRACTION = 0.5;
 const WRITE_FLUSH_FIRST_STEP_MS = 250;
@@ -55,8 +54,9 @@ export const bulkDatabase2Timing = {
     // Wait this long after the tab becomes visible before the first merge check, then check this often afterwards. Tab being hidden cancels the timers (no merges while in background). Browser-only; Node compactors (e.g. remoteFileServer) drive their own polling.
     visibleMergeIntervalMs: 5 * 60 * 1000,
     mergeSpacingMs: 5 * 60 * 1000,
-    firstMergeTriggerFiles: 20,
-    firstMergeTriggerRangeMs: 3 * 24 * 60 * 60 * 1000,
+    // Phase 2 rolls the loose bulk files up once they pass either of these. Bytes because read cost grows with them; count because each loose file holds its whole key list in memory no matter how few bytes it has, so a trickle of tiny folds has to be collapsed long before it reaches the byte trigger.
+    looseBulkTriggerBytes: 1024 * 1024 * 1024,
+    looseBulkTriggerFiles: 20,
     streamFoldTriggerBytes: 64 * 1024 * 1024,
     streamFileMaxBytes: 50 * 1024 * 1024,
     // How long to wait for peers to answer a stream-owner liveness probe. Runs inside a merge pass, which already waits 15s for the file lock, so a second here costs nothing.
@@ -314,7 +314,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
 
     // Stream files nobody can still be appending to, split by who owned them:
     //   retirable - a fold may delete these the moment it has consumed them, instead of waiting out streamSealAgeMs. Includes our own sealed files and merge-carry output.
-    //   ownerGone - nobody is left to fold these (a closed tab's leftovers, or a legacy name with no owner stamp), and until one is folded every reader has to decode all of it just to build the index. Worth folding at any size. Our own files are deliberately NOT in here: Pass 1 seals ours on every tick, so counting them would fold on every tick; the streamFileMaxBytes rollover and the streamFoldTriggerBytes gate cover ours instead.
+    //   ownerGone - nobody is left to fold these (a closed tab's leftovers, or a legacy name with no owner stamp), and until one is folded every reader has to decode all of it just to build the index. Worth folding at any size. Our own files are deliberately NOT in here: every merge pass seals ours, so counting them would fold on every tick; the streamFileMaxBytes rollover and the streamFoldTriggerBytes gate cover ours instead.
     //
     // Foreign owners are probed over the sync channel. In Node there is no channel, so we cannot know - every foreign owner is assumed alive and the streamSealAgeMs rule stands.
     private async findAbandonedStreams(streamFiles: StreamFileInfo[]): Promise<{ retirable: Set<string>; ownerGone: Set<string> }> {
@@ -913,9 +913,31 @@ export class BulkDatabaseBase<T extends { key: string }> {
         return true;
     }
 
-    // The merge policy (two passes, spaced by mergeSpacingMs):
-    //   1) Consolidate recent fragmentation: take newest files up to ~FIRST_MERGE_BYTES; merge them into one when they fragment or span too wide a time range.
-    //   2) Key-stratify: walk all keys in ~KEY_GROUP_BYTES groups; rewrite groups whose duplicate-key fraction passes DUP_THRESHOLD, highest first. Use tryMerge instead
+    // Splits the bulk tier the way the merge writer does. A merge cuts an output file once it reaches TARGET_FILE_BYTES, so only its LAST output can be under that — meaning a sub-target file is either a single stream fold or the tail of an earlier merge, and is still waiting to be rolled up ("loose"). Anything at or over the target is done growing ("combined") and only phase 3 touches it again.
+    //
+    // A file whose size won't read is reported as combined: phase 2 can't consume one (its reader won't load, so the merge won't retire it), and calling it loose would re-trigger phase 2 on every pass until handleUnreadableFile finally deletes it.
+    private async splitBulkTier(): Promise<{ loose: BulkFileInfo[]; looseBytes: number; combined: BulkFileInfo[] }> {
+        const { bulkFiles } = await this.listFiles();
+        const sizes = await Promise.all(bulkFiles.map(f => this.fileLogicalSize(f.fileName)));
+        const loose: BulkFileInfo[] = [];
+        const combined: BulkFileInfo[] = [];
+        let looseBytes = 0;
+        for (let i = 0; i < bulkFiles.length; i++) {
+            const bytes = sizes[i];
+            if (bytes === undefined || bytes >= TARGET_FILE_BYTES) {
+                combined.push(bulkFiles[i]);
+                continue;
+            }
+            loose.push(bulkFiles[i]);
+            looseBytes += bytes;
+        }
+        return { loose, looseBytes, combined };
+    }
+
+    // The merge policy: three phases, each spaced by mergeSpacingMs, each feeding the next. Every phase merges only files of its own tier, so the work it does is proportional to what it reclaims — no phase drags in a file it isn't there to shrink.
+    //   1) Stream -> bulk. Fold the tier-0 append log into a bulk file. This is the memory phase: stream data is held fully decoded, bulk data costs only an index.
+    //   2) Loose -> combined. Roll the small bulk files phase 1 leaves behind up into target-sized ones, once enough of them accumulate.
+    //   3) Dedup the combined files, whole-tier if duplication is high enough, otherwise key-group by key-group.
     private async testMergeINTERNAL_DO_NOT_CALL(): Promise<boolean> {
         let merged = false;
         await this.flushPending();
@@ -939,78 +961,63 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
         }
 
-        // Seal before both the stream-tier fold and Pass 1, so our own current file is final and can be folded in this same pass. Only seal when cross-tab sync can fold recent streams — in Node canDeleteStream needs them aged anyway, so sealing would just fragment streams every pass.
-        const foldRecentStreams = isSyncSupported();
-        if (foldRecentStreams) {
+        // Seal before phase 1, so every writer's current file is final and can be folded in this same pass. Only when cross-tab sync is available to carry the seal — in Node canDeleteStream needs streams aged anyway, so sealing would just fragment them every pass.
+        if (isSyncSupported()) {
             syncBroadcastSeal(this.name);
             this.streamFileName = undefined;
         }
 
-        // Stream-tier fold: the ENTIRE stream tier is parsed into memory and held there (subCaches.stream keeps every decoded entry) just to build the index, so it is the biggest single lever on our heap — a fold turns it into a bulk file we only read an index of. Whenever the foldable part of the tier passes streamFoldTriggerBytes, fold exactly that and nothing else: no bulk files are dragged in, so the work is proportional to the memory reclaimed.
-        //
-        // Pass 1 cannot be relied on for this. Its trigger measures only the streams that fall inside `recent` (the newest files up to FIRST_MERGE_BYTES = 128MB), so a single large recent bulk file can fill that window and hide an arbitrarily large stream tier behind it — leaving hundreds of MB decoded in memory with nothing but the 768MB hard limit to catch it.
+        // ── Phase 1: stream -> bulk ───────────────────────────────────────────────────────────────────
+        // The ENTIRE stream tier is parsed into memory and held there (subCaches.stream keeps every decoded entry) just to build the index, so it is the biggest single lever on our heap — a fold turns it into a bulk file we only read an index of. Folds streams and nothing else: no bulk file is dragged in, so the work is proportional to the memory reclaimed.
         {
             const { streamFiles } = await this.listFiles();
             if (streamFiles.length) {
                 const storage = await this.storage();
-                const { retirable } = await this.findAbandonedStreams(streamFiles);
+                const { retirable, ownerGone } = await this.findAbandonedStreams(streamFiles);
                 // Only fold what we can also retire. Folding a stream a live foreign owner may still append to would copy it into bulk without removing it, so the bytes would stay in memory and just get re-folded next pass; that owner rolls its own file over at streamFileMaxBytes instead.
                 // Aged past streamSealAgeMs counts as retirable too (canDeleteStream's own first rule): no writer appends past the seal age, and this is the only thing that frees the tier in Node, where liveness cannot be probed at all.
-                // Merge-carry files are excluded: they hold nothing but tombstones, so folding one alone just rewrites it into another carry file, forever.
                 const foldable = streamFiles.filter(f => f.ownerId !== MERGE_OUTPUT_OWNER
                     && (retirable.has(f.fileName) || Date.now() - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs));
-                const foldableSizes = await Promise.all(foldable.map(async f => { try { return (await storage.getInfo(f.fileName))?.size ?? 0; } catch { return 0; } }));
-                const foldableBytes = foldableSizes.reduce((a, b) => a + b, 0);
-                if (foldableBytes > bulkDatabase2Timing.streamFoldTriggerBytes) {
-                    const held = streamFiles.length - foldable.length;
-                    console.log(`${blue(this.name)} ${magenta("fold")} stream tier: ${fmtBytes(foldableBytes)} foldable across ${foldable.length} file(s) over ${fmtBytes(bulkDatabase2Timing.streamFoldTriggerBytes)}${held && `, ${held} left to their owners` || ""} - folding streams only`);
-                    if (!await runMerge([], foldable)) return merged;
+                const sizes = new Map<string, number>();
+                await Promise.all(foldable.map(async f => {
+                    try { sizes.set(f.fileName, (await storage.getInfo(f.fileName))?.size ?? 0); } catch { sizes.set(f.fileName, 0); }
+                }));
+                const foldableBytes = [...sizes.values()].reduce((a, b) => a + b, 0);
+                // A stream whose writer is gone will never grow and nothing else will ever fold it, so fold it at any size - even one row. Zero-byte ones are skipped: they hold no data to fold, and mergeFileSetInner retires them directly.
+                const abandoned = foldable.filter(f => ownerGone.has(f.fileName) && sizes.get(f.fileName));
+                if (foldableBytes > bulkDatabase2Timing.streamFoldTriggerBytes || abandoned.length) {
+                    // Merge-carry files hold nothing but tombstones and are never a REASON to fold — folding one alone would just rewrite it into another carry file, forever. They ride along whenever something else folds, which collapses however many have piled up into one.
+                    const carry = streamFiles.filter(f => f.ownerId === MERGE_OUTPUT_OWNER);
+                    const held = streamFiles.length - foldable.length - carry.length;
+                    const why = foldableBytes > bulkDatabase2Timing.streamFoldTriggerBytes
+                        && `${fmtBytes(foldableBytes)} over ${fmtBytes(bulkDatabase2Timing.streamFoldTriggerBytes)}`
+                        || `${abandoned.length} file(s) whose writer is gone`;
+                    console.log(`${blue(this.name)} ${magenta("fold")} phase 1 stream -> bulk: ${foldable.length} file(s), ${why}${carry.length && `, +${carry.length} tombstone carry` || ""}${held && `, ${held} left to their owners` || ""}`);
+                    if (!await runMerge([], [...foldable, ...carry])) return merged;
                 }
             }
         }
 
+        // ── Phase 2: loose bulk -> combined bulk ──────────────────────────────────────────────────────
+        // Phase 1 emits one small bulk file per fold. Each is cheap to read (index only) but holds its whole key list in memory and joins into every read, so they have to be rolled up. Merging just the loose ones also dedupes them for free — a rewrite-heavy workload collapses a gigabyte of near-identical folds into almost nothing — and it always terminates, because a merge cuts every output but the last at TARGET_FILE_BYTES, so one pass can leave at most one loose file behind.
         {
-            const { bulkFiles, streamFiles } = await this.listFiles();
-            const bulkMeta = await Promise.all(bulkFiles.map(async f => {
-                const [size, header] = await Promise.all([this.fileLogicalSize(f.fileName), this.readBulkHeader(f.fileName)]);
-                return { kind: "bulk" as const, file: f, bytes: size ?? 0, time: header?.maxTime || f.timestamp };
-            }));
-            const { retirable, ownerGone } = await this.findAbandonedStreams(streamFiles);
-            const streamMeta: { kind: "stream"; file: StreamFileInfo; bytes: number; time: number }[] = [];
-            for (const f of streamFiles) {
-                const aged = Date.now() - f.timestamp >= bulkDatabase2Timing.streamSealAgeMs;
-                if (!foldRecentStreams && !aged && !retirable.has(f.fileName)) continue;
-                let bytes = 0;
-                try { const info = await (await this.storage()).getInfo(f.fileName); bytes = info?.size ?? 0; } catch { bytes = 0; }
-                streamMeta.push({ kind: "stream", file: f, bytes, time: f.timestamp });
-            }
-            const items = [...bulkMeta, ...streamMeta].sort((a, b) => b.time - a.time);
-            const recent: typeof items = [];
-            let recentBytes = 0;
-            for (const it of items) {
-                recent.push(it);
-                recentBytes += it.bytes;
-                if (recentBytes >= FIRST_MERGE_BYTES) break;
-            }
-            const span = recent.length ? recent[0].time - recent[recent.length - 1].time : 0;
-            const recentStreamBytes = recent.reduce((a, it) => a + (it.kind === "stream" ? it.bytes : 0), 0);
-            const heavyStream = recentStreamBytes > bulkDatabase2Timing.streamFoldTriggerBytes;
-            // A stream whose writer is gone will never grow and nothing else will ever fold it, so fold it at any size - even one row. Zero-byte ones are skipped: they carry no data to fold, and mergeFileSetInner retires them directly.
-            const hasAbandonedStream = recent.some(it => it.kind === "stream" && it.bytes > 0 && ownerGone.has(it.file.fileName));
-            const triggered =
-                recent.length >= 2 && (recent.length > bulkDatabase2Timing.firstMergeTriggerFiles || span > bulkDatabase2Timing.firstMergeTriggerRangeMs)
-                || heavyStream
-                || hasAbandonedStream;
-            if (triggered) {
-                const rb = recent.filter(i => i.kind === "bulk").map(i => (i.file as BulkFileInfo));
-                const rs = recent.filter(i => i.kind === "stream").map(i => (i.file as StreamFileInfo));
-                if (!await runMerge(rb, rs)) return merged;
+            const { loose, looseBytes } = await this.splitBulkTier();
+            const byBytes = looseBytes >= bulkDatabase2Timing.looseBulkTriggerBytes;
+            // Under two files there is nothing to combine, and rewriting one file into an identical one would re-trigger forever.
+            if (loose.length >= 2 && (byBytes || loose.length >= bulkDatabase2Timing.looseBulkTriggerFiles)) {
+                const why = byBytes && `${fmtBytes(looseBytes)} over ${fmtBytes(bulkDatabase2Timing.looseBulkTriggerBytes)}`
+                    || `over ${bulkDatabase2Timing.looseBulkTriggerFiles} files`;
+                console.log(`${blue(this.name)} ${magenta("combine")} phase 2 loose -> combined: ${loose.length} file(s) under ${fmtBytes(TARGET_FILE_BYTES)} each, ${why}`);
+                if (!await runMerge(loose, [])) return merged;
             }
         }
 
-        // Whole-tier dedup short-circuit (between Pass 1 and the per-group Pass 2): when the bulk tier is big enough AND mostly duplicates, fold every bulk file in one merge. Avoids the per-group walk's 5-min spacing × N-groups latency.
+        // ── Phase 3: dedup the combined files ─────────────────────────────────────────────────────────
+        // Loose files are excluded throughout: phase 2 rewrites them anyway, and that rewrite already dedupes them, so pulling one in here would do the same work twice at key-group scale.
+        //
+        // Whole-tier short-circuit first: when the combined tier is big enough AND mostly duplicates, fold all of it in one merge rather than paying the per-group walk's 5-min spacing x N groups.
         {
-            const { bulkFiles } = await this.listFiles();
+            const { combined: bulkFiles } = await this.splitBulkTier();
             if (bulkFiles.length >= 2) {
                 const storage = await this.storage();
                 let totalBytes = 0;
@@ -1033,10 +1040,10 @@ export class BulkDatabaseBase<T extends { key: string }> {
             }
         }
 
-        // Pass 2: key-stratified deduplication. Disjoint key ranges → one group's merge doesn't change another's duplication; re-select each group's files at merge time (set shifts).
+        // Then key-stratified: disjoint key ranges → one group's merge doesn't change another's duplication; re-select each group's files at merge time (set shifts).
         const groups = await this.findDuplicateGroups();
         for (const g of groups) {
-            const { bulkFiles } = await this.listFiles();
+            const { combined: bulkFiles } = await this.splitBulkTier();
             const headers = await Promise.all(bulkFiles.map(f => this.readBulkHeader(f.fileName)));
             const groupFiles = bulkFiles.filter((f, i) => {
                 const h = headers[i];
@@ -1051,7 +1058,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
     }
 
     private async findDuplicateGroups(): Promise<{ lo: string; hi: string; dup: number }[]> {
-        const { bulkFiles } = await this.listFiles();
+        const { combined: bulkFiles } = await this.splitBulkTier();
         if (bulkFiles.length < 2) return [];
         const storage = await this.storage();
         const infos = await Promise.all(bulkFiles.map(async f => {
