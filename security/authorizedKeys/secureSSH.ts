@@ -303,15 +303,18 @@ async function installDaemon(config: { host: string; hostLabel: string; repoSour
 set -e
 $SUDO mkdir -p "${path.posix.dirname(REMOTE_CHECKOUT_PATH)}"
 if $SUDO test -d "${REMOTE_CHECKOUT_PATH}/.git"; then
+    # Stashed first, the way machine-alwaysup does it. Anything sitting modified in a host's
+    # checkout is either an accident or somebody editing the daemon in place, and either way it is
+    # worth keeping rather than quietly erasing. The identity is passed inline because a host has
+    # no git config of its own and stash writes a commit.
+    $SUDO git -C "${REMOTE_CHECKOUT_PATH}" add --all
+    $SUDO git -C "${REMOTE_CHECKOUT_PATH}" -c user.email=portsecure@localhost -c user.name=portsecure stash
     $SUDO git -C "${REMOTE_CHECKOUT_PATH}" fetch --prune origin
-    # set-head so origin/HEAD is whatever the remote's default branch is now, rather than whatever
-    # it was when this was first cloned. Then forced onto it: a checkout that has drifted, for any
-    # reason, must not be able to leave a host running old code.
+    # A stash and a pull cannot cross a branch that has diverged, and a drifted checkout must not be
+    # able to leave a host running old code, so it is put on the remote's state rather than merged
+    # with it. set-head so that is the remote's default branch now, not the one it had at clone.
     $SUDO git -C "${REMOTE_CHECKOUT_PATH}" remote set-head origin --auto
     $SUDO git -C "${REMOTE_CHECKOUT_PATH}" reset --hard origin/HEAD
-    # Tracked files are back to the commit, this takes out anything extra that was left lying
-    # around. Ignored files are kept, so node_modules survives and the install stays quick.
-    $SUDO git -C "${REMOTE_CHECKOUT_PATH}" clean -fd
 else
     $SUDO rm -rf "${REMOTE_CHECKOUT_PATH}"
     $SUDO git clone "${SLIFTUTILS_URL}" "${REMOTE_CHECKOUT_PATH}"
