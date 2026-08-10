@@ -30,6 +30,10 @@ origin to clone from.
 The daemon runs on the host, so `update` is how a host picks up a newer build of it. It changes
 nothing about which keys that host trusts.
 
+`update` installs the daemon from this checkout, not from anything the host fetches, so it pulls
+this checkout first and stops if that pull does not fast forward. It never installs code it
+cannot account for.
+
 Each source repo keeps its own deploy key. Both verbs refuse to run if the key you log in with
 would not survive the change, since that would lock you out of the host permanently.
 
