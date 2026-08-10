@@ -3,6 +3,7 @@ import path from "path";
 import { keyFingerprint, keyRestriction, keyRestrictionList, NO_RESTRICTION, summarizeKey } from "../authorizedKeys";
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
 import { notify } from "./notify";
+import { getState, saveState } from "./state";
 
 const KEY_FILE_HEADER = "# Managed by portsecure. Manual changes are reverted and reported.";
 
@@ -131,30 +132,62 @@ export async function archiveAuthorizedKeys(config: { filePath: string; reason: 
     return archivePath;
 }
 
-/** Puts the allowed keys back in place if anything else changed them. */
-export async function enforceRootKeys(config: { keys: string[]; reason: string }) {
-    let { keys, reason } = config;
+function sameKeys(one: string[], two: string[]) {
+    return one.length === two.length && one.every((key, index) => key === two[index]);
+}
+
+/** Puts the allowed keys in place, and says which of the two things happened.
+
+    Whether this was our own doing is decided by comparing what we want against what we last wrote,
+    not by guessing from whether a repo happened to change. A revocation changes what we want
+    without any repo changing, and reading that as somebody having edited the file was both wrong
+    and alarming. */
+export async function enforceRootKeys(keys: string[]) {
     if (!keys.length) {
         // No sources, or none of them readable. Writing an empty file would lock everyone out, so
         // whatever access is already in place stays exactly as it is.
         console.log(`No keys came from any source, leaving ${ROOT_AUTHORIZED_KEYS} as it is`);
         return;
     }
+    let state = getState();
     let currentKeys = await readAuthorizedKeysFile(ROOT_AUTHORIZED_KEYS);
-    let matches = currentKeys.length === keys.length && currentKeys.every((key, index) => key === keys[index]);
-    if (matches) {
+    if (!state.appliedKeys.length) {
+        // Nothing recorded yet, on a first start or an upgrade. Whatever is in the file is taken as
+        // ours, so the first check reports what actually changes rather than reintroducing every
+        // key that was already there.
+        state.appliedKeys = currentKeys;
+        await saveState();
+    }
+
+    if (sameKeys(currentKeys, keys)) {
+        if (!sameKeys(state.appliedKeys, keys)) {
+            state.appliedKeys = keys;
+            await saveState();
+        }
         return;
     }
-    let archivePath = await archiveAuthorizedKeys({ filePath: ROOT_AUTHORIZED_KEYS, reason });
+
+    let weChangedIt = !sameKeys(state.appliedKeys, keys);
+    let previouslyApplied = state.appliedKeys;
+    let archivePath = await archiveAuthorizedKeys({
+        filePath: ROOT_AUTHORIZED_KEYS,
+        reason: weChangedIt && "update" || "reverted",
+    });
     await writeAuthorizedKeysFile({ filePath: ROOT_AUTHORIZED_KEYS, keys });
-    let difference = describeKeyDifference({ before: currentKeys, after: keys });
-    let archiveNote = archivePath && `\nThe previous file is kept at \`${archivePath}\`.` || "";
-    if (reason === "repo") {
-        await notify(`root's authorized_keys was updated from the keys repo.\n\`\`\`\n${difference}\n\`\`\`${archiveNote}`);
+    state.appliedKeys = keys;
+    await saveState();
+    let archiveNote = archivePath && `\nThe file as it was is kept at \`${archivePath}\`.` || "";
+
+    if (weChangedIt) {
+        await notify(
+            `root's authorized_keys has been updated:`
+            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${archiveNote}`
+        );
         return;
     }
     await notify(
-        `root's authorized_keys was changed outside portsecure and has been reverted to the keys repo.`
-        + `\n\`\`\`\n${difference}\n\`\`\`${archiveNote}`
+        `root's authorized_keys was edited by something other than portsecure. The edit below has`
+        + ` been undone, and the keys from the repos are back in place.`
+        + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\`${archiveNote}`
     );
 }

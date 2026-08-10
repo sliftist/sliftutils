@@ -186,7 +186,9 @@ export async function recordRevocation(config: {
     }
     state.revocations[fingerprint] = {
         fingerprint, revocationId, unrevokeSeenAt: 0, unrevokeId: "", unrevoked: false,
-        reportedRemoved: false,
+        // The message below already says this machine has stopped accepting the key, so the one
+        // about noticing a revocation would only repeat it.
+        reportedRemoved: true,
     };
     await saveState();
     // What happened, then what was done about it, then what to do about it. In that order, because
@@ -297,14 +299,15 @@ export async function removeRevokedKeys(keys: string[]) {
             allowed.push(key);
             continue;
         }
-        // Said once, when the key actually goes, rather than every check for as long as it is gone.
+        // Said once, when the key actually goes, and only on a machine that is learning about the
+        // revocation from the repo. The machine that did the revoking already said so itself.
         let revocation = state.revocations[fingerprint];
         if (revocation && !revocation.reportedRemoved) {
             revocation.reportedRemoved = true;
             await saveState();
             await notify(
-                `\`${fingerprint}\` is revoked, so it has been removed from root's authorized_keys`
-                + ` and this machine no longer accepts it.`
+                `observed a revocation in the revoke repo for \`${fingerprint}\`, and removed that key`
+                + ` from root's authorized_keys. This machine no longer accepts it.`
             );
         }
     }
