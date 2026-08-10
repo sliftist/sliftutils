@@ -91,6 +91,19 @@ two it is gets reported:
 
 Either way it is reported once, not every time it is polled.
 
+## keys
+
+Derives a second ed25519 key from an existing one, by mixing a label into the source key's secret.
+The same label and source always give the same key, so a derived key is something you can work out
+again rather than something you have to keep a backup of.
+
+    yarn derivekey <label> <source-key> <derived-key>
+    yarn derivekey revokegithubkey ~/authorized_keys_access/id_ed25519 ~/authorized_keys_access/id_ed25519_revoke
+
+It writes an ordinary OpenSSH key pair, so the public key can be handed to anything that takes one.
+`deriveEd25519Key` in `deriveKey.ts` is the part to import elsewhere, and `sshKeyFile.ts` reads and
+writes the OpenSSH private key container that node itself cannot.
+
 ## helpers
 
 Shared plumbing: running commands over ssh, spawning child processes, and expanding `~`.

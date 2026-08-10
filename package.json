@@ -31,7 +31,8 @@
         "autohost": "node ./bin/autohost.js",
         "setupnotify": "node ./bin/setupnotify.js",
         "securessh": "node ./bin/securessh.js",
-        "signfiles": "node ./bin/signfiles.js"
+        "signfiles": "node ./bin/signfiles.js",
+        "derivekey": "node ./bin/derivekey.js"
     },
     "bin": {
         "filehoster": "./bin/filehoster.js",
@@ -51,7 +52,8 @@
         "sliftsetup": "./builders/setupRun.js",
         "setupnotify": "./bin/setupnotify.js",
         "securessh": "./bin/securessh.js",
-        "signfiles": "./bin/signfiles.js"
+        "signfiles": "./bin/signfiles.js",
+        "derivekey": "./bin/derivekey.js"
     },
     "dependencies": {
         "@types/chrome": "^0.0.237",
