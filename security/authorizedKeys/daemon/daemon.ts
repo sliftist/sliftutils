@@ -14,7 +14,7 @@ import { enforceRootKeys } from "./rootKeys";
 import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
 import { resolveSourceKeys } from "./trust";
-import { parseAuthLog, readNewAuthLog } from "./authLog";
+import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
 import { absorbRevocations, applyUnrevokes, recordRevocation, removeRevokedKeys, syncRevokeRepo } from "./revocation";
 import { keyFingerprint } from "../authorizedKeys";
 import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
@@ -157,24 +157,41 @@ async function queueRefusedKeys(allowedKeys: string[]) {
     await saveState();
 }
 
+// The log watcher and the periodic check both reach this, and two of them pushing to the same
+// revoke repo at once would only fight each other.
+let writingQueued = false;
+
 /** Writes down everything queued that we have not managed to write down yet. */
 async function writeQueuedRevocations() {
     let state = getState();
-    if (!state.pendingRevocations.length) {
+    if (!state.pendingRevocations.length || writingQueued) {
         return;
     }
-    let remaining = [];
-    for (let pending of state.pendingRevocations) {
-        if (state.revocations[pending.fingerprint]) {
-            continue;
+    writingQueued = true;
+    try {
+        let remaining = [];
+        for (let pending of state.pendingRevocations) {
+            if (state.revocations[pending.fingerprint]) {
+                continue;
+            }
+            let recorded = await recordRevocation({ ...pending, hostLabel: config.hostLabel });
+            if (!recorded && !state.revocations[pending.fingerprint]) {
+                remaining.push(pending);
+            }
         }
-        let recorded = await recordRevocation({ ...pending, hostLabel: config.hostLabel });
-        if (!recorded && !state.revocations[pending.fingerprint]) {
-            remaining.push(pending);
-        }
+        state.pendingRevocations = remaining;
+        await saveState();
+    } finally {
+        writingQueued = false;
     }
-    state.pendingRevocations = remaining;
-    await saveState();
+}
+
+/** Everything the arrival of a refused login needs: read what is new, queue it, write it down.
+    Kept small, and off the merged key set the periodic check rebuilds, so reacting to a log line
+    cannot race that check. */
+async function onAuthLogChanged() {
+    await queueRefusedKeys(getState().appliedKeys);
+    await writeQueuedRevocations();
 }
 
 /** Syncs one source. Returns whether the merged keys need reapplying. */
@@ -238,7 +255,8 @@ async function everyCheck() {
     await applyUnrevokes(config.repoSources);
 
     let mergedKeys = await readAllowedKeys();
-    await queueRefusedKeys(mergedKeys);
+    // The log is watched, not polled. This is only the retry for anything that could not be
+    // written down when it happened, because the revoke repo was unreachable.
     await writeQueuedRevocations();
 
     await enforceRootKeys(await removeRevokedKeys(mergedKeys));
@@ -296,6 +314,11 @@ export async function main() {
     // configureDiscordNotifications watches the webhook file on its own, so there is nothing to
     // schedule for it here.
     startInterval({ name: "check", intervalTime: CHECK_INTERVAL, run: everyCheck });
+
+    // A refused login is acted on when sshd writes it. The one pass here covers anything written
+    // while the daemon was not running.
+    let readAuthLogNow = watchAuthLog(onAuthLogChanged);
+    await readAuthLogNow();
 }
 
 process.on("uncaughtException", e => console.log(`Uncaught exception, staying up. ${e && e.stack || e}`));

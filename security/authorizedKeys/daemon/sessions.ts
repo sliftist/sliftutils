@@ -71,9 +71,11 @@ export async function endSessionsUsingKey(fingerprint: string) {
     return ended;
 }
 
-/** The listener has to survive, or nobody can get back in. Every openssh since 9.8 runs each
-    connection as a separate sshd-session, and on older ones the listener is the sshd that systemd
-    started directly and runs with -D. */
+/** Whether this process is one connection. The listener is not a connection - it is the process
+    that accepts them - so it is not a candidate here at all.
+
+    Every openssh since 9.8 runs each connection as its own sshd-session. On older ones connections
+    are named sshd too, and the listener is the one systemd started directly with -D. */
 async function isConnectionProcess(processId: number) {
     let name: string;
     try {
