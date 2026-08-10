@@ -36,16 +36,26 @@ export async function listRepoFiles(repoPath: string) {
         .sort();
 }
 
-export async function hashFile(filePath: string) {
-    return crypto.createHash("sha256").update(await fs.readFile(filePath)).digest("hex");
+/** A Windows checkout turns LF into CRLF, so the same commit hashes differently there than it
+    does on the machine that pulls it. Normalising first makes the digest describe the content
+    rather than whichever checkout produced it. latin1 round trips every byte, so this is safe on
+    files that are not text. */
+export function normalizeContent(contents: Buffer) {
+    return Buffer.from(contents.toString("latin1").replace(/\r\n/g, "\n"), "latin1");
+}
+
+/** The size and hash of a file's normalised content. The size is the normalised one on purpose,
+    so it agrees with the hash rather than with whatever the local checkout happens to hold. */
+export async function digestFile(filePath: string) {
+    let contents = normalizeContent(await fs.readFile(filePath));
+    return { size: contents.length, sha256: crypto.createHash("sha256").update(contents).digest("hex") };
 }
 
 export async function buildManifest(repoPath: string) {
     let files: Manifest["files"] = [];
     for (let relativePath of await listRepoFiles(repoPath)) {
-        let fullPath = path.join(repoPath, relativePath);
-        let stats = await fs.stat(fullPath);
-        files.push({ path: relativePath, size: stats.size, sha256: await hashFile(fullPath) });
+        let digest = await digestFile(path.join(repoPath, relativePath));
+        files.push({ path: relativePath, size: digest.size, sha256: digest.sha256 });
     }
     return { version: MANIFEST_VERSION, files };
 }

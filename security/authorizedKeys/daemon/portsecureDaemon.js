@@ -546,12 +546,11 @@ async function verifyManifestMatchesFiles(repoPath) {
     }
     for (let filePath of actual) {
         let expected = listed.get(filePath);
-        let fullPath = path.join(repoPath, filePath);
-        let stats = await fs.stat(fullPath);
-        if (stats.size !== expected.size) {
-            throw new Error(`Expected ${filePath} to be ${expected.size} bytes, was ${stats.size}`);
+        let contents = normalizeContent(await fs.readFile(path.join(repoPath, filePath)));
+        if (contents.length !== expected.size) {
+            throw new Error(`Expected ${filePath} to be ${expected.size} bytes, was ${contents.length}`);
         }
-        let hash = crypto.createHash("sha256").update(await fs.readFile(fullPath)).digest("hex");
+        let hash = crypto.createHash("sha256").update(contents).digest("hex");
         if (hash !== expected.sha256) {
             throw new Error(`Expected ${filePath} to hash to ${expected.sha256}, was ${hash}`);
         }
@@ -575,6 +574,13 @@ function publicKeyFromSignature(signatureText) {
     let keyType = readSSHString(publicKey, 0).toString();
     let fingerprint = "SHA256:" + crypto.createHash("sha256").update(publicKey).digest("base64").replace(/=+$/, "");
     return { publicKey: `${keyType} ${publicKey.toString("base64")}`, fingerprint };
+}
+
+/** PORTED CODE: matches normalizeContent in security/signedFiles/manifest.ts. A Windows checkout
+    turns LF into CRLF, so hashing raw bytes makes the same commit hash differently depending on
+    where it was signed. latin1 round trips every byte, so this is safe on files that are not text. */
+function normalizeContent(contents) {
+    return Buffer.from(contents.toString("latin1").replace(/\r\n/g, "\n"), "latin1");
 }
 
 function hashBytes(contents) {
@@ -610,7 +616,9 @@ async function verifyCheckoutSigner(config) {
     let result = await spawnPromise({
         command: "ssh-keygen",
         args: ["-Y", "check-novalidate", "-n", SIGN_NAMESPACE, "-s", path.join(repoPath, SIGNATURE_NAME)],
-        input: files.manifest.toString("utf8"),
+        // The signature covers the normalised bytes, so a checkout that arrived with CRLF still
+        // verifies rather than looking like tampering.
+        input: normalizeContent(files.manifest).toString("utf8"),
     });
     if (result.status !== 0) {
         throw new Error(`the signature over ${MANIFEST_NAME} does not verify: ${(result.stderr || "").trim().slice(0, MAX_ERROR_BODY_LENGTH)}`);

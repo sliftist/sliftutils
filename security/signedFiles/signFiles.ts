@@ -27,9 +27,10 @@ async function pathExists(filePath: string) {
     }
 }
 
-async function run(config: { command: string; args: string[]; cwd?: string; interactive?: boolean }) {
-    let { command, args, cwd, interactive } = config;
-    let result = await spawnPromise({ command, args, cwd, inheritStderr: interactive });
+async function run(config: { command: string; args: string[]; cwd?: string; interactive?: boolean; stdinFile?: string }) {
+    let { command, args, cwd, interactive, stdinFile } = config;
+    let input = stdinFile && await fs.readFile(stdinFile, "utf8") || undefined;
+    let result = await spawnPromise({ command, args, cwd, input, inheritStderr: interactive });
     if (result.error) {
         throw new Error(`Expected ${command} to run, failed with ${result.error.message}`);
     }
@@ -95,16 +96,31 @@ export async function main() {
     }
 
     let manifest = await buildManifest(repoPath);
-    let manifestPath = path.join(repoPath, MANIFEST_NAME);
-    await fs.writeFile(manifestPath, formatManifest(manifest));
     console.log(`${MANIFEST_NAME} covers ${manifest.files.length} file(s) in ${repoPath}`);
+
+    // The manifest is built and signed away from the repo, and only moved in once both exist.
+    // Landing a new manifest next to an old signature produces a pair that can never verify, and
+    // the daemon reading it can only treat that as tampering.
+    let stagingDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "signfiles-"));
+    let stagedManifest = path.join(stagingDirectory, MANIFEST_NAME);
+    let stagedSignature = `${stagedManifest}.sig`;
+    await fs.writeFile(stagedManifest, formatManifest(manifest));
 
     // Signing happens before any git work, so a failed push never costs a second touch of the key.
     await run({
         command: "ssh-keygen",
-        args: ["-Y", "sign", "-f", signingKey, "-n", SIGN_NAMESPACE, manifestPath],
+        args: ["-Y", "sign", "-f", signingKey, "-n", SIGN_NAMESPACE, stagedManifest],
         interactive: true,
     });
+    // Checked here rather than discovered by a machine that has already pulled it.
+    await run({
+        command: "ssh-keygen",
+        args: ["-Y", "check-novalidate", "-n", SIGN_NAMESPACE, "-s", stagedSignature, "-I", "signfiles"],
+        stdinFile: stagedManifest,
+    });
+    await fs.copyFile(stagedManifest, path.join(repoPath, MANIFEST_NAME));
+    await fs.copyFile(stagedSignature, path.join(repoPath, SIGNATURE_NAME));
+    await fs.rm(stagingDirectory, { recursive: true, force: true });
     console.log(`Signed with ${await publicKeyOf(signingKey)}`);
 
     if (!pushToGit) {
