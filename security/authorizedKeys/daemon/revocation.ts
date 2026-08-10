@@ -189,10 +189,16 @@ export async function recordRevocation(config: {
         reportedRemoved: false,
     };
     await saveState();
+    // What happened, then what was done about it, then what to do about it. In that order, because
+    // whoever reads this needs to know which of those two things it was before anything else.
     await notify(
-        `revoked \`${keyLine && summarizeKey(keyLine) || fingerprint}\` (\`${fingerprint}\`) after it was`
-        + ` used from \`${attempt.ip}\`, which its from= restriction does not allow (user`
-        + ` \`${attempt.user}\`, allowed \`${attempt.required}\`). Every machine will stop accepting it.`
+        `**AUTHENTICATED ACCESS FROM AN UNAPPROVED IP.** The key was correct, so either someone`
+        + ` else has this key, or a developer's IP has changed.`
+        + `\nkey \`${keyLine && summarizeKey(keyLine) || fingerprint}\` (\`${fingerprint}\`)`
+        + `\ntried from \`${attempt.ip}\` as user \`${attempt.user}\``
+        + `\nonly allowed from \`${attempt.required}\``
+        + `\n\nThat key is now revoked. Every machine will remove it from root's authorized_keys and`
+        + ` stop accepting it, from any address.`
         + `\n\nIf this really was an attack, IMMEDIATELY remove that key from \`${sourceURL}\`.`
         + `\nIf it was legitimate use, run this in \`${sourceURL}\` and deploy it as normal:`
         + `\n\`\`\`\nyarn unrevoke\nyarn signfiles git\n\`\`\``
