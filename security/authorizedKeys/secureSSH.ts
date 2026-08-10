@@ -8,9 +8,12 @@ import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
 import { readRemoteFile, remoteCommandExists, runOverSSH, SUDO_PREAMBLE, writeRemoteFile } from "../helpers/remoteSSH";
 
-const DAEMON_SOURCE = path.join(__dirname, "daemon", "portsecureDaemon.js");
 const SERVICE_SOURCE = path.join(__dirname, "daemon", "portsecure.service");
-const REMOTE_DAEMON_PATH = "/opt/portsecure/portsecure-daemon.js";
+// The daemon runs from a checkout of this repo on the host, rather than from a copy we upload, so
+// a host updates itself from github the same way anything else does. sliftutils is public, so this
+// needs no key.
+const SLIFTUTILS_URL = "https://github.com/sliftist/sliftutils.git";
+const REMOTE_CHECKOUT_PATH = "/opt/portsecure/sliftutils";
 const REMOTE_SERVICE_PATH = "/etc/systemd/system/portsecure.service";
 const REMOTE_CONFIG_PATH = "/etc/portsecure/daemon.json";
 const ROOT_AUTHORIZED_KEYS = "/root/.ssh/authorized_keys";
@@ -188,11 +191,29 @@ fi`,
 
 async function installDaemon(config: { host: string; hostLabel: string; repoSources: string[] }) {
     let { host, hostLabel, repoSources } = config;
-    for (let command of ["node", "git"]) {
+    for (let command of ["node", "git", "yarn"]) {
         if (!await remoteCommandExists({ host, command })) {
             throw new Error(`Expected ${command} to be installed on ${host}, it is not. Install it and rerun.`);
         }
     }
+
+    // The checkout is brought to the latest commit rather than a copy being pushed, so what runs on
+    // the host is exactly what is on github.
+    console.log(`Updating ${REMOTE_CHECKOUT_PATH} on ${host}`);
+    await runOverSSH({
+        host,
+        script: `${SUDO_PREAMBLE}
+set -e
+$SUDO mkdir -p "${path.posix.dirname(REMOTE_CHECKOUT_PATH)}"
+if $SUDO test -d "${REMOTE_CHECKOUT_PATH}/.git"; then
+    $SUDO git -C "${REMOTE_CHECKOUT_PATH}" fetch --prune origin
+    $SUDO git -C "${REMOTE_CHECKOUT_PATH}" reset --hard origin/HEAD
+else
+    $SUDO rm -rf "${REMOTE_CHECKOUT_PATH}"
+    $SUDO git clone "${SLIFTUTILS_URL}" "${REMOTE_CHECKOUT_PATH}"
+fi
+$SUDO yarn --cwd "${REMOTE_CHECKOUT_PATH}" install --production --non-interactive`,
+    });
     await writeRemoteFile({
         host,
         filePath: REMOTE_CONFIG_PATH,
@@ -201,13 +222,6 @@ async function installDaemon(config: { host: string; hostLabel: string; repoSour
         contents: JSON.stringify({ hostLabel, repoSources }, undefined, 4) + "\n",
         fileMode: "600",
         directoryMode: "700",
-    });
-    await writeRemoteFile({
-        host,
-        filePath: REMOTE_DAEMON_PATH,
-        contents: await fs.readFile(DAEMON_SOURCE, "utf8"),
-        fileMode: "755",
-        directoryMode: "755",
     });
     await writeRemoteFile({
         host,
@@ -382,6 +396,14 @@ async function pullLocalCheckout() {
             `Expected git pull in ${repoPath} to succeed, it did not, so nothing was installed.\n`
             + `${(pull.stdout + pull.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
+    }
+    // The host installs from github, not from here, so local commits that have not been pushed
+    // are not what it will run.
+    let local = await spawnPromise({ command: "git", args: ["rev-parse", "HEAD"], cwd: repoPath });
+    let remote = await spawnPromise({ command: "git", args: ["rev-parse", "@{u}"], cwd: repoPath });
+    if (local.stdout.trim() !== remote.stdout.trim()) {
+        console.log(`WARNING: ${repoPath} has commits that are not pushed. The host installs from github,`);
+        console.log(`         so it will run the pushed version, not what is here.`);
     }
     console.log(`Pulled ${repoPath}`);
 }

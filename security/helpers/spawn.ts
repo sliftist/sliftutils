@@ -12,8 +12,9 @@ export function spawnPromise(config: {
     cwd?: string;
     input?: string;
     inheritStderr?: boolean;
+    timeoutTime?: number;
 }) {
-    let { command, args, cwd, input, inheritStderr } = config;
+    let { command, args, cwd, input, inheritStderr, timeoutTime } = config;
     return new Promise<{ stdout: string; stderr: string; status: number | undefined; error: Error | undefined }>(resolve => {
         let child = spawn(command, args, {
             cwd,
@@ -21,6 +22,9 @@ export function spawnPromise(config: {
         });
         let stdout = "";
         let stderr = "";
+        // A command that never returns would otherwise hold up everything behind it.
+        let timer = timeoutTime && setTimeout(() => child.kill("SIGKILL"), timeoutTime) || undefined;
+        child.on("close", () => timer && clearTimeout(timer));
         child.stdout?.on("data", chunk => stdout += chunk);
         child.stderr?.on("data", chunk => stderr += chunk);
         child.on("error", error => resolve({ stdout, stderr, status: undefined, error }));

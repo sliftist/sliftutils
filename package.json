@@ -53,7 +53,8 @@
         "setupnotify": "./bin/setupnotify.js",
         "securessh": "./bin/securessh.js",
         "signfiles": "./bin/signfiles.js",
-        "derivekey": "./bin/derivekey.js"
+        "derivekey": "./bin/derivekey.js",
+        "portsecuredaemon": "./bin/portsecuredaemon.js"
     },
     "dependencies": {
         "@types/chrome": "^0.0.237",
