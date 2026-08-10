@@ -16,10 +16,14 @@ export function log(message: string) {
 // success, errors, retries and recoveries all belong in log() instead. The complete list of cases
 // that are allowed to notify is at the top of daemon.ts.
 export async function notify(message: string) {
+    let full = `**portsecure [${hostLabelValue || os.hostname()}]**: ${message}`;
+    // Logged before it is sent, and whether or not it arrives, so the journal is a complete record
+    // of what this machine had to say even when Discord is unreachable or the webhook is wrong.
+    log(`Discord: ${full}`);
     try {
-        await sendDiscordNotification(`**portsecure [${hostLabelValue || os.hostname()}]**: ${message}`);
+        await sendDiscordNotification(full);
     } catch (e) {
         // A failed notification must never take the daemon down, the local log is the fallback.
-        log(`Failed to send Discord notification. ${e}`);
+        log(`Failed to send the Discord notification above. ${e}`);
     }
 }
