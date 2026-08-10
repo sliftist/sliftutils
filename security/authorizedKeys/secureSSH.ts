@@ -363,9 +363,34 @@ $SUDO rm -rf "${sourceRepoPath(repoURL)}"`,
 
 /** Answers "who can log into this box, and which repo says so". The paths the daemon uses are
     left out on purpose, they are plumbing rather than something to act on. */
+/** The daemon is installed from this checkout, so the checkout is brought up to date first.
+    Anything that stops the pull - a conflict, local commits, no upstream - stops the update too,
+    rather than quietly installing whatever happened to be on disk. */
+async function pullLocalCheckout() {
+    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"], cwd: __dirname });
+    if (topLevel.status !== 0) {
+        throw new Error(
+            `Expected ${__dirname} to be inside a git checkout, it is not.`
+            + ` update installs the daemon from this checkout, so it has to be one.`
+        );
+    }
+    let repoPath = topLevel.stdout.trim();
+    let pull = await spawnPromise({ command: "git", args: ["pull", "--ff-only"], cwd: repoPath });
+    if (pull.status !== 0) {
+        throw new Error(
+            `Expected git pull in ${repoPath} to succeed, it did not, so nothing was installed.\n`
+            + `${(pull.stdout + pull.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
+        );
+    }
+    console.log(`Pulled ${repoPath}`);
+}
+
 /** Pushes the current daemon onto a host that already has one, for when this code has moved on.
     Nothing about which keys the host trusts is touched. */
 async function updateDaemon(host: string) {
+    // Pulled before anything else, so a checkout that cannot be brought up to date fails here
+    // rather than after we have already started changing the host.
+    await pullLocalCheckout();
     let contents = await readRemoteFile({ host, filePath: REMOTE_CONFIG_PATH });
     if (!contents) {
         throw new Error(
