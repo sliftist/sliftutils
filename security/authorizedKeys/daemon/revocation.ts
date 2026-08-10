@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { keyFingerprint } from "../authorizedKeys";
+import { keyFingerprint, summarizeKey } from "../authorizedKeys";
 import { deriveRevokeKey, revokeKeyPath, revokeRepoPath, revokeRepoURL } from "../revokeSource";
 import { sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, repoIsUsable, runGit } from "./git";
@@ -184,9 +184,12 @@ export async function recordRevocation(config: {
     };
     await saveState();
     await notify(
-        `revoked \`${fingerprint}\` after it was used from \`${attempt.ip}\`, which its from= restriction`
-        + ` does not allow (user \`${attempt.user}\`, allowed \`${attempt.required}\`).`
-        + ` Every machine will stop accepting this key.`
+        `revoked \`${keyLine && summarizeKey(keyLine) || fingerprint}\` (\`${fingerprint}\`) after it was`
+        + ` used from \`${attempt.ip}\`, which its from= restriction does not allow (user`
+        + ` \`${attempt.user}\`, allowed \`${attempt.required}\`). Every machine will stop accepting it.`
+        + `\n\nIf this really was an attack, IMMEDIATELY remove that key from \`${sourceURL}\`.`
+        + `\nIf it was legitimate use, run this in \`${sourceURL}\` and deploy it as normal:`
+        + `\n\`\`\`\nyarn unrevoke\nyarn signfiles git\n\`\`\``
     );
     return true;
 }
