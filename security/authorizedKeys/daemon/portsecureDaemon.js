@@ -16,6 +16,9 @@
 //   3. Another user's authorized_keys changed.
 //   4. The keys repo history was rewritten.
 //   4b. A source started being signed by a different key, so its new keys are being held.
+//   4c. A source is now signed when it was not before, applied right away.
+//   4d. A source changed without its signature being updated, so the change is ignored.
+//   4e. A source has a corrupted signature, so its contents are ignored.
 //   5. The webhook file itself changed, reported to the webhook being replaced.
 
 const fs = require("fs/promises");
@@ -328,6 +331,12 @@ function sourceState(repoURL) {
         accepted: false,
         acceptedSigner: UNSIGNED,
         acceptedKeys: [],
+        // What the signature files looked like when we accepted them, which tells a signature
+        // nobody updated apart from one that is broken.
+        acceptedManifestHash: "",
+        acceptedSignatureHash: "",
+        // The signature problem we last reported, so a lasting fault is not reported every poll.
+        reportedProblem: "",
         // A signer we have seen but not accepted yet, and when we first saw it.
         pendingSigner: UNSIGNED,
         pendingSince: 0,
@@ -548,39 +557,92 @@ async function verifyManifestMatchesFiles(repoPath) {
         }
     }
 }
+function readSSHString(buffer, offset) {
+    let length = buffer.readUInt32BE(offset);
+    return buffer.subarray(offset + 4, offset + 4 + length);
+}
+
+/** The signature carries the public key that made it, so the key itself can be reported rather
+    than only a fingerprint. Returns it in the usual "type base64" form. */
+function publicKeyFromSignature(signatureText) {
+    let body = signatureText.split("\n").filter(line => line && !line.startsWith("-----")).join("");
+    let blob = Buffer.from(body, "base64");
+    if (blob.subarray(0, 6).toString() !== "SSHSIG") {
+        throw new Error(`Expected an SSHSIG signature, started with ${blob.subarray(0, 6).toString()}`);
+    }
+    // The magic, then a uint32 version, then the public key.
+    let publicKey = readSSHString(blob, 6 + 4);
+    let keyType = readSSHString(publicKey, 0).toString();
+    let fingerprint = "SHA256:" + crypto.createHash("sha256").update(publicKey).digest("base64").replace(/=+$/, "");
+    return { publicKey: `${keyType} ${publicKey.toString("base64")}`, fingerprint };
+}
+
+function hashBytes(contents) {
+    return crypto.createHash("sha256").update(contents).digest("hex");
+}
+
+/** The manifest and signature as they stand, whether or not they are any good. The hashes are
+    what tell a signature that was never updated apart from one that is broken. */
+async function readSignatureFiles(repoPath) {
+    let manifestPath = path.join(repoPath, MANIFEST_NAME);
+    let signaturePath = path.join(repoPath, SIGNATURE_NAME);
+    let manifest = await pathExists(manifestPath) && await fs.readFile(manifestPath) || undefined;
+    let signature = await pathExists(signaturePath) && await fs.readFile(signaturePath) || undefined;
+    return {
+        manifest,
+        signature,
+        manifestHash: manifest && hashBytes(manifest) || "",
+        signatureHash: signature && hashBytes(signature) || "",
+    };
+}
 
 /** Who signed this checkout. Returns UNSIGNED when there is no signature at all, and throws when
     there is one that does not hold up - an unverifiable signature is never treated as an identity,
     so it can never become something we accept. */
-async function readCheckoutSigner(repoPath) {
-    let manifestPath = path.join(repoPath, MANIFEST_NAME);
-    let signaturePath = path.join(repoPath, SIGNATURE_NAME);
-    let hasManifest = await pathExists(manifestPath);
-    let hasSignature = await pathExists(signaturePath);
-    if (!hasManifest && !hasSignature) {
+async function verifyCheckoutSigner(config) {
+    let { repoPath, files } = config;
+    if (!files.manifest && !files.signature) {
         return UNSIGNED;
     }
-    if (!hasManifest || !hasSignature) {
+    if (!files.manifest || !files.signature) {
         throw new Error(`Expected both ${MANIFEST_NAME} and ${SIGNATURE_NAME}, only one is present`);
     }
     let result = await spawnPromise({
         command: "ssh-keygen",
-        args: ["-Y", "check-novalidate", "-n", SIGN_NAMESPACE, "-s", signaturePath],
-        input: await fs.readFile(manifestPath, "utf8"),
+        args: ["-Y", "check-novalidate", "-n", SIGN_NAMESPACE, "-s", path.join(repoPath, SIGNATURE_NAME)],
+        input: files.manifest.toString("utf8"),
     });
     if (result.status !== 0) {
-        throw new Error(`Expected a valid signature over ${MANIFEST_NAME}, ssh-keygen said ${(result.stderr || "").trim().slice(0, MAX_ERROR_BODY_LENGTH)}`);
+        throw new Error(`the signature over ${MANIFEST_NAME} does not verify: ${(result.stderr || "").trim().slice(0, MAX_ERROR_BODY_LENGTH)}`);
     }
-    let match = `${result.stdout} ${result.stderr}`.match(/(SHA256:[A-Za-z0-9+/=]+)/);
-    if (!match) {
-        throw new Error(`Expected a signer fingerprint from ssh-keygen, was ${result.stdout.slice(0, MAX_ERROR_BODY_LENGTH)}`);
+    let reported = `${result.stdout} ${result.stderr}`.match(/(SHA256:[A-Za-z0-9+/=]+)/);
+    if (!reported) {
+        throw new Error(`ssh-keygen reported no signer fingerprint, said ${result.stdout.slice(0, MAX_ERROR_BODY_LENGTH)}`);
+    }
+    let { publicKey, fingerprint } = publicKeyFromSignature(files.signature.toString("utf8"));
+    // The key we read out of the signature has to be the one ssh-keygen just checked against,
+    // otherwise we would be reporting an identity that did not sign anything.
+    if (fingerprint !== reported[1]) {
+        throw new Error(`the signing key reads as ${fingerprint} but ssh-keygen verified ${reported[1]}`);
     }
     await verifyManifestMatchesFiles(repoPath);
-    return match[1];
+    return publicKey;
 }
 
 function describeSigner(signer) {
-    return signer === UNSIGNED && "unsigned" || signer;
+    return signer === UNSIGNED && "<no public key>" || signer;
+}
+
+/** Reports a problem with a source's signature, but only when it is not the same problem we
+    already reported, so a fault that persists does not repeat every poll. */
+async function reportProblem(config) {
+    let { sourceStateValue, problem, message } = config;
+    if (sourceStateValue.reportedProblem === problem) {
+        return;
+    }
+    sourceStateValue.reportedProblem = problem;
+    await saveState();
+    await notify(message);
 }
 
 /** The keys a source is allowed to contribute right now. A source signed by someone we have not
@@ -588,39 +650,73 @@ function describeSigner(signer) {
 async function resolveSourceKeys(repoURL) {
     let sourceStateValue = sourceState(repoURL);
     let repoPath = sourceRepoPath(repoURL);
+    let files = await readSignatureFiles(repoPath);
 
     let signer;
     try {
-        signer = await readCheckoutSigner(repoPath);
+        signer = await verifyCheckoutSigner({ repoPath, files });
     } catch (e) {
-        // Nothing here is trustworthy, so nothing here is used.
-        log(`Ignoring the contents of ${repoURL}, its signature does not hold up. ${e}`);
+        // Nothing here is trustworthy, so nothing here is used. Which of the two problems it is
+        // depends on whether the signature is simply the one we already accepted.
+        let unchanged = files.manifestHash === sourceStateValue.acceptedManifestHash
+            && files.signatureHash === sourceStateValue.acceptedSignatureHash;
+        if (unchanged) {
+            await reportProblem({
+                sourceStateValue,
+                problem: "stale",
+                message: `\`${repoURL}\` changed but its signature was not updated, so the changes are being`
+                    + ` ignored. Still using the keys signed by \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
+                    + ` Run signfiles in that repo.`,
+            });
+        } else {
+            await reportProblem({
+                sourceStateValue,
+                problem: "corrupt",
+                message: `\`${repoURL}\` has a corrupted signature, so its contents are being ignored:`
+                    + ` ${e}.\nStill using the keys signed by \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`,
+            });
+        }
         return sourceStateValue.acceptedKeys;
+    }
+    if (sourceStateValue.reportedProblem) {
+        sourceStateValue.reportedProblem = "";
+        await saveState();
     }
     let checkoutKeys = await readCheckoutKeys(repoPath);
 
-    // Nothing has ever been accepted from this source, so this is what we start trusting.
-    if (!sourceStateValue.accepted) {
+    let accept = async () => {
         sourceStateValue.accepted = true;
         sourceStateValue.acceptedSigner = signer;
         sourceStateValue.acceptedKeys = checkoutKeys;
+        sourceStateValue.acceptedManifestHash = files.manifestHash;
+        sourceStateValue.acceptedSignatureHash = files.signatureHash;
         sourceStateValue.pendingSigner = UNSIGNED;
         sourceStateValue.pendingSince = 0;
-        log(`Trusting ${repoURL} as signed by ${describeSigner(signer)}`);
         await saveState();
         return checkoutKeys;
+    };
+
+    // Nothing has ever been accepted from this source, so this is what we start trusting.
+    if (!sourceStateValue.accepted) {
+        log(`Trusting ${repoURL} as signed by ${describeSigner(signer)}`);
+        return await accept();
     }
 
     if (signer === sourceStateValue.acceptedSigner) {
         // Back to the signer we already trust, so anything we were waiting on is moot.
         if (sourceStateValue.pendingSince) {
-            log(`${repoURL} is signed by ${describeSigner(signer)} again, dropping the pending change`);
-            sourceStateValue.pendingSigner = UNSIGNED;
-            sourceStateValue.pendingSince = 0;
+            log(`${repoURL} is signed by its accepted key again, dropping the pending change`);
         }
-        sourceStateValue.acceptedKeys = checkoutKeys;
-        await saveState();
-        return checkoutKeys;
+        return await accept();
+    }
+
+    // Going from nothing to something signed is only ever an improvement, so it does not wait.
+    if (sourceStateValue.acceptedSigner === UNSIGNED) {
+        await notify(
+            `\`${repoURL}\` is now signed, by \`${signer}\`. It was not signed before, so its keys are`
+            + ` being applied right away.`
+        );
+        return await accept();
     }
 
     // A signer we have not accepted. Anything new restarts the wait, so publishing twice in a row
@@ -631,27 +727,20 @@ async function resolveSourceKeys(repoURL) {
         sourceStateValue.pendingSince = Date.now();
         await saveState();
         await notify(
-            `\`${repoURL}\` is now signed by ${describeSigner(signer)}, which last signed as`
-            + ` ${describeSigner(sourceStateValue.acceptedSigner)}. Its keys are NOT being applied.`
+            `\`${repoURL}\` is now signed by \`${describeSigner(signer)}\`, where it was signed by`
+            + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`. Its keys are NOT being applied.`
             + ` If nothing changes they will be applied in 24 hours.`
         );
         return sourceStateValue.acceptedKeys;
     }
 
-    let waited = Date.now() - sourceStateValue.pendingSince;
-    if (waited < SIGNER_CHANGE_DELAY) {
+    if (Date.now() - sourceStateValue.pendingSince < SIGNER_CHANGE_DELAY) {
         return sourceStateValue.acceptedKeys;
     }
 
     // Same new signer, 24 hours later, and nobody stopped it.
     log(`Accepting ${describeSigner(signer)} for ${repoURL} after the ${SIGNER_CHANGE_DELAY}ms wait`);
-    sourceStateValue.accepted = true;
-    sourceStateValue.acceptedSigner = signer;
-    sourceStateValue.acceptedKeys = checkoutKeys;
-    sourceStateValue.pendingSigner = UNSIGNED;
-    sourceStateValue.pendingSince = 0;
-    await saveState();
-    return checkoutKeys;
+    return await accept();
 }
 
 /** The union of every source, in source order, with duplicates dropped. A source that cannot be
@@ -1007,7 +1096,9 @@ module.exports = {
     parseWebhookFile,
     readRepoKeys,
     readCheckoutKeys,
-    readCheckoutSigner,
+    verifyCheckoutSigner,
+    readSignatureFiles,
+    publicKeyFromSignature,
     verifyManifestMatchesFiles,
     resolveSourceKeys,
     sourceName,

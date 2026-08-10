@@ -60,13 +60,15 @@ async function ensureDefaultKey() {
     return keyPath;
 }
 
-async function fingerprintOf(keyPath: string) {
-    let result = await run({ command: "ssh-keygen", args: ["-lf", `${keyPath}.pub`] });
-    let match = result.stdout.match(/(SHA256:[A-Za-z0-9+/=]+)/);
-    if (!match) {
-        throw new Error(`Expected a fingerprint for ${keyPath}.pub, was ${result.stdout.slice(0, MAX_ERROR_BODY_LENGTH)}`);
+/** The public key in the form the daemon reports it, so what is printed here can be compared
+    against what arrives on Discord. */
+async function publicKeyOf(keyPath: string) {
+    let contents = await fs.readFile(`${keyPath}.pub`, "utf8");
+    let [keyType, keyBody] = contents.trim().split(/\s+/);
+    if (!keyType || !keyBody) {
+        throw new Error(`Expected a public key in ${keyPath}.pub, was ${contents.slice(0, MAX_ERROR_BODY_LENGTH)}`);
     }
-    return match[1];
+    return `${keyType} ${keyBody}`;
 }
 
 function parseArgs(argv: string[]) {
@@ -103,7 +105,7 @@ export async function main() {
         args: ["-Y", "sign", "-f", signingKey, "-n", SIGN_NAMESPACE, manifestPath],
         interactive: true,
     });
-    console.log(`Signed with ${await fingerprintOf(signingKey)}`);
+    console.log(`Signed with ${await publicKeyOf(signingKey)}`);
 
     if (!pushToGit) {
         console.log(`Commit and push ${MANIFEST_NAME} and ${SIGNATURE_NAME} for anything to see them.`);

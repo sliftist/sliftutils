@@ -67,10 +67,21 @@ When a source starts being signed by a different key, the daemon warns on Discor
 applying the keys it last accepted. It applies the new ones only after 24 hours of that same new
 signer. Any different signer restarts the wait, so publishing twice in a row gains nothing, and a
 return to the accepted signer cancels it. Losing a signature entirely counts as a change too, so
-stripping it does not get anything through faster.
+stripping it does not get anything through faster. Going the other way, from unsigned to signed,
+is only ever an improvement and applies right away.
+
+Every one of those messages names the public key, in the same `type base64` form `signfiles`
+prints, or `<no public key>` when there is none.
 
 A signature that does not verify, or a manifest that does not match the files on disk, is never
-treated as an identity - that content is ignored and the last accepted keys stay.
+treated as an identity - that content is ignored and the last accepted keys stay. Which of the
+two it is gets reported:
+
+- the signature is byte for byte the one we already accepted, so the repo changed and nobody
+  re-signed it. The changes are ignored until someone runs `signfiles` again.
+- the signature did change and does not hold up, so it is corrupt.
+
+Either way it is reported once, not every time it is polled.
 
 ## helpers
 
