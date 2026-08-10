@@ -4,6 +4,8 @@ import path from "path";
 import { DEFAULT_WEBHOOK_FILE_PATH, parseWebhookFile } from "../notifications/discord";
 import { normalizeKeys, readRepoKeys, summarizeKey } from "./authorizedKeys";
 import { sourceKeyPath, sourceRepoPath } from "./sources";
+import { deriveRevokeKey, REVOKE_KEY_LABEL, revokeRepoURL } from "./revokeSource";
+import { revokedKeysInRepo } from "./unrevoke";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
 import { readRemoteFile, remoteCommandExists, runOverSSH, SUDO_PREAMBLE, writeRemoteFile } from "../helpers/remoteSSH";
@@ -162,6 +164,61 @@ async function resolveRepoURL(passedURL: string | undefined) {
     return repoURL;
 }
 
+/** The revoke repo has to exist and be writable before a host is set up, because a host that
+    cannot write a revocation cannot revoke a key that is being misused. The key for it is derived
+    from the source's, since github will not take one public key on two repos. */
+async function ensureRevokeRepo(config: { keyPath: string; repoURL: string }) {
+    let { keyPath, repoURL } = config;
+    let revokeURL = revokeRepoURL(repoURL);
+    let derived = deriveRevokeKey(await fs.readFile(keyPath, "utf8"));
+
+    let temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "portsecure-revoke-"));
+    let derivedKeyPath = path.join(temporaryDirectory, "key");
+    await fs.writeFile(derivedKeyPath, derived.privateKeyFile, { mode: 0o600 });
+    let checkoutPath = path.join(temporaryDirectory, "repo");
+
+    let explain = (problem: string) => new Error(
+        `${problem}\n`
+        + `Create ${revokeURL} and add this as a deploy key WITH WRITE ACCESS:\n`
+        + `  ${derived.publicKey} ${REVOKE_KEY_LABEL}\n`
+        + `It has to be this key: it is derived from ${keyPath}, and github will not accept the same`
+        + ` public key on two repositories.`
+    );
+
+    console.log(`Checking ${revokeURL}`);
+    let clone = await gitWithKey({ keyPath: derivedKeyPath, args: ["clone", revokeURL, checkoutPath], allowFailure: true });
+    if (clone.status !== 0) {
+        throw explain(`Expected ${revokeURL} to be readable with the derived key, it is not.`);
+    }
+
+    // An empty repo has no branch for the daemon to clone, so it gets its first commit here. That
+    // doubles as the proof that we can write to it.
+    let head = await gitWithKey({ keyPath: derivedKeyPath, args: ["rev-parse", "HEAD"], cwd: checkoutPath, allowFailure: true });
+    if (head.status !== 0) {
+        await fs.writeFile(path.join(checkoutPath, "README.md"),
+            `# revoked keys\n\nWritten by portsecure. Each file under revocations/ is one key that was used from an\n`
+            + `address it is not allowed from, and is no longer accepted anywhere.\n`);
+        for (let args of [
+            ["add", "-A"],
+            ["-c", "user.email=portsecure@localhost", "-c", "user.name=portsecure", "commit", "-m", "initialise revoke repo"],
+        ]) {
+            await gitWithKey({ keyPath: derivedKeyPath, args, cwd: checkoutPath });
+        }
+        let push = await gitWithKey({ keyPath: derivedKeyPath, args: ["push", "origin", "HEAD"], cwd: checkoutPath, allowFailure: true });
+        if (push.status !== 0) {
+            throw explain(`Expected write access to ${revokeURL}, the first push was refused.\n${(push.stdout + push.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`);
+        }
+    } else {
+        let dryRun = await gitWithKey({ keyPath: derivedKeyPath, args: ["push", "--dry-run", "origin", "HEAD"], cwd: checkoutPath, allowFailure: true });
+        if (dryRun.status !== 0) {
+            throw explain(`Expected write access to ${revokeURL}, a dry run push was refused.\n${(dryRun.stdout + dryRun.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`);
+        }
+    }
+
+    await fs.rm(temporaryDirectory, { recursive: true, force: true });
+    console.log(`${revokeURL} is writable`);
+}
+
 async function readRemoteConfig(host: string) {
     let contents = await readRemoteFile({ host, filePath: REMOTE_CONFIG_PATH });
     if (!contents) {
@@ -314,6 +371,19 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
         );
     }
     console.log(`Our key ${ourFingerprint} is in the merged keys, access will survive.`);
+
+    await ensureRevokeRepo({ keyPath, repoURL });
+
+    // Deploying a repo that still holds a revoked key would hand it back to every machine.
+    let revoked = await revokedKeysInRepo({ repoPath: inspectionPath, sourceURL: repoURL, keyPath });
+    if (revoked.length) {
+        throw new Error(
+            `Expected ${repoURL} to hold no revoked keys, it holds ${revoked.length}:\n`
+            + revoked.map(entry => `  ${entry.revocation.fingerprint} revoked by`
+                + ` ${entry.revocation.revokedBy || "?"} after use from ${entry.revocation.attempt?.ip || "?"}`).join("\n")
+            + `\nDelete them from the repo, or run "yarn unrevoke" there to allow them again.`
+        );
+    }
 
     let webhookURL = await requireRemoteWebhook(host);
     console.log(`${host} notifies ${webhookURL}`);

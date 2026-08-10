@@ -104,6 +104,37 @@ It writes an ordinary OpenSSH key pair, so the public key can be handed to anyth
 `deriveEd25519Key` in `deriveKey.ts` is the part to import elsewhere, and `sshKeyFile.ts` reads and
 writes the OpenSSH private key container that node itself cannot.
 
+### Revoking keys
+
+A key that is used from an address its `from=` restriction does not allow is revoked everywhere,
+not just refused. The daemon reads sshd's log for exactly that refusal, takes the fingerprint sshd
+names for the same connection, and writes a revocation to the source's revoke repo.
+
+The revoke repo is derived from the source: `…/authorized_keys.git` gets `…/authorized_keys_revoked.git`,
+reached with a key derived from the source's deploy key under the label `revokegithubkey`. Github
+will not take one public key on two repos, which is why it is derived rather than reused, and it
+means nothing extra has to be configured or uploaded - anything holding the source key can work it
+out. `securessh add` checks that repo exists and is writable, and prints the deploy key to add if
+it is not.
+
+- One revocation per key, ever. The file is named after the fingerprint, and the key is checked
+  against local state before any network work, so a flood of unknown keys cannot become a flood of
+  commits.
+- A revocation is sticky once seen. Deleting it from the repo does not bring the key back: the key
+  that writes revocations is on every server, so whoever stole one could otherwise erase the record
+  that locked them out. Recovering from that means making a new key, which you would want anyway.
+- Each machine says so on Discord when a revoked key actually leaves its authorized_keys, once.
+
+    yarn unrevoke <source-repo-private-key>
+
+Run in the keys repo. It reads the revoke repo and writes one file under `unrevoked/` naming the
+revocations to undo, which then needs signing and pushing. Machines report when they see it, hold
+it for an hour, then report again when it takes effect - so a signing key that was itself stolen
+cannot instantly undo the revocation that shut it out.
+
+Deleting a revoked key from the repo is usually the right answer instead. `securessh` refuses to
+deploy a repo that still holds one.
+
 ## helpers
 
 Shared plumbing: running commands over ssh, spawning child processes, and expanding `~`.

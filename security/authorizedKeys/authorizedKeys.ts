@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 
@@ -8,6 +9,18 @@ import path from "path";
 
 export function normalizeKeys(contents: string) {
     return contents.split("\n").map(line => line.trim()).filter(line => line && !line.startsWith("#"));
+}
+
+/** The fingerprint ssh itself reports for a key, which is what the sshd log names and therefore
+    what a revocation is keyed by. Returns "" for a line that holds no key. */
+export function keyFingerprint(keyLine: string) {
+    let parts = keyLine.trim().split(/\s+/);
+    let typeIndex = parts.findIndex(part => /^(ssh-|ecdsa-|sk-)/.test(part));
+    let blob = typeIndex >= 0 && parts[typeIndex + 1] || "";
+    if (!blob) {
+        return "";
+    }
+    return "SHA256:" + crypto.createHash("sha256").update(Buffer.from(blob, "base64")).digest("base64").replace(/=+$/, "");
 }
 
 /** Enough to recognise whose key this is without printing the whole blob. */

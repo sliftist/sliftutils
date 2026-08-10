@@ -28,6 +28,9 @@ export type RevocationState = {
     unrevokeSeenAt: number;
     unrevokeId: string;
     unrevoked: boolean;
+    // Whether we have said that this key actually left root's authorized_keys. The removal is the
+    // thing worth reporting, and it is worth reporting exactly once.
+    reportedRemoved: boolean;
 };
 
 export type DaemonState = {

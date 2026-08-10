@@ -32,7 +32,8 @@
         "setupnotify": "node ./bin/setupnotify.js",
         "securessh": "node ./bin/securessh.js",
         "signfiles": "node ./bin/signfiles.js",
-        "derivekey": "node ./bin/derivekey.js"
+        "derivekey": "node ./bin/derivekey.js",
+        "unrevoke": "node ./bin/unrevoke.js"
     },
     "bin": {
         "filehoster": "./bin/filehoster.js",
@@ -54,7 +55,8 @@
         "securessh": "./bin/securessh.js",
         "signfiles": "./bin/signfiles.js",
         "derivekey": "./bin/derivekey.js",
-        "portsecuredaemon": "./bin/portsecuredaemon.js"
+        "portsecuredaemon": "./bin/portsecuredaemon.js",
+        "unrevoke": "./bin/unrevoke.js"
     },
     "dependencies": {
         "@types/chrome": "^0.0.237",

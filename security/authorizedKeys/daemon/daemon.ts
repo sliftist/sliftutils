@@ -14,6 +14,9 @@ import { enforceRootKeys } from "./rootKeys";
 import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
 import { resolveSourceKeys } from "./trust";
+import { parseAuthLog, readNewAuthLog } from "./authLog";
+import { absorbRevocations, applyUnrevokes, recordRevocation, removeRevokedKeys, syncRevokeRepo } from "./revocation";
+import { keyFingerprint } from "../authorizedKeys";
 import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 
 // portsecure authorized-keys daemon.
@@ -32,6 +35,10 @@ import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 //   7. A source changed without its signature being updated, so the change is ignored.
 //   8. A source has a corrupted signature, so its contents are ignored.
 //   9. The webhook file itself changed, reported to the webhook being replaced.
+//  10. A key was revoked here, after being used from an address it is not allowed from.
+//  11. A revoked key was removed from root's authorized_keys, said once per key.
+//  12. An unrevoke was published, and is being held for an hour.
+//  13. An unrevoke was applied once that hour passed.
 
 export type DaemonConfig = {
     repoSources: string[];
@@ -103,6 +110,47 @@ export async function readAllowedKeys() {
     return keys;
 }
 
+/** Which source contributed a key, so its revocation is written to that source's revoke repo. */
+function sourceOfFingerprint(fingerprint: string) {
+    for (let repoURL of config.repoSources) {
+        if (sourceState(repoURL).acceptedKeys.some(key => keyFingerprint(key) === fingerprint)) {
+            return repoURL;
+        }
+    }
+    return config.repoSources[0] || "";
+}
+
+/** Anything sshd refused because of a from= restriction gets that key revoked everywhere. Reading
+    the log is cheap and local, and the fingerprint is checked against what we already revoked
+    before any network work happens. */
+async function revokeRefusedKeys(allowedKeys: string[]) {
+    let contents = await readNewAuthLog();
+    if (!contents.trim()) {
+        return;
+    }
+    let seen = new Set<string>();
+    for (let found of parseAuthLog(contents)) {
+        // One key is revoked once, no matter how many addresses it was tried from.
+        if (seen.has(found.fingerprint)) {
+            continue;
+        }
+        seen.add(found.fingerprint);
+        let sourceURL = sourceOfFingerprint(found.fingerprint);
+        if (!sourceURL) {
+            log(`Nowhere to record the revocation of ${found.fingerprint}, no sources are configured`);
+            continue;
+        }
+        let keyLine = allowedKeys.find(key => keyFingerprint(key) === found.fingerprint) || "";
+        await recordRevocation({
+            sourceURL,
+            fingerprint: found.fingerprint,
+            keyLine,
+            attempt: found.attempt,
+            hostLabel: config.hostLabel,
+        });
+    }
+}
+
 /** Syncs one source. Returns whether the merged keys need reapplying. */
 async function pollSource(repoURL: string) {
     let result;
@@ -155,9 +203,20 @@ async function everyCheck() {
     if (anyChanged) {
         await saveState();
     }
+
+    // What other machines have revoked, and anything published to undo a revocation.
+    for (let repoURL of config.repoSources) {
+        await syncRevokeRepo(repoURL);
+    }
+    await absorbRevocations(config.repoSources);
+    await applyUnrevokes(config.repoSources);
+
+    let mergedKeys = await readAllowedKeys();
+    await revokeRefusedKeys(mergedKeys);
+
     // The repo is checked first, so a change that came from it is reported as an update rather
     // than as somebody having edited the file locally.
-    await enforceRootKeys({ keys: await readAllowedKeys(), reason: anyChanged && "repo" || "manual" });
+    await enforceRootKeys({ keys: await removeRevokedKeys(mergedKeys), reason: anyChanged && "repo" || "manual" });
     await checkOtherUserKeys();
     await enforceSSHDConfig();
 }
@@ -202,7 +261,11 @@ export async function main() {
     await saveState();
     await seedUserKeys();
 
-    await enforceRootKeys({ keys: await readAllowedKeys(), reason: "repo" });
+    for (let repoURL of config.repoSources) {
+        await syncRevokeRepo(repoURL);
+    }
+    await absorbRevocations(config.repoSources);
+    await enforceRootKeys({ keys: await removeRevokedKeys(await readAllowedKeys()), reason: "repo" });
     await enforceSSHDConfig();
 
     // configureDiscordNotifications watches the webhook file on its own, so there is nothing to
