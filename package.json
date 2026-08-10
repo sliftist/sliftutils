@@ -30,7 +30,8 @@
         "filehoster": "node ./bin/filehoster.js",
         "autohost": "node ./bin/autohost.js",
         "setupnotify": "node ./bin/setupnotify.js",
-        "securessh": "node ./bin/securessh.js"
+        "securessh": "node ./bin/securessh.js",
+        "signfiles": "node ./bin/signfiles.js"
     },
     "bin": {
         "filehoster": "./bin/filehoster.js",
@@ -49,7 +50,8 @@
         "slift-setup": "./builders/setupRun.js",
         "sliftsetup": "./builders/setupRun.js",
         "setupnotify": "./bin/setupnotify.js",
-        "securessh": "./bin/securessh.js"
+        "securessh": "./bin/securessh.js",
+        "signfiles": "./bin/signfiles.js"
     },
     "dependencies": {
         "@types/chrome": "^0.0.237",

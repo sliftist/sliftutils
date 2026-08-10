@@ -15,6 +15,7 @@
 //   2. root's authorized_keys was updated because the keys repo changed.
 //   3. Another user's authorized_keys changed.
 //   4. The keys repo history was rewritten.
+//   4b. A source started being signed by a different key, so its new keys are being held.
 //   5. The webhook file itself changed, reported to the webhook being replaced.
 
 const fs = require("fs/promises");
@@ -44,6 +45,18 @@ const WEBHOOK_CHECK_INTERVAL = 5 * 60 * 1000;
 // recovers from corruption, half finished clones and interrupted fetches.
 const MAX_REPO_FAILURES_BEFORE_RECLONE = 3;
 const GIT_TIMEOUT = 120 * 1000;
+// A source that starts being signed by someone new is held at arm's length for this long, so a
+// stolen signing key cannot push keys onto a machine before anyone notices the warning.
+const SIGNER_CHANGE_DELAY = 24 * 60 * 60 * 1000;
+
+// PORTED CODE: security/signedFiles/manifest.ts is the TypeScript twin of these. Both sides must
+// agree on the manifest shape and on which files it covers.
+const MANIFEST_NAME = "signedfiles.json";
+const SIGNATURE_NAME = "signedfiles.json.sig";
+const SIGN_NAMESPACE = "signfiles";
+// A source that has never been signed reads as this, so losing a signature counts as a change of
+// signer rather than as something to wave through.
+const UNSIGNED = "";
 const KEY_FILE_HEADER = "# Managed by portsecure. Manual changes are reverted and reported.";
 
 const SSHD_DROPIN_CONTENTS = `# Managed by portsecure. Manual changes are reverted and reported.
@@ -307,7 +320,18 @@ function sourceState(repoURL) {
     if (existing) {
         return existing;
     }
-    let created = { lastSha: "", branch: "" };
+    let created = {
+        lastSha: "",
+        branch: "",
+        // What we last decided to trust, kept on disk so nobody can tell us a different story
+        // about what we saw last time.
+        accepted: false,
+        acceptedSigner: UNSIGNED,
+        acceptedKeys: [],
+        // A signer we have seen but not accepted yet, and when we first saw it.
+        pendingSigner: UNSIGNED,
+        pendingSince: 0,
+    };
     state.sources[repoURL] = created;
     return created;
 }
@@ -473,6 +497,163 @@ async function readCheckoutKeys(repoPath) {
     return keys;
 }
 
+
+/** Every file in a checkout, other than git's own directory and the signature files, which cannot
+    describe themselves. */
+async function listCheckoutFiles(repoPath, prefix) {
+    let files = [];
+    for (let entry of await fs.readdir(path.join(repoPath, prefix || ""), { withFileTypes: true })) {
+        let relativePath = prefix && `${prefix}/${entry.name}` || entry.name;
+        if (entry.name === ".git") {
+            continue;
+        }
+        if (!prefix && (entry.name === MANIFEST_NAME || entry.name === SIGNATURE_NAME)) {
+            continue;
+        }
+        if (entry.isDirectory()) {
+            files.push(...await listCheckoutFiles(repoPath, relativePath));
+            continue;
+        }
+        files.push(relativePath);
+    }
+    return files.sort();
+}
+
+/** The signature only covers the manifest, so the manifest has to be checked against what is
+    actually on disk. Both directions matter: a missing file changes what the keys mean, and an
+    extra unlisted file could add keys nobody signed for. */
+async function verifyManifestMatchesFiles(repoPath) {
+    let manifest = JSON.parse(await fs.readFile(path.join(repoPath, MANIFEST_NAME), "utf8"));
+    let listed = new Map((manifest.files || []).map(file => [file.path, file]));
+    let actual = await listCheckoutFiles(repoPath);
+
+    let missing = [...listed.keys()].filter(filePath => !actual.includes(filePath));
+    if (missing.length) {
+        throw new Error(`Expected the signed files to be present, ${missing.length} missing, first ${missing[0]}`);
+    }
+    let extra = actual.filter(filePath => !listed.has(filePath));
+    if (extra.length) {
+        throw new Error(`Expected only signed files to be present, ${extra.length} extra, first ${extra[0]}`);
+    }
+    for (let filePath of actual) {
+        let expected = listed.get(filePath);
+        let fullPath = path.join(repoPath, filePath);
+        let stats = await fs.stat(fullPath);
+        if (stats.size !== expected.size) {
+            throw new Error(`Expected ${filePath} to be ${expected.size} bytes, was ${stats.size}`);
+        }
+        let hash = crypto.createHash("sha256").update(await fs.readFile(fullPath)).digest("hex");
+        if (hash !== expected.sha256) {
+            throw new Error(`Expected ${filePath} to hash to ${expected.sha256}, was ${hash}`);
+        }
+    }
+}
+
+/** Who signed this checkout. Returns UNSIGNED when there is no signature at all, and throws when
+    there is one that does not hold up - an unverifiable signature is never treated as an identity,
+    so it can never become something we accept. */
+async function readCheckoutSigner(repoPath) {
+    let manifestPath = path.join(repoPath, MANIFEST_NAME);
+    let signaturePath = path.join(repoPath, SIGNATURE_NAME);
+    let hasManifest = await pathExists(manifestPath);
+    let hasSignature = await pathExists(signaturePath);
+    if (!hasManifest && !hasSignature) {
+        return UNSIGNED;
+    }
+    if (!hasManifest || !hasSignature) {
+        throw new Error(`Expected both ${MANIFEST_NAME} and ${SIGNATURE_NAME}, only one is present`);
+    }
+    let result = await spawnPromise({
+        command: "ssh-keygen",
+        args: ["-Y", "check-novalidate", "-n", SIGN_NAMESPACE, "-s", signaturePath],
+        input: await fs.readFile(manifestPath, "utf8"),
+    });
+    if (result.status !== 0) {
+        throw new Error(`Expected a valid signature over ${MANIFEST_NAME}, ssh-keygen said ${(result.stderr || "").trim().slice(0, MAX_ERROR_BODY_LENGTH)}`);
+    }
+    let match = `${result.stdout} ${result.stderr}`.match(/(SHA256:[A-Za-z0-9+/=]+)/);
+    if (!match) {
+        throw new Error(`Expected a signer fingerprint from ssh-keygen, was ${result.stdout.slice(0, MAX_ERROR_BODY_LENGTH)}`);
+    }
+    await verifyManifestMatchesFiles(repoPath);
+    return match[1];
+}
+
+function describeSigner(signer) {
+    return signer === UNSIGNED && "unsigned" || signer;
+}
+
+/** The keys a source is allowed to contribute right now. A source signed by someone we have not
+    accepted keeps contributing the keys we last accepted, until the delay has passed. */
+async function resolveSourceKeys(repoURL) {
+    let sourceStateValue = sourceState(repoURL);
+    let repoPath = sourceRepoPath(repoURL);
+
+    let signer;
+    try {
+        signer = await readCheckoutSigner(repoPath);
+    } catch (e) {
+        // Nothing here is trustworthy, so nothing here is used.
+        log(`Ignoring the contents of ${repoURL}, its signature does not hold up. ${e}`);
+        return sourceStateValue.acceptedKeys;
+    }
+    let checkoutKeys = await readCheckoutKeys(repoPath);
+
+    // Nothing has ever been accepted from this source, so this is what we start trusting.
+    if (!sourceStateValue.accepted) {
+        sourceStateValue.accepted = true;
+        sourceStateValue.acceptedSigner = signer;
+        sourceStateValue.acceptedKeys = checkoutKeys;
+        sourceStateValue.pendingSigner = UNSIGNED;
+        sourceStateValue.pendingSince = 0;
+        log(`Trusting ${repoURL} as signed by ${describeSigner(signer)}`);
+        await saveState();
+        return checkoutKeys;
+    }
+
+    if (signer === sourceStateValue.acceptedSigner) {
+        // Back to the signer we already trust, so anything we were waiting on is moot.
+        if (sourceStateValue.pendingSince) {
+            log(`${repoURL} is signed by ${describeSigner(signer)} again, dropping the pending change`);
+            sourceStateValue.pendingSigner = UNSIGNED;
+            sourceStateValue.pendingSince = 0;
+        }
+        sourceStateValue.acceptedKeys = checkoutKeys;
+        await saveState();
+        return checkoutKeys;
+    }
+
+    // A signer we have not accepted. Anything new restarts the wait, so publishing twice in a row
+    // gains an attacker nothing. pendingSince is what marks a wait as running, because an unsigned
+    // checkout is itself a signer value and cannot double as "nothing pending".
+    if (!sourceStateValue.pendingSince || signer !== sourceStateValue.pendingSigner) {
+        sourceStateValue.pendingSigner = signer;
+        sourceStateValue.pendingSince = Date.now();
+        await saveState();
+        await notify(
+            `\`${repoURL}\` is now signed by ${describeSigner(signer)}, which last signed as`
+            + ` ${describeSigner(sourceStateValue.acceptedSigner)}. Its keys are NOT being applied.`
+            + ` If nothing changes they will be applied in 24 hours.`
+        );
+        return sourceStateValue.acceptedKeys;
+    }
+
+    let waited = Date.now() - sourceStateValue.pendingSince;
+    if (waited < SIGNER_CHANGE_DELAY) {
+        return sourceStateValue.acceptedKeys;
+    }
+
+    // Same new signer, 24 hours later, and nobody stopped it.
+    log(`Accepting ${describeSigner(signer)} for ${repoURL} after the ${SIGNER_CHANGE_DELAY}ms wait`);
+    sourceStateValue.accepted = true;
+    sourceStateValue.acceptedSigner = signer;
+    sourceStateValue.acceptedKeys = checkoutKeys;
+    sourceStateValue.pendingSigner = UNSIGNED;
+    sourceStateValue.pendingSince = 0;
+    await saveState();
+    return checkoutKeys;
+}
+
 /** The union of every source, in source order, with duplicates dropped. A source that cannot be
     read is skipped rather than emptying the merged set, so one broken repo cannot revoke the keys
     that came from the others. */
@@ -482,7 +663,7 @@ async function readRepoKeys() {
     for (let repoURL of config.repoSources) {
         let sourceKeys;
         try {
-            sourceKeys = await readCheckoutKeys(sourceRepoPath(repoURL));
+            sourceKeys = await resolveSourceKeys(repoURL);
         } catch (e) {
             log(`Skipping ${repoURL}, its checkout could not be read. ${e}`);
             continue;
@@ -826,6 +1007,9 @@ module.exports = {
     parseWebhookFile,
     readRepoKeys,
     readCheckoutKeys,
+    readCheckoutSigner,
+    verifyManifestMatchesFiles,
+    resolveSourceKeys,
     sourceName,
     sourceKeyPath,
     sourceRepoPath,

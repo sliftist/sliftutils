@@ -44,6 +44,34 @@ locking everyone out.
 The daemon carries hand ports of several TypeScript files here, because it cannot import them.
 Both copies are marked `PORTED CODE` and have to be changed together.
 
+## signedFiles
+
+Signs everything in a repo, so a machine pulling it can tell who published what it is about to
+trust. Run it inside the repo you want signed.
+
+    yarn signfiles [signing-key] [git]
+
+`signedfiles.json` lists every non-ignored file with its size and sha256, and
+`signedfiles.json.sig` is an ssh signature over it. With no key given, a hardware backed
+`ed25519-sk` key at `~/.ssh/signfiles_ed25519_sk` is used, and created if missing - a key on disk
+is compromised the moment the machine is, so the hardware key is the point. `git` also commits
+and pushes, after signing, so a failed push never costs a second touch of the key.
+
+### How authorizedKeys uses it
+
+The daemon records the signer it last accepted for each source, and the keys it accepted from
+them, on disk. Those recorded values are the reference, not the repo, because the repo is what an
+attacker would be rewriting.
+
+When a source starts being signed by a different key, the daemon warns on Discord and keeps
+applying the keys it last accepted. It applies the new ones only after 24 hours of that same new
+signer. Any different signer restarts the wait, so publishing twice in a row gains nothing, and a
+return to the accepted signer cancels it. Losing a signature entirely counts as a change too, so
+stripping it does not get anything through faster.
+
+A signature that does not verify, or a manifest that does not match the files on disk, is never
+treated as an identity - that content is ignored and the last accepted keys stay.
+
 ## helpers
 
 Shared plumbing: running commands over ssh, spawning child processes, and expanding `~`.
