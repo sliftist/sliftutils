@@ -8,10 +8,12 @@ from `.cursor/rules/*.mdc` so Claude reads them automatically.
 - The code automatically updates on save, so do not ever run commands to rerun the site.
 - Don't run shell commands when you need to create or move small code files. Use tool calls. Use tool calls to make files within folders — you don't need to make the folder, just make the file, the folder will be created automatically.
 - If you need to add a dependency, don't just edit `package.json`. Use `yarn add` so you get the latest version, unless the user specifies a version.
-- Use tool calls to read files and directories instead of running `ls`, `dir`, etc.
+- Use tool calls to read and write files and directories, as opposed to shell commands running `ls`, `dir`, etc.
+  
 
 ## Coding styles
 
+- Do not use synchronous file IO, or synchronous child_process functions.
 - Times should almost always be in milliseconds; assume milliseconds if not told otherwise.
 - Don't make functions that will never be reused and are short. If under 5 lines and not reused, don't create it unless explicitly told to.
 - Comments are used sparingly and only when required to explain what's being done. A comment that just restates the function name is forbidden.
