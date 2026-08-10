@@ -7,6 +7,7 @@ import { cloneRepo, repoIsUsable, runGit } from "./git";
 import { messageTimestamp } from "../../notifications/discord";
 import { UNREVOKE_DELAY } from "./paths";
 import { notify } from "./notify";
+import { describeEndedSessions, endSessionsUsingKey } from "./sessions";
 import { getState, saveState } from "./state";
 
 // One revocation per key, ever. Naming the file after the fingerprint is what makes that true:
@@ -192,6 +193,9 @@ export async function recordRevocation(config: {
         reportedRemoved: true,
     };
     await saveState();
+    // Killed before saying anything, so the message reports what was actually done rather than
+    // what was about to be attempted.
+    let ended = describeEndedSessions(await endSessionsUsingKey(fingerprint));
     // What happened, then what was done about it, then what to do about it. In that order, because
     // whoever reads this needs to know which of those two things it was before anything else.
     await notify(
@@ -201,7 +205,7 @@ export async function recordRevocation(config: {
         + `\ntried from \`${attempt.ip}\` as user \`${attempt.user}\``
         + `\nonly allowed from \`${attempt.required}\``
         + `\n\nThat key is now revoked. Every machine will remove it from root's authorized_keys and`
-        + ` stop accepting it, from any address.`
+        + ` stop accepting it, from any address.${ended}`
         + `\n\nIf this really was an attack, IMMEDIATELY remove that key from \`${sourceURL}\`.`
         + `\nIf it was legitimate use, run this in \`${sourceURL}\` and deploy it as normal:`
         + `\n\`\`\`\nyarn unrevoke\nyarn signfiles git\n\`\`\``
@@ -307,9 +311,11 @@ export async function removeRevokedKeys(keys: string[]) {
         if (revocation && !revocation.reportedRemoved) {
             revocation.reportedRemoved = true;
             await saveState();
+            // A machine learning of a revocation from the repo has its own sessions to end.
+            let ended = describeEndedSessions(await endSessionsUsingKey(fingerprint));
             await notify(
                 `observed a revocation in the revoke repo for \`${fingerprint}\`, and removed that key`
-                + ` from root's authorized_keys. This machine no longer accepts it.`
+                + ` from root's authorized_keys. This machine no longer accepts it.${ended}`
             );
         }
     }
