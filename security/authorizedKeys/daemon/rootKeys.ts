@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { summarizeKey } from "../authorizedKeys";
+import { keyFingerprint, keyRestriction, summarizeKey } from "../authorizedKeys";
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
 import { log, notify } from "./notify";
 
@@ -15,14 +15,50 @@ async function pathExists(filePath: string) {
     }
 }
 
+/** Keys are matched by the key itself, not by the text of the line, so changing which addresses a
+    key may be used from reads as that one key changing rather than as one key leaving and another
+    arriving. A line we cannot read a key out of falls back to the whole line. */
+function keyIdentity(keyLine: string) {
+    return keyFingerprint(keyLine) || keyLine;
+}
+
 export function describeKeyDifference(config: { before: string[]; after: string[] }) {
     let { before, after } = config;
-    let lines = [
-        ...after.filter(key => !before.includes(key)).map(key => `+ ${summarizeKey(key)}`),
-        ...before.filter(key => !after.includes(key)).map(key => `- ${summarizeKey(key)}`),
-    ];
+    let beforeByKey = new Map(before.map(key => [keyIdentity(key), key]));
+    let afterByKey = new Map(after.map(key => [keyIdentity(key), key]));
+
+    let lines: string[] = [];
+    for (let [identity, keyLine] of afterByKey) {
+        if (!beforeByKey.has(identity)) {
+            lines.push(`+ added   ${summarizeKey(keyLine)}\n          from ${keyRestriction(keyLine)}`);
+        }
+    }
+    for (let [identity, keyLine] of beforeByKey) {
+        if (!afterByKey.has(identity)) {
+            lines.push(`- removed ${summarizeKey(keyLine)}\n          from ${keyRestriction(keyLine)}`);
+        }
+    }
+    for (let [identity, previousLine] of beforeByKey) {
+        let currentLine = afterByKey.get(identity);
+        if (!currentLine || currentLine === previousLine) {
+            continue;
+        }
+        let previousFrom = keyRestriction(previousLine);
+        let currentFrom = keyRestriction(currentLine);
+        if (previousFrom !== currentFrom) {
+            lines.push(
+                `~ changed ${summarizeKey(currentLine)}\n          from ${previousFrom}\n`
+                + `            to ${currentFrom}`
+            );
+            continue;
+        }
+        lines.push(
+            `~ changed ${summarizeKey(currentLine)}\n          from ${currentFrom}\n`
+            + `          its options or comment changed`
+        );
+    }
     if (!lines.length) {
-        return "(no key lines differ)";
+        return "(no keys differ)";
     }
     return lines.join("\n");
 }
