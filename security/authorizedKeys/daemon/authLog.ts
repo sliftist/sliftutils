@@ -1,5 +1,7 @@
 import crypto from "crypto";
+import { watch } from "fs";
 import fs from "fs/promises";
+import path from "path";
 import { spawnPromise } from "../../helpers/spawn";
 import { AUTH_LOG_PATH } from "./paths";
 import { getState, saveState } from "./state";
@@ -114,4 +116,47 @@ export async function readNewAuthLog() {
     } finally {
         await handle.close();
     }
+}
+
+/** Reacts when sshd writes, rather than on a timer. A refused login is worth acting on at once,
+    and nothing is gained by hearing about it up to a minute later.
+
+    The directory is watched rather than the file. A watch on the file follows the inode, so it
+    goes silent the moment the log is rotated out from under it, while the directory keeps
+    reporting both the writes and the rotation. */
+export function watchAuthLog(onChange: () => Promise<void>) {
+    let running = false;
+    let againWhenDone = false;
+    let run = async () => {
+        // One at a time. Whatever arrives mid run is covered by a single further pass, rather than
+        // by however many events happened to fire.
+        if (running) {
+            againWhenDone = true;
+            return;
+        }
+        running = true;
+        try {
+            await onChange();
+        } catch (e) {
+            console.log(`Reading ${AUTH_LOG_PATH} failed. ${e}`);
+        }
+        running = false;
+        if (againWhenDone) {
+            againWhenDone = false;
+            void run();
+        }
+    };
+
+    let name = path.basename(AUTH_LOG_PATH);
+    try {
+        watch(path.dirname(AUTH_LOG_PATH), (type, changed) => {
+            if (changed === name) {
+                void run();
+            }
+        });
+        console.log(`Watching ${AUTH_LOG_PATH} for refused logins`);
+    } catch (e) {
+        console.log(`Cannot watch ${AUTH_LOG_PATH}, so refused logins will not be noticed. ${e}`);
+    }
+    return run;
 }
