@@ -143,11 +143,10 @@ function sameKeys(one: string[], two: string[]) {
     without any repo changing, and reading that as somebody having edited the file was both wrong
     and alarming. */
 export async function enforceRootKeys(keys: string[]) {
+    // An empty set is written out like any other. If every key is revoked then nobody should be
+    // getting in, and the way back is to put a key in the repo, which is already being watched.
     if (!keys.length) {
-        // No sources, or none of them readable. Writing an empty file would lock everyone out, so
-        // whatever access is already in place stays exactly as it is.
-        console.log(`No keys came from any source, leaving ${ROOT_AUTHORIZED_KEYS} as it is`);
-        return;
+        console.log(`No keys are allowed, so ${ROOT_AUTHORIZED_KEYS} is being emptied`);
     }
     let state = getState();
     let currentKeys = await readAuthorizedKeysFile(ROOT_AUTHORIZED_KEYS);
