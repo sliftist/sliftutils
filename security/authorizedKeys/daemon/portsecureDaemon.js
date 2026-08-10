@@ -62,6 +62,9 @@ const SIGN_NAMESPACE = "signfiles";
 // A source that has never been signed reads as this, so losing a signature counts as a change of
 // signer rather than as something to wave through.
 const UNSIGNED = "";
+// What fixes both of the signature problems we report, so the message can say so rather than
+// leaving someone to work it out.
+const SIGN_COMMAND = "yarn signfiles git";
 const KEY_FILE_HEADER = "# Managed by portsecure. Manual changes are reverted and reported.";
 
 const SSHD_DROPIN_CONTENTS = `# Managed by portsecure. Manual changes are reverted and reported.
@@ -693,14 +696,15 @@ async function resolveSourceKeys(repoURL) {
                 problem: "stale",
                 message: `\`${repoURL}\` changed but its signature was not updated, so the changes are being`
                     + ` ignored. Still using the keys signed by \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
-                    + ` Run signfiles in that repo.`,
+                    + `\nTo deploy the change, run this in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
             });
         } else {
             await reportProblem({
                 sourceStateValue,
                 problem: "corrupt",
                 message: `\`${repoURL}\` has a corrupted signature, so its contents are being ignored:`
-                    + ` ${e}.\nStill using the keys signed by \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`,
+                    + ` ${e}.\nStill using the keys signed by \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
+                    + `\nTo replace it, run this in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
             });
         }
         return sourceStateValue.acceptedKeys;
