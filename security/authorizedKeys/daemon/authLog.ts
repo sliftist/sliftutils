@@ -88,6 +88,16 @@ export async function readNewAuthLog() {
         await handle.read(head, 0, head.length, 0);
         let signature = crypto.createHash("sha256").update(head).digest("hex");
 
+        if (!state.authLogSignature) {
+            // First time we have ever looked. Start from the end: the log holds history from
+            // before this machine watched it, and revoking keys over refusals nobody was watching
+            // for could take away access that is still in use.
+            state.authLogOffset = stats.size;
+            state.authLogSignature = signature;
+            await saveState();
+            log(`Watching ${AUTH_LOG_PATH} from its current end, ${stats.size} bytes in`);
+            return "";
+        }
         let offset = state.authLogOffset;
         if (signature !== state.authLogSignature || stats.size < offset) {
             // Rotated, or replaced. Everything in the new file is new.

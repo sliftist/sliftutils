@@ -269,7 +269,9 @@ else
     $SUDO rm -rf "${REMOTE_CHECKOUT_PATH}"
     $SUDO git clone "${SLIFTUTILS_URL}" "${REMOTE_CHECKOUT_PATH}"
 fi
-$SUDO yarn --cwd "${REMOTE_CHECKOUT_PATH}" install --production --non-interactive`,
+$SUDO yarn --cwd "${REMOTE_CHECKOUT_PATH}" install --production --non-interactive
+# The single file daemon this replaced, left over on a host set up by an older version.
+$SUDO rm -f /opt/portsecure/portsecure-daemon.js`,
     });
     await writeRemoteFile({
         host,
