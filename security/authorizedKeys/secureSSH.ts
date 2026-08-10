@@ -164,6 +164,46 @@ async function resolveRepoURL(passedURL: string | undefined) {
     return repoURL;
 }
 
+/** Every source's revoke repo has to exist and hold at least one commit, or the hosts using it
+    cannot record a revocation. Checked with this machine's own git credentials, since update is
+    not given any deploy key, and an empty repo is initialised rather than merely complained about.
+
+    A host that cannot write a revocation silently keeps accepting a key it just saw being misused,
+    which is the one failure this whole thing exists to prevent, so it is checked on every deploy
+    and not only when a source is first added. */
+async function ensureRevokeReposExist(repoSources: string[]) {
+    for (let repoURL of repoSources) {
+        let revokeURL = revokeRepoURL(repoURL);
+        let temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "portsecure-revoke-"));
+        let checkoutPath = path.join(temporaryDirectory, "repo");
+        let clone = await runLocal({ command: "git", args: ["clone", revokeURL, checkoutPath], allowFailure: true });
+        if (clone.status !== 0) {
+            await fs.rm(temporaryDirectory, { recursive: true, force: true });
+            throw new Error(
+                `Expected ${revokeURL} to exist, it does not, so ${repoURL} has nowhere to record a`
+                + ` revocation.\nCreate it, then run "yarn securessh <host> add" for that source to`
+                + ` register its deploy key.\n${(clone.stdout + clone.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
+            );
+        }
+        let head = await runLocal({ command: "git", args: ["-C", checkoutPath, "rev-parse", "HEAD"], allowFailure: true });
+        if (head.status !== 0) {
+            console.log(`${revokeURL} is empty, giving it a first commit`);
+            await fs.writeFile(path.join(checkoutPath, "README.md"),
+                `# revoked keys\n\nWritten by portsecure. Each file under revocations/ is one key that was used from an\n`
+                + `address it is not allowed from, and is no longer accepted anywhere.\n`);
+            for (let args of [
+                ["-C", checkoutPath, "add", "-A"],
+                ["-C", checkoutPath, "-c", "user.email=portsecure@localhost", "-c", "user.name=portsecure", "commit", "-m", "initialise revoke repo"],
+                ["-C", checkoutPath, "push", "origin", "HEAD"],
+            ]) {
+                await runLocal({ command: "git", args });
+            }
+        }
+        await fs.rm(temporaryDirectory, { recursive: true, force: true });
+        console.log(`${revokeURL} is ready`);
+    }
+}
+
 /** The revoke repo has to exist and be writable before a host is set up, because a host that
     cannot write a revocation cannot revoke a key that is being misused. The key for it is derived
     from the source's, since github will not take one public key on two repos. */
@@ -496,6 +536,7 @@ async function updateDaemon(host: string) {
     let parsed = JSON.parse(contents) as { hostLabel?: string; repoSources?: string[] };
     let repoSources = parsed.repoSources || [];
     await requireRemoteWebhook(host);
+    await ensureRevokeReposExist(repoSources);
     await installDaemon({ host, hostLabel: parsed.hostLabel || host, repoSources });
     console.log(`Updated the daemon on ${host}. ${repoSources.length} source(s), unchanged.`);
 }

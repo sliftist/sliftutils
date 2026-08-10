@@ -32,10 +32,21 @@ export type RevocationState = {
     reportedRemoved: boolean;
 };
 
+/** A refusal we saw but could not write down yet. Held until it is recorded, because the log is
+    read once and moves on: losing one of these to a repo that happened to be unreachable would
+    leave a key that was misused accepted forever. */
+export type PendingRevocation = {
+    fingerprint: string;
+    keyLine: string;
+    sourceURL: string;
+    attempt: { ip: string; user: string; port: string; required: string; line: string };
+};
+
 export type DaemonState = {
     sources: { [repoURL: string]: SourceState };
     userKeyHashes: { [userName: string]: string };
     revocations: { [fingerprint: string]: RevocationState };
+    pendingRevocations: PendingRevocation[];
     // Where we had read up to in the auth log, so a restart does not re-report old attempts.
     authLogOffset: number;
     authLogSignature: string;
@@ -45,6 +56,7 @@ let state: DaemonState = {
     sources: {},
     userKeyHashes: {},
     revocations: {},
+    pendingRevocations: [],
     authLogOffset: 0,
     authLogSignature: "",
 };

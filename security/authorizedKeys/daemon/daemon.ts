@@ -122,33 +122,59 @@ function sourceOfFingerprint(fingerprint: string) {
 
 /** Anything sshd refused because of a from= restriction gets that key revoked everywhere. Reading
     the log is cheap and local, and the fingerprint is checked against what we already revoked
-    before any network work happens. */
-async function revokeRefusedKeys(allowedKeys: string[]) {
+    before any network work happens.
+
+    A refusal is queued rather than acted on directly, because the log is read once and moves past:
+    if the revoke repo is unreachable at that moment, dropping the refusal would leave a key that
+    was misused accepted forever. The queue is retried until it is written down. */
+async function queueRefusedKeys(allowedKeys: string[]) {
     let contents = await readNewAuthLog();
     if (!contents.trim()) {
         return;
     }
-    let seen = new Set<string>();
+    let state = getState();
     for (let found of parseAuthLog(contents)) {
         // One key is revoked once, no matter how many addresses it was tried from.
-        if (seen.has(found.fingerprint)) {
+        if (state.revocations[found.fingerprint]) {
             continue;
         }
-        seen.add(found.fingerprint);
+        if (state.pendingRevocations.some(pending => pending.fingerprint === found.fingerprint)) {
+            continue;
+        }
         let sourceURL = sourceOfFingerprint(found.fingerprint);
         if (!sourceURL) {
             console.log(`Nowhere to record the revocation of ${found.fingerprint}, no sources are configured`);
             continue;
         }
-        let keyLine = allowedKeys.find(key => keyFingerprint(key) === found.fingerprint) || "";
-        await recordRevocation({
-            sourceURL,
+        console.log(`Queued the revocation of ${found.fingerprint}, used from ${found.attempt.ip}`);
+        state.pendingRevocations.push({
             fingerprint: found.fingerprint,
-            keyLine,
+            keyLine: allowedKeys.find(key => keyFingerprint(key) === found.fingerprint) || "",
+            sourceURL,
             attempt: found.attempt,
-            hostLabel: config.hostLabel,
         });
     }
+    await saveState();
+}
+
+/** Writes down everything queued that we have not managed to write down yet. */
+async function writeQueuedRevocations() {
+    let state = getState();
+    if (!state.pendingRevocations.length) {
+        return;
+    }
+    let remaining = [];
+    for (let pending of state.pendingRevocations) {
+        if (state.revocations[pending.fingerprint]) {
+            continue;
+        }
+        let recorded = await recordRevocation({ ...pending, hostLabel: config.hostLabel });
+        if (!recorded && !state.revocations[pending.fingerprint]) {
+            remaining.push(pending);
+        }
+    }
+    state.pendingRevocations = remaining;
+    await saveState();
 }
 
 /** Syncs one source. Returns whether the merged keys need reapplying. */
@@ -212,7 +238,8 @@ async function everyCheck() {
     await applyUnrevokes(config.repoSources);
 
     let mergedKeys = await readAllowedKeys();
-    await revokeRefusedKeys(mergedKeys);
+    await queueRefusedKeys(mergedKeys);
+    await writeQueuedRevocations();
 
     // The repo is checked first, so a change that came from it is reported as an update rather
     // than as somebody having edited the file locally.
