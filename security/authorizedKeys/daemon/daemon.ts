@@ -241,9 +241,7 @@ async function everyCheck() {
     await queueRefusedKeys(mergedKeys);
     await writeQueuedRevocations();
 
-    // The repo is checked first, so a change that came from it is reported as an update rather
-    // than as somebody having edited the file locally.
-    await enforceRootKeys({ keys: await removeRevokedKeys(mergedKeys), reason: anyChanged && "repo" || "manual" });
+    await enforceRootKeys(await removeRevokedKeys(mergedKeys));
     await checkOtherUserKeys();
     await enforceSSHDConfig();
 }
@@ -292,7 +290,7 @@ export async function main() {
         await syncRevokeRepo(repoURL);
     }
     await absorbRevocations(config.repoSources);
-    await enforceRootKeys({ keys: await removeRevokedKeys(await readAllowedKeys()), reason: "repo" });
+    await enforceRootKeys(await removeRevokedKeys(await readAllowedKeys()));
     await enforceSSHDConfig();
 
     // configureDiscordNotifications watches the webhook file on its own, so there is nothing to

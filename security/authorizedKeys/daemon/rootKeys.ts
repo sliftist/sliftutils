@@ -1,8 +1,9 @@
 import fs from "fs/promises";
 import path from "path";
-import { keyFingerprint, keyRestriction, summarizeKey } from "../authorizedKeys";
+import { keyFingerprint, keyRestriction, keyRestrictionList, NO_RESTRICTION, summarizeKey } from "../authorizedKeys";
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
 import { notify } from "./notify";
+import { getState, saveState } from "./state";
 
 const KEY_FILE_HEADER = "# Managed by portsecure. Manual changes are reverted and reported.";
 
@@ -20,6 +21,35 @@ async function pathExists(filePath: string) {
     arriving. A line we cannot read a key out of falls back to the whole line. */
 function keyIdentity(keyLine: string) {
     return keyFingerprint(keyLine) || keyLine;
+}
+
+/** Which addresses a key gained or lost, rather than two long lists to compare by eye. Returns ""
+    when the addresses did not change at all. Losing the from= altogether is the loudest case there
+    is, so it is spelled out rather than shown as a list of removals. */
+function describeAddressChange(config: { previousLine: string; currentLine: string }) {
+    let { previousLine, currentLine } = config;
+    let previous = keyRestrictionList(previousLine);
+    let current = keyRestrictionList(currentLine);
+    if (!previous && !current) {
+        return "";
+    }
+    if (previous && !current) {
+        return `          was ${previous.join(",")}\n          now ${NO_RESTRICTION}`;
+    }
+    if (!previous && current) {
+        return `          was ${NO_RESTRICTION}\n          now restricted to ${current.join(",")}`;
+    }
+    let removed = (previous || []).filter(address => !(current || []).includes(address));
+    let added = (current || []).filter(address => !(previous || []).includes(address));
+    if (!removed.length && !added.length) {
+        return "";
+    }
+    let lines = [
+        ...removed.map(address => `          no longer allowed from ${address}`),
+        ...added.map(address => `          now also allowed from ${address}`),
+    ];
+    lines.push(`          still allowed from ${(current || []).filter(address => !added.includes(address)).join(",") || "nothing"}`);
+    return lines.join("\n");
 }
 
 export function describeKeyDifference(config: { before: string[]; after: string[] }) {
@@ -43,17 +73,13 @@ export function describeKeyDifference(config: { before: string[]; after: string[
         if (!currentLine || currentLine === previousLine) {
             continue;
         }
-        let previousFrom = keyRestriction(previousLine);
-        let currentFrom = keyRestriction(currentLine);
-        if (previousFrom !== currentFrom) {
-            lines.push(
-                `~ changed ${summarizeKey(currentLine)}\n          from ${previousFrom}\n`
-                + `            to ${currentFrom}`
-            );
+        let addressChange = describeAddressChange({ previousLine, currentLine });
+        if (addressChange) {
+            lines.push(`~ changed ${summarizeKey(currentLine)}\n${addressChange}`);
             continue;
         }
         lines.push(
-            `~ changed ${summarizeKey(currentLine)}\n          from ${currentFrom}\n`
+            `~ changed ${summarizeKey(currentLine)}\n          from ${keyRestriction(currentLine)}\n`
             + `          its options or comment changed`
         );
     }
@@ -106,30 +132,62 @@ export async function archiveAuthorizedKeys(config: { filePath: string; reason: 
     return archivePath;
 }
 
-/** Puts the allowed keys back in place if anything else changed them. */
-export async function enforceRootKeys(config: { keys: string[]; reason: string }) {
-    let { keys, reason } = config;
+function sameKeys(one: string[], two: string[]) {
+    return one.length === two.length && one.every((key, index) => key === two[index]);
+}
+
+/** Puts the allowed keys in place, and says which of the two things happened.
+
+    Whether this was our own doing is decided by comparing what we want against what we last wrote,
+    not by guessing from whether a repo happened to change. A revocation changes what we want
+    without any repo changing, and reading that as somebody having edited the file was both wrong
+    and alarming. */
+export async function enforceRootKeys(keys: string[]) {
     if (!keys.length) {
         // No sources, or none of them readable. Writing an empty file would lock everyone out, so
         // whatever access is already in place stays exactly as it is.
         console.log(`No keys came from any source, leaving ${ROOT_AUTHORIZED_KEYS} as it is`);
         return;
     }
+    let state = getState();
     let currentKeys = await readAuthorizedKeysFile(ROOT_AUTHORIZED_KEYS);
-    let matches = currentKeys.length === keys.length && currentKeys.every((key, index) => key === keys[index]);
-    if (matches) {
+    if (!state.appliedKeys.length) {
+        // Nothing recorded yet, on a first start or an upgrade. Whatever is in the file is taken as
+        // ours, so the first check reports what actually changes rather than reintroducing every
+        // key that was already there.
+        state.appliedKeys = currentKeys;
+        await saveState();
+    }
+
+    if (sameKeys(currentKeys, keys)) {
+        if (!sameKeys(state.appliedKeys, keys)) {
+            state.appliedKeys = keys;
+            await saveState();
+        }
         return;
     }
-    let archivePath = await archiveAuthorizedKeys({ filePath: ROOT_AUTHORIZED_KEYS, reason });
+
+    let weChangedIt = !sameKeys(state.appliedKeys, keys);
+    let previouslyApplied = state.appliedKeys;
+    let archivePath = await archiveAuthorizedKeys({
+        filePath: ROOT_AUTHORIZED_KEYS,
+        reason: weChangedIt && "update" || "reverted",
+    });
     await writeAuthorizedKeysFile({ filePath: ROOT_AUTHORIZED_KEYS, keys });
-    let difference = describeKeyDifference({ before: currentKeys, after: keys });
-    let archiveNote = archivePath && `\nThe previous file is kept at \`${archivePath}\`.` || "";
-    if (reason === "repo") {
-        await notify(`root's authorized_keys was updated from the keys repo.\n\`\`\`\n${difference}\n\`\`\`${archiveNote}`);
+    state.appliedKeys = keys;
+    await saveState();
+    let archiveNote = archivePath && `\nThe file as it was is kept at \`${archivePath}\`.` || "";
+
+    if (weChangedIt) {
+        await notify(
+            `root's authorized_keys has been updated:`
+            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${archiveNote}`
+        );
         return;
     }
     await notify(
-        `root's authorized_keys was changed outside portsecure and has been reverted to the keys repo.`
-        + `\n\`\`\`\n${difference}\n\`\`\`${archiveNote}`
+        `root's authorized_keys was edited by something other than portsecure. The edit below has`
+        + ` been undone, and the keys from the repos are back in place.`
+        + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\`${archiveNote}`
     );
 }

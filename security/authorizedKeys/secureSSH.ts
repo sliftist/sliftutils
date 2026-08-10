@@ -538,7 +538,12 @@ async function updateDaemon(host: string) {
     await requireRemoteWebhook(host);
     await ensureRevokeReposExist(repoSources);
     await installDaemon({ host, hostLabel: parsed.hostLabel || host, repoSources });
-    console.log(`Updated the daemon on ${host}. ${repoSources.length} source(s), unchanged.`);
+    console.log(`Updated the daemon on ${host}, and restarted it.`);
+    console.log(`Its ${repoSources.length} key source(s) were left as they are, along with the keys and`);
+    console.log(`signers it has already accepted. Only the daemon itself changed:`);
+    for (let repoURL of repoSources) {
+        console.log(`  ${repoURL}`);
+    }
 }
 
 async function listSources(host: string) {

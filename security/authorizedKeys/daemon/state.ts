@@ -47,6 +47,9 @@ export type DaemonState = {
     userKeyHashes: { [userName: string]: string };
     revocations: { [fingerprint: string]: RevocationState };
     pendingRevocations: PendingRevocation[];
+    // The keys we last wrote out. What tells a change we made apart from one somebody else made:
+    // if this still matches what we want, and the file does not, the file was edited behind us.
+    appliedKeys: string[];
     // Where we had read up to in the auth log, so a restart does not re-report old attempts.
     authLogOffset: number;
     authLogSignature: string;
@@ -57,6 +60,7 @@ let state: DaemonState = {
     userKeyHashes: {},
     revocations: {},
     pendingRevocations: [],
+    appliedKeys: [],
     authLogOffset: 0,
     authLogSignature: "",
 };

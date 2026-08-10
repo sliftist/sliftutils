@@ -2,11 +2,6 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 
-// PORTED CODE: security/authorizedKeys/daemon/portsecureDaemon.js contains a plain JS port of normalizeKeys,
-// summarizeKey and readRepoKeys, so it can resolve the same keys with no dependencies. The two
-// must agree on which keys a repo produces - if you change one, make the matching change in the
-// other.
-
 export function normalizeKeys(contents: string) {
     return contents.split("\n").map(line => line.trim()).filter(line => line && !line.startsWith("#"));
 }
@@ -23,14 +18,26 @@ export function keyFingerprint(keyLine: string) {
     return "SHA256:" + crypto.createHash("sha256").update(Buffer.from(blob, "base64")).digest("base64").replace(/=+$/, "");
 }
 
+export const NO_RESTRICTION = "ANY ADDRESS (no from= restriction)";
+
+/** The addresses a key may be used from, one by one, or undefined when the key carries no from=
+    at all. Undefined and an empty list are very different things, so they stay distinguishable. */
+export function keyRestrictionList(keyLine: string) {
+    let match = keyLine.match(/from="([^"]*)"/);
+    if (!match) {
+        return undefined;
+    }
+    return match[1].split(",").map(entry => entry.trim()).filter(entry => entry);
+}
+
 /** The addresses a key may be used from, which is the part of an authorized_keys line that
     decides how much a stolen key is worth. A key with no restriction says so loudly. */
 export function keyRestriction(keyLine: string) {
-    let match = keyLine.match(/from="([^"]*)"/);
-    if (!match) {
-        return "ANY ADDRESS (no from= restriction)";
+    let list = keyRestrictionList(keyLine);
+    if (!list) {
+        return NO_RESTRICTION;
     }
-    return match[1];
+    return list.join(",");
 }
 
 /** Enough to recognise whose key this is without printing the whole blob. */
@@ -44,6 +51,39 @@ export function summarizeKey(keyLine: string) {
     let blob = parts[typeIndex + 1] || "";
     let comment = parts.slice(typeIndex + 2).join(" ");
     return `${type} ...${blob.slice(-12)}${comment && ` ${comment}` || ""}`;
+}
+
+/** What a set of keys has to satisfy before it is worth signing, as a list of complaints.
+
+    Every key needs a from=, because an unrestricted key can never be caught being used from the
+    wrong place, and being caught is the only thing that triggers a revocation.
+
+    No two keys may allow the same addresses, because that is one person holding two keys: revoking
+    one of them leaves the other working, so the revocation achieves nothing. */
+export function findKeyProblems(keys: string[]) {
+    let problems: string[] = [];
+    let byRestriction = new Map<string, string[]>();
+    for (let key of keys) {
+        let restriction = keyRestrictionList(key);
+        if (!restriction) {
+            problems.push(`no from= restriction, so it can be used from anywhere:\n      ${summarizeKey(key)}`);
+            continue;
+        }
+        // Sorted, so the same addresses written in a different order still count as the same.
+        let identity = [...restriction].sort().join(",");
+        byRestriction.set(identity, [...(byRestriction.get(identity) || []), key]);
+    }
+    for (let [restriction, sharing] of byRestriction) {
+        if (sharing.length < 2) {
+            continue;
+        }
+        problems.push(
+            `${sharing.length} keys allow exactly the same addresses (${restriction}), which is one`
+            + ` person holding more than one key:\n`
+            + sharing.map(key => `      ${summarizeKey(key)}`).join("\n")
+        );
+    }
+    return problems;
 }
 
 /** Reads the authorized keys a repo checkout wants applied. Prefers a top level authorized_keys

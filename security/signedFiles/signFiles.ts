@@ -5,6 +5,7 @@ import { runPromise } from "socket-function/src/runPromise";
 import { expandHome } from "../helpers/paths";
 import { buildManifest, formatManifest, MANIFEST_NAME, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
 import { revokedKeysInRepo } from "../authorizedKeys/unrevoke";
+import { findKeyProblems, normalizeKeys } from "../authorizedKeys/authorizedKeys";
 
 // A hardware backed key is the entire point. A key sitting on disk is compromised the moment the
 // machine is, and then the signature proves nothing, so this is what we make when asked to make one.
@@ -58,6 +59,27 @@ async function publicKeyOf(keyPath: string) {
     return `${keyType} ${keyBody}`;
 }
 
+/** A keys repo has rules the rest of this cannot enforce afterwards, so they are enforced before it
+    is signed. Signing anything that is not a keys repo is none of this function's business. */
+async function refuseUnusableKeys(repoPath: string) {
+    let authorizedPath = path.join(repoPath, "authorized_keys");
+    if (!await pathExists(authorizedPath)) {
+        return;
+    }
+    let problems = findKeyProblems(normalizeKeys(await fs.readFile(authorizedPath, "utf8")));
+    if (!problems.length) {
+        return;
+    }
+    throw new Error(
+        `Expected every key in ${authorizedPath} to be restricted and to belong to one person,`
+        + ` found ${problems.length} problem(s):\n`
+        + problems.map(problem => `  - ${problem}`).join("\n")
+        + `\n\nEvery key needs a from= naming the addresses it may be used from, and no two keys may`
+        + `\nname the same ones. Revoking a key that shares its addresses with another leaves that`
+        + `\nother key working, which defeats the point of revoking it.`
+    );
+}
+
 /** Signing a keys repo that still holds a revoked key would publish it back to every machine that
     took it out. Only applies to a repo that holds keys and has a revoke repo to check - signing
     anything else is none of this function's business. */
@@ -96,19 +118,16 @@ function parseArgs(argv: string[]) {
     return { keyPath: positional[0], pushToGit };
 }
 
-export async function main() {
-    let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
-
-    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true })).trim();
-    if (!repoPath) {
-        throw new Error(`Expected the current directory to be inside a git repo, it is not.\n${USAGE}`);
-    }
-
-    let signingKey = keyPath && expandHome(keyPath) || await ensureDefaultKey();
+/** Writes the manifest and its signature into a repo. Separate from the command so anything that
+    changes a keys repo can leave it signed, rather than telling someone to go and do it. */
+export async function signRepo(config: { repoPath: string; keyPath?: string }) {
+    let { repoPath } = config;
+    let signingKey = config.keyPath && expandHome(config.keyPath) || await ensureDefaultKey();
     if (!await pathExists(signingKey)) {
         throw new Error(`Expected a signing key at ${signingKey}, no such file exists`);
     }
 
+    await refuseUnusableKeys(repoPath);
     await refuseRevokedKeys(repoPath);
 
     let manifest = await buildManifest(repoPath);
@@ -132,6 +151,16 @@ export async function main() {
     await fs.copyFile(stagedSignature, path.join(repoPath, SIGNATURE_NAME));
     await fs.rm(stagingDirectory, { recursive: true, force: true });
     console.log(`Signed with ${await publicKeyOf(signingKey)}`);
+}
+
+export async function main() {
+    let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
+
+    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true })).trim();
+    if (!repoPath) {
+        throw new Error(`Expected the current directory to be inside a git repo, it is not.\n${USAGE}`);
+    }
+    await signRepo({ repoPath, keyPath });
 
     if (!pushToGit) {
         console.log(`Commit and push ${MANIFEST_NAME} and ${SIGNATURE_NAME} for anything to see them.`);

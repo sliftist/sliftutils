@@ -72,8 +72,25 @@ async function readWebhookFile(filePath: string) {
     return parseWebhookFile({ contents, sourceName: filePath });
 }
 
+/** When the message was sent, in the sending machine's own time zone. Discord shows when it
+    received something, which is not the same thing when a machine has been offline or a send has
+    been retried, and the zone matters when the machines are not all in one place. */
+export function messageTimestamp(now: Date) {
+    let date = now.toLocaleDateString("en-CA");
+    let time = now.toLocaleTimeString("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true,
+        timeZoneName: "short",
+    });
+    return `${date} ${time}`;
+}
+
 async function postToWebhook(webhookURL: string, message: string) {
-    let content = message;
+    // Stamped once rather than per attempt, so a retry says when the thing happened rather than
+    // when we last managed to get it out.
+    let content = `\`${messageTimestamp(new Date())}\` ${message}`;
     if (content.length > DISCORD_MESSAGE_LIMIT) {
         content = content.slice(0, DISCORD_MESSAGE_LIMIT - 3) + "...";
     }
