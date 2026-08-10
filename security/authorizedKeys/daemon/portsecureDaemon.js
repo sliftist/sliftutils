@@ -41,12 +41,14 @@ const SSHD_DROPIN_DIR = "/etc/ssh/sshd_config.d";
 const SSHD_DROPIN_PATH = "/etc/ssh/sshd_config.d/00-portsecure.conf";
 const PASSWD_PATH = "/etc/passwd";
 
-const KEYS_CHECK_INTERVAL = 60 * 1000;
-const REPO_POLL_INTERVAL = 5 * 60 * 1000;
+// One minute covers everything: asking the remote for a branch sha is a few hundred bytes, so
+// there is no reason to notice a key change any later than a manual edit.
+const CHECK_INTERVAL = 60 * 1000;
 const WEBHOOK_CHECK_INTERVAL = 5 * 60 * 1000;
 // After this many consecutive failures the repo is thrown away and cloned from scratch, which
-// recovers from corruption, half finished clones and interrupted fetches.
-const MAX_REPO_FAILURES_BEFORE_RECLONE = 3;
+// recovers from corruption, half finished clones and interrupted fetches. Counted in checks, so
+// this is a quarter of an hour of failing before we resort to that.
+const MAX_REPO_FAILURES_BEFORE_RECLONE = 15;
 const GIT_TIMEOUT = 120 * 1000;
 // A source that starts being signed by someone new is held at arm's length for this long, so a
 // stolen signing key cannot push keys onto a machine before anyone notices the warning.
@@ -403,9 +405,14 @@ async function repoIsUsable(repoURL) {
 async function cloneRepo(repoURL) {
     let repoPath = sourceRepoPath(repoURL);
     let keyPath = sourceKeyPath(repoURL);
-    await fs.rm(repoPath, { recursive: true, force: true });
+    // Cloned beside the old checkout and swapped in, so a clone that fails leaves the copy we are
+    // already using untouched rather than deleting the only keys we have.
+    let incomingPath = `${repoPath}.incoming`;
+    await fs.rm(incomingPath, { recursive: true, force: true });
     await fs.mkdir(path.dirname(repoPath), { recursive: true });
-    await runGit(["clone", repoURL, repoPath], { keyPath });
+    await runGit(["clone", repoURL, incomingPath], { keyPath });
+    await fs.rm(repoPath, { recursive: true, force: true });
+    await fs.rename(incomingPath, repoPath);
     sourceState(repoURL).branch = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoPath, keyPath });
     log(`Cloned ${repoURL} into ${repoPath} on branch ${sourceState(repoURL).branch}`);
 }
@@ -430,12 +437,21 @@ async function syncRepo(repoURL) {
     let repoPath = sourceRepoPath(repoURL);
     let keyPath = sourceKeyPath(repoURL);
     let branch = sourceState(repoURL).branch;
-    await runGit(["fetch", "--prune", "origin", branch], { cwd: repoPath, keyPath });
-    let remoteSha = await runGit(["rev-parse", `origin/${branch}`], { cwd: repoPath, keyPath });
     let localSha = await runGit(["rev-parse", "HEAD"], { cwd: repoPath, keyPath });
+
+    // A ref listing is a few hundred bytes and no objects, so the usual case of nothing having
+    // changed costs almost nothing and we only fetch when there is something to fetch.
+    let listing = await runGit(["ls-remote", "origin", branch], { cwd: repoPath, keyPath });
+    let remoteSha = (listing.split(/\s+/)[0] || "").trim();
+    if (!remoteSha) {
+        throw new Error(`Expected origin to report a sha for ${branch}, listed ${listing.slice(0, MAX_ERROR_BODY_LENGTH)}`);
+    }
     if (remoteSha === localSha && remoteSha === sourceState(repoURL).lastSha) {
         return { changed: false, historyRewritten: false, remoteSha, previousSha: localSha };
     }
+
+    await runGit(["fetch", "--prune", "origin", branch], { cwd: repoPath, keyPath });
+    remoteSha = await runGit(["rev-parse", `origin/${branch}`], { cwd: repoPath, keyPath });
     let previousSha = sourceState(repoURL).lastSha || localSha;
     let historyRewritten = false;
     if (previousSha && previousSha !== remoteSha) {
@@ -1018,6 +1034,9 @@ async function pollRepo() {
 }
 
 async function everyMinute() {
+    // The repo is checked first, so a change that came from it is reported as an update rather
+    // than as somebody having edited the file locally.
+    await pollRepo();
     await enforceRootKeys({ reason: "manual" });
     await checkOtherUserKeys();
     await enforceSSHDConfig();
@@ -1078,8 +1097,7 @@ async function main() {
     await enforceRootKeys({ reason: "repo" });
     await enforceSSHDConfig();
 
-    startInterval({ name: "key check", intervalTime: KEYS_CHECK_INTERVAL, run: everyMinute });
-    startInterval({ name: "repo poll", intervalTime: REPO_POLL_INTERVAL, run: pollRepo });
+    startInterval({ name: "check", intervalTime: CHECK_INTERVAL, run: everyMinute });
     startInterval({ name: "webhook check", intervalTime: WEBHOOK_CHECK_INTERVAL, run: checkWebhookFileChanged });
 }
 
