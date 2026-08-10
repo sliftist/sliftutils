@@ -16,12 +16,13 @@ const REMOTE_CONFIG_PATH = "/etc/portsecure/daemon.json";
 const ROOT_AUTHORIZED_KEYS = "/root/.ssh/authorized_keys";
 const SERVICE_NAME = "portsecure";
 const MAX_ERROR_BODY_LENGTH = 500;
-const VERBS = ["add", "remove", "list"];
+const VERBS = ["add", "remove", "list", "update"];
 // The repo url is optional, and defaults to the repo the command is run from.
 const USAGE = `Usage:
   yarn securessh <host> add <repo-private-key> [repo-url]
   yarn securessh <host> remove [repo-url]
-  yarn securessh <host> list`;
+  yarn securessh <host> list
+  yarn securessh <host> update`;
 
 async function pathExists(filePath: string) {
     try {
@@ -362,6 +363,23 @@ $SUDO rm -rf "${sourceRepoPath(repoURL)}"`,
 
 /** Answers "who can log into this box, and which repo says so". The paths the daemon uses are
     left out on purpose, they are plumbing rather than something to act on. */
+/** Pushes the current daemon onto a host that already has one, for when this code has moved on.
+    Nothing about which keys the host trusts is touched. */
+async function updateDaemon(host: string) {
+    let contents = await readRemoteFile({ host, filePath: REMOTE_CONFIG_PATH });
+    if (!contents) {
+        throw new Error(
+            `Expected ${host} to already have portsecure, ${REMOTE_CONFIG_PATH} does not exist.\n`
+            + `Set it up with:\n  yarn securessh ${host} add <repo-private-key> [repo-url]`
+        );
+    }
+    let parsed = JSON.parse(contents) as { hostLabel?: string; repoSources?: string[] };
+    let repoSources = parsed.repoSources || [];
+    await requireRemoteWebhook(host);
+    await installDaemon({ host, hostLabel: parsed.hostLabel || host, repoSources });
+    console.log(`Updated the daemon on ${host}. ${repoSources.length} source(s), unchanged.`);
+}
+
 async function listSources(host: string) {
     let remoteConfig = await readRemoteConfig(host);
     if (!remoteConfig.repoSources.length) {
@@ -411,6 +429,13 @@ export async function main() {
 
     if (verb === "list") {
         await listSources(host);
+        return;
+    }
+    if (verb === "update") {
+        if (rest.length) {
+            throw new Error(`Expected nothing after update, was ${rest.length} argument(s)\n${USAGE}`);
+        }
+        await updateDaemon(host);
         return;
     }
     if (verb === "add") {
