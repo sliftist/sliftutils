@@ -5,7 +5,7 @@ import { deriveRevokeKey, revokeKeyPath, revokeRepoPath, revokeRepoURL } from ".
 import { sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, repoIsUsable, runGit } from "./git";
 import { UNREVOKE_DELAY } from "./paths";
-import { log, notify } from "./notify";
+import { notify } from "./notify";
 import { getState, saveState } from "./state";
 
 // One revocation per key, ever. Naming the file after the fingerprint is what makes that true:
@@ -44,7 +44,7 @@ async function ensureRevokeKey(sourceURL: string) {
     let derived = deriveRevokeKey(await fs.readFile(sourceKeyPath(sourceURL), "utf8"));
     await fs.mkdir(path.dirname(keyPath), { recursive: true, mode: 0o700 });
     await fs.writeFile(keyPath, derived.privateKeyFile, { mode: 0o600 });
-    log(`Derived the revoke key for ${sourceURL}`);
+    console.log(`Derived the revoke key for ${sourceURL}`);
     return keyPath;
 }
 
@@ -59,8 +59,14 @@ export async function syncRevokeRepo(sourceURL: string) {
             await cloneRepo({ repoURL, repoPath, keyPath });
             return true;
         }
+        let localHead = await runGit({ args: ["rev-parse", "HEAD"], cwd: repoPath, keyPath, allowFailure: true });
+        if (localHead.status !== 0) {
+            // A revoke repo with no commits yet. Nothing has ever been revoked, which is the state
+            // every one of these starts in, so there is nothing to pull and nothing to say.
+            return true;
+        }
         let head = (await runGit({ args: ["rev-parse", "--abbrev-ref", "HEAD"], cwd: repoPath, keyPath })).stdout.trim();
-        let localSha = (await runGit({ args: ["rev-parse", "HEAD"], cwd: repoPath, keyPath })).stdout.trim();
+        let localSha = localHead.stdout.trim();
         // A ref listing is a few hundred bytes and no objects, so the usual case of nothing having
         // been revoked anywhere costs almost nothing.
         let listing = (await runGit({ args: ["ls-remote", "origin", head], cwd: repoPath, keyPath })).stdout;
@@ -73,7 +79,7 @@ export async function syncRevokeRepo(sourceURL: string) {
         await runGit({ args: ["clean", "-fdx"], cwd: repoPath, keyPath });
         return true;
     } catch (e) {
-        log(`Could not sync ${repoURL}. ${e}`);
+        console.log(`Could not sync ${repoURL}. ${e}`);
         return false;
     }
 }
@@ -94,7 +100,7 @@ export async function readRevocationFiles(sourceURL: string) {
                 revocations.push({ fingerprint: parsed.fingerprint, revocationId: parsed.revocationId || name.replace(/\.json$/, "") });
             }
         } catch (e) {
-            log(`Ignoring unreadable revocation ${name}. ${e}`);
+            console.log(`Ignoring unreadable revocation ${name}. ${e}`);
         }
     }
     return revocations;
@@ -117,7 +123,7 @@ export async function readUnrevokeIds(sourceURL: string) {
                 ids.set(revocationId, name.replace(/\.json$/, ""));
             }
         } catch (e) {
-            log(`Ignoring unreadable unrevoke ${name}. ${e}`);
+            console.log(`Ignoring unreadable unrevoke ${name}. ${e}`);
         }
     }
     return ids;
@@ -139,7 +145,7 @@ export async function recordRevocation(config: {
         return false;
     }
     if (!await syncRevokeRepo(sourceURL)) {
-        log(`Cannot record the revocation of ${fingerprint}, ${revokeRepoURL(sourceURL)} is unreachable`);
+        console.log(`Cannot record the revocation of ${fingerprint}, ${revokeRepoURL(sourceURL)} is unreachable`);
         return false;
     }
     let revocationId = revocationIdOf(fingerprint);
@@ -175,7 +181,7 @@ export async function recordRevocation(config: {
     if (push.status !== 0) {
         // Most likely another machine pushed the same revocation first. The next check will pull
         // it and record it, so there is nothing to retry here.
-        log(`Could not push the revocation of ${fingerprint}, will pick it up on the next check. ${(push.stdout + push.stderr).trim()}`);
+        console.log(`Could not push the revocation of ${fingerprint}, will pick it up on the next check. ${(push.stdout + push.stderr).trim()}`);
         return false;
     }
     state.revocations[fingerprint] = {

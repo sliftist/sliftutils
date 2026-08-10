@@ -2,7 +2,6 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import { spawnPromise } from "../../helpers/spawn";
 import { AUTH_LOG_PATH } from "./paths";
-import { log } from "./notify";
 import { getState, saveState } from "./state";
 import { Attempt } from "./revocation";
 
@@ -44,7 +43,7 @@ export function parseAuthLog(contents: string) {
     for (let [processId, entries] of refusals) {
         let key = fingerprints.get(processId);
         if (!key) {
-            log(`A refused attempt named no key, so nothing is being revoked for it: ${entries[0].line}`);
+            console.log(`A refused attempt named no key, so nothing is being revoked for it: ${entries[0].line}`);
             continue;
         }
         for (let entry of entries) {
@@ -77,7 +76,7 @@ export async function readNewAuthLog() {
             args: ["-u", "ssh", "-u", "sshd", "--no-pager", "--since", "-10min"],
         });
         if (result.status !== 0) {
-            log(`No auth log to read: ${AUTH_LOG_PATH} is unreadable and journalctl exited ${result.status}`);
+            console.log(`No auth log to read: ${AUTH_LOG_PATH} is unreadable and journalctl exited ${result.status}`);
             return "";
         }
         return result.stdout;
@@ -95,7 +94,7 @@ export async function readNewAuthLog() {
             state.authLogOffset = stats.size;
             state.authLogSignature = signature;
             await saveState();
-            log(`Watching ${AUTH_LOG_PATH} from its current end, ${stats.size} bytes in`);
+            console.log(`Watching ${AUTH_LOG_PATH} from its current end, ${stats.size} bytes in`);
             return "";
         }
         let offset = state.authLogOffset;

@@ -9,7 +9,7 @@ import {
     MAX_REPO_FAILURES_BEFORE_RECLONE,
     ROOT_AUTHORIZED_KEYS,
 } from "./paths";
-import { log, notify, setHostLabel } from "./notify";
+import { notify, setHostLabel } from "./notify";
 import { enforceRootKeys } from "./rootKeys";
 import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
@@ -96,7 +96,7 @@ export async function readAllowedKeys() {
         try {
             sourceKeys = await resolveSourceKeys(repoURL);
         } catch (e) {
-            log(`Skipping ${repoURL}, its checkout could not be read. ${e}`);
+            console.log(`Skipping ${repoURL}, its checkout could not be read. ${e}`);
             continue;
         }
         for (let key of sourceKeys) {
@@ -137,7 +137,7 @@ async function revokeRefusedKeys(allowedKeys: string[]) {
         seen.add(found.fingerprint);
         let sourceURL = sourceOfFingerprint(found.fingerprint);
         if (!sourceURL) {
-            log(`Nowhere to record the revocation of ${found.fingerprint}, no sources are configured`);
+            console.log(`Nowhere to record the revocation of ${found.fingerprint}, no sources are configured`);
             continue;
         }
         let keyLine = allowedKeys.find(key => keyFingerprint(key) === found.fingerprint) || "";
@@ -160,18 +160,18 @@ async function pollSource(repoURL: string) {
     } catch (e) {
         let failures = (repoFailureCounts[repoURL] || 0) + 1;
         repoFailureCounts[repoURL] = failures;
-        log(`Sync of ${repoURL} failed (${failures} in a row). ${e}`);
+        console.log(`Sync of ${repoURL} failed (${failures} in a row). ${e}`);
         if (failures < MAX_REPO_FAILURES_BEFORE_RECLONE) {
             return false;
         }
         // Availability over tidiness: throw the working copy away and start again.
-        log(`Discarding the checkout of ${repoURL} and cloning from scratch`);
+        console.log(`Discarding the checkout of ${repoURL} and cloning from scratch`);
         try {
             await cloneRepo({ repoURL, repoPath: sourceRepoPath(repoURL), keyPath: sourceKeyPath(repoURL) });
             repoFailureCounts[repoURL] = 0;
             return true;
         } catch (cloneError) {
-            log(`${repoURL} cannot be reached or cloned, its last known keys stay in place. ${cloneError}`);
+            console.log(`${repoURL} cannot be reached or cloned, its last known keys stay in place. ${cloneError}`);
             return false;
         }
     }
@@ -197,7 +197,7 @@ async function everyCheck() {
         try {
             anyChanged = await pollSource(repoURL) || anyChanged;
         } catch (e) {
-            log(`Polling ${repoURL} failed. ${e && (e as Error).stack || e}`);
+            console.log(`Polling ${repoURL} failed. ${e && (e as Error).stack || e}`);
         }
     }
     if (anyChanged) {
@@ -226,7 +226,7 @@ function startInterval(config: { intervalTime: number; run: () => Promise<void>;
     let running = false;
     let tick = async () => {
         if (running) {
-            log(`Skipping ${name}, the previous run has not finished`);
+            console.log(`Skipping ${name}, the previous run has not finished`);
             return;
         }
         running = true;
@@ -234,7 +234,7 @@ function startInterval(config: { intervalTime: number; run: () => Promise<void>;
             await run();
         } catch (e) {
             // Every scheduled job swallows its own errors, the daemon must outlive any single one.
-            log(`${name} failed. ${e && (e as Error).stack || e}`);
+            console.log(`${name} failed. ${e && (e as Error).stack || e}`);
         }
         running = false;
     };
@@ -247,7 +247,7 @@ export async function main() {
     await loadState();
     await configureDiscordNotifications({ filePath: DEFAULT_WEBHOOK_FILE_PATH });
 
-    log(`Starting, ${config.repoSources.length} source(s), keys applied to ${ROOT_AUTHORIZED_KEYS}`);
+    console.log(`Starting, ${config.repoSources.length} source(s), keys applied to ${ROOT_AUTHORIZED_KEYS}`);
 
     // A first pass has to happen before the intervals, so a machine is correct immediately after
     // boot rather than a minute later.
@@ -255,7 +255,7 @@ export async function main() {
         try {
             sourceState(repoURL).lastSha = (await syncRepo(repoURL)).remoteSha;
         } catch (e) {
-            log(`Initial sync of ${repoURL} failed, continuing with whatever is on disk. ${e}`);
+            console.log(`Initial sync of ${repoURL} failed, continuing with whatever is on disk. ${e}`);
         }
     }
     await saveState();
@@ -273,9 +273,9 @@ export async function main() {
     startInterval({ name: "check", intervalTime: CHECK_INTERVAL, run: everyCheck });
 }
 
-process.on("uncaughtException", e => log(`Uncaught exception, staying up. ${e && e.stack || e}`));
-process.on("unhandledRejection", e => log(`Unhandled rejection, staying up. ${e}`));
+process.on("uncaughtException", e => console.log(`Uncaught exception, staying up. ${e && e.stack || e}`));
+process.on("unhandledRejection", e => console.log(`Unhandled rejection, staying up. ${e}`));
 process.on("SIGTERM", () => {
-    log("Received SIGTERM, exiting");
+    console.log("Received SIGTERM, exiting");
     process.exit(0);
 });

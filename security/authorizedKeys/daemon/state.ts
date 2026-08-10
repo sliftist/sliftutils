@@ -1,7 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
 import { STATE_PATH } from "./paths";
-import { log } from "./notify";
 
 /** What we last decided to trust for one source, kept on disk so nobody can tell us a different
     story about what we saw last time. */
@@ -87,7 +86,7 @@ export async function loadState() {
         state = Object.assign(state, JSON.parse(contents));
     } catch (e) {
         // Corrupt state only costs us one duplicate notification, so it is not worth failing over.
-        log(`Ignoring unreadable state file ${STATE_PATH}. ${e}`);
+        console.log(`Ignoring unreadable state file ${STATE_PATH}. ${e}`);
     }
 }
 

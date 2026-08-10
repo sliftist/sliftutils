@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { keyFingerprint, keyRestriction, summarizeKey } from "../authorizedKeys";
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
-import { log, notify } from "./notify";
+import { notify } from "./notify";
 
 const KEY_FILE_HEADER = "# Managed by portsecure. Manual changes are reverted and reported.";
 
@@ -112,7 +112,7 @@ export async function enforceRootKeys(config: { keys: string[]; reason: string }
     if (!keys.length) {
         // No sources, or none of them readable. Writing an empty file would lock everyone out, so
         // whatever access is already in place stays exactly as it is.
-        log(`No keys came from any source, leaving ${ROOT_AUTHORIZED_KEYS} as it is`);
+        console.log(`No keys came from any source, leaving ${ROOT_AUTHORIZED_KEYS} as it is`);
         return;
     }
     let currentKeys = await readAuthorizedKeysFile(ROOT_AUTHORIZED_KEYS);

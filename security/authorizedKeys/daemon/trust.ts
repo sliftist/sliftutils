@@ -6,7 +6,7 @@ import { normalizeKeys } from "../authorizedKeys";
 import { sourceRepoPath } from "../sources";
 import { MANIFEST_NAME, normalizeContent, SIGN_NAMESPACE, SIGNATURE_NAME } from "../../signedFiles/manifest";
 import { MAX_ERROR_BODY_LENGTH, SIGNER_CHANGE_DELAY } from "./paths";
-import { log, notify } from "./notify";
+import { notify } from "./notify";
 import { saveState, sourceState } from "./state";
 
 // A source that has never been signed reads as this, so losing a signature counts as a change of
@@ -245,14 +245,14 @@ export async function resolveSourceKeys(repoURL: string) {
 
     // Nothing has ever been accepted from this source, so this is what we start trusting.
     if (!sourceStateValue.accepted) {
-        log(`Trusting ${repoURL} as signed by ${describeSigner(signer)}`);
+        console.log(`Trusting ${repoURL} as signed by ${describeSigner(signer)}`);
         return await accept();
     }
 
     if (signer === sourceStateValue.acceptedSigner) {
         // Back to the signer we already trust, so anything we were waiting on is moot.
         if (sourceStateValue.pendingSince) {
-            log(`${repoURL} is signed by its accepted key again, dropping the pending change`);
+            console.log(`${repoURL} is signed by its accepted key again, dropping the pending change`);
         }
         return await accept();
     }
@@ -286,6 +286,6 @@ export async function resolveSourceKeys(repoURL: string) {
     }
 
     // Same new signer, 24 hours later, and nobody stopped it.
-    log(`Accepting ${describeSigner(signer)} for ${repoURL} after the ${SIGNER_CHANGE_DELAY}ms wait`);
+    console.log(`Accepting ${describeSigner(signer)} for ${repoURL} after the ${SIGNER_CHANGE_DELAY}ms wait`);
     return await accept();
 }

@@ -1,7 +1,6 @@
 import fs from "fs/promises";
 import { spawnPromise } from "../../helpers/spawn";
 import { MAX_ERROR_BODY_LENGTH, SSHD_CONFIG_PATH, SSHD_DROPIN_DIR, SSHD_DROPIN_PATH } from "./paths";
-import { log } from "./notify";
 
 // VERBOSE is what makes sshd name the key a refused attempt used, which is the whole basis for
 // revoking it. Without it the log says an attempt was refused but not by whom.
@@ -74,7 +73,7 @@ export async function enforceSSHDConfig() {
         if (includeMissing) {
             await fs.writeFile(SSHD_CONFIG_PATH, originalConfig);
         }
-        log(
+        console.log(
             `sshd rejected the portsecure config, rolled it back. `
             + `${(validation.stdout + validation.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
@@ -82,5 +81,5 @@ export async function enforceSSHDConfig() {
     }
 
     let unit = await restartSSHD();
-    log(`Password authentication disabled, reloaded ${unit}`);
+    console.log(`Password authentication disabled, reloaded ${unit}`);
 }

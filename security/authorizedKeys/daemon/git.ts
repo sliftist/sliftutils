@@ -3,7 +3,6 @@ import path from "path";
 import { spawnPromise } from "../../helpers/spawn";
 import { sourceKeyPath, sourceRepoPath } from "../sources";
 import { GIT_TIMEOUT, MAX_ERROR_BODY_LENGTH } from "./paths";
-import { log } from "./notify";
 import { sourceState } from "./state";
 
 async function pathExists(filePath: string) {
@@ -44,7 +43,7 @@ export async function repoIsUsable(config: { repoPath: string; keyPath: string }
     }
     let result = await runGit({ args: ["rev-parse", "--git-dir"], cwd: repoPath, keyPath, allowFailure: true });
     if (result.status !== 0) {
-        log(`Repo at ${repoPath} is not usable. ${(result.stdout + result.stderr).trim()}`);
+        console.log(`Repo at ${repoPath} is not usable. ${(result.stdout + result.stderr).trim()}`);
         return false;
     }
     return true;
@@ -60,7 +59,7 @@ export async function cloneRepo(config: { repoURL: string; repoPath: string; key
     await runGit({ args: ["clone", repoURL, incomingPath], keyPath });
     await fs.rm(repoPath, { recursive: true, force: true });
     await fs.rename(incomingPath, repoPath);
-    log(`Cloned ${repoURL} into ${repoPath}`);
+    console.log(`Cloned ${repoURL} into ${repoPath}`);
 }
 
 export async function currentBranch(config: { repoPath: string; keyPath: string }) {
