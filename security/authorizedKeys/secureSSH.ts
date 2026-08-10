@@ -17,9 +17,10 @@ const ROOT_AUTHORIZED_KEYS = "/root/.ssh/authorized_keys";
 const SERVICE_NAME = "portsecure";
 const MAX_ERROR_BODY_LENGTH = 500;
 const VERBS = ["add", "remove", "list"];
+// The repo url is optional, and defaults to the repo the command is run from.
 const USAGE = `Usage:
-  yarn securessh <host> add <repo-private-key> <repo-url>
-  yarn securessh <host> remove <repo-url>
+  yarn securessh <host> add <repo-private-key> [repo-url]
+  yarn securessh <host> remove [repo-url]
   yarn securessh <host> list`;
 
 async function pathExists(filePath: string) {
@@ -31,9 +32,9 @@ async function pathExists(filePath: string) {
     }
 }
 
-async function runLocal(config: { command: string; args: string[]; allowFailure?: boolean }) {
-    let { command, args, allowFailure } = config;
-    let result = await spawnPromise({ command, args });
+async function runLocal(config: { command: string; args: string[]; cwd?: string; allowFailure?: boolean }) {
+    let { command, args, cwd, allowFailure } = config;
+    let result = await spawnPromise({ command, args, cwd });
     if (result.error) {
         throw new Error(`Expected ${command} to run, failed with ${result.error.message}`);
     }
@@ -120,6 +121,41 @@ async function cloneRepoForInspection(config: { repoURL: string; keyPath: string
     let repoPath = path.join(temporaryDirectory, "repo");
     await gitWithKey({ keyPath, args: ["clone", "--depth", "1", repoURL, repoPath] });
     return repoPath;
+}
+
+/** With no repo url given, the repo we are standing in is used. It has to actually hold keys
+    before we hand it to a host, so a stray working directory cannot be deployed by accident. */
+async function resolveRepoURL(passedURL: string | undefined) {
+    if (passedURL) {
+        return normalizeRepoURL(passedURL);
+    }
+    let topLevel = await runLocal({ command: "git", args: ["rev-parse", "--show-toplevel"], allowFailure: true });
+    if (topLevel.status !== 0) {
+        throw new Error(`Expected a repo url, or the current directory to be inside a git repo, it is not.\n${USAGE}`);
+    }
+    let repoPath = topLevel.stdout.trim();
+    try {
+        await readRepoKeys(repoPath);
+    } catch (e) {
+        throw new Error(
+            `Expected a repo url, or the current repo (${repoPath}) to hold keys, it does not.\n${e}\n${USAGE}`
+        );
+    }
+    let origin = await runLocal({
+        command: "git",
+        args: ["remote", "get-url", "origin"],
+        cwd: repoPath,
+        allowFailure: true,
+    });
+    if (origin.status !== 0 || !origin.stdout.trim()) {
+        throw new Error(
+            `Expected the current repo (${repoPath}) to have an origin remote, it has none.`
+            + ` The host clones the source itself, so a local path is no use to it.`
+        );
+    }
+    let repoURL = normalizeRepoURL(origin.stdout.trim());
+    console.log(`No repo url given, using the current repo: ${repoURL}`);
+    return repoURL;
 }
 
 async function readRemoteConfig(host: string) {
@@ -378,14 +414,14 @@ export async function main() {
         return;
     }
     if (verb === "add") {
-        if (rest.length !== 2) {
-            throw new Error(`Expected a private key and a repo url, was ${rest.length} argument(s)\n${USAGE}`);
+        if (!rest.length || rest.length > 2) {
+            throw new Error(`Expected a private key and optionally a repo url, was ${rest.length} argument(s)\n${USAGE}`);
         }
-        await addSource({ host, keyPath: expandHome(rest[0]), repoURL: normalizeRepoURL(rest[1]) });
+        await addSource({ host, keyPath: expandHome(rest[0]), repoURL: await resolveRepoURL(rest[1]) });
         return;
     }
-    if (rest.length !== 1) {
-        throw new Error(`Expected a repo url to remove, was ${rest.length} argument(s)\n${USAGE}`);
+    if (rest.length > 1) {
+        throw new Error(`Expected at most a repo url to remove, was ${rest.length} argument(s)\n${USAGE}`);
     }
-    await removeSource({ host, repoURL: normalizeRepoURL(rest[0]) });
+    await removeSource({ host, repoURL: await resolveRepoURL(rest[0]) });
 }

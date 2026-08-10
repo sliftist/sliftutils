@@ -19,9 +19,12 @@ missing, then watches the file and warns the old webhook if it is ever swapped.
 Keeps root's `authorized_keys` equal to the merged contents of one or more git repos, and turns
 off every other way in.
 
-    yarn securessh <host> add <repo-private-key> <repo-url>
-    yarn securessh <host> remove <repo-url>
+    yarn securessh <host> add <repo-private-key> [repo-url]
+    yarn securessh <host> remove [repo-url]
     yarn securessh <host> list
+
+With no repo url, the repo you are standing in is used, as long as it holds keys and has an
+origin to clone from.
 
 Each source repo keeps its own deploy key. Both verbs refuse to run if the key you log in with
 would not survive the change, since that would lock you out of the host permanently.
