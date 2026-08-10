@@ -382,7 +382,7 @@ async function runGit(args, options) {
     if (result.status !== 0) {
         throw new Error(
             `Expected git ${args.join(" ")} to exit 0, was ${result.status}. `
-            + `${(result.stderr || "").slice(0, MAX_ERROR_BODY_LENGTH)}`
+            + `${(result.stdout + result.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
     }
     return result.stdout.trim();
@@ -637,7 +637,10 @@ async function verifyCheckoutSigner(config) {
         input: normalizeContent(files.manifest).toString("utf8"),
     });
     if (result.status !== 0) {
-        throw new Error(`the signature over ${MANIFEST_NAME} does not verify: ${(result.stderr || "").trim().slice(0, MAX_ERROR_BODY_LENGTH)}`);
+        throw new Error(
+            `the signature over ${MANIFEST_NAME} does not verify: `
+            + `${(result.stdout + result.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
+        );
     }
     let reported = `${result.stdout} ${result.stderr}`.match(/(SHA256:[A-Za-z0-9+/=]+)/);
     if (!reported) {
@@ -960,7 +963,7 @@ async function enforceSSHDConfig() {
         }
         log(
             `sshd rejected the portsecure config, rolled it back. `
-            + `${(validation.stderr || "").slice(0, MAX_ERROR_BODY_LENGTH)}`
+            + `${(validation.stdout + validation.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
         return;
     }

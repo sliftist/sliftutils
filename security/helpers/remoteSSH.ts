@@ -28,8 +28,9 @@ export async function runOverSSH(config: { host: string; script: string; input?:
     }
     if (result.status !== 0 && !allowFailure) {
         throw new Error(
-            `Expected ssh to ${host} to exit 0, was ${result.status} (see the error output above).`
-            + ` Non-interactive ssh access to ${host} has to work on its own - fix it in your ssh config.`
+            `Expected ssh to ${host} to exit 0, was ${result.status}.`
+            + ` Non-interactive ssh access to ${host} has to work on its own - fix it in your ssh config.\n`
+            + `${(result.stdout + result.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
     }
     return { stdout: result.stdout || "", stderr: result.stderr || "", status: result.status };

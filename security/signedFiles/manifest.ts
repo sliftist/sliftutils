@@ -28,7 +28,10 @@ export async function listRepoFiles(repoPath: string) {
         cwd: repoPath,
     });
     if (result.status !== 0) {
-        throw new Error(`Expected to list the files in ${repoPath}, git ls-files exited ${result.status}. ${result.stderr}`);
+        throw new Error(
+            `Expected to list the files in ${repoPath}, git ls-files exited ${result.status}. `
+            + `${(result.stdout + result.stderr).trim()}`
+        );
     }
     return result.stdout.split("\n")
         .map(line => line.trim())

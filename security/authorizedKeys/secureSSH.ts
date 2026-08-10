@@ -42,7 +42,7 @@ async function runLocal(config: { command: string; args: string[]; cwd?: string;
     if (result.status !== 0 && !allowFailure) {
         throw new Error(
             `Expected ${command} ${args.join(" ")} to exit 0, was ${result.status}. `
-            + `${(result.stderr || "").slice(0, MAX_ERROR_BODY_LENGTH)}`
+            + `${(result.stdout + result.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
     }
     return result;
@@ -70,7 +70,7 @@ async function gitWithKey(config: { keyPath: string; args: string[]; cwd?: strin
     if (result.status !== 0 && !allowFailure) {
         throw new Error(
             `Expected git ${args.join(" ")} to exit 0, was ${result.status}. `
-            + `${(result.stderr || "").slice(0, MAX_ERROR_BODY_LENGTH)}`
+            + `${(result.stdout + result.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
     }
     return result;
@@ -272,7 +272,8 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
     if (reachable.status !== 0) {
         throw new Error(
             `Expected ${repoURL} to be reachable with ${keyPath}, git ls-remote failed.`
-            + ` The daemon would have no way to fetch keys.\n${reachable.stderr.slice(0, MAX_ERROR_BODY_LENGTH)}`
+            + ` The daemon would have no way to fetch keys.\n`
+            + `${(reachable.stdout + reachable.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
     }
 

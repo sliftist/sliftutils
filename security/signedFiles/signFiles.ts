@@ -1,8 +1,8 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
+import { runPromise } from "socket-function/src/runPromise";
 import { expandHome } from "../helpers/paths";
-import { spawnPromise } from "../helpers/spawn";
 import { buildManifest, formatManifest, MANIFEST_NAME, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
 
 // A hardware backed key is the entire point. A key sitting on disk is compromised the moment the
@@ -18,6 +18,12 @@ Signs the files of the repo in the current directory. With no key, a hardware ba
 ${DEFAULT_KEY_TYPE} key at ${DEFAULT_KEY_PATH} is used, and created if it does not exist.
 Pass ${GIT_KEYWORD} to also commit and push the result.`;
 
+/** runPromise takes a command line rather than an argument list, so anything holding a path has to
+    survive the shell. Double quotes work on both cmd and posix shells. */
+function quote(value: string) {
+    return `"${value}"`;
+}
+
 async function pathExists(filePath: string) {
     try {
         await fs.access(filePath);
@@ -27,24 +33,7 @@ async function pathExists(filePath: string) {
     }
 }
 
-async function run(config: { command: string; args: string[]; cwd?: string; interactive?: boolean; stdinFile?: string }) {
-    let { command, args, cwd, interactive, stdinFile } = config;
-    let input = stdinFile && await fs.readFile(stdinFile, "utf8") || undefined;
-    let result = await spawnPromise({ command, args, cwd, input, inheritStderr: interactive });
-    if (result.error) {
-        throw new Error(`Expected ${command} to run, failed with ${result.error.message}`);
-    }
-    if (result.status !== 0) {
-        throw new Error(
-            `Expected ${command} ${args.join(" ")} to exit 0, was ${result.status}. `
-            + `${(result.stderr || "").slice(0, MAX_ERROR_BODY_LENGTH)}`
-        );
-    }
-    return result;
-}
-
-/** Creating this needs the security key plugged in, and a touch, so its output goes straight to
-    the terminal rather than being captured. */
+/** Creating this needs the security key plugged in, and a touch. */
 async function ensureDefaultKey() {
     let keyPath = expandHome(DEFAULT_KEY_PATH);
     if (await pathExists(keyPath)) {
@@ -53,11 +42,7 @@ async function ensureDefaultKey() {
     console.log(`No signing key at ${keyPath}, creating an ${DEFAULT_KEY_TYPE} one.`);
     console.log(`Plug your security key in - you will be asked to touch it.`);
     await fs.mkdir(path.dirname(keyPath), { recursive: true, mode: 0o700 });
-    await run({
-        command: "ssh-keygen",
-        args: ["-t", DEFAULT_KEY_TYPE, "-f", keyPath, "-N", "", "-C", "signfiles"],
-        interactive: true,
-    });
+    await runPromise(`ssh-keygen -t ${DEFAULT_KEY_TYPE} -f ${quote(keyPath)} -N "" -C signfiles`);
     return keyPath;
 }
 
@@ -84,11 +69,10 @@ function parseArgs(argv: string[]) {
 export async function main() {
     let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
 
-    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"] });
-    if (topLevel.status !== 0) {
+    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true })).trim();
+    if (!repoPath) {
         throw new Error(`Expected the current directory to be inside a git repo, it is not.\n${USAGE}`);
     }
-    let repoPath = topLevel.stdout.trim();
 
     let signingKey = keyPath && expandHome(keyPath) || await ensureDefaultKey();
     if (!await pathExists(signingKey)) {
@@ -107,17 +91,11 @@ export async function main() {
     await fs.writeFile(stagedManifest, formatManifest(manifest));
 
     // Signing happens before any git work, so a failed push never costs a second touch of the key.
-    await run({
-        command: "ssh-keygen",
-        args: ["-Y", "sign", "-f", signingKey, "-n", SIGN_NAMESPACE, stagedManifest],
-        interactive: true,
-    });
-    // Checked here rather than discovered by a machine that has already pulled it.
-    await run({
-        command: "ssh-keygen",
-        args: ["-Y", "check-novalidate", "-n", SIGN_NAMESPACE, "-s", stagedSignature, "-I", "signfiles"],
-        stdinFile: stagedManifest,
-    });
+    await runPromise(`ssh-keygen -Y sign -f ${quote(signingKey)} -n ${SIGN_NAMESPACE} ${quote(stagedManifest)}`);
+    // Checked here rather than left for a machine that has already pulled it to discover.
+    await runPromise(
+        `ssh-keygen -Y check-novalidate -n ${SIGN_NAMESPACE} -s ${quote(stagedSignature)} < ${quote(stagedManifest)}`
+    );
     await fs.copyFile(stagedManifest, path.join(repoPath, MANIFEST_NAME));
     await fs.copyFile(stagedSignature, path.join(repoPath, SIGNATURE_NAME));
     await fs.rm(stagingDirectory, { recursive: true, force: true });
@@ -127,8 +105,15 @@ export async function main() {
         console.log(`Commit and push ${MANIFEST_NAME} and ${SIGNATURE_NAME} for anything to see them.`);
         return;
     }
-    await run({ command: "git", args: ["add", "-A"], cwd: repoPath, interactive: true });
-    await run({ command: "git", args: ["commit", "-m", COMMIT_MESSAGE], cwd: repoPath, interactive: true });
-    await run({ command: "git", args: ["push"], cwd: repoPath, interactive: true });
+    await runPromise(`git add -A`, { cwd: repoPath });
+    // Nothing staged is not worth stopping on. git commit calls that a failure, but it only means
+    // the signature matches the one already committed, so there is nothing to deploy.
+    let staged = await runPromise(`git status --porcelain`, { cwd: repoPath, quiet: true });
+    if (!staged.trim()) {
+        console.log(`Nothing changed, ${MANIFEST_NAME} and ${SIGNATURE_NAME} are already committed.`);
+        return;
+    }
+    await runPromise(`git commit -m ${quote(COMMIT_MESSAGE)}`, { cwd: repoPath });
+    await runPromise(`git push`, { cwd: repoPath });
     console.log(`Committed and pushed.`);
 }
