@@ -299,12 +299,14 @@ export async function removeRevokedKeys(keys: string[]) {
     }
     let state = getState();
     let allowed: string[] = [];
+    let dropped: string[] = [];
     for (let key of keys) {
         let fingerprint = keyFingerprint(key);
         if (!fingerprint || !revoked.has(fingerprint)) {
             allowed.push(key);
             continue;
         }
+        dropped.push(fingerprint);
         // Said once, when the key actually goes, and only on a machine that is learning about the
         // revocation from the repo. The machine that did the revoking already said so itself.
         let revocation = state.revocations[fingerprint];
@@ -318,6 +320,15 @@ export async function removeRevokedKeys(keys: string[]) {
                 + ` from root's authorized_keys. This machine no longer accepts it.${ended}`
             );
         }
+    }
+    // Said on every check, not once. A key being held out of authorized_keys is the current state
+    // of the machine, and someone reading the log to work out why a key does not work should find
+    // the answer there rather than having to know what to search the history for.
+    if (dropped.length) {
+        console.log(
+            `Dropped ${dropped.length} revoked key(s) from the merged set, ${allowed.length} left.`
+            + ` Revoked: ${dropped.join(", ")}`
+        );
     }
     return allowed;
 }
