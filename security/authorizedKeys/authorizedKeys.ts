@@ -2,11 +2,6 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 
-// PORTED CODE: security/authorizedKeys/daemon/portsecureDaemon.js contains a plain JS port of normalizeKeys,
-// summarizeKey and readRepoKeys, so it can resolve the same keys with no dependencies. The two
-// must agree on which keys a repo produces - if you change one, make the matching change in the
-// other.
-
 export function normalizeKeys(contents: string) {
     return contents.split("\n").map(line => line.trim()).filter(line => line && !line.startsWith("#"));
 }
@@ -56,6 +51,39 @@ export function summarizeKey(keyLine: string) {
     let blob = parts[typeIndex + 1] || "";
     let comment = parts.slice(typeIndex + 2).join(" ");
     return `${type} ...${blob.slice(-12)}${comment && ` ${comment}` || ""}`;
+}
+
+/** What a set of keys has to satisfy before it is worth signing, as a list of complaints.
+
+    Every key needs a from=, because an unrestricted key can never be caught being used from the
+    wrong place, and being caught is the only thing that triggers a revocation.
+
+    No two keys may allow the same addresses, because that is one person holding two keys: revoking
+    one of them leaves the other working, so the revocation achieves nothing. */
+export function findKeyProblems(keys: string[]) {
+    let problems: string[] = [];
+    let byRestriction = new Map<string, string[]>();
+    for (let key of keys) {
+        let restriction = keyRestrictionList(key);
+        if (!restriction) {
+            problems.push(`no from= restriction, so it can be used from anywhere:\n      ${summarizeKey(key)}`);
+            continue;
+        }
+        // Sorted, so the same addresses written in a different order still count as the same.
+        let identity = [...restriction].sort().join(",");
+        byRestriction.set(identity, [...(byRestriction.get(identity) || []), key]);
+    }
+    for (let [restriction, sharing] of byRestriction) {
+        if (sharing.length < 2) {
+            continue;
+        }
+        problems.push(
+            `${sharing.length} keys allow exactly the same addresses (${restriction}), which is one`
+            + ` person holding more than one key:\n`
+            + sharing.map(key => `      ${summarizeKey(key)}`).join("\n")
+        );
+    }
+    return problems;
 }
 
 /** Reads the authorized keys a repo checkout wants applied. Prefers a top level authorized_keys
