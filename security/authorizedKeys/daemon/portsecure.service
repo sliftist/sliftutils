@@ -1,0 +1,18 @@
+[Unit]
+Description=portsecure authorized keys daemon
+Documentation=https://github.com/sliftist/portsecure
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node /opt/portsecure/portsecure-daemon.js
+User=root
+# Availability is the point of this daemon, so it always comes back.
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

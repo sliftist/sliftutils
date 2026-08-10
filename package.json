@@ -28,7 +28,9 @@
         "notes": "mobx, preact, socket-function, typenode SHOULD be peerDependencies. But we want to use yarn (better dependency deduplication), so we can't use peerDependencies (as they aren't installed by default, which makes them a nightmare to use). If you want to override the versions, feel free to use overrides/resolutions.",
         "test": "typenode ./test.ts",
         "filehoster": "node ./bin/filehoster.js",
-        "autohost": "node ./bin/autohost.js"
+        "autohost": "node ./bin/autohost.js",
+        "setupnotify": "node ./bin/setupnotify.js",
+        "securessh": "node ./bin/securessh.js"
     },
     "bin": {
         "filehoster": "./bin/filehoster.js",
@@ -45,7 +47,9 @@
         "slift-watch": "./builders/watchRun.js",
         "sliftwatch": "./builders/watchRun.js",
         "slift-setup": "./builders/setupRun.js",
-        "sliftsetup": "./builders/setupRun.js"
+        "sliftsetup": "./builders/setupRun.js",
+        "setupnotify": "./bin/setupnotify.js",
+        "securessh": "./bin/securessh.js"
     },
     "dependencies": {
         "@types/chrome": "^0.0.237",
