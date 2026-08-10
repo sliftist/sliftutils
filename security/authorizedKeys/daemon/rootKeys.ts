@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { keyFingerprint, keyRestriction, summarizeKey } from "../authorizedKeys";
+import { keyFingerprint, keyRestriction, keyRestrictionList, NO_RESTRICTION, summarizeKey } from "../authorizedKeys";
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
 import { notify } from "./notify";
 
@@ -20,6 +20,35 @@ async function pathExists(filePath: string) {
     arriving. A line we cannot read a key out of falls back to the whole line. */
 function keyIdentity(keyLine: string) {
     return keyFingerprint(keyLine) || keyLine;
+}
+
+/** Which addresses a key gained or lost, rather than two long lists to compare by eye. Returns ""
+    when the addresses did not change at all. Losing the from= altogether is the loudest case there
+    is, so it is spelled out rather than shown as a list of removals. */
+function describeAddressChange(config: { previousLine: string; currentLine: string }) {
+    let { previousLine, currentLine } = config;
+    let previous = keyRestrictionList(previousLine);
+    let current = keyRestrictionList(currentLine);
+    if (!previous && !current) {
+        return "";
+    }
+    if (previous && !current) {
+        return `          was ${previous.join(",")}\n          now ${NO_RESTRICTION}`;
+    }
+    if (!previous && current) {
+        return `          was ${NO_RESTRICTION}\n          now restricted to ${current.join(",")}`;
+    }
+    let removed = (previous || []).filter(address => !(current || []).includes(address));
+    let added = (current || []).filter(address => !(previous || []).includes(address));
+    if (!removed.length && !added.length) {
+        return "";
+    }
+    let lines = [
+        ...removed.map(address => `          no longer allowed from ${address}`),
+        ...added.map(address => `          now also allowed from ${address}`),
+    ];
+    lines.push(`          still allowed from ${(current || []).filter(address => !added.includes(address)).join(",") || "nothing"}`);
+    return lines.join("\n");
 }
 
 export function describeKeyDifference(config: { before: string[]; after: string[] }) {
@@ -43,17 +72,13 @@ export function describeKeyDifference(config: { before: string[]; after: string[
         if (!currentLine || currentLine === previousLine) {
             continue;
         }
-        let previousFrom = keyRestriction(previousLine);
-        let currentFrom = keyRestriction(currentLine);
-        if (previousFrom !== currentFrom) {
-            lines.push(
-                `~ changed ${summarizeKey(currentLine)}\n          from ${previousFrom}\n`
-                + `            to ${currentFrom}`
-            );
+        let addressChange = describeAddressChange({ previousLine, currentLine });
+        if (addressChange) {
+            lines.push(`~ changed ${summarizeKey(currentLine)}\n${addressChange}`);
             continue;
         }
         lines.push(
-            `~ changed ${summarizeKey(currentLine)}\n          from ${currentFrom}\n`
+            `~ changed ${summarizeKey(currentLine)}\n          from ${keyRestriction(currentLine)}\n`
             + `          its options or comment changed`
         );
     }

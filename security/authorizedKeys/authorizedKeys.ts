@@ -23,14 +23,26 @@ export function keyFingerprint(keyLine: string) {
     return "SHA256:" + crypto.createHash("sha256").update(Buffer.from(blob, "base64")).digest("base64").replace(/=+$/, "");
 }
 
+export const NO_RESTRICTION = "ANY ADDRESS (no from= restriction)";
+
+/** The addresses a key may be used from, one by one, or undefined when the key carries no from=
+    at all. Undefined and an empty list are very different things, so they stay distinguishable. */
+export function keyRestrictionList(keyLine: string) {
+    let match = keyLine.match(/from="([^"]*)"/);
+    if (!match) {
+        return undefined;
+    }
+    return match[1].split(",").map(entry => entry.trim()).filter(entry => entry);
+}
+
 /** The addresses a key may be used from, which is the part of an authorized_keys line that
     decides how much a stolen key is worth. A key with no restriction says so loudly. */
 export function keyRestriction(keyLine: string) {
-    let match = keyLine.match(/from="([^"]*)"/);
-    if (!match) {
-        return "ANY ADDRESS (no from= restriction)";
+    let list = keyRestrictionList(keyLine);
+    if (!list) {
+        return NO_RESTRICTION;
     }
-    return match[1];
+    return list.join(",");
 }
 
 /** Enough to recognise whose key this is without printing the whole blob. */
