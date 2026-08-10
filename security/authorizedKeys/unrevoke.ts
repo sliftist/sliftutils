@@ -3,16 +3,18 @@ import os from "os";
 import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
 import { keyFingerprint, normalizeKeys } from "./authorizedKeys";
-import { deriveRevokeKey, revokeRepoURL } from "./revokeSource";
+import { revokeRepoURL } from "./revokeSource";
+import { readRepoKeys } from "./authorizedKeys";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
 
 const UNREVOKES_DIR = "unrevoked";
 const REVOCATIONS_DIR = "revocations";
-const USAGE = `Usage: yarn unrevoke <source-repo-private-key>
+const USAGE = `Usage: yarn unrevoke [keys-repo]
 
-Run this in a keys repo. It reads that repo's revoke repo and writes one unrevoke file naming
-every revocation in it, so the keys are accepted again once each machine's hour long wait passes.
+Run this in a keys repo, or name one. It reads that repo's revoke repo and writes one unrevoke file
+naming every revocation in it, so the keys are accepted again once each machine's hour long wait
+passes.
 
 Keys that were revoked should normally be deleted from the repo instead. Unrevoking only matters
 for a key you still want.`;
@@ -26,24 +28,21 @@ export type Revocation = {
     attempt?: { ip?: string; user?: string; required?: string };
 };
 
-/** Every revocation the revoke repo lists. Cloned read only into a temp directory, since this runs
-    on a developer machine that has no business holding a checkout of it. */
-export async function readRemoteRevocations(config: { sourceURL: string; keyPath: string }) {
-    let { sourceURL, keyPath } = config;
-    let derived = deriveRevokeKey(await fs.readFile(keyPath, "utf8"));
+/** Every revocation the revoke repo lists. Cloned read only into a temp directory, with whatever
+    credentials this machine already has - the derived deploy key is for servers, and a person
+    running this has their own access to the repo. */
+export async function readRemoteRevocations(config: { sourceURL: string }) {
+    let { sourceURL } = config;
     let temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "unrevoke-"));
-    let derivedKeyPath = path.join(temporaryDirectory, "key");
-    await fs.writeFile(derivedKeyPath, derived.privateKeyFile, { mode: 0o600 });
     let repoPath = path.join(temporaryDirectory, "repo");
-    let sshCommand = `ssh -i ${derivedKeyPath} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`;
     let clone = await spawnPromise({
         command: "git",
-        args: ["-c", `core.sshCommand=${sshCommand}`, "clone", "--depth", "1", revokeRepoURL(sourceURL), repoPath],
+        args: ["clone", "--depth", "1", revokeRepoURL(sourceURL), repoPath],
     });
     if (clone.status !== 0) {
         await fs.rm(temporaryDirectory, { recursive: true, force: true });
         throw new Error(
-            `Expected ${revokeRepoURL(sourceURL)} to be readable with the key derived from ${keyPath}.\n`
+            `Expected to be able to read ${revokeRepoURL(sourceURL)}.\n`
             + `${(clone.stdout + clone.stderr).trim()}`
         );
     }
@@ -63,9 +62,9 @@ export async function readRemoteRevocations(config: { sourceURL: string; keyPath
 }
 
 /** Which keys in a repo are revoked. What signfiles and securessh refuse over. */
-export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: string; keyPath: string }) {
-    let { repoPath, sourceURL, keyPath } = config;
-    let revocations = await readRemoteRevocations({ sourceURL, keyPath });
+export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: string }) {
+    let { repoPath, sourceURL } = config;
+    let revocations = await readRemoteRevocations({ sourceURL });
     let revokedFingerprints = new Set(revocations.map(revocation => revocation.fingerprint));
     let unrevoked = new Set<string>();
     try {
@@ -89,20 +88,34 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
         .map(revocation => ({ revocation, key: keys.find(key => keyFingerprint(key) === revocation.fingerprint) || "" }));
 }
 
+/** The repo named, or the one we are standing in. Checked the same way securessh checks it: a git
+    repo that actually holds keys and has an origin to clone from. */
+async function resolveKeysRepo(named: string | undefined) {
+    let cwd = named && expandHome(named) || undefined;
+    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true, cwd })).trim();
+    if (!repoPath) {
+        throw new Error(`Expected ${named || "the current directory"} to be inside a git repo, it is not.\n${USAGE}`);
+    }
+    try {
+        await readRepoKeys(repoPath);
+    } catch (e) {
+        throw new Error(`Expected ${repoPath} to be a keys repo, it holds no keys.\n${e}\n${USAGE}`);
+    }
+    let originURL = (await runPromise("git remote get-url origin", { quiet: true, cwd: repoPath })).trim();
+    if (!originURL) {
+        throw new Error(`Expected ${repoPath} to have an origin remote, it has none.\n${USAGE}`);
+    }
+    return { repoPath, originURL };
+}
+
 export async function main() {
     let argv = process.argv.slice(2);
-    if (argv.length !== 1) {
-        throw new Error(`Expected the source repo's private key, was ${argv.length} argument(s)\n${USAGE}`);
+    if (argv.length > 1) {
+        throw new Error(`Expected at most a keys repo, was ${argv.length} argument(s)\n${USAGE}`);
     }
-    let keyPath = expandHome(argv[0]);
+    let { repoPath, originURL } = await resolveKeysRepo(argv[0]);
 
-    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true })).trim();
-    let originURL = (await runPromise("git remote get-url origin", { quiet: true })).trim();
-    if (!repoPath || !originURL) {
-        throw new Error(`Expected the current directory to be a git repo with an origin, it is not.\n${USAGE}`);
-    }
-
-    let revocations = await readRemoteRevocations({ sourceURL: originURL, keyPath });
+    let revocations = await readRemoteRevocations({ sourceURL: originURL });
     if (!revocations.length) {
         console.log(`${revokeRepoURL(originURL)} lists no revocations, so there is nothing to undo.`);
         return;

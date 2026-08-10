@@ -125,15 +125,16 @@ it is not.
   that locked them out. Recovering from that means making a new key, which you would want anyway.
 - Each machine says so on Discord when a revoked key actually leaves its authorized_keys, once.
 
-    yarn unrevoke <source-repo-private-key>
+    yarn unrevoke [keys-repo]
 
-Run in the keys repo. It reads the revoke repo and writes one file under `unrevoked/` naming the
-revocations to undo, which then needs signing and pushing. Machines report when they see it, hold
+Run in the keys repo, or name one. It uses whatever git credentials the machine already has, since
+the derived deploy key is for servers rather than for people. It reads the revoke repo and writes
+one file under `unrevoked/` naming the revocations to undo, which then needs signing and pushing. Machines report when they see it, hold
 it for an hour, then report again when it takes effect - so a signing key that was itself stolen
 cannot instantly undo the revocation that shut it out.
 
-Deleting a revoked key from the repo is usually the right answer instead. `securessh` refuses to
-deploy a repo that still holds one.
+Deleting a revoked key from the repo is usually the right answer instead. Both `signfiles` and
+`securessh` refuse while a repo still holds a revoked key, and say which one it is.
 
 ## helpers
 

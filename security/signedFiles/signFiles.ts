@@ -4,6 +4,7 @@ import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
 import { expandHome } from "../helpers/paths";
 import { buildManifest, formatManifest, MANIFEST_NAME, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
+import { revokedKeysInRepo } from "../authorizedKeys/unrevoke";
 
 // A hardware backed key is the entire point. A key sitting on disk is compromised the moment the
 // machine is, and then the signature proves nothing, so this is what we make when asked to make one.
@@ -57,6 +58,35 @@ async function publicKeyOf(keyPath: string) {
     return `${keyType} ${keyBody}`;
 }
 
+/** Signing a keys repo that still holds a revoked key would publish it back to every machine that
+    took it out. Only applies to a repo that holds keys and has a revoke repo to check - signing
+    anything else is none of this function's business. */
+async function refuseRevokedKeys(repoPath: string) {
+    if (!await pathExists(path.join(repoPath, "authorized_keys"))) {
+        return;
+    }
+    let originURL = (await runPromise("git remote get-url origin", { cwd: repoPath, quiet: true, nothrow: true })).trim();
+    if (!originURL) {
+        return;
+    }
+    let revoked;
+    try {
+        revoked = await revokedKeysInRepo({ repoPath, sourceURL: originURL });
+    } catch (e) {
+        // No revoke repo, or no access to it. Nothing has been revoked that we can see.
+        return;
+    }
+    if (!revoked.length) {
+        return;
+    }
+    throw new Error(
+        `Expected ${repoPath} to hold no revoked keys, it holds ${revoked.length}:\n`
+        + revoked.map(entry => `  ${entry.revocation.fingerprint} revoked by ${entry.revocation.revokedBy || "?"}`
+            + ` after use from ${entry.revocation.attempt?.ip || "?"}`).join("\n")
+        + `\nDelete them from authorized_keys, or run "yarn unrevoke" here to allow them again.`
+    );
+}
+
 function parseArgs(argv: string[]) {
     let pushToGit = argv.includes(GIT_KEYWORD);
     let positional = argv.filter(arg => arg !== GIT_KEYWORD);
@@ -78,6 +108,8 @@ export async function main() {
     if (!await pathExists(signingKey)) {
         throw new Error(`Expected a signing key at ${signingKey}, no such file exists`);
     }
+
+    await refuseRevokedKeys(repoPath);
 
     let manifest = await buildManifest(repoPath);
     console.log(`${MANIFEST_NAME} covers ${manifest.files.length} file(s) in ${repoPath}`);

@@ -375,7 +375,7 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
     await ensureRevokeRepo({ keyPath, repoURL });
 
     // Deploying a repo that still holds a revoked key would hand it back to every machine.
-    let revoked = await revokedKeysInRepo({ repoPath: inspectionPath, sourceURL: repoURL, keyPath });
+    let revoked = await revokedKeysInRepo({ repoPath: inspectionPath, sourceURL: repoURL });
     if (revoked.length) {
         throw new Error(
             `Expected ${repoURL} to hold no revoked keys, it holds ${revoked.length}:\n`
