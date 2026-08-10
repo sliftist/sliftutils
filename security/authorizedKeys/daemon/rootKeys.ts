@@ -4,7 +4,6 @@ import { keyFingerprint, keyRestriction, keyRestrictionList, NO_RESTRICTION, sum
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
 import { notify } from "./notify";
 import { getState, saveState } from "./state";
-import { describeAllEnded, endAllSSHSessions } from "./sessions";
 
 const KEY_FILE_HEADER = "# Managed by portsecure. Manual changes are reverted and reported.";
 
@@ -178,15 +177,10 @@ export async function enforceRootKeys(keys: string[]) {
     await saveState();
     let archiveNote = archivePath && `\nThe file as it was is kept at \`${archivePath}\`.` || "";
 
-    // A key that is no longer allowed may well be holding a session open right now, and taking it
-    // out of the file does nothing to that session. Whoever still has a key can reconnect at once.
-    let lostKeys = previouslyApplied.filter(key => !keys.includes(key));
-    let ended = lostKeys.length && describeAllEnded(await endAllSSHSessions()) || "";
-
     if (weChangedIt) {
         await notify(
             `root's authorized_keys has been updated:`
-            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${archiveNote}${ended}`
+            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${archiveNote}`
         );
         return;
     }
