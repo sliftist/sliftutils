@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
+import { runPromise } from "socket-function/src/runPromise";
 import { DEFAULT_WEBHOOK_FILE_PATH, parseWebhookFile } from "../notifications/discord";
 import { normalizeKeys, readRepoKeys, summarizeKey } from "./authorizedKeys";
 import { sourceKeyPath, sourceRepoPath } from "./sources";
@@ -502,22 +503,22 @@ async function pullLocalCheckout() {
         );
     }
     let repoPath = topLevel.stdout.trim();
-    let pull = await spawnPromise({ command: "git", args: ["pull", "--ff-only"], cwd: repoPath });
-    if (pull.status !== 0) {
+    let upstream = (await runPromise("git rev-parse --abbrev-ref @{u}", { cwd: repoPath, quiet: true, nothrow: true })).trim();
+    if (!upstream || upstream.includes("fatal")) {
         throw new Error(
-            `Expected git pull in ${repoPath} to succeed, it did not, so nothing was installed.\n`
-            + `${(pull.stdout + pull.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
+            `Expected ${repoPath} to track a branch on a remote, it does not, so there is nothing to`
+            + ` bring it up to date from.`
         );
     }
-    // The host installs from github, not from here, so local commits that have not been pushed
-    // are not what it will run.
-    let local = await spawnPromise({ command: "git", args: ["rev-parse", "HEAD"], cwd: repoPath });
-    let remote = await spawnPromise({ command: "git", args: ["rev-parse", "@{u}"], cwd: repoPath });
-    if (local.stdout.trim() !== remote.stdout.trim()) {
-        console.log(`WARNING: ${repoPath} has commits that are not pushed. The host installs from github,`);
-        console.log(`         so it will run the pushed version, not what is here.`);
-    }
-    console.log(`Pulled ${repoPath}`);
+    // Forced to whatever the remote holds rather than merged into it. The host installs from
+    // github, so anything here that github does not have is not what would run, and a checkout
+    // that has drifted must not be able to stop a deploy. Local work is stashed rather than
+    // dropped, and discarded commits are still in the reflog.
+    await runPromise("git add --all", { cwd: repoPath });
+    await runPromise("git stash", { cwd: repoPath });
+    await runPromise("git fetch origin", { cwd: repoPath });
+    await runPromise(`git reset --hard ${upstream}`, { cwd: repoPath });
+    console.log(`Forced ${repoPath} to ${upstream}`);
 }
 
 /** Pushes the current daemon onto a host that already has one, for when this code has moved on.
