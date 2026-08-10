@@ -71,6 +71,63 @@ export async function endSessionsUsingKey(fingerprint: string) {
     return ended;
 }
 
+/** The listener has to survive, or nobody can get back in. Every openssh since 9.8 runs each
+    connection as a separate sshd-session, and on older ones the listener is the sshd that systemd
+    started directly and runs with -D. */
+async function isConnectionProcess(processId: number) {
+    let name: string;
+    try {
+        name = (await fs.readFile(`/proc/${processId}/comm`, "utf8")).trim();
+    } catch (e) {
+        return false;
+    }
+    if (name === "sshd-session") {
+        return true;
+    }
+    if (name !== "sshd") {
+        return false;
+    }
+    let commandLine = await fs.readFile(`/proc/${processId}/cmdline`, "utf8").catch(() => "");
+    let parentId = Number((await fs.readFile(`/proc/${processId}/stat`, "utf8").catch(() => "")).split(") ")[1]?.split(" ")[1] || 0);
+    return !commandLine.includes("-D") && parentId !== 1;
+}
+
+/** Disconnects every ssh session on the machine.
+
+    Not only the ones using the key that was just taken away: a session that predates the key being
+    removed is exactly as dangerous, and working out which sessions are still entitled to be here
+    is guesswork. Anyone who still has access can reconnect in a second, and anyone who does not
+    should not be here. */
+export async function endAllSSHSessions() {
+    let ended: number[] = [];
+    for (let entry of await fs.readdir("/proc")) {
+        let processId = Number(entry);
+        if (!processId || processId <= 1 || processId === process.pid) {
+            continue;
+        }
+        if (!await isConnectionProcess(processId)) {
+            continue;
+        }
+        try {
+            process.kill(processId, "SIGKILL");
+            ended.push(processId);
+        } catch (e) {
+            // Gone between looking and killing, which is the outcome we wanted anyway.
+        }
+    }
+    if (ended.length) {
+        console.log(`Disconnected ${ended.length} ssh session(s): ${ended.join(", ")}`);
+    }
+    return ended;
+}
+
+export function describeAllEnded(ended: number[]) {
+    if (!ended.length) {
+        return " Nothing was connected.";
+    }
+    return ` Every ssh session on this machine was disconnected, ${ended.length} of them.`;
+}
+
 export function describeEndedSessions(ended: KeySession[]) {
     if (!ended.length) {
         return " Nothing was connected with it.";
