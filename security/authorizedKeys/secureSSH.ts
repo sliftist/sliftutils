@@ -1,7 +1,6 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { runPromise } from "socket-function/src/runPromise";
 import { DEFAULT_WEBHOOK_FILE_PATH, parseWebhookFile } from "../notifications/discord";
 import { normalizeKeys, readRepoKeys, summarizeKey } from "./authorizedKeys";
 import { sourceKeyPath, sourceRepoPath } from "./sources";
@@ -305,7 +304,14 @@ set -e
 $SUDO mkdir -p "${path.posix.dirname(REMOTE_CHECKOUT_PATH)}"
 if $SUDO test -d "${REMOTE_CHECKOUT_PATH}/.git"; then
     $SUDO git -C "${REMOTE_CHECKOUT_PATH}" fetch --prune origin
+    # set-head so origin/HEAD is whatever the remote's default branch is now, rather than whatever
+    # it was when this was first cloned. Then forced onto it: a checkout that has drifted, for any
+    # reason, must not be able to leave a host running old code.
+    $SUDO git -C "${REMOTE_CHECKOUT_PATH}" remote set-head origin --auto
     $SUDO git -C "${REMOTE_CHECKOUT_PATH}" reset --hard origin/HEAD
+    # Tracked files are back to the commit, this takes out anything extra that was left lying
+    # around. Ignored files are kept, so node_modules survives and the install stays quick.
+    $SUDO git -C "${REMOTE_CHECKOUT_PATH}" clean -fd
 else
     $SUDO rm -rf "${REMOTE_CHECKOUT_PATH}"
     $SUDO git clone "${SLIFTUTILS_URL}" "${REMOTE_CHECKOUT_PATH}"
@@ -491,42 +497,10 @@ $SUDO rm -rf "${sourceRepoPath(repoURL)}"`,
 
 /** Answers "who can log into this box, and which repo says so". The paths the daemon uses are
     left out on purpose, they are plumbing rather than something to act on. */
-/** The daemon is installed from this checkout, so the checkout is brought up to date first.
-    Anything that stops the pull - a conflict, local commits, no upstream - stops the update too,
-    rather than quietly installing whatever happened to be on disk. */
-async function pullLocalCheckout() {
-    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"], cwd: __dirname });
-    if (topLevel.status !== 0) {
-        throw new Error(
-            `Expected ${__dirname} to be inside a git checkout, it is not.`
-            + ` update installs the daemon from this checkout, so it has to be one.`
-        );
-    }
-    let repoPath = topLevel.stdout.trim();
-    let upstream = (await runPromise("git rev-parse --abbrev-ref @{u}", { cwd: repoPath, quiet: true, nothrow: true })).trim();
-    if (!upstream || upstream.includes("fatal")) {
-        throw new Error(
-            `Expected ${repoPath} to track a branch on a remote, it does not, so there is nothing to`
-            + ` bring it up to date from.`
-        );
-    }
-    // Forced to whatever the remote holds rather than merged into it. The host installs from
-    // github, so anything here that github does not have is not what would run, and a checkout
-    // that has drifted must not be able to stop a deploy. Local work is stashed rather than
-    // dropped, and discarded commits are still in the reflog.
-    await runPromise("git add --all", { cwd: repoPath });
-    await runPromise("git stash", { cwd: repoPath });
-    await runPromise("git fetch origin", { cwd: repoPath });
-    await runPromise(`git reset --hard ${upstream}`, { cwd: repoPath });
-    console.log(`Forced ${repoPath} to ${upstream}`);
-}
 
 /** Pushes the current daemon onto a host that already has one, for when this code has moved on.
     Nothing about which keys the host trusts is touched. */
 async function updateDaemon(host: string) {
-    // Pulled before anything else, so a checkout that cannot be brought up to date fails here
-    // rather than after we have already started changing the host.
-    await pullLocalCheckout();
     let contents = await readRemoteFile({ host, filePath: REMOTE_CONFIG_PATH });
     if (!contents) {
         throw new Error(
