@@ -4,6 +4,7 @@ import { keyFingerprint, summarizeKey } from "../authorizedKeys";
 import { deriveRevokeKey, revokeKeyPath, revokeRepoPath, revokeRepoURL } from "../revokeSource";
 import { sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, repoIsUsable, runGit } from "./git";
+import { messageTimestamp } from "../../notifications/discord";
 import { UNREVOKE_DELAY } from "./paths";
 import { notify } from "./notify";
 import { getState, saveState } from "./state";
@@ -259,7 +260,8 @@ export async function applyUnrevokes(sourceURLs: string[]) {
             await saveState();
             await notify(
                 `an unrevoke for \`${revocation.fingerprint}\` was published as \`${unrevokeId}\`.`
-                + ` It will be applied in ${Math.round(UNREVOKE_DELAY / 60000)} minutes, not now.`
+                + ` It will NOT be applied now. That key starts working again at`
+                + ` \`${messageTimestamp(new Date(revocation.unrevokeSeenAt + UNREVOKE_DELAY))}\`.`
             );
             continue;
         }

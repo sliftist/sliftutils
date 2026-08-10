@@ -96,15 +96,11 @@ function parseArgs(argv: string[]) {
     return { keyPath: positional[0], pushToGit };
 }
 
-export async function main() {
-    let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
-
-    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true })).trim();
-    if (!repoPath) {
-        throw new Error(`Expected the current directory to be inside a git repo, it is not.\n${USAGE}`);
-    }
-
-    let signingKey = keyPath && expandHome(keyPath) || await ensureDefaultKey();
+/** Writes the manifest and its signature into a repo. Separate from the command so anything that
+    changes a keys repo can leave it signed, rather than telling someone to go and do it. */
+export async function signRepo(config: { repoPath: string; keyPath?: string }) {
+    let { repoPath } = config;
+    let signingKey = config.keyPath && expandHome(config.keyPath) || await ensureDefaultKey();
     if (!await pathExists(signingKey)) {
         throw new Error(`Expected a signing key at ${signingKey}, no such file exists`);
     }
@@ -132,6 +128,16 @@ export async function main() {
     await fs.copyFile(stagedSignature, path.join(repoPath, SIGNATURE_NAME));
     await fs.rm(stagingDirectory, { recursive: true, force: true });
     console.log(`Signed with ${await publicKeyOf(signingKey)}`);
+}
+
+export async function main() {
+    let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
+
+    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true })).trim();
+    if (!repoPath) {
+        throw new Error(`Expected the current directory to be inside a git repo, it is not.\n${USAGE}`);
+    }
+    await signRepo({ repoPath, keyPath });
 
     if (!pushToGit) {
         console.log(`Commit and push ${MANIFEST_NAME} and ${SIGNATURE_NAME} for anything to see them.`);

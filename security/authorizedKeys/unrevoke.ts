@@ -4,6 +4,7 @@ import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
 import { keyFingerprint, normalizeKeys } from "./authorizedKeys";
 import { revokeRepoURL } from "./revokeSource";
+import { signRepo } from "../signedFiles/signFiles";
 import { readRepoKeys } from "./authorizedKeys";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
@@ -144,6 +145,12 @@ export async function main() {
     for (let revocation of revocations) {
         console.log(`  ${revocation.fingerprint} revoked by ${revocation.revokedBy || "?"} from ${revocation.attempt?.ip || "?"}`);
     }
-    console.log(`Each machine waits an hour after seeing it before the keys work again.`);
-    console.log(`Sign and publish it with:\n  yarn signfiles git`);
+
+    // Signed here rather than left as a step to remember. An unrevoke nobody signed does nothing at
+    // all, and the repo would sit there looking done while every machine ignored it.
+    await signRepo({ repoPath });
+
+    console.log(`\nCommit and push it, and each machine will wait an hour after seeing it before`);
+    console.log(`those keys work again:`);
+    console.log(`\`\`\`\ngit add -A\ngit commit -m "unrevoke keys"\ngit push\n\`\`\``);
 }
