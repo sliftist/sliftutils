@@ -3,8 +3,9 @@ import os from "os";
 import path from "path";
 import { DEFAULT_WEBHOOK_FILE_PATH, parseWebhookFile } from "../notifications/discord";
 import { normalizeKeys, readRepoKeys, summarizeKey } from "./authorizedKeys";
-import { sourceKeyPath, sourceRepoPath } from "./sources";
+import { findSourceKey, KEYS_DIR_NAME, sourceKeyPath, sourceName, sourceRepoPath } from "./sources";
 import { deriveRevokeKey, REVOKE_KEY_LABEL, revokeRepoURL } from "./revokeSource";
+import { legacySourceKeyPath } from "./sources";
 import { revokedKeysInRepo } from "./unrevoke";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
@@ -125,6 +126,27 @@ async function fingerprintKeys(keys: string[]) {
     return fingerprints;
 }
 
+/** Where the daemon on that machine keeps its keys: the home of the user it runs as. Asked of the
+    machine itself, because the answer is not the same everywhere and certainly not the same as the
+    home of whoever is running this. */
+async function daemonKeysDir(host: string) {
+    let result = await runOverSSH({
+        host,
+        script: `${SUDO_PREAMBLE}\n$SUDO getent passwd root | cut -d: -f6`,
+    });
+    let home = result.stdout.trim();
+    if (!home) {
+        throw new Error(`Expected ${describeHost(host)} to report a home directory for root, it reported nothing`);
+    }
+    return `${home}/${KEYS_DIR_NAME}`;
+}
+
+/** The public half of a private key, as ssh-keygen derives it. */
+async function publicKeyOf(privateKeyPath: string) {
+    let result = await runLocal({ command: "ssh-keygen", args: ["-y", "-f", privateKeyPath] });
+    return `${result.stdout.trim()}\n`;
+}
+
 async function cloneRepoForInspection(config: { repoURL: string; keyPath: string }) {
     let { repoURL, keyPath } = config;
     let temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "portsecure-repo-"));
@@ -184,8 +206,9 @@ async function ensureRevokeReposExist(repoSources: string[]) {
         // and the key derived from it is the one credential that repo is guaranteed to accept.
         // Anywhere else, a person is running this and has their own access.
         let ownKey = "";
-        if (await pathExists(sourceKeyPath(repoURL))) {
-            let derived = deriveRevokeKey(await fs.readFile(sourceKeyPath(repoURL), "utf8"));
+        let localSourceKey = await findSourceKey(repoURL);
+        if (localSourceKey) {
+            let derived = deriveRevokeKey(await fs.readFile(localSourceKey, "utf8"));
             ownKey = path.join(temporaryDirectory, "key");
             await fs.writeFile(ownKey, derived.privateKeyFile, { mode: 0o600 });
         }
@@ -467,11 +490,24 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
     let webhookURL = await requireRemoteWebhook(host);
     console.log(`${describeHost(host)} notifies ${webhookURL}`);
 
+    // Into the home of whoever the daemon runs as, which is where it looks. Asked of the host
+    // rather than worked out here: this may be running on a machine with no such user, and with a
+    // home directory in an entirely different shape.
+    let hostKeysDirectory = await daemonKeysDir(host);
     await writeRemoteFile({
         host,
-        filePath: sourceKeyPath(repoURL),
+        filePath: `${hostKeysDirectory}/${sourceName(repoURL)}`,
         contents: await fs.readFile(keyPath, "utf8"),
         fileMode: "600",
+        directoryMode: "700",
+    });
+    // The public half too, so the deploy key that a repo was given can be looked up on the machine
+    // using it, rather than only in whatever github shows.
+    await writeRemoteFile({
+        host,
+        filePath: `${hostKeysDirectory}/${sourceName(repoURL)}.pub`,
+        contents: await publicKeyOf(keyPath),
+        fileMode: "644",
         directoryMode: "700",
     });
 
@@ -519,7 +555,7 @@ async function removeSource(config: { host: string; repoURL: string }) {
     await runOverSSH({
         host,
         script: `${SUDO_PREAMBLE}
-$SUDO rm -f "${sourceKeyPath(repoURL)}"
+$SUDO rm -f "${sourceKeyPath(repoURL)}" "${sourceKeyPath(repoURL)}.pub" "${legacySourceKeyPath(repoURL)}"
 $SUDO rm -rf "${sourceRepoPath(repoURL)}"`,
     });
     await installDaemon({ host, hostLabel: remoteConfig.hostLabel, repoSources });

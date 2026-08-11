@@ -1,6 +1,7 @@
 import { deriveEd25519Key } from "../keys/deriveKey";
 import { formatOpenSSHPrivateKey, parseOpenSSHPrivateKey } from "../keys/sshKeyFile";
-import { REPO_KEYS_DIR, REPOS_DIR, sourceName } from "./sources";
+import path from "path";
+import { findKey, keysDir, LEGACY_REPO_KEYS_DIR, REPOS_DIR, sourceName } from "./sources";
 
 // A source's revocations live in a repo beside it. Derived rather than configured, so adding a
 // source brings its revoke repo with it and there is nothing extra to pass on the command line.
@@ -15,7 +16,16 @@ export function revokeRepoURL(sourceURL: string) {
 }
 
 export function revokeKeyPath(sourceURL: string) {
-    return `${REPO_KEYS_DIR}/${sourceName(sourceURL)}${REVOKED_SUFFIX}`;
+    return path.join(keysDir(), `${sourceName(sourceURL)}${REVOKED_SUFFIX}`);
+}
+
+export function legacyRevokeKeyPath(sourceURL: string) {
+    return `${LEGACY_REPO_KEYS_DIR}/${sourceName(sourceURL)}${REVOKED_SUFFIX}`;
+}
+
+/** Wherever this source's revoke key already is, or nothing if it has not been derived yet. */
+export async function findRevokeKey(sourceURL: string) {
+    return await findKey({ current: revokeKeyPath(sourceURL), legacy: legacyRevokeKeyPath(sourceURL) });
 }
 
 export function revokeRepoPath(sourceURL: string) {

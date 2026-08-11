@@ -3,7 +3,8 @@ import os from "os";
 import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
 import { keyFingerprint, normalizeKeys } from "./authorizedKeys";
-import { revokeRepoURL } from "./revokeSource";
+import { deriveRevokeKey, revokeRepoURL } from "./revokeSource";
+import { findSourceKey } from "./sources";
 import { signRepo } from "../signedFiles/signFiles";
 import { readRepoKeys } from "./authorizedKeys";
 import { expandHome } from "../helpers/paths";
@@ -31,17 +32,25 @@ export type Revocation = {
     attempt?: { ip?: string; user?: string; required?: string };
 };
 
-/** Every revocation the revoke repo lists. Cloned read only into a temp directory, with whatever
-    credentials this machine already has - the derived deploy key is for servers, and a person
-    running this has their own access to the repo. */
+/** Every revocation the revoke repo lists. Cloned read only into a temp directory.
+
+    A person running this has their own access to the repo, so their credentials are what is used.
+    On a machine that is already a portsecure host there may be no such credentials, but the source
+    deploy key is right there, and the key derived from it is one that repo definitely accepts. */
 export async function readRemoteRevocations(config: { sourceURL: string }) {
     let { sourceURL } = config;
     let temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "unrevoke-"));
     let repoPath = path.join(temporaryDirectory, "repo");
-    let clone = await spawnPromise({
-        command: "git",
-        args: ["clone", "--depth", "1", revokeRepoURL(sourceURL), repoPath],
-    });
+    let cloneArgs = ["clone", "--depth", "1", revokeRepoURL(sourceURL), repoPath];
+    let sourceKey = await findSourceKey(sourceURL);
+    if (sourceKey) {
+        let derived = deriveRevokeKey(await fs.readFile(sourceKey, "utf8"));
+        let derivedKeyPath = path.join(temporaryDirectory, "key");
+        await fs.writeFile(derivedKeyPath, derived.privateKeyFile, { mode: 0o600 });
+        let sshCommand = `ssh -i ${derivedKeyPath} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`;
+        cloneArgs = ["-c", `core.sshCommand=${sshCommand}`, ...cloneArgs];
+    }
+    let clone = await spawnPromise({ command: "git", args: cloneArgs });
     if (clone.status !== 0) {
         await fs.rm(temporaryDirectory, { recursive: true, force: true });
         throw new Error(

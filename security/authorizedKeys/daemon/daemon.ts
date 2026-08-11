@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import os from "os";
 import { configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../../notifications/discord";
-import { sourceKeyPath, sourceRepoPath } from "../sources";
+import { findSourceKey, legacySourceKeyPath, sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, syncRepo } from "./git";
 import {
     CHECK_INTERVAL,
@@ -74,10 +74,11 @@ async function loadConfig(): Promise<DaemonConfig> {
         process.exit(1);
     }
     for (let repoURL of parsed.repoSources) {
-        try {
-            await fs.access(sourceKeyPath(repoURL));
-        } catch (e) {
-            console.error(`portsecure: expected the private key for ${repoURL} at ${sourceKeyPath(repoURL)}, ${e}`);
+        if (!await findSourceKey(repoURL)) {
+            console.error(
+                `portsecure: expected the private key for ${repoURL} at ${sourceKeyPath(repoURL)}`
+                + ` or ${legacySourceKeyPath(repoURL)}, neither exists`
+            );
             process.exit(1);
         }
     }
@@ -213,7 +214,7 @@ async function pollSource(repoURL: string) {
         // Availability over tidiness: throw the working copy away and start again.
         console.log(`Discarding the checkout of ${repoURL} and cloning from scratch`);
         try {
-            await cloneRepo({ repoURL, repoPath: sourceRepoPath(repoURL), keyPath: sourceKeyPath(repoURL) });
+            await cloneRepo({ repoURL, repoPath: sourceRepoPath(repoURL), keyPath: await findSourceKey(repoURL) || sourceKeyPath(repoURL) });
             repoFailureCounts[repoURL] = 0;
             return true;
         } catch (cloneError) {
