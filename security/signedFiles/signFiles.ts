@@ -6,6 +6,7 @@ import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
 import { buildManifest, formatManifest, MANIFEST_NAME, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
 import { revokedKeysInRepo } from "../authorizedKeys/unrevoke";
+import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
 import { findKeyProblems, normalizeKeys } from "../authorizedKeys/authorizedKeys";
 
 // A hardware backed key is the entire point. A key sitting on disk is compromised the moment the
@@ -159,16 +160,11 @@ export async function signRepo(config: { repoPath: string; keyPath?: string }) {
 export async function main() {
     let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
 
-    // Read for its value, so stdout has to be on its own. runPromise joins it with stderr, and a
-    // git warning glued to the front of this becomes a directory that does not exist.
-    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"] });
-    let repoPath = topLevel.stdout.trim();
-    if (topLevel.status !== 0 || !repoPath) {
-        throw new Error(
-            `Expected the current directory to be inside a git repo, it is not.\n`
-            + `${(topLevel.stdout + topLevel.stderr).trim()}\n${USAGE}`
-        );
-    }
+    // The keys repo, which is this one when it holds keys and this machine's otherwise. Signing
+    // whatever repo the terminal happened to be in is how you end up signing something that is not
+    // a keys repo at all.
+    let { repoPath } = await resolveKeysRepo();
+    console.log(`Signing ${repoPath}`);
     await signRepo({ repoPath, keyPath });
 
     if (!pushToGit) {

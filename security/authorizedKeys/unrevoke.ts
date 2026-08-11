@@ -10,6 +10,7 @@ import { readRepoKeys } from "./authorizedKeys";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
 import { getMachines, setMachines } from "../machines/machines";
+import { resolveKeysRepo } from "./keysRepo";
 
 const UNREVOKES_DIR = "unrevoked";
 const REVOCATIONS_DIR = "revocations";
@@ -196,32 +197,6 @@ async function allowAddressesForMachines(config: { repoPath: string; revocations
     return added;
 }
 
-/** The repo named, or the one we are standing in. Checked the same way securessh checks it: a git
-    repo that actually holds keys and has an origin to clone from. */
-async function resolveKeysRepo(named: string | undefined) {
-    let cwd = named && expandHome(named) || undefined;
-    // spawnPromise rather than runPromise, because these two are read for their value. runPromise
-    // returns stdout and stderr joined, so one git warning ends up glued to the front of the path.
-    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"], cwd });
-    let repoPath = topLevel.stdout.trim();
-    if (topLevel.status !== 0 || !repoPath) {
-        throw new Error(
-            `Expected ${named || "the current directory"} to be inside a git repo, it is not.\n`
-            + `${(topLevel.stdout + topLevel.stderr).trim()}\n${USAGE}`
-        );
-    }
-    try {
-        await readRepoKeys(repoPath);
-    } catch (e) {
-        throw new Error(`Expected ${repoPath} to be a keys repo, it holds no keys.\n${e}\n${USAGE}`);
-    }
-    let origin = await spawnPromise({ command: "git", args: ["remote", "get-url", "origin"], cwd: repoPath });
-    let originURL = origin.stdout.trim();
-    if (origin.status !== 0 || !originURL) {
-        throw new Error(`Expected ${repoPath} to have an origin remote, it has none.\n${USAGE}`);
-    }
-    return { repoPath, originURL };
-}
 
 export async function main() {
     let argv = process.argv.slice(2);
@@ -230,7 +205,7 @@ export async function main() {
     if (positional.length > 1) {
         throw new Error(`Expected at most a keys repo, was ${positional.length} argument(s)\n${USAGE}`);
     }
-    let { repoPath, originURL } = await resolveKeysRepo(positional[0]);
+    let { repoPath, sourceURL: originURL } = await resolveKeysRepo(positional[0]);
 
     let revocations = await readRemoteRevocations({ sourceURL: originURL });
     if (!revocations.length) {
