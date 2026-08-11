@@ -3,6 +3,7 @@ import os from "os";
 import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
 import { expandHome } from "../helpers/paths";
+import { spawnPromise } from "../helpers/spawn";
 import { buildManifest, formatManifest, MANIFEST_NAME, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
 import { revokedKeysInRepo } from "../authorizedKeys/unrevoke";
 import { findKeyProblems, normalizeKeys } from "../authorizedKeys/authorizedKeys";
@@ -87,8 +88,10 @@ async function refuseRevokedKeys(repoPath: string) {
     if (!await pathExists(path.join(repoPath, "authorized_keys"))) {
         return;
     }
-    let originURL = (await runPromise("git remote get-url origin", { cwd: repoPath, quiet: true, nothrow: true })).trim();
-    if (!originURL) {
+    // Read for its value, so stdout has to be on its own. runPromise joins it with stderr.
+    let origin = await spawnPromise({ command: "git", args: ["remote", "get-url", "origin"], cwd: repoPath });
+    let originURL = origin.stdout.trim();
+    if (origin.status !== 0 || !originURL) {
         return;
     }
     let revoked;
@@ -156,9 +159,15 @@ export async function signRepo(config: { repoPath: string; keyPath?: string }) {
 export async function main() {
     let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
 
-    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true })).trim();
-    if (!repoPath) {
-        throw new Error(`Expected the current directory to be inside a git repo, it is not.\n${USAGE}`);
+    // Read for its value, so stdout has to be on its own. runPromise joins it with stderr, and a
+    // git warning glued to the front of this becomes a directory that does not exist.
+    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"] });
+    let repoPath = topLevel.stdout.trim();
+    if (topLevel.status !== 0 || !repoPath) {
+        throw new Error(
+            `Expected the current directory to be inside a git repo, it is not.\n`
+            + `${(topLevel.stdout + topLevel.stderr).trim()}\n${USAGE}`
+        );
     }
     await signRepo({ repoPath, keyPath });
 
@@ -169,7 +178,8 @@ export async function main() {
     await runPromise(`git add -A`, { cwd: repoPath });
     // Nothing staged is not worth stopping on. git commit calls that a failure, but it only means
     // the signature matches the one already committed, so there is nothing to deploy.
-    let staged = await runPromise(`git status --porcelain`, { cwd: repoPath, quiet: true });
+    let status = await spawnPromise({ command: "git", args: ["status", "--porcelain"], cwd: repoPath });
+    let staged = status.stdout;
     if (!staged.trim()) {
         console.log(`Nothing changed, ${MANIFEST_NAME} and ${SIGNATURE_NAME} are already committed.`);
         return;
