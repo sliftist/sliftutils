@@ -174,6 +174,16 @@ async function verifyCheckoutSigner(config: {
     return publicKey;
 }
 
+/** Proves a checkout on disk was signed, and that the files in it are the ones that were signed.
+    Returns the signer, and throws if anything about that does not hold.
+
+    Anything reading a repo for something other than ssh keys goes through this first: the whole
+    checkout is covered by one manifest, so a machine list is exactly as trustworthy as the keys
+    beside it, and neither is worth reading unsigned. */
+export async function verifyCheckout(repoPath: string) {
+    return await verifyCheckoutSigner({ repoPath, files: await readSignatureFiles(repoPath) });
+}
+
 export function describeSigner(signer: string) {
     return signer === UNSIGNED && "<no public key>" || signer;
 }

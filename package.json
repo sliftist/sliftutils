@@ -34,7 +34,10 @@
         "signfiles": "node ./bin/signfiles.js",
         "derivekey": "node ./bin/derivekey.js",
         "unrevoke": "node ./bin/unrevoke.js",
-        "testnotify": "node ./bin/testnotify.js"
+        "testnotify": "node ./bin/testnotify.js",
+        "addmachine": "node ./bin/addmachine.js",
+        "machineserver": "node ./bin/machineserver.js",
+        "machineclient": "node ./bin/machineclient.js"
     },
     "bin": {
         "filehoster": "./bin/filehoster.js",
@@ -58,7 +61,10 @@
         "derivekey": "./bin/derivekey.js",
         "portsecuredaemon": "./bin/portsecuredaemon.js",
         "unrevoke": "./bin/unrevoke.js",
-        "testnotify": "./bin/testnotify.js"
+        "testnotify": "./bin/testnotify.js",
+        "addmachine": "./bin/addmachine.js",
+        "machineserver": "./bin/machineserver.js",
+        "machineclient": "./bin/machineclient.js"
     },
     "dependencies": {
         "@types/chrome": "^0.0.237",
