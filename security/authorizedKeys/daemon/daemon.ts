@@ -231,9 +231,11 @@ async function pollSource(repoURL: string) {
 
     if (result.historyRewritten) {
         await notify(
-            `the history of \`${repoURL}\` was rewritten. Commit \`${result.previousSha.slice(0, 12)}\` is no`
-            + ` longer an ancestor of \`${result.remoteSha.slice(0, 12)}\`, so history was force pushed or`
-            + ` tampered with. The new state has been applied.`
+            `**KEY REPO HISTORY REWRITTEN: ${repoURL}**`
+            + `\n\nCommits that used to be in that repo are gone, so somebody force pushed over it`
+            + ` or tampered with it. Whatever it says now has been applied.`
+            + `\n\nwas at: \`${result.previousSha.slice(0, 12)}\``
+            + `\nnow at: \`${result.remoteSha.slice(0, 12)}\``
         );
     }
     if (!result.changed) {
@@ -241,7 +243,7 @@ async function pollSource(repoURL: string) {
     }
     // Said when the file is written, and only if it came out different. A commit that does not
     // touch the keys is not worth telling anyone about.
-    addChangeReason(`\`${repoURL}\` moved to \`${result.remoteSha.slice(0, 12)}\`.`);
+    addChangeReason(`The key repo \`${repoURL}\` moved to \`${result.remoteSha.slice(0, 12)}\`.`);
     sourceState(repoURL).lastSha = result.remoteSha;
     return true;
 }

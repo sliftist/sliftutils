@@ -210,17 +210,24 @@ export async function resolveSourceKeys(repoURL: string) {
             await reportProblem({
                 repoURL,
                 problem: "stale",
-                message: `\`${repoURL}\` changed but its signature was not updated, so the changes are being`
-                    + ` ignored. Still using the keys signed by \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
-                    + `\nTo deploy the change, run this in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
+                message: `**KEY REPO CHANGED WITHOUT BEING SIGNED: ${repoURL}**`
+                    + `\n\nThat repo changed, but nobody signed the change, so it is being ignored`
+                    + ` and this machine is still using the keys signed by`
+                    + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
+                    + `\n\nTo make the change take effect, run this in that repo:`
+                    + `\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
             });
         } else {
             await reportProblem({
                 repoURL,
                 problem: "corrupt",
-                message: `\`${repoURL}\` has a corrupted signature, so its contents are being ignored:`
-                    + ` ${e}.\nStill using the keys signed by \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
-                    + `\nTo replace it, run this in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
+                message: `**KEY REPO SIGNATURE IS BROKEN: ${repoURL}**`
+                    + `\n\nThe signature on that repo does not check out, so everything in it is`
+                    + ` being ignored and this machine is still using the keys signed by`
+                    + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
+                    + `\n\n${e}`
+                    + `\n\nTo replace the signature, run this in that repo:`
+                    + `\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
             });
         }
         return sourceStateValue.acceptedKeys;
@@ -260,8 +267,10 @@ export async function resolveSourceKeys(repoURL: string) {
     // Going from nothing to something signed is only ever an improvement, so it does not wait.
     if (sourceStateValue.acceptedSigner === UNSIGNED) {
         await notify(
-            `\`${repoURL}\` is now signed, by \`${signer}\`. It was not signed before, so its keys are`
-            + ` being applied right away.`
+            `**KEY REPO IS NOW SIGNED: ${repoURL}**`
+            + `\n\nIt was not signed at all before, so this is an improvement and its keys are being`
+            + ` applied right away.`
+            + `\n\nsigned by: \`${signer}\``
         );
         return await accept();
     }
@@ -274,9 +283,13 @@ export async function resolveSourceKeys(repoURL: string) {
         sourceStateValue.pendingSince = Date.now();
         await saveState();
         await notify(
-            `\`${repoURL}\` is now signed by \`${describeSigner(signer)}\`, where it was signed by`
-            + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`. Its keys are NOT being applied.`
-            + ` If nothing changes they will be applied in 24 hours.`
+            `**KEY REPO SIGNED BY A DIFFERENT KEY: ${repoURL}**`
+            + `\n\nSomebody else is signing that repo now. Its keys are NOT being applied, and this`
+            + ` machine is still using the ones it already had. If nothing changes, the new signer`
+            + ` is accepted in 24 hours.`
+            + `\n\nsigned by now: \`${describeSigner(signer)}\``
+            + `\nsigned by before: \`${describeSigner(sourceStateValue.acceptedSigner)}\``
+            + `\n\nIf that was not you, fix the repo before the 24 hours are up.`
         );
         return sourceStateValue.acceptedKeys;
     }

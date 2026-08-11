@@ -149,9 +149,11 @@ async function checkWebhookFileChanged() {
     try {
         await queueSend(
             state.webhookURL,
-            `**portsecure**: the Discord webhook in \`${state.filePath}\` changed to`
-            + ` \`${redactWebhookURL(newWebhookURL)}\`.`
-            + ` Notifications are moving to the new webhook and this channel will stop receiving them.`
+            `**portsecure**: **NOTIFICATIONS ARE MOVING TO ANOTHER CHANNEL**`
+            + `\n\nThis channel stops receiving them now. If that was not you, somebody with access`
+            + ` to this machine just redirected its alerts.`
+            + `\n\nnew webhook: \`${redactWebhookURL(newWebhookURL)}\``
+            + `\nset in: \`${state.filePath}\``
         );
     } catch (e) {
         console.error(`portsecure: failed to warn the old Discord webhook about the change. ${e}`);

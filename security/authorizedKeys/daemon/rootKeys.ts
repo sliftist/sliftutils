@@ -181,18 +181,23 @@ export async function enforceRootKeys(keys: string[]) {
     state.appliedKeys = keys;
     await saveState();
 
-    let reasons = takeChangeReasons();
+    let { leading, reasons } = takeChangeReasons();
+    // An attack is read first and the bookkeeping second, so it leads the message rather than
+    // sitting under a diff.
+    let alert = leading.length && `${leading.join("\n\n")}\n\n` || "";
     let why = reasons.length && `\n\n${reasons.join("\n\n")}` || "";
     if (weChangedIt) {
         await notify(
-            `applied authorized key changes:`
+            `${alert}**SSH KEYS CHANGED on this machine**`
+            + `\n\nWho can log in as root here is now:`
             + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${why}`
         );
         return;
     }
     await notify(
-        `root's authorized_keys was edited by something other than portsecure. The edit below has`
-        + ` been undone, and the keys from the repos are back in place.`
+        `${alert}**SSH KEYS EDITED BY SOMETHING ELSE, and put back**`
+        + `\n\nSomething other than portsecure edited root's authorized_keys on this machine. The`
+        + ` edit below has been undone, and the keys from the repos are back in place.`
         + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\`${why}`
     );
 }
