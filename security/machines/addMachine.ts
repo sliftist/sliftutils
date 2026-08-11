@@ -1,6 +1,6 @@
 import os from "os";
 import { describeHost } from "../helpers/remoteSSH";
-import { createRemoteIdentity, localDomains, localIdentity, remoteIdentity } from "./identity";
+import { createRemoteIdentity, Identity, localDomains, localIdentity, remoteIdentity } from "./identity";
 import { machineState, resolveKeysRepo } from "./machines";
 
 const USAGE = `Usage: yarn addmachine <domain> [ip]
@@ -15,17 +15,44 @@ It edits the keys repo this machine reads, wherever that is, not whatever direct
 from. Nothing is signed or pushed here. Run "yarn signfiles git" in that repo afterwards, or no
 machine will believe any of it.`;
 
-/** This machine's own addresses, which are what it would be talking to anything else from. */
-function localAddresses() {
-    let addresses: string[] = [];
+// Asked what address the world sees us as. A machine cannot work that out alone: on this side of
+// a NAT it only knows its own interfaces, and anything across the NAT sees the router.
+const EXTERNAL_IP_URL = "https://api.ipify.org";
+const EXTERNAL_IP_TIMEOUT = 10 * 1000;
+
+/** The address the internet sees us as, or "" if we could not find out. */
+async function externalAddress() {
+    try {
+        let response = await fetch(EXTERNAL_IP_URL, { signal: AbortSignal.timeout(EXTERNAL_IP_TIMEOUT) });
+        let address = (await response.text()).trim();
+        return /^[0-9.]+$/.test(address) && address || "";
+    } catch (e) {
+        console.log(`Could not ask ${EXTERNAL_IP_URL} what our external address is. ${e}`);
+        return "";
+    }
+}
+
+/** Every address this machine could be talking to something else from: the real ones on its own
+    interfaces, and the one the world sees it as. Loopback and link local are left out, since
+    nothing reaches us on those, and ipv6 is left out because the entries are ipv4.
+
+    Both, because which one applies depends on who is being talked to: something on the same
+    network sees an interface address, and anything past the NAT sees the external one. They are
+    often the same address on a machine that is not behind a NAT, hence the set. */
+async function localAddresses() {
+    let addresses = new Set<string>();
     for (let entries of Object.values(os.networkInterfaces())) {
         for (let entry of entries || []) {
             if (!entry.internal && entry.family === "IPv4") {
-                addresses.push(entry.address);
+                addresses.add(entry.address);
             }
         }
     }
-    return addresses;
+    let external = await externalAddress();
+    if (external) {
+        addresses.add(external);
+    }
+    return [...addresses];
 }
 
 export async function main() {
@@ -38,11 +65,11 @@ export async function main() {
     // nothing on this machine ever looks at.
     let { repoPath } = await resolveKeysRepo();
 
-    let identity;
+    let identity: Identity;
     let addresses: string[];
     if (!host) {
-        identity = await localIdentity(domain);
-        if (!identity) {
+        let found = await localIdentity(domain);
+        if (!found) {
             throw new Error(
                 `Expected an identity for ${domain} in ${os.homedir()}, this machine has none.\n`
                 + `It has: ${(await localDomains()).join(", ") || "no identities at all"}\n`
@@ -50,27 +77,36 @@ export async function main() {
                 + ` first, or name another machine to add instead.`
             );
         }
-        addresses = localAddresses();
+        identity = found;
+        addresses = await localAddresses();
         if (!addresses.length) {
             throw new Error(`Expected this machine to have a non local address, it has none`);
         }
     } else {
-        identity = await remoteIdentity(host, domain);
-        if (!identity) {
-            // Nothing there under this domain, so it gets one. Its own from this point on: the key
-            // is written there and nothing keeps a copy.
+        // Nothing there under this domain means it gets one. Its own from this point on: the key
+        // is written there and nothing keeps a copy.
+        let found = await remoteIdentity(host, domain);
+        if (!found) {
             console.log(`${describeHost(host)} has no identity for ${domain}, generating one`);
-            identity = await createRemoteIdentity({ host, domain });
         }
+        identity = found || await createRemoteIdentity({ host, domain });
         // The address it was named by is the address it talks to us from, which is the one thing
         // it cannot lie about.
         addresses = [host];
     }
 
-    let existing = await machineState({ repoPath, machineId: identity.machineId });
+    // The whole list is read and written back, because setting is by the set: writing this one
+    // machine alone would remove every other machine from the repo.
+    let machines = await machineState({ repoPath });
+    let existing = machines.find(machine => machine.machineId === identity.machineId);
     let ips = [...(existing?.ips || [])];
     let added = addresses.filter(address => !ips.includes(address));
-    await machineState({ repoPath, machineId: identity.machineId, ips: [...ips, ...added] });
+    if (existing) {
+        existing.ips = [...ips, ...added];
+    } else {
+        machines.push({ machineId: identity.machineId, ips: [...added], addedAt: "" });
+    }
+    await machineState({ repoPath, machines });
 
     console.log(`\nTrusting machine ${identity.machineId}`);
     console.log(`Allowing IP ${[...ips, ...added].join(", ")}`);

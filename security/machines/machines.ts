@@ -45,50 +45,61 @@ function machineFilePath(repoPath: string, machineId: string) {
     return path.join(repoPath, MACHINES_DIR, `${machineId}.json`);
 }
 
-/** Reads a machine, writes one, or removes one, in a checkout on disk.
+/** Reads every machine a checkout lists, or sets them.
 
-    Pass `ips` to write, leave it out to read. An empty list removes the machine, because a machine
-    allowed from nowhere is not a machine we talk to.
+    Passing `machines` makes the repo match it exactly: machines named are written with the
+    addresses given, and machines not named are removed. That is why the addresses are part of
+    setting rather than a separate step - a machine with no address it may talk from is not a
+    machine we would accept anyway, so there is no state where naming one without them means
+    anything. Read first, change what you want, write the result.
 
     Nothing here signs or commits anything. The signature is what every other machine checks before
     believing any of this, and it takes the hardware key, so `yarn signfiles git` is still yours to
     run afterwards. */
 export async function machineState(config: {
     repoPath: string;
-    machineId: string;
-    ips?: string[];
-}): Promise<MachineState | undefined> {
-    let { repoPath, machineId, ips } = config;
-    if (!machineId) {
-        throw new Error(`Expected a machineId, was ${JSON.stringify(machineId)}`);
+    machines?: { machineId: string; ips: string[] }[];
+}): Promise<MachineState[]> {
+    let { repoPath, machines } = config;
+    let existing = await readMachines(repoPath);
+    if (!machines) {
+        return [...existing.values()];
     }
-    let filePath = machineFilePath(repoPath, machineId);
-    if (!ips) {
-        let contents = await fs.readFile(filePath, "utf8").catch(() => "");
-        if (!contents) {
-            return undefined;
+
+    let directory = path.join(repoPath, MACHINES_DIR);
+    let written: MachineState[] = [];
+    for (let machine of machines) {
+        if (!machine.machineId) {
+            throw new Error(`Expected a machineId, was ${JSON.stringify(machine.machineId)}`);
         }
-        let parsed = JSON.parse(contents);
-        return { machineId, ips: parsed.ips || [], addedAt: parsed.addedAt || "" };
+        if (!machine.ips.length) {
+            throw new Error(
+                `Expected addresses for ${machine.machineId}, was none. A machine is trusted from`
+                + ` the addresses it may talk from, so leave it out of the list to remove it.`
+            );
+        }
+        let ips = machine.ips.filter((ip, index) => ip && machine.ips.indexOf(ip) === index);
+        let state: MachineState = {
+            machineId: machine.machineId,
+            // In the order given, without duplicates, so the file reads the way it was set.
+            ips,
+            addedAt: existing.get(machine.machineId)?.addedAt || new Date().toISOString(),
+        };
+        await fs.mkdir(directory, { recursive: true });
+        await fs.writeFile(machineFilePath(repoPath, state.machineId), JSON.stringify(state, undefined, 4) + "\n");
+        written.push(state);
     }
-    if (!ips.length) {
-        await fs.rm(filePath, { force: true });
-        return undefined;
+
+    // Whatever the repo had and the caller did not name is no longer trusted.
+    for (let machineId of existing.keys()) {
+        if (!machines.some(machine => machine.machineId === machineId)) {
+            await fs.rm(machineFilePath(repoPath, machineId), { force: true });
+        }
     }
-    let given = ips;
-    let existing = await machineState({ repoPath, machineId });
-    let state: MachineState = {
-        machineId,
-        // Written in the order given, without duplicates, so the file reads the way it was set.
-        ips: given.filter((ip, index) => ip && given.indexOf(ip) === index),
-        addedAt: existing?.addedAt || new Date().toISOString(),
-    };
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, JSON.stringify(state, undefined, 4) + "\n");
-    return state;
+    return written;
 }
 
-/** Every machine the repo lists, read through the signature gate. */
+/** Every machine the repo lists. */
 async function readMachines(repoPath: string) {
     let machines = new Map<string, MachineState>();
     let directory = path.join(repoPath, MACHINES_DIR);

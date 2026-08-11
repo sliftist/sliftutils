@@ -168,13 +168,16 @@ async function allowAddressesInRepo(config: {
 async function allowAddressesForMachines(config: { repoPath: string; revocations: Revocation[] }) {
     let { repoPath, revocations } = config;
     let added = new Map<string, string[]>();
+    // Read the whole list, change what these revocations are about, write it back. Setting is by
+    // the whole set, so writing one machine at a time would delete every other machine.
+    let machines = await machineState({ repoPath });
     for (let revocation of revocations) {
         let machineId = revocation.machineId;
         let ip = revocationIP(revocation);
         if (!machineId || !ip) {
             continue;
         }
-        let existing = await machineState({ repoPath, machineId });
+        let existing = machines.find(machine => machine.machineId === machineId);
         if (!existing) {
             // Removed from the repo since it was revoked, so there is nothing to allow. Deleting a
             // machine is the stronger statement and it stands.
@@ -184,8 +187,11 @@ async function allowAddressesForMachines(config: { repoPath: string; revocations
         if (existing.ips.includes(ip)) {
             continue;
         }
-        await machineState({ repoPath, machineId, ips: [...existing.ips, ip] });
+        existing.ips = [...existing.ips, ip];
         added.set(machineId, [...(added.get(machineId) || []), ip]);
+    }
+    if (added.size) {
+        await machineState({ repoPath, machines });
     }
     return added;
 }
