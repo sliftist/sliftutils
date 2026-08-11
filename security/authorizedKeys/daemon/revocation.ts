@@ -199,11 +199,10 @@ export async function recordRevocation(config: {
     // What happened, then what was done about it, then what to do about it. In that order, because
     // whoever reads this needs to know which of those two things it was before anything else.
     await notify(
-        `**AUTHENTICATED ACCESS FROM AN UNAPPROVED IP.** The key was correct, so either someone`
-        + ` else has this key, or a developer's IP has changed.`
+        `**AUTHENTICATED ACCESS FROM AN UNAPPROVED IP: \`${attempt.ip}\`** The key was correct, so`
+        + ` either someone else has this key, or a developer's IP has changed.`
         + `\nkey \`${keyLine && summarizeKey(keyLine) || fingerprint}\` (\`${fingerprint}\`)`
-        + `\ntried from \`${attempt.ip}\` as user \`${attempt.user}\``
-        + `\nonly allowed from \`${attempt.required}\``
+        + `\ntried as user \`${attempt.user}\`, and is only allowed from \`${attempt.required}\``
         + `\n\nThat key is now revoked. Every machine will remove it from root's authorized_keys and`
         + ` stop accepting it, from any address.${ended}`
         + `\n\nIf this really was an attack, IMMEDIATELY remove that key from \`${sourceURL}\`.`
