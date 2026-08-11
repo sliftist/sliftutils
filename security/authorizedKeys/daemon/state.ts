@@ -23,6 +23,12 @@ export type SourceState = {
 export type RevocationState = {
     fingerprint: string;
     revocationId: string;
+    // Why this key was revoked, carried from the revocation file so a machine that reads one
+    // written elsewhere can say what happened rather than only that something did.
+    revokedAt: string;
+    revokedBy: string;
+    reason: string;
+    attemptIP: string;
     // Set once an unrevoke has been seen, so the wait can be served out across restarts.
     unrevokeSeenAt: number;
     unrevokeId: string;

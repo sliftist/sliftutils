@@ -1,12 +1,11 @@
 import fs from "fs/promises";
 import path from "path";
 import { keyFingerprint, summarizeKey } from "../authorizedKeys";
-import { deriveRevokeKey, findRevokeKey, REVOKE_KEY_LABEL, revokeKeyPath, revokeRepoPath, revokeRepoURL } from "../revokeSource";
-import { findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
-import { cloneRepo, repoIsUsable, runGit } from "./git";
+import { revokeRepoPath, revokeRepoURL } from "../revokeSource";
+import { runGit } from "./git";
+import { ensureRevokeKey, listRepoDir, readRepoFile, revokeRepo, sourceRepo, syncRepoFiles } from "./repoFiles";
 import { messageTimestamp } from "../../notifications/discord";
 import { UNREVOKE_DELAY } from "./paths";
-import { notify } from "./notify";
 import { addChangeReason } from "./changes";
 import { describeAllEnded, endAllSSHSessions } from "./sessions";
 import { getState, saveState } from "./state";
@@ -15,6 +14,7 @@ import { getState, saveState } from "./state";
 // a second attempt from a different address lands on a name that already exists.
 const REVOCATIONS_DIR = "revocations";
 const UNREVOKES_DIR = "unrevoked";
+const REVOCATION_REASON = "authenticated access from an unapproved IP";
 
 export type Attempt = {
     ip: string;
@@ -28,85 +28,45 @@ export function revocationIdOf(fingerprint: string) {
     return fingerprint.replace(/^SHA256:/, "").replace(/[^A-Za-z0-9]+/g, "-");
 }
 
-async function pathExists(filePath: string) {
-    try {
-        await fs.access(filePath);
-        return true;
-    } catch (e) {
-        return false;
-    }
+/** Why a key stopped being accepted, in the words of whichever machine saw it happen. */
+function describeRevocation(revocation: { revokedAt: string; revokedBy: string; reason: string; attemptIP: string }) {
+    let when = Date.parse(revocation.revokedAt);
+    let parts = [
+        Number.isFinite(when) ? `revoked ${messageTimestamp(new Date(when))}` : `revoked at an unrecorded time`,
+        revocation.revokedBy && `by \`${revocation.revokedBy}\`` || "",
+        revocation.reason || "",
+        revocation.attemptIP && `from \`${revocation.attemptIP}\`` || "",
+    ];
+    return parts.filter(part => part).join(", ");
 }
 
-/** The revoke repo's key is worked out from the source's, so nothing extra had to be uploaded and
-    nothing extra is stored anywhere it could be taken from. */
-async function ensureRevokeKey(sourceURL: string) {
-    let existing = await findRevokeKey(sourceURL);
-    if (existing) {
-        return existing;
-    }
-    let sourceKey = await findSourceKey(sourceURL);
-    if (!sourceKey) {
-        throw new Error(`Expected a key for ${sourceURL} at ${sourceKeyPath(sourceURL)}, no such file exists`);
-    }
-    let derived = deriveRevokeKey(await fs.readFile(sourceKey, "utf8"));
-    let keyPath = revokeKeyPath(sourceURL);
-    await fs.mkdir(path.dirname(keyPath), { recursive: true, mode: 0o700 });
-    await fs.writeFile(keyPath, derived.privateKeyFile, { mode: 0o600 });
-    await fs.writeFile(`${keyPath}.pub`, `${derived.publicKey} ${REVOKE_KEY_LABEL}\n`, { mode: 0o644 });
-    console.log(`Derived the revoke key for ${sourceURL} into ${keyPath}`);
-    return keyPath;
-}
+export type RevocationFile = {
+    fingerprint: string;
+    revocationId: string;
+    revokedAt: string;
+    revokedBy: string;
+    reason: string;
+    attemptIP: string;
+};
 
-/** Brings the revoke checkout up to date. Returns false when it cannot be reached, so a missing
-    revoke repo degrades to "keep what we already know" rather than stopping everything. */
-export async function syncRevokeRepo(sourceURL: string) {
-    let repoURL = revokeRepoURL(sourceURL);
-    let repoPath = revokeRepoPath(sourceURL);
-    let keyPath = await ensureRevokeKey(sourceURL);
-    try {
-        if (!await repoIsUsable({ repoPath, keyPath })) {
-            await cloneRepo({ repoURL, repoPath, keyPath });
-            return true;
-        }
-        let localHead = await runGit({ args: ["rev-parse", "HEAD"], cwd: repoPath, keyPath, allowFailure: true });
-        if (localHead.status !== 0) {
-            // A revoke repo with no commits yet. Nothing has ever been revoked, which is the state
-            // every one of these starts in, so there is nothing to pull and nothing to say.
-            return true;
-        }
-        let head = (await runGit({ args: ["rev-parse", "--abbrev-ref", "HEAD"], cwd: repoPath, keyPath })).stdout.trim();
-        let localSha = localHead.stdout.trim();
-        // A ref listing is a few hundred bytes and no objects, so the usual case of nothing having
-        // been revoked anywhere costs almost nothing.
-        let listing = (await runGit({ args: ["ls-remote", "origin", head], cwd: repoPath, keyPath })).stdout;
-        let remoteSha = (listing.split(/\s+/)[0] || "").trim();
-        if (remoteSha && remoteSha === localSha) {
-            return true;
-        }
-        await runGit({ args: ["fetch", "--prune", "origin"], cwd: repoPath, keyPath });
-        await runGit({ args: ["reset", "--hard", `origin/${head}`], cwd: repoPath, keyPath });
-        await runGit({ args: ["clean", "-fdx"], cwd: repoPath, keyPath });
-        return true;
-    } catch (e) {
-        console.log(`Could not sync ${repoURL}. ${e}`);
-        return false;
-    }
-}
-
-export async function readRevocationFiles(sourceURL: string) {
-    let directory = path.join(revokeRepoPath(sourceURL), REVOCATIONS_DIR);
-    if (!await pathExists(directory)) {
-        return [];
-    }
-    let revocations: { fingerprint: string; revocationId: string }[] = [];
-    for (let name of (await fs.readdir(directory)).sort()) {
+export async function readRevocationFiles(sourceURL: string): Promise<RevocationFile[]> {
+    let repo = revokeRepo(sourceURL);
+    let revocations: RevocationFile[] = [];
+    for (let name of await listRepoDir(repo, REVOCATIONS_DIR)) {
         if (!name.endsWith(".json")) {
             continue;
         }
         try {
-            let parsed = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
+            let parsed = JSON.parse(await readRepoFile(repo, path.join(REVOCATIONS_DIR, name)) || "");
             if (parsed.fingerprint) {
-                revocations.push({ fingerprint: parsed.fingerprint, revocationId: parsed.revocationId || name.replace(/\.json$/, "") });
+                revocations.push({
+                    fingerprint: parsed.fingerprint,
+                    revocationId: parsed.revocationId || name.replace(/\.json$/, ""),
+                    revokedAt: parsed.revokedAt || "",
+                    revokedBy: parsed.revokedBy || "",
+                    reason: parsed.reason || "",
+                    attemptIP: parsed.attempt?.ip || "",
+                });
             }
         } catch (e) {
             console.log(`Ignoring unreadable revocation ${name}. ${e}`);
@@ -115,21 +75,26 @@ export async function readRevocationFiles(sourceURL: string) {
     return revocations;
 }
 
-/** Unrevokes live in the source repo, so they are covered by its signature. */
+/** Unrevokes live in the source repo, so they are covered by its signature. The time the unrevoke
+    was written is what the wait is measured from, rather than the moment this machine first read
+    it: otherwise every restart starts the hour again and the unrevoke never arrives. */
+export type UnrevokeFile = { unrevokeId: string; createdAt: number };
+
 export async function readUnrevokeIds(sourceURL: string) {
-    let directory = path.join(sourceRepoPath(sourceURL), UNREVOKES_DIR);
-    if (!await pathExists(directory)) {
-        return new Map<string, string>();
-    }
-    let ids = new Map<string, string>();
-    for (let name of (await fs.readdir(directory)).sort()) {
+    let repo = sourceRepo(sourceURL);
+    let ids = new Map<string, UnrevokeFile>();
+    for (let name of await listRepoDir(repo, UNREVOKES_DIR)) {
         if (!name.endsWith(".json")) {
             continue;
         }
         try {
-            let parsed = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
+            let parsed = JSON.parse(await readRepoFile(repo, path.join(UNREVOKES_DIR, name)) || "");
+            let createdAt = Date.parse(parsed.createdAt || "");
             for (let revocationId of parsed.revocationIds || []) {
-                ids.set(revocationId, name.replace(/\.json$/, ""));
+                ids.set(revocationId, {
+                    unrevokeId: name.replace(/\.json$/, ""),
+                    createdAt: Number.isFinite(createdAt) ? createdAt : 0,
+                });
             }
         } catch (e) {
             console.log(`Ignoring unreadable unrevoke ${name}. ${e}`);
@@ -153,17 +118,22 @@ export async function recordRevocation(config: {
     if (state.revocations[fingerprint]) {
         return false;
     }
-    if (!await syncRevokeRepo(sourceURL)) {
-        console.log(`Cannot record the revocation of ${fingerprint}, ${revokeRepoURL(sourceURL)} is unreachable`);
+    try {
+        await syncRepoFiles(revokeRepo(sourceURL));
+    } catch (e) {
+        console.error(`Cannot record the revocation of ${fingerprint}, ${revokeRepoURL(sourceURL)} could not be read. ${e}`);
         return false;
     }
     let revocationId = revocationIdOf(fingerprint);
-    let alreadyThere = (await readRevocationFiles(sourceURL)).some(entry => entry.fingerprint === fingerprint);
-    if (alreadyThere) {
+    let existing = (await readRevocationFiles(sourceURL)).find(entry => entry.fingerprint === fingerprint);
+    if (existing) {
         // Another machine got there first, which is the normal outcome when several see the same
         // attempt. Record it locally so we never look again.
         state.revocations[fingerprint] = {
-            fingerprint, revocationId, unrevokeSeenAt: 0, unrevokeId: "", unrevoked: false,
+            fingerprint, revocationId,
+            revokedAt: existing.revokedAt, revokedBy: existing.revokedBy,
+            reason: existing.reason, attemptIP: existing.attemptIP,
+            unrevokeSeenAt: 0, unrevokeId: "", unrevoked: false,
             reportedRemoved: false,
         };
         await saveState();
@@ -174,13 +144,14 @@ export async function recordRevocation(config: {
     let keyPath = await ensureRevokeKey(sourceURL);
     let directory = path.join(repoPath, REVOCATIONS_DIR);
     await fs.mkdir(directory, { recursive: true });
+    let revokedAt = new Date().toISOString();
     await fs.writeFile(path.join(directory, `${revocationId}.json`), JSON.stringify({
         revocationId,
         fingerprint,
         key: keyLine,
-        revokedAt: new Date().toISOString(),
+        revokedAt,
         revokedBy: hostLabel,
-        reason: "used from an address its from= restriction does not allow",
+        reason: REVOCATION_REASON,
         attempt,
     }, undefined, 4) + "\n");
 
@@ -194,7 +165,9 @@ export async function recordRevocation(config: {
         return false;
     }
     state.revocations[fingerprint] = {
-        fingerprint, revocationId, unrevokeSeenAt: 0, unrevokeId: "", unrevoked: false,
+        fingerprint, revocationId,
+        revokedAt, revokedBy: hostLabel, reason: REVOCATION_REASON, attemptIP: attempt.ip,
+        unrevokeSeenAt: 0, unrevokeId: "", unrevoked: false,
         // The message below already says this machine has stopped accepting the key, so the one
         // about noticing a revocation would only repeat it.
         reportedRemoved: true,
@@ -221,13 +194,25 @@ export async function absorbRevocations(sourceURLs: string[]) {
     let state = getState();
     let changed = false;
     for (let sourceURL of sourceURLs) {
-        for (let entry of await readRevocationFiles(sourceURL)) {
+        let entries;
+        try {
+            entries = await readRevocationFiles(sourceURL);
+        } catch (e) {
+            // Unreadable is not empty. Whatever we already knew stays exactly as it is.
+            console.error(`Skipping the revocations of ${revokeRepoURL(sourceURL)}, they could not be read. ${e}`);
+            continue;
+        }
+        for (let entry of entries) {
             if (state.revocations[entry.fingerprint]) {
                 continue;
             }
             state.revocations[entry.fingerprint] = {
                 fingerprint: entry.fingerprint,
                 revocationId: entry.revocationId,
+                revokedAt: entry.revokedAt,
+                revokedBy: entry.revokedBy,
+                reason: entry.reason,
+                attemptIP: entry.attemptIP,
                 unrevokeSeenAt: 0,
                 unrevokeId: "",
                 unrevoked: false,
@@ -242,43 +227,55 @@ export async function absorbRevocations(sourceURLs: string[]) {
 }
 
 /** An unrevoke is held for an hour before it counts, so a signing key that was itself compromised
-    cannot instantly undo the revocation that shut it out. */
+    cannot instantly undo the revocation that shut it out.
+
+    The hour runs from when the unrevoke was written, not from when this machine first read it.
+    Revocations are held in memory, so a restart forgets them and reads them back out of the repo:
+    measuring from first sight meant every restart began the hour again, and an unrevoke published
+    long ago would revoke the key all over again, disconnect everyone, and make them wait. */
 export async function applyUnrevokes(sourceURLs: string[]) {
     let state = getState();
-    let unrevokeIds = new Map<string, string>();
+    let unrevokes = new Map<string, UnrevokeFile>();
     for (let sourceURL of sourceURLs) {
-        for (let [revocationId, unrevokeId] of await readUnrevokeIds(sourceURL)) {
-            unrevokeIds.set(revocationId, unrevokeId);
+        try {
+            for (let [revocationId, unrevoke] of await readUnrevokeIds(sourceURL)) {
+                unrevokes.set(revocationId, unrevoke);
+            }
+        } catch (e) {
+            // Unreadable is not "there are no unrevokes". The revocations simply stand.
+            console.error(`Skipping the unrevokes of ${sourceURL}, they could not be read. ${e}`);
         }
     }
     for (let revocation of Object.values(state.revocations)) {
         if (revocation.unrevoked) {
             continue;
         }
-        let unrevokeId = unrevokeIds.get(revocation.revocationId);
-        if (!unrevokeId) {
+        let unrevoke = unrevokes.get(revocation.revocationId);
+        if (!unrevoke) {
             continue;
         }
+        // An unrevoke with no usable timestamp falls back to the moment we saw it, which is the
+        // safe direction: it waits longer rather than taking effect early.
+        let effectiveAt = (unrevoke.createdAt || revocation.unrevokeSeenAt || Date.now()) + UNREVOKE_DELAY;
         if (!revocation.unrevokeSeenAt) {
             revocation.unrevokeSeenAt = Date.now();
-            revocation.unrevokeId = unrevokeId;
+            revocation.unrevokeId = unrevoke.unrevokeId;
             await saveState();
+        }
+        if (Date.now() < effectiveAt) {
             // Nothing has changed yet, so nobody is told. Whoever published it was already told it
             // takes an hour, and every machine seeing the same unrevoke would say so separately.
             console.log(
-                `Holding the unrevoke ${unrevokeId} for ${revocation.fingerprint} until`
-                + ` ${messageTimestamp(new Date(revocation.unrevokeSeenAt + UNREVOKE_DELAY))}`
+                `Holding the unrevoke ${unrevoke.unrevokeId} for ${revocation.fingerprint} until`
+                + ` ${messageTimestamp(new Date(effectiveAt))}`
             );
-            continue;
-        }
-        if (Date.now() - revocation.unrevokeSeenAt < UNREVOKE_DELAY) {
             continue;
         }
         revocation.unrevoked = true;
         revocation.reportedRemoved = false;
         await saveState();
         // Only means anything if the key comes back into the file, so it is said there.
-        addChangeReason(`the unrevoke of \`${revocation.fingerprint}\` has taken effect, ${unrevokeId}.`);
+        addChangeReason(`the unrevoke of \`${revocation.fingerprint}\` has taken effect, ${unrevoke.unrevokeId}.`);
     }
 }
 
@@ -320,7 +317,10 @@ export async function removeRevokedKeys(keys: string[]) {
         }
         // Whatever that key is holding open goes with it.
         let ended = describeAllEnded(await endAllSSHSessions());
-        addChangeReason(`a revocation for \`${fingerprint}\` was published elsewhere.${ended}`);
+        addChangeReason(
+            `a revocation published elsewhere for \`${fingerprint}\`,`
+            + ` ${describeRevocation(revocation)}.${ended}`
+        );
     }
     // Said on every check, not once. A key being held out of authorized_keys is the current state
     // of the machine, and someone reading the log to work out why a key does not work should find

@@ -15,7 +15,9 @@ import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
 import { resolveSourceKeys } from "./trust";
 import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
-import { absorbRevocations, applyUnrevokes, recordRevocation, removeRevokedKeys, syncRevokeRepo } from "./revocation";
+import { absorbRevocations, applyUnrevokes, recordRevocation, removeRevokedKeys } from "./revocation";
+import { revokeRepo, syncRepoFiles } from "./repoFiles";
+import { revokeRepoURL } from "../revokeSource";
 import { keyFingerprint } from "../authorizedKeys";
 import { addChangeReason } from "./changes";
 import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
@@ -240,6 +242,13 @@ async function pollSource(repoURL: string) {
     return true;
 }
 
+/** The one loop. Every repo this machine reads is brought up to date here: each source, and the
+    revoke repo beside it that says which of its keys are no longer accepted.
+
+    A repo that cannot be read is reported and skipped, and nothing downstream may read that as an
+    answer. An unreachable source keeps the keys it last gave us, and an unreachable revoke repo
+    keeps the revocations we already know - the alternative is one network failure emptying
+    authorized_keys, or handing a revoked key back to every machine. */
 async function everyCheck() {
     let anyChanged = false;
     for (let repoURL of config.repoSources) {
@@ -247,17 +256,20 @@ async function everyCheck() {
         try {
             anyChanged = await pollSource(repoURL) || anyChanged;
         } catch (e) {
-            console.log(`Polling ${repoURL} failed. ${e && (e as Error).stack || e}`);
+            console.error(`Polling ${repoURL} failed, its last known keys stay in place. ${e && (e as Error).stack || e}`);
+        }
+        try {
+            await syncRepoFiles(revokeRepo(repoURL));
+        } catch (e) {
+            console.error(
+                `Could not read ${revokeRepoURL(repoURL)}, the revocations already known stay in place. ${e}`
+            );
         }
     }
     if (anyChanged) {
         await saveState();
     }
 
-    // What other machines have revoked, and anything published to undo a revocation.
-    for (let repoURL of config.repoSources) {
-        await syncRevokeRepo(repoURL);
-    }
     await absorbRevocations(config.repoSources);
     await applyUnrevokes(config.repoSources);
 
@@ -299,28 +311,18 @@ export async function main() {
 
     console.log(`Starting, ${config.repoSources.length} source(s), keys applied to ${ROOT_AUTHORIZED_KEYS}`);
 
-    // A first pass has to happen before the intervals, so a machine is correct immediately after
-    // boot rather than a minute later.
-    for (let repoURL of config.repoSources) {
-        try {
-            sourceState(repoURL).lastSha = (await syncRepo(repoURL)).remoteSha;
-        } catch (e) {
-            console.log(`Initial sync of ${repoURL} failed, continuing with whatever is on disk. ${e}`);
-        }
-    }
-    await saveState();
+    // Whatever other users already have, before the first check, so what is there at startup is
+    // not reported as somebody having just changed it.
     await seedUserKeys();
-
-    for (let repoURL of config.repoSources) {
-        await syncRevokeRepo(repoURL);
-    }
-    await absorbRevocations(config.repoSources);
-    await enforceRootKeys(await removeRevokedKeys(await readAllowedKeys()));
-    await enforceSSHDConfig();
 
     // configureDiscordNotifications watches the webhook file on its own, so there is nothing to
     // schedule for it here.
-    startInterval({ name: "check", intervalTime: CHECK_INTERVAL, run: everyCheck });
+    let runCheck = startInterval({ name: "check", intervalTime: CHECK_INTERVAL, run: everyCheck });
+    // The same check as every other, run once now rather than a minute from now: a machine has to
+    // be correct immediately after boot. Running the one function, rather than a startup copy of
+    // it, is what keeps a step from being left out of one of them - the copy here had no
+    // applyUnrevokes, so every restart re-applied a revocation that had already been undone.
+    await runCheck();
 
     // A refused login is acted on when sshd writes it. The one pass here covers anything written
     // while the daemon was not running.
