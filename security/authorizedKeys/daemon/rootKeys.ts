@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { keyFingerprint, keyRestriction, keyRestrictionList, NO_RESTRICTION, summarizeKey } from "../authorizedKeys";
+import { keyFingerprint, keyNiceName, keyRestriction, keyRestrictionList, NO_RESTRICTION, summarizeKey } from "../authorizedKeys";
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
 import { notify } from "./notify";
 import { getState, saveState } from "./state";
@@ -51,6 +51,64 @@ function describeAddressChange(config: { previousLine: string; currentLine: stri
     ];
     lines.push(`          still allowed from ${(current || []).filter(address => !added.includes(address)).join(",") || "nothing"}`);
     return lines.join("\n");
+}
+
+/** The change in one line, for the notification preview. One key added, one removed, or one
+    address gained or lost, said plainly - that covers nearly every real change. Anything with more
+    than one part to it falls back to counting, because a line that tries to say four things says
+    none of them in the space a preview gives it. */
+export function summarizeKeyDifference(config: { before: string[]; after: string[] }) {
+    let { before, after } = config;
+    let beforeByKey = new Map(before.map(key => [keyIdentity(key), key]));
+    let afterByKey = new Map(after.map(key => [keyIdentity(key), key]));
+
+    let added = [...afterByKey].filter(([identity]) => !beforeByKey.has(identity)).map(([, key]) => key);
+    let removed = [...beforeByKey].filter(([identity]) => !afterByKey.has(identity)).map(([, key]) => key);
+    let addressesAdded: { key: string; address: string }[] = [];
+    let addressesRemoved: { key: string; address: string }[] = [];
+    let otherwiseChanged: string[] = [];
+    for (let [identity, previousLine] of beforeByKey) {
+        let currentLine = afterByKey.get(identity);
+        if (!currentLine || currentLine === previousLine) {
+            continue;
+        }
+        let keyLine = currentLine;
+        let previous = keyRestrictionList(previousLine) || [];
+        let current = keyRestrictionList(keyLine) || [];
+        let gained = current.filter(address => !previous.includes(address));
+        let lost = previous.filter(address => !current.includes(address));
+        if (!gained.length && !lost.length) {
+            otherwiseChanged.push(keyLine);
+            continue;
+        }
+        addressesAdded.push(...gained.map(address => ({ key: keyLine, address })));
+        addressesRemoved.push(...lost.map(address => ({ key: keyLine, address })));
+    }
+
+    let changes = added.length + removed.length + addressesAdded.length + addressesRemoved.length
+        + otherwiseChanged.length;
+    if (changes === 1) {
+        if (added.length) {
+            return `SSH KEY ADDED ${keyNiceName(added[0])}`;
+        }
+        if (removed.length) {
+            return `SSH KEY REMOVED ${keyNiceName(removed[0])}`;
+        }
+        if (addressesAdded.length) {
+            return `IP ${addressesAdded[0].address} ALLOWED ON ${keyNiceName(addressesAdded[0].key)}`;
+        }
+        if (addressesRemoved.length) {
+            return `IP ${addressesRemoved[0].address} REMOVED FROM ${keyNiceName(addressesRemoved[0].key)}`;
+        }
+        return `SSH KEY CHANGED ${keyNiceName(otherwiseChanged[0])}`;
+    }
+    let counted = [
+        added.length && `${added.length} key(s) added` || "",
+        removed.length && `${removed.length} key(s) removed` || "",
+        addressesAdded.length && `${addressesAdded.length} IP(s) allowed` || "",
+        addressesRemoved.length && `${addressesRemoved.length} IP(s) removed` || "",
+    ].filter(part => part);
+    return `SSH KEYS CHANGED: ${counted.join(", ") || "no keys differ"}`;
 }
 
 export function describeKeyDifference(config: { before: string[]; after: string[] }) {
@@ -182,22 +240,26 @@ export async function enforceRootKeys(keys: string[]) {
     await saveState();
 
     let { leading, reasons } = takeChangeReasons();
-    // An attack is read first and the bookkeeping second, so it leads the message rather than
-    // sitting under a diff.
-    let alert = leading.length && `${leading.join("\n\n")}\n\n` || "";
-    let why = reasons.length && `\n\n${reasons.join("\n\n")}` || "";
+    // An attack names the message. Whoever is looking at a preview needs to see that, not that
+    // some keys changed - the change is what the attack caused.
+    let alert = leading.map(entry => entry.body).join("\n\n");
+    let why = [alert, ...reasons].filter(part => part).join("\n\n");
+    let before = weChangedIt && previouslyApplied || keys;
+    let after = weChangedIt && keys || currentKeys;
+    let headline = leading[0]?.headline || summarizeKeyDifference({ before, after });
+
     if (weChangedIt) {
-        await notify(
-            `${alert}**SSH KEYS CHANGED on this machine**`
-            + `\n\nWho can log in as root here is now:`
-            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${why}`
+        await notify(headline,
+            `Who can log in as root:`
+            + `\n\`\`\`\n${describeKeyDifference({ before, after })}\n\`\`\``
+            + `${why && `\n${why}` || ""}`
         );
         return;
     }
-    await notify(
-        `${alert}**SSH KEYS EDITED BY SOMETHING ELSE, and put back**`
-        + `\n\nSomething other than portsecure edited root's authorized_keys on this machine. The`
-        + ` edit below has been undone, and the keys from the repos are back in place.`
-        + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\`${why}`
+    await notify(leading[0]?.headline || `SSH KEYS EDITED BY SOMETHING ELSE`,
+        `Something other than portsecure edited root's authorized_keys. The edit below has been`
+        + ` undone, and the keys from the repos are back in place.`
+        + `\n\`\`\`\n${describeKeyDifference({ before, after })}\n\`\`\``
+        + `${why && `\n${why}` || ""}`
     );
 }

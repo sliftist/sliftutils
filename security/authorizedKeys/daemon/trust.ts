@@ -180,15 +180,15 @@ export function describeSigner(signer: string) {
 
 /** Reports a problem with a source's signature, but only when it is not the same problem we
     already reported, so a fault that persists does not repeat every check. */
-async function reportProblem(config: { repoURL: string; problem: string; message: string }) {
-    let { repoURL, problem, message } = config;
+async function reportProblem(config: { repoURL: string; problem: string; headline: string; body: string }) {
+    let { repoURL, problem, headline, body } = config;
     let sourceStateValue = sourceState(repoURL);
     if (sourceStateValue.reportedProblem === problem) {
         return;
     }
     sourceStateValue.reportedProblem = problem;
     await saveState();
-    await notify(message);
+    await notify(headline, body);
 }
 
 /** The keys a source is allowed to contribute right now. A source signed by someone we have not
@@ -210,8 +210,8 @@ export async function resolveSourceKeys(repoURL: string) {
             await reportProblem({
                 repoURL,
                 problem: "stale",
-                message: `**KEY REPO CHANGED WITHOUT BEING SIGNED: ${repoURL}**`
-                    + `\n\nThat repo changed, but nobody signed the change, so it is being ignored`
+                headline: `KEY REPO CHANGED WITHOUT BEING SIGNED`,
+                body: `\`${repoURL}\` changed, but nobody signed the change, so it is being ignored`
                     + ` and this machine is still using the keys signed by`
                     + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
                     + `\n\nTo make the change take effect, run this in that repo:`
@@ -221,8 +221,8 @@ export async function resolveSourceKeys(repoURL: string) {
             await reportProblem({
                 repoURL,
                 problem: "corrupt",
-                message: `**KEY REPO SIGNATURE IS BROKEN: ${repoURL}**`
-                    + `\n\nThe signature on that repo does not check out, so everything in it is`
+                headline: `KEY REPO SIGNATURE IS BROKEN`,
+                body: `The signature on \`${repoURL}\` does not check out, so everything in it is`
                     + ` being ignored and this machine is still using the keys signed by`
                     + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
                     + `\n\n${e}`
@@ -266,10 +266,9 @@ export async function resolveSourceKeys(repoURL: string) {
 
     // Going from nothing to something signed is only ever an improvement, so it does not wait.
     if (sourceStateValue.acceptedSigner === UNSIGNED) {
-        await notify(
-            `**KEY REPO IS NOW SIGNED: ${repoURL}**`
-            + `\n\nIt was not signed at all before, so this is an improvement and its keys are being`
-            + ` applied right away.`
+        await notify(`KEY REPO IS NOW SIGNED`,
+            `\`${repoURL}\` was not signed at all before, so this is an improvement and its keys`
+            + ` are being applied right away.`
             + `\n\nsigned by: \`${signer}\``
         );
         return await accept();
@@ -282,14 +281,13 @@ export async function resolveSourceKeys(repoURL: string) {
         sourceStateValue.pendingSigner = signer;
         sourceStateValue.pendingSince = Date.now();
         await saveState();
-        await notify(
-            `**KEY REPO SIGNED BY A DIFFERENT KEY: ${repoURL}**`
-            + `\n\nSomebody else is signing that repo now. Its keys are NOT being applied, and this`
+        await notify(`KEY REPO SIGNED BY A DIFFERENT KEY`,
+            `Somebody else is signing \`${repoURL}\` now. Its keys are NOT being applied, and this`
             + ` machine is still using the ones it already had. If nothing changes, the new signer`
             + ` is accepted in 24 hours.`
+            + `\n\nIf that was not you, fix the repo before the 24 hours are up.`
             + `\n\nsigned by now: \`${describeSigner(signer)}\``
             + `\nsigned by before: \`${describeSigner(sourceStateValue.acceptedSigner)}\``
-            + `\n\nIf that was not you, fix the repo before the 24 hours are up.`
         );
         return sourceStateValue.acceptedKeys;
     }

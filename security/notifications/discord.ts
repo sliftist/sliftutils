@@ -89,8 +89,9 @@ export function messageTimestamp(now: Date) {
 
 async function postToWebhook(webhookURL: string, message: string) {
     // Stamped once rather than per attempt, so a retry says when the thing happened rather than
-    // when we last managed to get it out.
-    let content = `\`${messageTimestamp(new Date())}\` ${message}`;
+    // when we last managed to get it out. At the end, because the first line of a message is the
+    // notification preview and a timestamp there would spend it saying nothing.
+    let content = `${message} · \`${messageTimestamp(new Date())}\``;
     if (content.length > DISCORD_MESSAGE_LIMIT) {
         content = content.slice(0, DISCORD_MESSAGE_LIMIT - 3) + "...";
     }

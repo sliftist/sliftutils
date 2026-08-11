@@ -110,8 +110,10 @@ export async function readNewAuthLog() {
     try {
         let stats = await handle.stat();
         let head = Buffer.alloc(Math.min(SIGNATURE_LENGTH, stats.size));
-        await handle.read(head, 0, head.length, 0);
-        let signature = crypto.createHash("sha256").update(head).digest("hex");
+        // Only the bytes actually read. A short read leaves the rest of the buffer as zeroes, and
+        // hashing those would make the signature depend on how the read happened to be split.
+        let headRead = await handle.read(head, 0, head.length, 0);
+        let signature = crypto.createHash("sha256").update(head.subarray(0, headRead.bytesRead)).digest("hex");
 
         if (!state.authLogSignature) {
             // First time we have ever looked. Start from the end: the log holds history from
@@ -132,11 +134,16 @@ export async function readNewAuthLog() {
             return "";
         }
         let contents = Buffer.alloc(stats.size - offset);
-        await handle.read(contents, 0, contents.length, offset);
-        state.authLogOffset = stats.size;
+        // Read can return fewer bytes than were asked for. Whatever it did not fill is still the
+        // zeroes Buffer.alloc left there, so the string is built from the bytes that were actually
+        // read - otherwise a short read puts NUL characters into the middle of a log line, and
+        // from there into the revocation file that quotes it. The offset moves by the same amount,
+        // so the bytes that were not read are read next time rather than skipped.
+        let read = await handle.read(contents, 0, contents.length, offset);
+        state.authLogOffset = offset + read.bytesRead;
         state.authLogSignature = signature;
         await saveState();
-        return contents.toString("utf8");
+        return contents.subarray(0, read.bytesRead).toString("utf8");
     } finally {
         await handle.close();
     }

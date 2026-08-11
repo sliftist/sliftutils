@@ -230,9 +230,8 @@ async function pollSource(repoURL: string) {
     }
 
     if (result.historyRewritten) {
-        await notify(
-            `**KEY REPO HISTORY REWRITTEN: ${repoURL}**`
-            + `\n\nCommits that used to be in that repo are gone, so somebody force pushed over it`
+        await notify(`KEY REPO HISTORY REWRITTEN`,
+            `Commits that used to be in \`${repoURL}\` are gone, so somebody force pushed over it`
             + ` or tampered with it. Whatever it says now has been applied.`
             + `\n\nwas at: \`${result.previousSha.slice(0, 12)}\``
             + `\nnow at: \`${result.remoteSha.slice(0, 12)}\``

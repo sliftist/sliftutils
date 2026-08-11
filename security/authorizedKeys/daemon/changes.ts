@@ -8,8 +8,13 @@
 // Doing it the other way round is what produced several messages for one event, and messages about
 // removing a key that had already gone.
 
+/** A reason important enough to name the whole message. Its headline replaces the one the change
+    itself would have got, because "somebody is using a key they should not" outranks "the keys
+    changed" in the one line a phone shows. */
+export type LeadingReason = { headline: string; body: string };
+
 let reasons: string[] = [];
-let leadingReasons: string[] = [];
+let leadingReasons: LeadingReason[] = [];
 
 export function addChangeReason(reason: string) {
     // The same reason twice in one pass says nothing the once did not.
@@ -19,9 +24,9 @@ export function addChangeReason(reason: string) {
 }
 
 /** For the one thing worth reading before anything else: somebody using a key from an address it
-    is not allowed from. It goes above the list of what changed, not below it. */
-export function addLeadingChangeReason(reason: string) {
-    if (!leadingReasons.includes(reason)) {
+    is not allowed from. */
+export function addLeadingChangeReason(reason: LeadingReason) {
+    if (!leadingReasons.some(existing => existing.headline === reason.headline)) {
         leadingReasons.push(reason);
     }
 }

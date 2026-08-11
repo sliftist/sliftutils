@@ -65,11 +65,9 @@ export async function checkOtherUserKeys() {
         if (previousHash === undefined || previousHash === hash) {
             continue;
         }
-        await notify(
-            `**SSH KEYS CHANGED for user ${entry.name}**`
-            + `\n\nSomebody changed who can log in as \`${entry.name}\` on this machine. portsecure`
-            + ` does not manage that account, so the change was left alone. Who can log in as`
-            + ` \`${entry.name}\` now:`
+        await notify(`SSH KEYS CHANGED FOR USER ${entry.name}`,
+            `Somebody changed who can log in as \`${entry.name}\`. portsecure does not manage that`
+            + ` account, so the change was left alone. Who can log in as \`${entry.name}\` now:`
             + `\n\`\`\`\n${keys.map(summarizeKey).join("\n") || "(nobody, the file is now empty)"}\n\`\`\``
             + `\n${entry.filePath}`
         );
