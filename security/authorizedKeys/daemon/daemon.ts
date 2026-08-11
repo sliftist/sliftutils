@@ -17,6 +17,7 @@ import { resolveSourceKeys } from "./trust";
 import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
 import { absorbRevocations, applyUnrevokes, recordRevocation, removeRevokedKeys, syncRevokeRepo } from "./revocation";
 import { keyFingerprint } from "../authorizedKeys";
+import { addChangeReason } from "./changes";
 import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 
 // portsecure authorized-keys daemon.
@@ -26,19 +27,23 @@ import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 //
 // The complete list of things that send a Discord message. Nothing else may be added to it
 // without the user asking for that specific case - everything else goes to the log.
-//   1. root's authorized_keys was changed outside portsecure, and was reverted.
-//   2. root's authorized_keys was updated because a source changed.
-//   3. Another user's authorized_keys changed.
+//
+// Anything that changes which keys root may use says nothing at the time. It leaves its reason
+// with addChangeReason, the file is written, and if it came out different that one message carries
+// the difference and every reason behind it. Announcing at the point of deciding is what produced
+// several messages for one event, and messages about removing a key that was already gone.
+//   1. root's authorized_keys changed, with what changed and why: a key revoked here, a revocation
+//      published elsewhere, an unrevoke taking effect, a source moving on.
+//   2. root's authorized_keys was edited by something else, and was put back.
+//   3. Another user's authorized_keys changed. A different file, and not one we manage.
 //   4. A source's history was rewritten.
 //   5. A source started being signed by a different key, so its new keys are being held.
 //   6. A source is now signed when it was not before, applied right away.
 //   7. A source changed without its signature being updated, so the change is ignored.
 //   8. A source has a corrupted signature, so its contents are ignored.
 //   9. The webhook file itself changed, reported to the webhook being replaced.
-//  10. A key was revoked here, after being used from an address it is not allowed from.
-//  11. A revoked key was removed from root's authorized_keys, said once per key.
-//  12. An unrevoke was published, and is being held for an hour.
-//  13. An unrevoke was applied once that hour passed.
+//  10. An unrevoke was published, and is being held for an hour. Nothing has changed yet, which is
+//      the point of saying so.
 
 export type DaemonConfig = {
     repoSources: string[];
@@ -229,6 +234,9 @@ async function pollSource(repoURL: string) {
     if (!result.changed) {
         return false;
     }
+    // Said when the file is written, and only if it came out different. A commit that does not
+    // touch the keys is not worth telling anyone about.
+    addChangeReason(`\`${repoURL}\` moved to \`${result.remoteSha.slice(0, 12)}\`.`);
     sourceState(repoURL).lastSha = result.remoteSha;
     return true;
 }

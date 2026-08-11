@@ -4,6 +4,7 @@ import { keyFingerprint, keyRestriction, keyRestrictionList, NO_RESTRICTION, sum
 import { KEYS_HISTORY_PATH, ROOT_AUTHORIZED_KEYS } from "./paths";
 import { notify } from "./notify";
 import { getState, saveState } from "./state";
+import { takeChangeReasons } from "./changes";
 
 const KEY_FILE_HEADER = "# Managed by portsecure. Manual changes are reverted and reported.";
 
@@ -159,6 +160,8 @@ export async function enforceRootKeys(keys: string[]) {
     }
 
     if (sameKeys(currentKeys, keys)) {
+        // Nothing came of whatever was decided this pass, so none of it is reported.
+        takeChangeReasons();
         if (!sameKeys(state.appliedKeys, keys)) {
             state.appliedKeys = keys;
             await saveState();
@@ -178,16 +181,18 @@ export async function enforceRootKeys(keys: string[]) {
     state.appliedKeys = keys;
     await saveState();
 
+    let reasons = takeChangeReasons();
+    let why = reasons.length && `\n\n${reasons.join("\n\n")}` || "";
     if (weChangedIt) {
         await notify(
             `applied authorized key changes:`
-            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\``
+            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${why}`
         );
         return;
     }
     await notify(
         `root's authorized_keys was edited by something other than portsecure. The edit below has`
         + ` been undone, and the keys from the repos are back in place.`
-        + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\``
+        + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\`${why}`
     );
 }
