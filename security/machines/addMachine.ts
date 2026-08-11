@@ -1,12 +1,15 @@
 import os from "os";
 import { describeHost } from "../helpers/remoteSSH";
-import { createRemoteIdentity, localIdentity, remoteIdentity } from "./identity";
+import { createRemoteIdentity, localDomains, localIdentity, remoteIdentity } from "./identity";
 import { machineState, resolveKeysRepo } from "./machines";
 
-const USAGE = `Usage: yarn addmachine [ip]
+const USAGE = `Usage: yarn addmachine <domain> [ip]
+
+The domain is required: a machine has a different identity, and so a different machine id, under
+every domain it runs under, so there is no such thing as "this machine" without one.
 
 With no ip it adds this machine, with its own addresses. With an ip it asks that machine over ssh
-for its identity, gives it one if it has none, and adds it under that address.
+for its identity under that domain, gives it one if it has none, and adds it under that address.
 
 It edits the keys repo this machine reads, wherever that is, not whatever directory this was run
 from. Nothing is signed or pushed here. Run "yarn signfiles git" in that repo afterwards, or no
@@ -27,10 +30,10 @@ function localAddresses() {
 
 export async function main() {
     let argv = process.argv.slice(2);
-    if (argv.length > 1) {
-        throw new Error(`Expected at most an ip, was ${argv.length} argument(s)\n${USAGE}`);
+    if (!argv.length || argv.length > 2) {
+        throw new Error(`Expected a domain and optionally an ip, was ${argv.length} argument(s)\n${USAGE}`);
     }
-    let host = argv[0] || "";
+    let [domain, host = ""] = argv;
     // The same repo the acceptance check reads. Editing anything else would write a machine list
     // nothing on this machine ever looks at.
     let { repoPath } = await resolveKeysRepo();
@@ -38,11 +41,12 @@ export async function main() {
     let identity;
     let addresses: string[];
     if (!host) {
-        identity = await localIdentity();
+        identity = await localIdentity(domain);
         if (!identity) {
             throw new Error(
-                `Expected an identity in ${os.homedir()}, this machine has none yet.\n`
-                + `It is generated the first time something runs here under a domain, so run that`
+                `Expected an identity for ${domain} in ${os.homedir()}, this machine has none.\n`
+                + `It has: ${(await localDomains()).join(", ") || "no identities at all"}\n`
+                + `One is generated the first time something runs here under a domain, so run that`
                 + ` first, or name another machine to add instead.`
             );
         }
@@ -51,19 +55,12 @@ export async function main() {
             throw new Error(`Expected this machine to have a non local address, it has none`);
         }
     } else {
-        identity = await remoteIdentity(host);
+        identity = await remoteIdentity(host, domain);
         if (!identity) {
-            // It has no identity, so it gets one. Its own from this point on: the key is written
-            // there and nothing keeps a copy.
-            let ours = await localIdentity();
-            if (!ours) {
-                throw new Error(
-                    `${describeHost(host)} has no identity, and neither does this machine, so there`
-                    + ` is no domain to give it one under.`
-                );
-            }
-            console.log(`${describeHost(host)} has no identity, generating one under ${ours.domain}`);
-            identity = await createRemoteIdentity({ host, domain: ours.domain });
+            // Nothing there under this domain, so it gets one. Its own from this point on: the key
+            // is written there and nothing keeps a copy.
+            console.log(`${describeHost(host)} has no identity for ${domain}, generating one`);
+            identity = await createRemoteIdentity({ host, domain });
         }
         // The address it was named by is the address it talks to us from, which is the one thing
         // it cannot lie about.
@@ -83,6 +80,7 @@ export async function main() {
         console.log(`  already allowed from ${addresses.join(", ")}`);
     }
     console.log(`  identity ${identity.fullDomain}`);
-    console.log(`\nNothing believes this until it is signed. In this repo, run:`);
+    console.log(`  in ${repoPath}`);
+    console.log(`\nNothing believes this until it is signed. In that repo, run:`);
     console.log(`\`\`\`\nyarn signfiles git\n\`\`\``);
 }

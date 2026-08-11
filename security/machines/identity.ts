@@ -44,35 +44,44 @@ function describeIdentity(config: { domain: string; stored: IdentityStorageType 
     };
 }
 
-/** This machine's identity. Several would mean this machine runs under several domains, which is
-    ambiguous rather than wrong, so it is reported rather than guessed at. */
-export async function localIdentity(): Promise<Identity | undefined> {
-    let home = os.homedir();
+/** Every domain this machine holds an identity under. A machine has one identity per domain, and
+    they are different machine ids, so which one is meant is a real question rather than a detail. */
+export async function localDomains() {
     let domains: string[] = [];
-    for (let name of (await fs.readdir(home).catch(() => [] as string[])).sort()) {
+    for (let name of (await fs.readdir(os.homedir()).catch(() => [] as string[])).sort()) {
         let domain = domainOfFileName(name);
         if (domain) {
             domains.push(domain);
         }
     }
-    if (!domains.length) {
+    return domains;
+}
+
+/** This machine's identity under one domain. Undefined when it has none under that one.
+
+    The domain is required everywhere it appears. A machine has a different identity, and so a
+    different machine id, under every domain it runs under, so "this machine" on its own does not
+    name anything: answering under the wrong one means answering as a machine we are not. */
+export async function localIdentity(domain: string): Promise<Identity | undefined> {
+    if (!domain) {
+        throw new Error(`Expected a domain, was ${JSON.stringify(domain)}`);
+    }
+    let contents = await fs.readFile(path.join(os.homedir(), identityFileName(domain)), "utf8").catch(() => "");
+    if (!contents) {
         return undefined;
     }
-    if (domains.length > 1) {
-        throw new Error(
-            `Expected one identity in ${home}, found ${domains.length}: ${domains.join(", ")}.\n`
-            + `Which of those this machine is depends on the domain, so it cannot be guessed at here.`
-        );
-    }
-    let stored = JSON.parse(await fs.readFile(path.join(home, identityFileName(domains[0])), "utf8"));
-    return describeIdentity({ domain: domains[0], stored });
+    return describeIdentity({ domain, stored: JSON.parse(contents) });
 }
 
 /** This machine's identity and its keys, for signing. */
-export async function localIdentityKeys() {
-    let identity = await localIdentity();
+export async function localIdentityKeys(domain: string) {
+    let identity = await localIdentity(domain);
     if (!identity) {
-        throw new Error(`Expected an identity in ${os.homedir()}, this machine has none`);
+        throw new Error(
+            `Expected an identity for ${domain} at ${path.join(os.homedir(), identityFileName(domain))},`
+            + ` there is none.\n`
+            + `This machine has: ${(await localDomains()).join(", ") || "no identities at all"}`
+        );
     }
     let stored: IdentityStorageType = JSON.parse(
         await fs.readFile(path.join(os.homedir(), identity.fileName), "utf8")
@@ -80,25 +89,24 @@ export async function localIdentityKeys() {
     return { identity, stored };
 }
 
-/** The identity of another machine, over ssh. Undefined when it has none yet. */
-export async function remoteIdentity(host: string): Promise<Identity | undefined> {
+/** The identity of another machine under one domain, over ssh. Undefined when it has none under
+    that domain, whatever else it may have under others. */
+export async function remoteIdentity(host: string, domain: string): Promise<Identity | undefined> {
+    if (!domain) {
+        throw new Error(`Expected a domain, was ${JSON.stringify(domain)}`);
+    }
     let home = (await runOverSSH({ host, script: `echo $HOME` })).stdout.trim();
     if (!home) {
         throw new Error(`Expected ${host} to report a home directory, it reported nothing`);
     }
-    let listing = await runOverSSH({
+    let contents = await runOverSSH({
         host,
-        script: `ls ${home} 2>/dev/null | grep '^${IDENTITY_PREFIX}' | grep '${IDENTITY_SUFFIX}$' || true`,
+        script: `cat ${home}/${identityFileName(domain)} 2>/dev/null || true`,
     });
-    let names = listing.stdout.split("\n").map(line => line.trim()).filter(line => line);
-    if (!names.length) {
+    if (!contents.stdout.trim()) {
         return undefined;
     }
-    if (names.length > 1) {
-        throw new Error(`Expected one identity on ${host}, found ${names.length}: ${names.join(", ")}`);
-    }
-    let contents = await runOverSSH({ host, script: `cat ${home}/${names[0]}` });
-    return describeIdentity({ domain: domainOfFileName(names[0]), stored: JSON.parse(contents.stdout) });
+    return describeIdentity({ domain, stored: JSON.parse(contents.stdout) });
 }
 
 /** Gives a machine an identity it does not have yet, by generating one here and writing it there.
@@ -142,8 +150,8 @@ export type TrustPacket = {
 
 /** Proves we hold the private key behind our machine id, right now. The signature covers the id
     and the time, so the packet cannot be replayed later or reused for another id. */
-export async function signTrustPacket(): Promise<TrustPacket> {
-    let { identity, stored } = await localIdentityKeys();
+export async function signTrustPacket(domain: string): Promise<TrustPacket> {
+    let { identity, stored } = await localIdentityKeys(domain);
     let signedAt = Date.now();
     let signature = crypto.sign(
         null,
