@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { spawnPromise } from "../../helpers/spawn";
-import { sourceKeyPath, sourceRepoPath } from "../sources";
+import { findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
 import { GIT_TIMEOUT, MAX_ERROR_BODY_LENGTH } from "./paths";
 import { sourceState } from "./state";
 
@@ -68,7 +68,7 @@ export async function currentBranch(config: { repoPath: string; keyPath: string 
 
 async function ensureSourceRepo(repoURL: string) {
     let repoPath = sourceRepoPath(repoURL);
-    let keyPath = sourceKeyPath(repoURL);
+    let keyPath = await findSourceKey(repoURL) || sourceKeyPath(repoURL);
     if (!await repoIsUsable({ repoPath, keyPath })) {
         await cloneRepo({ repoURL, repoPath, keyPath });
     }
@@ -82,7 +82,7 @@ async function ensureSourceRepo(repoURL: string) {
 export async function syncRepo(repoURL: string) {
     await ensureSourceRepo(repoURL);
     let repoPath = sourceRepoPath(repoURL);
-    let keyPath = sourceKeyPath(repoURL);
+    let keyPath = await findSourceKey(repoURL) || sourceKeyPath(repoURL);
     let branch = sourceState(repoURL).branch;
     let localSha = (await runGit({ args: ["rev-parse", "HEAD"], cwd: repoPath, keyPath })).stdout.trim();
 

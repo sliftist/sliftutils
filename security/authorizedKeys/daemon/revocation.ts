@@ -1,8 +1,8 @@
 import fs from "fs/promises";
 import path from "path";
 import { keyFingerprint, summarizeKey } from "../authorizedKeys";
-import { deriveRevokeKey, revokeKeyPath, revokeRepoPath, revokeRepoURL } from "../revokeSource";
-import { sourceKeyPath, sourceRepoPath } from "../sources";
+import { deriveRevokeKey, findRevokeKey, REVOKE_KEY_LABEL, revokeKeyPath, revokeRepoPath, revokeRepoURL } from "../revokeSource";
+import { findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, repoIsUsable, runGit } from "./git";
 import { messageTimestamp } from "../../notifications/discord";
 import { UNREVOKE_DELAY } from "./paths";
@@ -40,14 +40,20 @@ async function pathExists(filePath: string) {
 /** The revoke repo's key is worked out from the source's, so nothing extra had to be uploaded and
     nothing extra is stored anywhere it could be taken from. */
 async function ensureRevokeKey(sourceURL: string) {
-    let keyPath = revokeKeyPath(sourceURL);
-    if (await pathExists(keyPath)) {
-        return keyPath;
+    let existing = await findRevokeKey(sourceURL);
+    if (existing) {
+        return existing;
     }
-    let derived = deriveRevokeKey(await fs.readFile(sourceKeyPath(sourceURL), "utf8"));
+    let sourceKey = await findSourceKey(sourceURL);
+    if (!sourceKey) {
+        throw new Error(`Expected a key for ${sourceURL} at ${sourceKeyPath(sourceURL)}, no such file exists`);
+    }
+    let derived = deriveRevokeKey(await fs.readFile(sourceKey, "utf8"));
+    let keyPath = revokeKeyPath(sourceURL);
     await fs.mkdir(path.dirname(keyPath), { recursive: true, mode: 0o700 });
     await fs.writeFile(keyPath, derived.privateKeyFile, { mode: 0o600 });
-    console.log(`Derived the revoke key for ${sourceURL}`);
+    await fs.writeFile(`${keyPath}.pub`, `${derived.publicKey} ${REVOKE_KEY_LABEL}\n`, { mode: 0o644 });
+    console.log(`Derived the revoke key for ${sourceURL} into ${keyPath}`);
     return keyPath;
 }
 
@@ -165,7 +171,7 @@ export async function recordRevocation(config: {
     }
 
     let repoPath = revokeRepoPath(sourceURL);
-    let keyPath = revokeKeyPath(sourceURL);
+    let keyPath = await ensureRevokeKey(sourceURL);
     let directory = path.join(repoPath, REVOCATIONS_DIR);
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(directory, `${revocationId}.json`), JSON.stringify({
