@@ -29,8 +29,8 @@ export type RevocationState = {
     revokedBy: string;
     reason: string;
     attemptIP: string;
-    // Set once an unrevoke has been seen, so the wait can be served out across restarts.
-    unrevokeSeenAt: number;
+    // Which unrevoke covers this, once one has been seen. When the wait it started runs out is in
+    // unrevokeFirstSeen, which outlives the daemon.
     unrevokeId: string;
     unrevoked: boolean;
     // Whether we have said that this key actually left root's authorized_keys. The removal is the
@@ -57,6 +57,11 @@ export type DaemonState = {
     // shut them out. Restarting the daemon does clear it, which is the way back from a revocation
     // that should not have happened.
     revocations: { [fingerprint: string]: RevocationState };
+    // When this machine first saw each unrevoke, by unrevoke id. On disk, unlike the revocations
+    // themselves, because it is what the hour long wait is counted from: measuring from a time the
+    // unrevoke file states would let whoever wrote it backdate the file and skip the wait, and
+    // measuring from process start would restart the wait on every restart.
+    unrevokeFirstSeen: { [unrevokeId: string]: number };
     pendingRevocations: PendingRevocation[];
     // The keys we last wrote out. What tells a change we made apart from one somebody else made:
     // if this still matches what we want, and the file does not, the file was edited behind us.
@@ -70,6 +75,7 @@ let state: DaemonState = {
     sources: {},
     userKeyHashes: {},
     revocations: {},
+    unrevokeFirstSeen: {},
     pendingRevocations: [],
     appliedKeys: [],
     authLogOffset: 0,

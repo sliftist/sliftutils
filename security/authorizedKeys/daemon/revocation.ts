@@ -75,26 +75,20 @@ export async function readRevocationFiles(sourceURL: string): Promise<Revocation
     return revocations;
 }
 
-/** Unrevokes live in the source repo, so they are covered by its signature. The time the unrevoke
-    was written is what the wait is measured from, rather than the moment this machine first read
-    it: otherwise every restart starts the hour again and the unrevoke never arrives. */
-export type UnrevokeFile = { unrevokeId: string; createdAt: number };
-
+/** Unrevokes live in the source repo, so they are covered by its signature. Nothing is read out of
+    them but which revocations they name: the times they state are written by whoever wrote the
+    file, and a file that could set its own age could set it to an hour ago and skip the wait. */
 export async function readUnrevokeIds(sourceURL: string) {
     let repo = sourceRepo(sourceURL);
-    let ids = new Map<string, UnrevokeFile>();
+    let ids = new Map<string, string>();
     for (let name of await listRepoDir(repo, UNREVOKES_DIR)) {
         if (!name.endsWith(".json")) {
             continue;
         }
         try {
             let parsed = JSON.parse(await readRepoFile(repo, path.join(UNREVOKES_DIR, name)) || "");
-            let createdAt = Date.parse(parsed.createdAt || "");
             for (let revocationId of parsed.revocationIds || []) {
-                ids.set(revocationId, {
-                    unrevokeId: name.replace(/\.json$/, ""),
-                    createdAt: Number.isFinite(createdAt) ? createdAt : 0,
-                });
+                ids.set(revocationId, name.replace(/\.json$/, ""));
             }
         } catch (e) {
             console.log(`Ignoring unreadable unrevoke ${name}. ${e}`);
@@ -133,7 +127,7 @@ export async function recordRevocation(config: {
             fingerprint, revocationId,
             revokedAt: existing.revokedAt, revokedBy: existing.revokedBy,
             reason: existing.reason, attemptIP: existing.attemptIP,
-            unrevokeSeenAt: 0, unrevokeId: "", unrevoked: false,
+            unrevokeId: "", unrevoked: false,
             reportedRemoved: false,
         };
         await saveState();
@@ -167,7 +161,7 @@ export async function recordRevocation(config: {
     state.revocations[fingerprint] = {
         fingerprint, revocationId,
         revokedAt, revokedBy: hostLabel, reason: REVOCATION_REASON, attemptIP: attempt.ip,
-        unrevokeSeenAt: 0, unrevokeId: "", unrevoked: false,
+        unrevokeId: "", unrevoked: false,
         // The message below already says this machine has stopped accepting the key, so the one
         // about noticing a revocation would only repeat it.
         reportedRemoved: true,
@@ -213,7 +207,6 @@ export async function absorbRevocations(sourceURLs: string[]) {
                 revokedBy: entry.revokedBy,
                 reason: entry.reason,
                 attemptIP: entry.attemptIP,
-                unrevokeSeenAt: 0,
                 unrevokeId: "",
                 unrevoked: false,
                 reportedRemoved: false,
@@ -229,17 +222,17 @@ export async function absorbRevocations(sourceURLs: string[]) {
 /** An unrevoke is held for an hour before it counts, so a signing key that was itself compromised
     cannot instantly undo the revocation that shut it out.
 
-    The hour runs from when the unrevoke was written, not from when this machine first read it.
-    Revocations are held in memory, so a restart forgets them and reads them back out of the repo:
-    measuring from first sight meant every restart began the hour again, and an unrevoke published
-    long ago would revoke the key all over again, disconnect everyone, and make them wait. */
+    The hour is counted from when this machine first saw the unrevoke, and that moment is written
+    to disk. Revocations themselves are held in memory, so a restart forgets them and reads them
+    back out of the repo - if the wait were kept alongside them it would start again on every
+    restart, and a machine that restarts would never let an unrevoke through. */
 export async function applyUnrevokes(sourceURLs: string[]) {
     let state = getState();
-    let unrevokes = new Map<string, UnrevokeFile>();
+    let unrevokeIds = new Map<string, string>();
     for (let sourceURL of sourceURLs) {
         try {
-            for (let [revocationId, unrevoke] of await readUnrevokeIds(sourceURL)) {
-                unrevokes.set(revocationId, unrevoke);
+            for (let [revocationId, unrevokeId] of await readUnrevokeIds(sourceURL)) {
+                unrevokeIds.set(revocationId, unrevokeId);
             }
         } catch (e) {
             // Unreadable is not "there are no unrevokes". The revocations simply stand.
@@ -250,24 +243,23 @@ export async function applyUnrevokes(sourceURLs: string[]) {
         if (revocation.unrevoked) {
             continue;
         }
-        let unrevoke = unrevokes.get(revocation.revocationId);
-        if (!unrevoke) {
+        let unrevokeId = unrevokeIds.get(revocation.revocationId);
+        if (!unrevokeId) {
             continue;
         }
-        // An unrevoke with no usable timestamp falls back to the moment we saw it, which is the
-        // safe direction: it waits longer rather than taking effect early.
-        let effectiveAt = (unrevoke.createdAt || revocation.unrevokeSeenAt || Date.now()) + UNREVOKE_DELAY;
-        if (!revocation.unrevokeSeenAt) {
-            revocation.unrevokeSeenAt = Date.now();
-            revocation.unrevokeId = unrevoke.unrevokeId;
+        let firstSeen = state.unrevokeFirstSeen[unrevokeId];
+        if (!firstSeen) {
+            firstSeen = Date.now();
+            state.unrevokeFirstSeen[unrevokeId] = firstSeen;
+            revocation.unrevokeId = unrevokeId;
             await saveState();
         }
-        if (Date.now() < effectiveAt) {
+        if (Date.now() - firstSeen < UNREVOKE_DELAY) {
             // Nothing has changed yet, so nobody is told. Whoever published it was already told it
             // takes an hour, and every machine seeing the same unrevoke would say so separately.
             console.log(
-                `Holding the unrevoke ${unrevoke.unrevokeId} for ${revocation.fingerprint} until`
-                + ` ${messageTimestamp(new Date(effectiveAt))}`
+                `Holding the unrevoke ${unrevokeId} for ${revocation.fingerprint} until`
+                + ` ${messageTimestamp(new Date(firstSeen + UNREVOKE_DELAY))}`
             );
             continue;
         }
@@ -275,7 +267,7 @@ export async function applyUnrevokes(sourceURLs: string[]) {
         revocation.reportedRemoved = false;
         await saveState();
         // Only means anything if the key comes back into the file, so it is said there.
-        addChangeReason(`the unrevoke of \`${revocation.fingerprint}\` has taken effect, ${unrevoke.unrevokeId}.`);
+        addChangeReason(`the unrevoke of \`${revocation.fingerprint}\` has taken effect, ${unrevokeId}.`);
     }
 }
 
