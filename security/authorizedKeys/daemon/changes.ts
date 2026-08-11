@@ -9,6 +9,7 @@
 // removing a key that had already gone.
 
 let reasons: string[] = [];
+let leadingReasons: string[] = [];
 
 export function addChangeReason(reason: string) {
     // The same reason twice in one pass says nothing the once did not.
@@ -17,10 +18,19 @@ export function addChangeReason(reason: string) {
     }
 }
 
+/** For the one thing worth reading before anything else: somebody using a key from an address it
+    is not allowed from. It goes above the list of what changed, not below it. */
+export function addLeadingChangeReason(reason: string) {
+    if (!leadingReasons.includes(reason)) {
+        leadingReasons.push(reason);
+    }
+}
+
 /** The reasons gathered since the last write, and clears them. Called whether or not anything
     changed, so reasons that came to nothing cannot show up against some later change. */
 export function takeChangeReasons() {
-    let taken = reasons;
+    let taken = { leading: leadingReasons, reasons };
+    leadingReasons = [];
     reasons = [];
     return taken;
 }

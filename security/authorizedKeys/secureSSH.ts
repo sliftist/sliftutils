@@ -449,6 +449,31 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
         console.log(`${describeHost(host)} already has ${repoURL}, refreshing its key and the daemon.`);
     }
 
+    // Copied into place before anything else needs it. The checks below look this source's key up
+    // where the machine keeps it, not at the path it was handed on the command line, so a key that
+    // is still only sitting in the caller's directory reads as no key at all.
+    //
+    // Into the home of whoever the daemon runs as, which is where it looks. Asked of the host
+    // rather than worked out here: this may be running on a machine with no such user, and with a
+    // home directory in an entirely different shape.
+    let hostKeysDirectory = await daemonKeysDir(host);
+    await writeRemoteFile({
+        host,
+        filePath: `${hostKeysDirectory}/${sourceName(repoURL)}`,
+        contents: await fs.readFile(keyPath, "utf8"),
+        fileMode: "600",
+        directoryMode: "700",
+    });
+    // The public half too, so the deploy key that a repo was given can be looked up on the machine
+    // using it, rather than only in whatever github shows.
+    await writeRemoteFile({
+        host,
+        filePath: `${hostKeysDirectory}/${sourceName(repoURL)}.pub`,
+        contents: await publicKeyOf(keyPath),
+        fileMode: "644",
+        directoryMode: "700",
+    });
+
     // The merged result is what root ends up with, so our own key has to be somewhere in it. On
     // this machine there is no ssh session to preserve, so there is nothing to check.
     let ourFingerprint = "";
@@ -489,27 +514,6 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
 
     let webhookURL = await requireRemoteWebhook(host);
     console.log(`${describeHost(host)} notifies ${webhookURL}`);
-
-    // Into the home of whoever the daemon runs as, which is where it looks. Asked of the host
-    // rather than worked out here: this may be running on a machine with no such user, and with a
-    // home directory in an entirely different shape.
-    let hostKeysDirectory = await daemonKeysDir(host);
-    await writeRemoteFile({
-        host,
-        filePath: `${hostKeysDirectory}/${sourceName(repoURL)}`,
-        contents: await fs.readFile(keyPath, "utf8"),
-        fileMode: "600",
-        directoryMode: "700",
-    });
-    // The public half too, so the deploy key that a repo was given can be looked up on the machine
-    // using it, rather than only in whatever github shows.
-    await writeRemoteFile({
-        host,
-        filePath: `${hostKeysDirectory}/${sourceName(repoURL)}.pub`,
-        contents: await publicKeyOf(keyPath),
-        fileMode: "644",
-        directoryMode: "700",
-    });
 
     let repoSources = remoteConfig.repoSources.filter(source => source !== repoURL);
     repoSources.push(repoURL);
@@ -637,7 +641,21 @@ function parseArgs(argv: string[]) {
     return { verb, host, rest: positional };
 }
 
+/** Everything here is root's: root's authorized_keys, root's keys directory, the sshd config, the
+    systemd unit. Run as anyone else it reads a different home and writes files the daemon will
+    never see, and it gets there several steps in rather than failing at the start. */
+function requireRoot() {
+    let uid = process.getuid?.();
+    if (uid !== 0) {
+        throw new Error(
+            `Expected to be running as root, is uid ${uid ?? "unknown"}.\n`
+            + `Rerun this with sudo.`
+        );
+    }
+}
+
 export async function main() {
+    requireRoot();
     let { verb, host, rest } = parseArgs(process.argv.slice(2));
 
     if (verb === "list") {

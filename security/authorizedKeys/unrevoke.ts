@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import os from "os";
 import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
-import { keyFingerprint, normalizeKeys } from "./authorizedKeys";
+import { allowAddresses, keyFingerprint, normalizeKeys, summarizeKey } from "./authorizedKeys";
 import { deriveRevokeKey, revokeRepoURL } from "./revokeSource";
 import { findSourceKey } from "./sources";
 import { signRepo } from "../signedFiles/signFiles";
@@ -26,11 +26,20 @@ for a key you still want.`;
 export type Revocation = {
     revocationId: string;
     fingerprint: string;
+    // The address the key was used from. A revocation is about this pair, and an unrevoke undoes
+    // it by allowing that same pair - which is why unrevoking never makes a key unrevokable: used
+    // from some other address, it is revoked again.
+    ip?: string;
     key?: string;
     revokedAt?: string;
     revokedBy?: string;
     attempt?: { ip?: string; user?: string; required?: string };
 };
+
+/** Older revocation files carry the address under attempt only. */
+export function revocationIP(revocation: Revocation) {
+    return revocation.ip || revocation.attempt?.ip || "";
+}
 
 /** Every revocation the revoke repo lists. Cloned read only into a temp directory.
 
@@ -86,6 +95,10 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
                 continue;
             }
             let parsed = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
+            for (let allowed of parsed.allowed || []) {
+                unrevoked.add(`${allowed.fingerprint} ${allowed.ip}`);
+            }
+            // Named ids, for the unrevokes written before this was about pairs.
             for (let revocationId of parsed.revocationIds || []) {
                 unrevoked.add(revocationId);
             }
@@ -93,11 +106,48 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
     } catch (e) {
         // Nothing has been unrevoked.
     }
-    let stillRevoked = revocations.filter(revocation => !unrevoked.has(revocation.revocationId));
+    let stillRevoked = revocations.filter(revocation => !unrevoked.has(revocation.revocationId)
+        && !unrevoked.has(`${revocation.fingerprint} ${revocationIP(revocation)}`));
     let keys = normalizeKeys(await fs.readFile(path.join(repoPath, "authorized_keys"), "utf8").catch(() => ""));
     return stillRevoked
         .filter(revocation => keys.some(key => keyFingerprint(key) === revocation.fingerprint))
         .map(revocation => ({ revocation, key: keys.find(key => keyFingerprint(key) === revocation.fingerprint) || "" }));
+}
+
+/** Writes the addresses into the from= list of each key in the repo's authorized_keys, and says
+    which ones were actually new. Only the lines being changed are touched, so comments, ordering
+    and any key not involved come out of this byte for byte the same. */
+async function allowAddressesInRepo(config: {
+    repoPath: string;
+    addressesByFingerprint: Map<string, string[]>;
+}) {
+    let { repoPath, addressesByFingerprint } = config;
+    let added = new Map<string, string[]>();
+    let filePath = path.join(repoPath, "authorized_keys");
+    let contents;
+    try {
+        contents = await fs.readFile(filePath, "utf8");
+    } catch (e) {
+        // A repo holding its keys as separate .pub files. Nothing to edit in one place, so the
+        // caller's listing is all whoever ran this gets.
+        console.log(`No authorized_keys in ${repoPath}, so the addresses were not added to any key.`);
+        return added;
+    }
+    let lines = contents.split("\n");
+    for (let index = 0; index < lines.length; index++) {
+        let fingerprint = keyFingerprint(lines[index]);
+        let addresses = fingerprint && addressesByFingerprint.get(fingerprint);
+        if (!addresses || !addresses.length) {
+            continue;
+        }
+        let result = allowAddresses(lines[index], addresses);
+        lines[index] = result.keyLine;
+        added.set(fingerprint, [...(added.get(fingerprint) || []), ...result.added]);
+    }
+    if ([...added.values()].some(list => list.length)) {
+        await fs.writeFile(filePath, lines.join("\n"));
+    }
+    return added;
 }
 
 /** The repo named, or the one we are standing in. Checked the same way securessh checks it: a git
@@ -149,22 +199,70 @@ export async function main() {
     await fs.writeFile(path.join(directory, `${unrevokeId}.json`), JSON.stringify({
         unrevokeId,
         createdAt: new Date().toISOString(),
-        // Named one by one rather than as a blanket "allow everything again", so this file only
-        // ever undoes the revocations that existed when it was written.
-        revocationIds: revocations.map(revocation => revocation.revocationId),
+        // What this file says: each of these keys is allowed from this address. Pairs, not keys,
+        // and not a blanket "allow everything again" - a key forgiven here for one address is
+        // still revoked the moment it is used from another.
+        allowed: revocations.map(revocation => ({
+            fingerprint: revocation.fingerprint,
+            ip: revocationIP(revocation),
+        })),
         revocations: revocations.map(revocation => ({
             revocationId: revocation.revocationId,
             fingerprint: revocation.fingerprint,
+            ip: revocationIP(revocation),
             revokedAt: revocation.revokedAt,
             revokedBy: revocation.revokedBy,
             attempt: revocation.attempt,
         })),
     }, undefined, 4) + "\n");
 
-    console.log(`Wrote ${UNREVOKES_DIR}/${unrevokeId}.json covering ${revocations.length} revocation(s):`);
-    for (let revocation of revocations) {
-        console.log(`  ${revocation.fingerprint} revoked by ${revocation.revokedBy || "?"} from ${revocation.attempt?.ip || "?"}`);
+    // Named the way the notifications name them. A fingerprint is not in authorized_keys and
+    // cannot be worked out by eye, so on its own it tells whoever is reading this nothing about
+    // which of their keys is being talked about.
+    let keysByFingerprint = new Map<string, string>();
+    for (let key of await readRepoKeys(repoPath).catch(() => [] as string[])) {
+        keysByFingerprint.set(keyFingerprint(key), key);
     }
+    let describeKey = (revocation: Revocation) => {
+        let key = keysByFingerprint.get(revocation.fingerprint) || revocation.key || "";
+        return key && summarizeKey(key) || `a key no longer in this repo (${revocation.fingerprint})`;
+    };
+
+    let addressesByFingerprint = new Map<string, string[]>();
+    for (let revocation of revocations) {
+        let ip = revocationIP(revocation);
+        let existing = addressesByFingerprint.get(revocation.fingerprint) || [];
+        if (ip && !existing.includes(ip)) {
+            existing.push(ip);
+        }
+        addressesByFingerprint.set(revocation.fingerprint, existing);
+    }
+
+    // Cancelling the revocation on its own would leave sshd refusing that address and the machines
+    // revoking the key all over again, so the addresses go into the key's from= here. We are in
+    // the repo that owns authorized_keys, so there is nothing to hand back to whoever ran this.
+    let added = await allowAddressesInRepo({ repoPath, addressesByFingerprint });
+
+    console.log("");
+    for (let [fingerprint, addresses] of addressesByFingerprint) {
+        let revocation = revocations.find(entry => entry.fingerprint === fingerprint)!;
+        console.log(`Unfreezing ${describeKey(revocation)}`);
+        console.log(`Allowing IP ${addresses.join(", ") || "(no address recorded)"}`);
+        let addedHere = added.get(fingerprint) || [];
+        if (addedHere.length) {
+            console.log(`  added to that key's from= list in authorized_keys: ${addedHere.join(", ")}`);
+        } else {
+            console.log(`  that key's from= list already allowed ${addresses.join(", ") ? "them" : "everything"}`);
+        }
+        for (let entry of revocations.filter(entry => entry.fingerprint === fingerprint)) {
+            console.log(
+                `  frozen by ${entry.revokedBy || "?"} ${entry.revokedAt || "at an unrecorded time"}`
+            );
+        }
+        console.log("");
+    }
+    console.log(`Every other address stays frozen, and one of these keys used from anywhere else`);
+    console.log(`is frozen again.`);
 
     // Signed here rather than left as a step to remember. An unrevoke nobody signed does nothing at
     // all, and the repo would sit there looking done while every machine ignored it.

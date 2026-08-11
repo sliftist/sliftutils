@@ -15,7 +15,9 @@ import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
 import { resolveSourceKeys } from "./trust";
 import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
-import { absorbRevocations, applyUnrevokes, recordRevocation, removeRevokedKeys, syncRevokeRepo } from "./revocation";
+import { absorbRevocations, applyUnrevokes, pairKey, recordRevocation, removeRevokedKeys } from "./revocation";
+import { revokeRepo, syncRepoFiles } from "./repoFiles";
+import { revokeRepoURL } from "../revokeSource";
 import { keyFingerprint } from "../authorizedKeys";
 import { addChangeReason } from "./changes";
 import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
@@ -138,11 +140,13 @@ async function queueRefusedKeys(allowedKeys: string[]) {
     }
     let state = getState();
     for (let found of parseAuthLog(contents)) {
-        // One key is revoked once, no matter how many addresses it was tried from.
-        if (state.revocations[found.fingerprint]) {
+        // A key and the address it was used from. The same pair twice is one revocation, but the
+        // same key from somewhere else is a new event, whatever was forgiven before.
+        let pair = pairKey({ fingerprint: found.fingerprint, ip: found.attempt.ip });
+        if (Object.values(state.revocations).some(revocation => pairKey(revocation) === pair)) {
             continue;
         }
-        if (state.pendingRevocations.some(pending => pending.fingerprint === found.fingerprint)) {
+        if (state.pendingRevocations.some(pending => pairKey({ fingerprint: pending.fingerprint, ip: pending.attempt.ip }) === pair)) {
             continue;
         }
         let sourceURL = sourceOfFingerprint(found.fingerprint);
@@ -175,11 +179,13 @@ async function writeQueuedRevocations() {
     try {
         let remaining = [];
         for (let pending of state.pendingRevocations) {
-            if (state.revocations[pending.fingerprint]) {
+            let known = () => Object.values(state.revocations)
+                .some(revocation => pairKey(revocation) === pairKey({ fingerprint: pending.fingerprint, ip: pending.attempt.ip }));
+            if (known()) {
                 continue;
             }
             let recorded = await recordRevocation({ ...pending, hostLabel: config.hostLabel });
-            if (!recorded && !state.revocations[pending.fingerprint]) {
+            if (!recorded && !known()) {
                 remaining.push(pending);
             }
         }
@@ -225,9 +231,11 @@ async function pollSource(repoURL: string) {
 
     if (result.historyRewritten) {
         await notify(
-            `the history of \`${repoURL}\` was rewritten. Commit \`${result.previousSha.slice(0, 12)}\` is no`
-            + ` longer an ancestor of \`${result.remoteSha.slice(0, 12)}\`, so history was force pushed or`
-            + ` tampered with. The new state has been applied.`
+            `**KEY REPO HISTORY REWRITTEN: ${repoURL}**`
+            + `\n\nCommits that used to be in that repo are gone, so somebody force pushed over it`
+            + ` or tampered with it. Whatever it says now has been applied.`
+            + `\n\nwas at: \`${result.previousSha.slice(0, 12)}\``
+            + `\nnow at: \`${result.remoteSha.slice(0, 12)}\``
         );
     }
     if (!result.changed) {
@@ -235,11 +243,18 @@ async function pollSource(repoURL: string) {
     }
     // Said when the file is written, and only if it came out different. A commit that does not
     // touch the keys is not worth telling anyone about.
-    addChangeReason(`\`${repoURL}\` moved to \`${result.remoteSha.slice(0, 12)}\`.`);
+    addChangeReason(`The key repo \`${repoURL}\` moved to \`${result.remoteSha.slice(0, 12)}\`.`);
     sourceState(repoURL).lastSha = result.remoteSha;
     return true;
 }
 
+/** The one loop. Every repo this machine reads is brought up to date here: each source, and the
+    revoke repo beside it that says which of its keys are no longer accepted.
+
+    A repo that cannot be read is reported and skipped, and nothing downstream may read that as an
+    answer. An unreachable source keeps the keys it last gave us, and an unreachable revoke repo
+    keeps the revocations we already know - the alternative is one network failure emptying
+    authorized_keys, or handing a revoked key back to every machine. */
 async function everyCheck() {
     let anyChanged = false;
     for (let repoURL of config.repoSources) {
@@ -247,17 +262,20 @@ async function everyCheck() {
         try {
             anyChanged = await pollSource(repoURL) || anyChanged;
         } catch (e) {
-            console.log(`Polling ${repoURL} failed. ${e && (e as Error).stack || e}`);
+            console.error(`Polling ${repoURL} failed, its last known keys stay in place. ${e && (e as Error).stack || e}`);
+        }
+        try {
+            await syncRepoFiles(revokeRepo(repoURL));
+        } catch (e) {
+            console.error(
+                `Could not read ${revokeRepoURL(repoURL)}, the revocations already known stay in place. ${e}`
+            );
         }
     }
     if (anyChanged) {
         await saveState();
     }
 
-    // What other machines have revoked, and anything published to undo a revocation.
-    for (let repoURL of config.repoSources) {
-        await syncRevokeRepo(repoURL);
-    }
     await absorbRevocations(config.repoSources);
     await applyUnrevokes(config.repoSources);
 
@@ -299,28 +317,18 @@ export async function main() {
 
     console.log(`Starting, ${config.repoSources.length} source(s), keys applied to ${ROOT_AUTHORIZED_KEYS}`);
 
-    // A first pass has to happen before the intervals, so a machine is correct immediately after
-    // boot rather than a minute later.
-    for (let repoURL of config.repoSources) {
-        try {
-            sourceState(repoURL).lastSha = (await syncRepo(repoURL)).remoteSha;
-        } catch (e) {
-            console.log(`Initial sync of ${repoURL} failed, continuing with whatever is on disk. ${e}`);
-        }
-    }
-    await saveState();
+    // Whatever other users already have, before the first check, so what is there at startup is
+    // not reported as somebody having just changed it.
     await seedUserKeys();
-
-    for (let repoURL of config.repoSources) {
-        await syncRevokeRepo(repoURL);
-    }
-    await absorbRevocations(config.repoSources);
-    await enforceRootKeys(await removeRevokedKeys(await readAllowedKeys()));
-    await enforceSSHDConfig();
 
     // configureDiscordNotifications watches the webhook file on its own, so there is nothing to
     // schedule for it here.
-    startInterval({ name: "check", intervalTime: CHECK_INTERVAL, run: everyCheck });
+    let runCheck = startInterval({ name: "check", intervalTime: CHECK_INTERVAL, run: everyCheck });
+    // The same check as every other, run once now rather than a minute from now: a machine has to
+    // be correct immediately after boot. Running the one function, rather than a startup copy of
+    // it, is what keeps a step from being left out of one of them - the copy here had no
+    // applyUnrevokes, so every restart re-applied a revocation that had already been undone.
+    await runCheck();
 
     // A refused login is acted on when sshd writes it. The one pass here covers anything written
     // while the daemon was not running.

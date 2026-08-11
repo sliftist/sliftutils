@@ -40,6 +40,27 @@ export function keyRestriction(keyLine: string) {
     return list.join(",");
 }
 
+/** Adds addresses to a key's from= list, leaving the rest of the line exactly as it was. Returns
+    which addresses were actually new, so a caller can report only what it changed.
+
+    A key with no from= at all is left alone: adding one would silently restrict a key that is
+    currently unrestricted, which is a different decision than the one being made here. */
+export function allowAddresses(keyLine: string, addresses: string[]) {
+    let list = keyRestrictionList(keyLine);
+    if (!list) {
+        return { keyLine, added: [] as string[] };
+    }
+    let allowed = list;
+    let added = addresses.filter(address => address && !allowed.includes(address));
+    if (!added.length) {
+        return { keyLine, added };
+    }
+    return {
+        keyLine: keyLine.replace(/from="[^"]*"/, `from="${[...allowed, ...added].join(",")}"`),
+        added,
+    };
+}
+
 /** Enough to recognise whose key this is without printing the whole blob. */
 export function summarizeKey(keyLine: string) {
     let parts = keyLine.trim().split(/\s+/);
@@ -51,6 +72,19 @@ export function summarizeKey(keyLine: string) {
     let blob = parts[typeIndex + 1] || "";
     let comment = parts.slice(typeIndex + 2).join(" ");
     return `${type} ...${blob.slice(-12)}${comment && ` ${comment}` || ""}`;
+}
+
+/** The shortest thing that still identifies a key to a person: the comment it carries, which is
+    usually user@machine, and otherwise the tail of the key itself. For the first line of a
+    notification, where there is only room for the one thing that matters. */
+export function keyNiceName(keyLine: string) {
+    let parts = keyLine.trim().split(/\s+/);
+    let typeIndex = parts.findIndex(part => /^(ssh-|ecdsa-|sk-)/.test(part));
+    if (typeIndex < 0) {
+        return keyLine.slice(0, 20);
+    }
+    let comment = parts.slice(typeIndex + 2).join(" ");
+    return comment || `...${(parts[typeIndex + 1] || "").slice(-8)}`;
 }
 
 /** What a set of keys has to satisfy before it is worth signing, as a list of complaints.
