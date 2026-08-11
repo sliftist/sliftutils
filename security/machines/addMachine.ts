@@ -2,7 +2,7 @@ import os from "os";
 import { getOwnIPs } from "../../misc/ownIPs";
 import { describeHost } from "../helpers/remoteSSH";
 import { createRemoteIdentity, Identity, localDomains, localIdentity, remoteIdentity } from "./identity";
-import { machineState, resolveKeysRepo } from "./machines";
+import { getMachines, resolveKeysRepo, setMachines } from "./machines";
 
 const USAGE = `Usage: yarn addmachine <domain> [ip]
 
@@ -58,7 +58,7 @@ export async function main() {
 
     // The whole list is read and written back, because setting is by the set: writing this one
     // machine alone would remove every other machine from the repo.
-    let machines = await machineState({ repoPath });
+    let machines = await getMachines(repoPath);
     let existing = machines.find(machine => machine.machineId === identity.machineId);
     let ips = [...(existing?.ips || [])];
     let added = addresses.filter(address => !ips.includes(address));
@@ -67,7 +67,7 @@ export async function main() {
     } else {
         machines.push({ machineId: identity.machineId, ips: [...added], addedAt: "" });
     }
-    await machineState({ repoPath, machines });
+    await setMachines({ repoPath, machines });
 
     console.log(`\nTrusting machine ${identity.machineId}`);
     console.log(`Allowing IP ${[...ips, ...added].join(", ")}`);
