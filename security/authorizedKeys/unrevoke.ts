@@ -11,11 +11,13 @@ import { spawnPromise } from "../helpers/spawn";
 
 const UNREVOKES_DIR = "unrevoked";
 const REVOCATIONS_DIR = "revocations";
-const USAGE = `Usage: yarn unrevoke [keys-repo]
+const GIT_KEYWORD = "git";
+const COMMIT_MESSAGE = "unrevoke keys";
+const USAGE = `Usage: yarn unrevoke [keys-repo] [${GIT_KEYWORD}]
 
 Run this in a keys repo, or name one. It reads that repo's revoke repo and writes one unrevoke file
 naming every revocation in it, so the keys are accepted again once each machine's hour long wait
-passes.
+passes. It signs the result, and with ${GIT_KEYWORD} it commits and pushes it too.
 
 Keys that were revoked should normally be deleted from the repo instead. Unrevoking only matters
 for a key you still want.`;
@@ -111,10 +113,12 @@ async function resolveKeysRepo(named: string | undefined) {
 
 export async function main() {
     let argv = process.argv.slice(2);
-    if (argv.length > 1) {
-        throw new Error(`Expected at most a keys repo, was ${argv.length} argument(s)\n${USAGE}`);
+    let pushToGit = argv.includes(GIT_KEYWORD);
+    let positional = argv.filter(arg => arg !== GIT_KEYWORD);
+    if (positional.length > 1) {
+        throw new Error(`Expected at most a keys repo, was ${positional.length} argument(s)\n${USAGE}`);
     }
-    let { repoPath, originURL } = await resolveKeysRepo(argv[0]);
+    let { repoPath, originURL } = await resolveKeysRepo(positional[0]);
 
     let revocations = await readRemoteRevocations({ sourceURL: originURL });
     if (!revocations.length) {
@@ -150,7 +154,15 @@ export async function main() {
     // all, and the repo would sit there looking done while every machine ignored it.
     await signRepo({ repoPath });
 
-    console.log(`\nCommit and push it, and each machine will wait an hour after seeing it before`);
-    console.log(`those keys work again:`);
-    console.log(`\`\`\`\ngit add -A\ngit commit -m "unrevoke keys"\ngit push\n\`\`\``);
+    if (!pushToGit) {
+        console.log(`\nCommit and push it, and each machine will wait an hour after seeing it before`);
+        console.log(`those keys work again:`);
+        console.log(`\`\`\`\ngit add -A\ngit commit -m "${COMMIT_MESSAGE}"\ngit push\n\`\`\``);
+        return;
+    }
+    await runPromise(`git add -A`, { cwd: repoPath });
+    await runPromise(`git commit -m "${COMMIT_MESSAGE}"`, { cwd: repoPath });
+    await runPromise(`git push`, { cwd: repoPath });
+    console.log(`\nCommitted and pushed. Each machine waits an hour after seeing it before those`);
+    console.log(`keys work again.`);
 }
