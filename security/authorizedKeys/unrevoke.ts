@@ -95,17 +95,24 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
     repo that actually holds keys and has an origin to clone from. */
 async function resolveKeysRepo(named: string | undefined) {
     let cwd = named && expandHome(named) || undefined;
-    let repoPath = (await runPromise("git rev-parse --show-toplevel", { quiet: true, cwd })).trim();
-    if (!repoPath) {
-        throw new Error(`Expected ${named || "the current directory"} to be inside a git repo, it is not.\n${USAGE}`);
+    // spawnPromise rather than runPromise, because these two are read for their value. runPromise
+    // returns stdout and stderr joined, so one git warning ends up glued to the front of the path.
+    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"], cwd });
+    let repoPath = topLevel.stdout.trim();
+    if (topLevel.status !== 0 || !repoPath) {
+        throw new Error(
+            `Expected ${named || "the current directory"} to be inside a git repo, it is not.\n`
+            + `${(topLevel.stdout + topLevel.stderr).trim()}\n${USAGE}`
+        );
     }
     try {
         await readRepoKeys(repoPath);
     } catch (e) {
         throw new Error(`Expected ${repoPath} to be a keys repo, it holds no keys.\n${e}\n${USAGE}`);
     }
-    let originURL = (await runPromise("git remote get-url origin", { quiet: true, cwd: repoPath })).trim();
-    if (!originURL) {
+    let origin = await spawnPromise({ command: "git", args: ["remote", "get-url", "origin"], cwd: repoPath });
+    let originURL = origin.stdout.trim();
+    if (origin.status !== 0 || !originURL) {
         throw new Error(`Expected ${repoPath} to have an origin remote, it has none.\n${USAGE}`);
     }
     return { repoPath, originURL };
