@@ -168,25 +168,26 @@ export async function enforceRootKeys(keys: string[]) {
 
     let weChangedIt = !sameKeys(state.appliedKeys, keys);
     let previouslyApplied = state.appliedKeys;
-    let archivePath = await archiveAuthorizedKeys({
+    // Still archived, it is just not worth a line in the message. Whoever needs the old file knows
+    // where the history is.
+    await archiveAuthorizedKeys({
         filePath: ROOT_AUTHORIZED_KEYS,
         reason: weChangedIt && "update" || "reverted",
     });
     await writeAuthorizedKeysFile({ filePath: ROOT_AUTHORIZED_KEYS, keys });
     state.appliedKeys = keys;
     await saveState();
-    let archiveNote = archivePath && `\nThe file as it was is kept at \`${archivePath}\`.` || "";
 
     if (weChangedIt) {
         await notify(
-            `root's authorized_keys has been updated:`
-            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\`${archiveNote}`
+            `applied authorized key changes:`
+            + `\n\`\`\`\n${describeKeyDifference({ before: previouslyApplied, after: keys })}\n\`\`\``
         );
         return;
     }
     await notify(
         `root's authorized_keys was edited by something other than portsecure. The edit below has`
         + ` been undone, and the keys from the repos are back in place.`
-        + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\`${archiveNote}`
+        + `\n\`\`\`\n${describeKeyDifference({ before: keys, after: currentKeys })}\n\`\`\``
     );
 }

@@ -306,19 +306,24 @@ export async function removeRevokedKeys(keys: string[]) {
             continue;
         }
         dropped.push(fingerprint);
-        // Said once, when the key actually goes, and only on a machine that is learning about the
-        // revocation from the repo. The machine that did the revoking already said so itself.
         let revocation = state.revocations[fingerprint];
-        if (revocation && !revocation.reportedRemoved) {
-            revocation.reportedRemoved = true;
-            await saveState();
-            // A machine learning of a revocation from the repo has its own sessions to end.
-            let ended = describeAllEnded(await endAllSSHSessions());
-            await notify(
-                `observed a revocation in the revoke repo for \`${fingerprint}\`, and removed that key`
-                + ` from root's authorized_keys. This machine no longer accepts it.${ended}`
-            );
+        if (!revocation || revocation.reportedRemoved) {
+            continue;
         }
+        revocation.reportedRemoved = true;
+        await saveState();
+        // Only worth saying when the key is actually going. If it is not among the keys currently
+        // in the file then it left long ago, and this is a machine that has restarted and read the
+        // revocation back out of the repo, which is not news and removes nothing.
+        if (!state.appliedKeys.includes(key)) {
+            continue;
+        }
+        // Whatever that key is holding open goes with it.
+        let ended = describeAllEnded(await endAllSSHSessions());
+        await notify(
+            `observed a revocation in the revoke repo for \`${fingerprint}\`, and removed that key`
+            + ` from root's authorized_keys. This machine no longer accepts it.${ended}`
+        );
     }
     // Said on every check, not once. A key being held out of authorized_keys is the current state
     // of the machine, and someone reading the log to work out why a key does not work should find
