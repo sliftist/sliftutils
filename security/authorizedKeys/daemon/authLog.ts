@@ -17,11 +17,29 @@ const SIGNATURE_LENGTH = 512;
 
 export type RefusedAttempt = { fingerprint: string; attempt: Attempt };
 
+// The two halves of one refusal are separate log lines, written milliseconds apart, and a watcher
+// woken by the first of them reads only as far as that. So the halves are kept between reads and
+// paired when both have arrived, keyed by the connection's process id.
+let refusals = new Map<string, { user: string; ip: string; required: string; line: string }[]>();
+let fingerprints = new Map<string, { fingerprint: string; port: string }>();
+// A half that never finds its other half would otherwise sit there forever. Maps keep insertion
+// order, so the oldest are the ones to drop.
+const MAX_HALVES = 500;
+
+function forget(half: Map<string, unknown>) {
+    while (half.size > MAX_HALVES) {
+        let oldest = half.keys().next().value;
+        if (oldest === undefined) {
+            return;
+        }
+        half.delete(oldest);
+    }
+}
+
 /** Pairs each refusal with the fingerprint sshd logged for the same connection. A refusal we
-    cannot tie to a key is dropped: revoking the wrong key would lock out the wrong person. */
+    cannot tie to a key is held rather than acted on: revoking the wrong key would lock out the
+    wrong person, and the line naming the key usually arrives a moment later. */
 export function parseAuthLog(contents: string) {
-    let refusals = new Map<string, { user: string; ip: string; required: string; line: string }[]>();
-    let fingerprints = new Map<string, { fingerprint: string; port: string }>();
     for (let line of contents.split("\n")) {
         let processMatch = line.match(PROCESS_ID);
         if (!processMatch) {
@@ -42,10 +60,11 @@ export function parseAuthLog(contents: string) {
     }
 
     let attempts: RefusedAttempt[] = [];
-    for (let [processId, entries] of refusals) {
+    for (let [processId, entries] of [...refusals]) {
         let key = fingerprints.get(processId);
         if (!key) {
-            console.log(`A refused attempt named no key, so nothing is being revoked for it: ${entries[0].line}`);
+            // The line naming the key has not been written yet, or not been read yet. Kept for the
+            // next read rather than thrown away.
             continue;
         }
         for (let entry of entries) {
@@ -60,7 +79,12 @@ export function parseAuthLog(contents: string) {
                 },
             });
         }
+        // Paired, so neither half is needed again.
+        refusals.delete(processId);
+        fingerprints.delete(processId);
     }
+    forget(refusals);
+    forget(fingerprints);
     return attempts;
 }
 
