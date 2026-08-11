@@ -8,28 +8,39 @@ const MAX_ERROR_BODY_LENGTH = 500;
 // /etc is root owned, so fall back to sudo whenever the SSH user is not root.
 export const SUDO_PREAMBLE = `SUDO=""; if [ "$(id -u)" -ne 0 ]; then SUDO="sudo -n"; fi`;
 
+/** No host means this machine, so the very same script runs with nothing in front of it. Local and
+    remote then do exactly the same thing, rather than being two pieces of code that have to be kept
+    saying the same thing. */
+export const THIS_MACHINE = "";
+
+export function describeHost(host: string) {
+    return host || "this machine";
+}
+
 /** The host string is handed to ssh untouched. Users, keys and ports belong in the caller's ssh
     config, so BatchMode makes a missing setup fail immediately instead of prompting. */
 export async function runOverSSH(config: { host: string; script: string; input?: string; allowFailure?: boolean }) {
     let { host, script, input, allowFailure } = config;
     let result = await spawnPromise({
-        command: "ssh",
-        args: [
+        command: host && "ssh" || "sh",
+        args: host && [
             "-o", "BatchMode=yes",
             "-o", `ConnectTimeout=${SSH_CONNECT_TIMEOUT}`,
             host,
             script,
-        ],
+        ] || ["-c", script],
         input,
         inheritStderr: !allowFailure,
     });
     if (result.error) {
-        throw new Error(`Expected ssh to run against ${host}, failed with ${result.error.message}`);
+        throw new Error(`Expected to run against ${describeHost(host)}, failed with ${result.error.message}`);
     }
     if (result.status !== 0 && !allowFailure) {
+        let advice = host
+            && ` Non-interactive ssh access to ${host} has to work on its own - fix it in your ssh config.`
+            || "";
         throw new Error(
-            `Expected ssh to ${host} to exit 0, was ${result.status}.`
-            + ` Non-interactive ssh access to ${host} has to work on its own - fix it in your ssh config.\n`
+            `Expected the script on ${describeHost(host)} to exit 0, was ${result.status}.${advice}\n`
             + `${(result.stdout + result.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
         );
     }
