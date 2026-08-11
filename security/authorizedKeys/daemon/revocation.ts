@@ -7,6 +7,7 @@ import { cloneRepo, repoIsUsable, runGit } from "./git";
 import { messageTimestamp } from "../../notifications/discord";
 import { UNREVOKE_DELAY } from "./paths";
 import { notify } from "./notify";
+import { addChangeReason } from "./changes";
 import { describeAllEnded, endAllSSHSessions } from "./sessions";
 import { getState, saveState } from "./state";
 
@@ -193,22 +194,16 @@ export async function recordRevocation(config: {
         reportedRemoved: true,
     };
     await saveState();
-    // Killed before saying anything, so the message reports what was actually done rather than
-    // what was about to be attempted.
     let ended = describeAllEnded(await endAllSSHSessions());
-    // What happened, then what was done about it, then what to do about it. In that order, because
-    // whoever reads this needs to know which of those two things it was before anything else.
-    await notify(
-        `**AUTHENTICATED ACCESS FROM AN UNAPPROVED IP.** The key was correct, so either someone`
-        + ` else has this key, or a developer's IP has changed.`
+    // Said when the file is written, not here, so one event produces one message.
+    addChangeReason(
+        `**AUTHENTICATED ACCESS FROM AN UNAPPROVED IP: \`${attempt.ip}\`** The key was correct, so`
+        + ` either someone else has this key, or a developer's IP has changed.`
         + `\nkey \`${keyLine && summarizeKey(keyLine) || fingerprint}\` (\`${fingerprint}\`)`
-        + `\ntried from \`${attempt.ip}\` as user \`${attempt.user}\``
-        + `\nonly allowed from \`${attempt.required}\``
-        + `\n\nThat key is now revoked. Every machine will remove it from root's authorized_keys and`
-        + ` stop accepting it, from any address.${ended}`
-        + `\n\nIf this really was an attack, IMMEDIATELY remove that key from \`${sourceURL}\`.`
-        + `\nIf it was legitimate use, run this in \`${sourceURL}\` and deploy it as normal:`
-        + `\n\`\`\`\nyarn unrevoke\nyarn signfiles git\n\`\`\``
+        + `\ntried as user \`${attempt.user}\`, and is only allowed from \`${attempt.required}\``
+        + `\nThat key is now revoked everywhere.${ended}`
+        + `\nIf this really was an attack, IMMEDIATELY remove that key from \`${sourceURL}\`.`
+        + `\nIf it was legitimate use, run this in \`${sourceURL}\`: \`yarn unrevoke git\``
     );
     return true;
 }
@@ -275,10 +270,8 @@ export async function applyUnrevokes(sourceURLs: string[]) {
         revocation.unrevoked = true;
         revocation.reportedRemoved = false;
         await saveState();
-        await notify(
-            `the unrevoke of \`${revocation.fingerprint}\` has been applied. The key is accepted again`
-            + ` if it is still in a keys repo.`
-        );
+        // Only means anything if the key comes back into the file, so it is said there.
+        addChangeReason(`the unrevoke of \`${revocation.fingerprint}\` has taken effect, ${unrevokeId}.`);
     }
 }
 
@@ -307,19 +300,20 @@ export async function removeRevokedKeys(keys: string[]) {
             continue;
         }
         dropped.push(fingerprint);
-        // Said once, when the key actually goes, and only on a machine that is learning about the
-        // revocation from the repo. The machine that did the revoking already said so itself.
         let revocation = state.revocations[fingerprint];
-        if (revocation && !revocation.reportedRemoved) {
-            revocation.reportedRemoved = true;
-            await saveState();
-            // A machine learning of a revocation from the repo has its own sessions to end.
-            let ended = describeAllEnded(await endAllSSHSessions());
-            await notify(
-                `observed a revocation in the revoke repo for \`${fingerprint}\`, and removed that key`
-                + ` from root's authorized_keys. This machine no longer accepts it.${ended}`
-            );
+        if (!revocation || revocation.reportedRemoved) {
+            continue;
         }
+        revocation.reportedRemoved = true;
+        await saveState();
+        // Nothing to do if the key is not in the file. It left long ago, and this is a machine that
+        // restarted and read the revocation back out of the repo.
+        if (!state.appliedKeys.includes(key)) {
+            continue;
+        }
+        // Whatever that key is holding open goes with it.
+        let ended = describeAllEnded(await endAllSSHSessions());
+        addChangeReason(`a revocation for \`${fingerprint}\` was published elsewhere.${ended}`);
     }
     // Said on every check, not once. A key being held out of authorized_keys is the current state
     // of the machine, and someone reading the log to work out why a key does not work should find
