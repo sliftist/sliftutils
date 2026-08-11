@@ -247,6 +247,8 @@ export async function applyUnrevokes(sourceURLs: string[]) {
         if (!unrevokeId) {
             continue;
         }
+        // Keyed by the unrevoke rather than by the revocation, so one unrevoke covering several
+        // keys serves one wait for all of them rather than a separate one each.
         let firstSeen = state.unrevokeFirstSeen[unrevokeId];
         if (!firstSeen) {
             firstSeen = Date.now();
