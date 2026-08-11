@@ -1,4 +1,5 @@
 import os from "os";
+import { getOwnIPs } from "../../misc/ownIPs";
 import { describeHost } from "../helpers/remoteSSH";
 import { createRemoteIdentity, Identity, localDomains, localIdentity, remoteIdentity } from "./identity";
 import { machineState, resolveKeysRepo } from "./machines";
@@ -14,46 +15,6 @@ for its identity under that domain, gives it one if it has none, and adds it und
 It edits the keys repo this machine reads, wherever that is, not whatever directory this was run
 from. Nothing is signed or pushed here. Run "yarn signfiles git" in that repo afterwards, or no
 machine will believe any of it.`;
-
-// Asked what address the world sees us as. A machine cannot work that out alone: on this side of
-// a NAT it only knows its own interfaces, and anything across the NAT sees the router.
-const EXTERNAL_IP_URL = "https://api.ipify.org";
-const EXTERNAL_IP_TIMEOUT = 10 * 1000;
-
-/** The address the internet sees us as, or "" if we could not find out. */
-async function externalAddress() {
-    try {
-        let response = await fetch(EXTERNAL_IP_URL, { signal: AbortSignal.timeout(EXTERNAL_IP_TIMEOUT) });
-        let address = (await response.text()).trim();
-        return /^[0-9.]+$/.test(address) && address || "";
-    } catch (e) {
-        console.log(`Could not ask ${EXTERNAL_IP_URL} what our external address is. ${e}`);
-        return "";
-    }
-}
-
-/** Every address this machine could be talking to something else from: the real ones on its own
-    interfaces, and the one the world sees it as. Loopback and link local are left out, since
-    nothing reaches us on those, and ipv6 is left out because the entries are ipv4.
-
-    Both, because which one applies depends on who is being talked to: something on the same
-    network sees an interface address, and anything past the NAT sees the external one. They are
-    often the same address on a machine that is not behind a NAT, hence the set. */
-async function localAddresses() {
-    let addresses = new Set<string>();
-    for (let entries of Object.values(os.networkInterfaces())) {
-        for (let entry of entries || []) {
-            if (!entry.internal && entry.family === "IPv4") {
-                addresses.add(entry.address);
-            }
-        }
-    }
-    let external = await externalAddress();
-    if (external) {
-        addresses.add(external);
-    }
-    return [...addresses];
-}
 
 export async function main() {
     let argv = process.argv.slice(2);
@@ -78,9 +39,9 @@ export async function main() {
             );
         }
         identity = found;
-        addresses = await localAddresses();
+        addresses = await getOwnIPs();
         if (!addresses.length) {
-            throw new Error(`Expected this machine to have a non local address, it has none`);
+            throw new Error(`Expected this machine to have an address anything else can see, it has none`);
         }
     } else {
         // Nothing there under this domain means it gets one. Its own from this point on: the key
