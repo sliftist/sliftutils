@@ -9,7 +9,7 @@ import { signRepo } from "../signedFiles/signFiles";
 import { readRepoKeys } from "./authorizedKeys";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
-import { machineState } from "../machines/machines";
+import { getMachines, setMachines } from "../machines/machines";
 
 const UNREVOKES_DIR = "unrevoked";
 const REVOCATIONS_DIR = "revocations";
@@ -170,7 +170,7 @@ async function allowAddressesForMachines(config: { repoPath: string; revocations
     let added = new Map<string, string[]>();
     // Read the whole list, change what these revocations are about, write it back. Setting is by
     // the whole set, so writing one machine at a time would delete every other machine.
-    let machines = await machineState({ repoPath });
+    let machines = await getMachines(repoPath);
     for (let revocation of revocations) {
         let machineId = revocation.machineId;
         let ip = revocationIP(revocation);
@@ -191,7 +191,7 @@ async function allowAddressesForMachines(config: { repoPath: string; revocations
         added.set(machineId, [...(added.get(machineId) || []), ip]);
     }
     if (added.size) {
-        await machineState({ repoPath, machines });
+        await setMachines({ repoPath, machines });
     }
     return added;
 }

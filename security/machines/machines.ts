@@ -48,27 +48,27 @@ function machineFilePath(repoPath: string, machineId: string) {
     return path.join(repoPath, MACHINES_DIR, `${machineId}.json`);
 }
 
-/** Reads every machine a checkout lists, or sets them.
+/** Every machine a checkout lists. */
+export async function getMachines(repoPath: string): Promise<MachineState[]> {
+    return [...(await readMachines(repoPath)).values()];
+}
 
-    Passing `machines` makes the repo match it exactly: machines named are written with the
-    addresses given, and machines not named are removed. That is why the addresses are part of
-    setting rather than a separate step - a machine with no address it may talk from is not a
-    machine we would accept anyway, so there is no state where naming one without them means
-    anything. Read first, change what you want, write the result.
+/** Makes a checkout list exactly these machines: those named are written with the addresses given,
+    and anything not named is removed. So read them, change what you want, and write the result.
 
-    Nothing here signs or commits anything. The signature is what every other machine checks before
+    The addresses are part of setting rather than a separate step, because a machine with no
+    address it may talk from is not a machine that would ever be accepted - there is no state where
+    naming one without them means anything.
+
+    Nothing here signs or commits. The signature is what every other machine checks before
     believing any of this, and it takes the hardware key, so `yarn signfiles git` is still yours to
     run afterwards. */
-export async function machineState(config: {
+export async function setMachines(config: {
     repoPath: string;
-    machines?: { machineId: string; ips: string[] }[];
+    machines: { machineId: string; ips: string[] }[];
 }): Promise<MachineState[]> {
     let { repoPath, machines } = config;
     let existing = await readMachines(repoPath);
-    if (!machines) {
-        return [...existing.values()];
-    }
-
     let directory = path.join(repoPath, MACHINES_DIR);
     let written: MachineState[] = [];
     for (let machine of machines) {
