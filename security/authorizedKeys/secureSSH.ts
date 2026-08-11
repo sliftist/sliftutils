@@ -8,7 +8,7 @@ import { deriveRevokeKey, REVOKE_KEY_LABEL, revokeRepoURL } from "./revokeSource
 import { revokedKeysInRepo } from "./unrevoke";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
-import { readRemoteFile, remoteCommandExists, runOverSSH, SUDO_PREAMBLE, writeRemoteFile } from "../helpers/remoteSSH";
+import { describeHost, readRemoteFile, remoteCommandExists, runOverSSH, SUDO_PREAMBLE, THIS_MACHINE, writeRemoteFile } from "../helpers/remoteSSH";
 
 const SERVICE_SOURCE = path.join(__dirname, "daemon", "portsecure.service");
 // The daemon runs from a checkout of this repo on the host, rather than from a copy we upload, so
@@ -22,12 +22,16 @@ const ROOT_AUTHORIZED_KEYS = "/root/.ssh/authorized_keys";
 const SERVICE_NAME = "portsecure";
 const MAX_ERROR_BODY_LENGTH = 500;
 const VERBS = ["add", "remove", "list", "update"];
-// The repo url is optional, and defaults to the repo the command is run from.
+// The host is optional, and without one everything happens on this machine. The repo url is
+// optional too, and defaults to the repo the command is run from.
 const USAGE = `Usage:
-  yarn securessh <host> add <repo-private-key> [repo-url]
-  yarn securessh <host> remove [repo-url]
-  yarn securessh <host> list
-  yarn securessh <host> update`;
+  yarn securessh [host] add <repo-private-key> [repo-url]
+  yarn securessh [host] remove [repo-url]
+  yarn securessh [host] list
+  yarn securessh [host] update
+
+With no host it acts on this machine, and still installs from github rather than from wherever
+this was run.`;
 
 async function pathExists(filePath: string) {
     try {
@@ -176,7 +180,19 @@ async function ensureRevokeReposExist(repoSources: string[]) {
         let revokeURL = revokeRepoURL(repoURL);
         let temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "portsecure-revoke-"));
         let checkoutPath = path.join(temporaryDirectory, "repo");
-        let clone = await runLocal({ command: "git", args: ["clone", revokeURL, checkoutPath], allowFailure: true });
+        // On a machine that is already a portsecure host, the source's deploy key is right there,
+        // and the key derived from it is the one credential that repo is guaranteed to accept.
+        // Anywhere else, a person is running this and has their own access.
+        let ownKey = "";
+        if (await pathExists(sourceKeyPath(repoURL))) {
+            let derived = deriveRevokeKey(await fs.readFile(sourceKeyPath(repoURL), "utf8"));
+            ownKey = path.join(temporaryDirectory, "key");
+            await fs.writeFile(ownKey, derived.privateKeyFile, { mode: 0o600 });
+        }
+        let cloneRevoke = async (allowFailure: boolean) => ownKey
+            && await gitWithKey({ keyPath: ownKey, args: ["clone", revokeURL, checkoutPath], allowFailure })
+            || await runLocal({ command: "git", args: ["clone", revokeURL, checkoutPath], allowFailure });
+        let clone = await cloneRevoke(true);
         if (clone.status !== 0) {
             await fs.rm(temporaryDirectory, { recursive: true, force: true });
             throw new Error(
@@ -194,9 +210,14 @@ async function ensureRevokeReposExist(repoSources: string[]) {
             for (let args of [
                 ["-C", checkoutPath, "add", "-A"],
                 ["-C", checkoutPath, "-c", "user.email=portsecure@localhost", "-c", "user.name=portsecure", "commit", "-m", "initialise revoke repo"],
-                ["-C", checkoutPath, "push", "origin", "HEAD"],
             ]) {
                 await runLocal({ command: "git", args });
+            }
+            let push = ["-C", checkoutPath, "push", "origin", "HEAD"];
+            if (ownKey) {
+                await gitWithKey({ keyPath: ownKey, args: push });
+            } else {
+                await runLocal({ command: "git", args: push });
             }
         }
         await fs.rm(temporaryDirectory, { recursive: true, force: true });
@@ -296,7 +317,7 @@ async function installDaemon(config: { host: string; hostLabel: string; repoSour
 
     // The checkout is brought to the latest commit rather than a copy being pushed, so what runs on
     // the host is exactly what is on github.
-    console.log(`Updating ${REMOTE_CHECKOUT_PATH} on ${host}`);
+    console.log(`Updating ${REMOTE_CHECKOUT_PATH} on ${describeHost(host)}`);
     await runOverSSH({
         host,
         script: `${SUDO_PREAMBLE}
@@ -378,7 +399,7 @@ async function requireRemoteWebhook(host: string) {
         throw new Error(
             `Expected a Discord webhook at ${DEFAULT_WEBHOOK_FILE_PATH} on ${host}, no such file exists.`
             + ` The daemon will not start without one.\n`
-            + `Set it up first:\n  yarn setupnotify ${host} <discord-webhook-url>`
+            + `Set it up first:\n  yarn setupnotify ${host} <discord-webhook-url>`.replace(" <discord", host && " <discord" || "<discord")
         );
     }
     return parseWebhookFile({ contents, sourceName: `${host}:${DEFAULT_WEBHOOK_FILE_PATH}` });
@@ -402,18 +423,22 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
 
     let remoteConfig = await readRemoteConfig(host);
     if (remoteConfig.repoSources.includes(repoURL)) {
-        console.log(`${host} already has ${repoURL}, refreshing its key and the daemon.`);
+        console.log(`${describeHost(host)} already has ${repoURL}, refreshing its key and the daemon.`);
     }
 
-    // The merged result is what root ends up with, so our own key has to be somewhere in it.
-    console.log(`Checking our access to ${host} survives the merged keys`);
-    let ourFingerprint = await findAuthenticatingFingerprint(host);
+    // The merged result is what root ends up with, so our own key has to be somewhere in it. On
+    // this machine there is no ssh session to preserve, so there is nothing to check.
+    let ourFingerprint = "";
+    if (host) {
+        console.log(`Checking our access to ${describeHost(host)} survives the merged keys`);
+        ourFingerprint = await findAuthenticatingFingerprint(host);
+    }
     let inspectionPath = await cloneRepoForInspection({ repoURL, keyPath });
     let newKeys = await readRepoKeys(inspectionPath);
     // Whatever is applied on the host came from the existing sources, so it stays in the merge.
     let existingKeys = normalizeKeys(await readRemoteFile({ host, filePath: ROOT_AUTHORIZED_KEYS }) || "");
     let mergedFingerprints = await fingerprintKeys([...existingKeys, ...newKeys]);
-    if (!mergedFingerprints.includes(ourFingerprint)) {
+    if (ourFingerprint && !mergedFingerprints.includes(ourFingerprint)) {
         throw new Error(
             `Expected the key we use for ${host} to be in the merged keys, it is not.\n`
             + `Ours:   ${ourFingerprint}\n`
@@ -422,7 +447,9 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
             + ` lock you out of ${host}. Add your public key to ${repoURL} first.`
         );
     }
-    console.log(`Our key ${ourFingerprint} is in the merged keys, access will survive.`);
+    if (ourFingerprint) {
+        console.log(`Our key ${ourFingerprint} is in the merged keys, access will survive.`);
+    }
 
     await ensureRevokeRepo({ keyPath, repoURL });
 
@@ -438,7 +465,7 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
     }
 
     let webhookURL = await requireRemoteWebhook(host);
-    console.log(`${host} notifies ${webhookURL}`);
+    console.log(`${describeHost(host)} notifies ${webhookURL}`);
 
     await writeRemoteFile({
         host,
@@ -451,7 +478,7 @@ async function addSource(config: { host: string; keyPath: string; repoURL: strin
     let repoSources = remoteConfig.repoSources.filter(source => source !== repoURL);
     repoSources.push(repoURL);
     await installDaemon({ host, hostLabel: remoteConfig.hostLabel, repoSources });
-    console.log(`${repoURL} added to ${host}. ${repoSources.length} source(s) now merged.`);
+    console.log(`${repoURL} added to ${describeHost(host)}. ${repoSources.length} source(s) now merged.`);
 }
 
 async function removeSource(config: { host: string; repoURL: string }) {
@@ -465,9 +492,10 @@ async function removeSource(config: { host: string; repoURL: string }) {
     }
     let repoSources = remoteConfig.repoSources.filter(source => source !== repoURL);
 
-    if (repoSources.length) {
+    // On this machine there is no ssh session to preserve, so there is nothing to check.
+    if (repoSources.length && host) {
         // The keys left over are what root gets, so our own key has to be among them.
-        console.log(`Checking our access to ${host} survives without ${repoURL}`);
+        console.log(`Checking our access to ${describeHost(host)} survives without ${repoURL}`);
         let ourFingerprint = await findAuthenticatingFingerprint(host);
         let remainingKeys: string[] = [];
         for (let source of repoSources) {
@@ -495,7 +523,7 @@ $SUDO rm -f "${sourceKeyPath(repoURL)}"
 $SUDO rm -rf "${sourceRepoPath(repoURL)}"`,
     });
     await installDaemon({ host, hostLabel: remoteConfig.hostLabel, repoSources });
-    console.log(`${repoURL} removed from ${host}. ${repoSources.length} source(s) left.`);
+    console.log(`${repoURL} removed from ${describeHost(host)}. ${repoSources.length} source(s) left.`);
 }
 
 /** Answers "who can log into this box, and which repo says so". The paths the daemon uses are
@@ -516,7 +544,7 @@ async function updateDaemon(host: string) {
     await requireRemoteWebhook(host);
     await ensureRevokeReposExist(repoSources);
     await installDaemon({ host, hostLabel: parsed.hostLabel || host, repoSources });
-    console.log(`Updated the daemon on ${host}, and restarted it.`);
+    console.log(`Updated the daemon on ${describeHost(host)}, and restarted it.`);
     console.log(`Its ${repoSources.length} key source(s) were left as they are, along with the keys and`);
     console.log(`signers it has already accepted. Only the daemon itself changed:`);
     for (let repoURL of repoSources) {
@@ -527,10 +555,10 @@ async function updateDaemon(host: string) {
 async function listSources(host: string) {
     let remoteConfig = await readRemoteConfig(host);
     if (!remoteConfig.repoSources.length) {
-        console.log(`${host} has no key sources. root's authorized_keys is left exactly as it is.`);
+        console.log(`${describeHost(host)} has no key sources. root's authorized_keys is left exactly as it is.`);
         return;
     }
-    console.log(`${host} lets root log in with the keys from ${remoteConfig.repoSources.length} repo(s):`);
+    console.log(`${describeHost(host)} lets root log in with the keys from ${remoteConfig.repoSources.length} repo(s):`);
     let merged = new Set<string>();
     for (let repoURL of remoteConfig.repoSources) {
         let keys = await readRemoteSourceKeys({ host, repoURL });
@@ -561,11 +589,16 @@ function parseArgs(argv: string[]) {
         throw new Error(`Expected one of ${VERBS.join(", ")}, was ${verbs.join(" and ")}\n${USAGE}`);
     }
     let verb = verbs[0];
-    let [host, ...rest] = argv.filter(arg => arg !== verb);
-    if (!host) {
-        throw new Error(`Expected a host, was nothing\n${USAGE}`);
+    let positional = argv.filter(arg => arg !== verb);
+    // A host, when there is one, comes first and is a bare name or address. Everything else that
+    // can appear here is a path or a repo url, and those all carry a slash, which is what tells
+    // them apart. So no host at all means this machine.
+    let host = THIS_MACHINE;
+    if (positional.length && !/[\/~\\]/.test(positional[0])) {
+        host = positional[0];
+        positional = positional.slice(1);
     }
-    return { verb, host, rest };
+    return { verb, host, rest: positional };
 }
 
 export async function main() {
