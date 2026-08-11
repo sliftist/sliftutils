@@ -42,8 +42,6 @@ import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 //   7. A source changed without its signature being updated, so the change is ignored.
 //   8. A source has a corrupted signature, so its contents are ignored.
 //   9. The webhook file itself changed, reported to the webhook being replaced.
-//  10. An unrevoke was published, and is being held for an hour. Nothing has changed yet, which is
-//      the point of saying so.
 
 export type DaemonConfig = {
     repoSources: string[];

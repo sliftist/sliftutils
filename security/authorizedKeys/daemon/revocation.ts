@@ -257,10 +257,11 @@ export async function applyUnrevokes(sourceURLs: string[]) {
             revocation.unrevokeSeenAt = Date.now();
             revocation.unrevokeId = unrevokeId;
             await saveState();
-            await notify(
-                `an unrevoke for \`${revocation.fingerprint}\` was published as \`${unrevokeId}\`.`
-                + ` It will NOT be applied now. That key starts working again at`
-                + ` \`${messageTimestamp(new Date(revocation.unrevokeSeenAt + UNREVOKE_DELAY))}\`.`
+            // Nothing has changed yet, so nobody is told. Whoever published it was already told it
+            // takes an hour, and every machine seeing the same unrevoke would say so separately.
+            console.log(
+                `Holding the unrevoke ${unrevokeId} for ${revocation.fingerprint} until`
+                + ` ${messageTimestamp(new Date(revocation.unrevokeSeenAt + UNREVOKE_DELAY))}`
             );
             continue;
         }
