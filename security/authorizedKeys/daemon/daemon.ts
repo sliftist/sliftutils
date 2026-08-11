@@ -15,7 +15,7 @@ import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
 import { resolveSourceKeys } from "./trust";
 import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
-import { absorbRevocations, applyUnrevokes, recordRevocation, removeRevokedKeys } from "./revocation";
+import { absorbRevocations, applyUnrevokes, pairKey, recordRevocation, removeRevokedKeys } from "./revocation";
 import { revokeRepo, syncRepoFiles } from "./repoFiles";
 import { revokeRepoURL } from "../revokeSource";
 import { keyFingerprint } from "../authorizedKeys";
@@ -140,11 +140,13 @@ async function queueRefusedKeys(allowedKeys: string[]) {
     }
     let state = getState();
     for (let found of parseAuthLog(contents)) {
-        // One key is revoked once, no matter how many addresses it was tried from.
-        if (state.revocations[found.fingerprint]) {
+        // A key and the address it was used from. The same pair twice is one revocation, but the
+        // same key from somewhere else is a new event, whatever was forgiven before.
+        let pair = pairKey({ fingerprint: found.fingerprint, ip: found.attempt.ip });
+        if (Object.values(state.revocations).some(revocation => pairKey(revocation) === pair)) {
             continue;
         }
-        if (state.pendingRevocations.some(pending => pending.fingerprint === found.fingerprint)) {
+        if (state.pendingRevocations.some(pending => pairKey({ fingerprint: pending.fingerprint, ip: pending.attempt.ip }) === pair)) {
             continue;
         }
         let sourceURL = sourceOfFingerprint(found.fingerprint);
@@ -177,11 +179,13 @@ async function writeQueuedRevocations() {
     try {
         let remaining = [];
         for (let pending of state.pendingRevocations) {
-            if (state.revocations[pending.fingerprint]) {
+            let known = () => Object.values(state.revocations)
+                .some(revocation => pairKey(revocation) === pairKey({ fingerprint: pending.fingerprint, ip: pending.attempt.ip }));
+            if (known()) {
                 continue;
             }
             let recorded = await recordRevocation({ ...pending, hostLabel: config.hostLabel });
-            if (!recorded && !state.revocations[pending.fingerprint]) {
+            if (!recorded && !known()) {
                 remaining.push(pending);
             }
         }

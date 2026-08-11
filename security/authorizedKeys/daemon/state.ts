@@ -17,20 +17,26 @@ export type SourceState = {
     reportedProblem: string;
 };
 
-/** A key this machine has stopped accepting. Kept even when the revoke repo no longer lists it:
-    the deploy key that writes revocations lives on every server, so an attacker who took one could
-    otherwise delete the revocation that locked them out. */
+/** One revocation event: this key, used from this address, so it is no longer accepted. Kept even
+    when the revoke repo no longer lists it: the deploy key that writes revocations lives on every
+    server, so an attacker who took one could otherwise delete the revocation that locked them out.
+
+    The id is unique to the event, never derived from the key. A key that has been forgiven for one
+    address is still an ordinary key, and using it from some other address revokes it again, with a
+    new id that no existing unrevoke names. */
 export type RevocationState = {
-    fingerprint: string;
     revocationId: string;
+    fingerprint: string;
+    // The address it was used from. Half of what a revocation says, and the half an unrevoke has
+    // to name to undo it.
+    ip: string;
     // Why this key was revoked, carried from the revocation file so a machine that reads one
     // written elsewhere can say what happened rather than only that something did.
     revokedAt: string;
     revokedBy: string;
     reason: string;
-    attemptIP: string;
-    // Which unrevoke covers this, once one has been seen. When the wait it started runs out is in
-    // unrevokeFirstSeen, which outlives the daemon.
+    // Which unrevoke allowed this key from this address, once one has been seen. When the wait it
+    // started runs out is in unrevokeFirstSeen, which outlives the daemon.
     unrevokeId: string;
     unrevoked: boolean;
     // Whether we have said that this key actually left root's authorized_keys. The removal is the
@@ -56,7 +62,7 @@ export type DaemonState = {
     // revocations is on every server, so whoever stole one could otherwise erase the record that
     // shut them out. Restarting the daemon does clear it, which is the way back from a revocation
     // that should not have happened.
-    revocations: { [fingerprint: string]: RevocationState };
+    revocations: { [revocationId: string]: RevocationState };
     // When this machine first saw each unrevoke, by unrevoke id. On disk, unlike the revocations
     // themselves, because it is what the hour long wait is counted from: measuring from a time the
     // unrevoke file states would let whoever wrote it backdate the file and skip the wait, and

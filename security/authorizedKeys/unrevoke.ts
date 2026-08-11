@@ -26,11 +26,20 @@ for a key you still want.`;
 export type Revocation = {
     revocationId: string;
     fingerprint: string;
+    // The address the key was used from. A revocation is about this pair, and an unrevoke undoes
+    // it by allowing that same pair - which is why unrevoking never makes a key unrevokable: used
+    // from some other address, it is revoked again.
+    ip?: string;
     key?: string;
     revokedAt?: string;
     revokedBy?: string;
     attempt?: { ip?: string; user?: string; required?: string };
 };
+
+/** Older revocation files carry the address under attempt only. */
+export function revocationIP(revocation: Revocation) {
+    return revocation.ip || revocation.attempt?.ip || "";
+}
 
 /** Every revocation the revoke repo lists. Cloned read only into a temp directory.
 
@@ -86,6 +95,10 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
                 continue;
             }
             let parsed = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
+            for (let allowed of parsed.allowed || []) {
+                unrevoked.add(`${allowed.fingerprint} ${allowed.ip}`);
+            }
+            // Named ids, for the unrevokes written before this was about pairs.
             for (let revocationId of parsed.revocationIds || []) {
                 unrevoked.add(revocationId);
             }
@@ -93,7 +106,8 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
     } catch (e) {
         // Nothing has been unrevoked.
     }
-    let stillRevoked = revocations.filter(revocation => !unrevoked.has(revocation.revocationId));
+    let stillRevoked = revocations.filter(revocation => !unrevoked.has(revocation.revocationId)
+        && !unrevoked.has(`${revocation.fingerprint} ${revocationIP(revocation)}`));
     let keys = normalizeKeys(await fs.readFile(path.join(repoPath, "authorized_keys"), "utf8").catch(() => ""));
     return stillRevoked
         .filter(revocation => keys.some(key => keyFingerprint(key) === revocation.fingerprint))
@@ -149,22 +163,32 @@ export async function main() {
     await fs.writeFile(path.join(directory, `${unrevokeId}.json`), JSON.stringify({
         unrevokeId,
         createdAt: new Date().toISOString(),
-        // Named one by one rather than as a blanket "allow everything again", so this file only
-        // ever undoes the revocations that existed when it was written.
-        revocationIds: revocations.map(revocation => revocation.revocationId),
+        // What this file says: each of these keys is allowed from this address. Pairs, not keys,
+        // and not a blanket "allow everything again" - a key forgiven here for one address is
+        // still revoked the moment it is used from another.
+        allowed: revocations.map(revocation => ({
+            fingerprint: revocation.fingerprint,
+            ip: revocationIP(revocation),
+        })),
         revocations: revocations.map(revocation => ({
             revocationId: revocation.revocationId,
             fingerprint: revocation.fingerprint,
+            ip: revocationIP(revocation),
             revokedAt: revocation.revokedAt,
             revokedBy: revocation.revokedBy,
             attempt: revocation.attempt,
         })),
     }, undefined, 4) + "\n");
 
-    console.log(`Wrote ${UNREVOKES_DIR}/${unrevokeId}.json covering ${revocations.length} revocation(s):`);
+    console.log(`\nWrote ${UNREVOKES_DIR}/${unrevokeId}.json.`);
+    console.log(`\nThese addresses become permanently allowed for these keys, everywhere:`);
     for (let revocation of revocations) {
-        console.log(`  ${revocation.fingerprint} revoked by ${revocation.revokedBy || "?"} from ${revocation.attempt?.ip || "?"}`);
+        console.log(`  ${revocation.fingerprint}`);
+        console.log(`    from ${revocationIP(revocation) || "(no address recorded)"}`);
+        console.log(`    revoked ${revocation.revokedAt || "at an unrecorded time"} by ${revocation.revokedBy || "?"}`);
     }
+    console.log(`\nEvery other address stays revoked, and using one of these keys from anywhere`);
+    console.log(`else revokes it again.`);
 
     // Signed here rather than left as a step to remember. An unrevoke nobody signed does nothing at
     // all, and the repo would sit there looking done while every machine ignored it.
