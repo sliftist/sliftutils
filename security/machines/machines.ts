@@ -10,6 +10,9 @@ import { ensureRevokeKey } from "../authorizedKeys/daemon/repoFiles";
 import { verifyCheckout } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { sourceRepoPath } from "../authorizedKeys/sources";
+import { notify } from "../authorizedKeys/daemon/notify";
+import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
+import { unrevokeInEffect } from "./trustState";
 import { spawnPromise } from "../helpers/spawn";
 
 // Which machines this system talks to, kept in the same repo as the ssh keys. That repo is already
@@ -215,6 +218,26 @@ async function readMachineRevocations(sourceURL: string) {
     return revocations;
 }
 
+/** Sends the one notification this file is allowed to send, when it can.
+
+    The daemon configures notifications on startup and would simply send. This can also run in some
+    other process, which has not, so the webhook is picked up here if it is readable. A machine
+    with no webhook set up still records the revocation - being unable to tell anyone is not a
+    reason to keep accepting a machine that is being misused. */
+async function notifyBestEffort(headline: string, body: string) {
+    try {
+        if (!areDiscordNotificationsConfigured()) {
+            // Read first: configureDiscordNotifications exits the process when the file is missing,
+            // which is right for the daemon at startup and wrong for a library call.
+            await fs.readFile(DEFAULT_WEBHOOK_FILE_PATH, "utf8");
+            await configureDiscordNotifications({ filePath: DEFAULT_WEBHOOK_FILE_PATH });
+        }
+        await notify(headline, body);
+    } catch (e) {
+        console.log(`Could not send a notification about this, it is only in the log. ${e}`);
+    }
+}
+
 /** Records that a machine we accept talked to us from an address it is not allowed from. One per
     machine and address, so a second address is a second revocation and an unrevoke of the first
     does not cover it. */
@@ -251,6 +274,21 @@ async function recordMachineRevocation(config: {
         return;
     }
     console.log(`Revoked ${machineId} from ${ip}, ${revocationId}`);
+
+    // Said by whoever wrote the revocation, once, the same as for an ssh key. Machines that only
+    // read it later say nothing, or one event would be reported by every machine that saw it.
+    await notifyBestEffort(
+        `SUSPICIOUS IP ${ip} FROZE MACHINE ${machineId}`,
+        `A machine we trust talked to us from ${ip}, which is not an address it is allowed to talk`
+        + ` from. It proved it holds that machine's key, so either someone else has a copy of it,`
+        + ` or that machine's address changed.`
+        + `\n\nIt is frozen everywhere now, and nothing accepts it.`
+        + `\n\nIf this was an attack, remove \`machines/${machineId}.json\` from \`${sourceURL}\` now.`
+        + `\nIf it was legitimate, run \`yarn unrevoke git\` in that repo. It allows ${ip} for that`
+        + ` machine, and takes an hour to reach every machine.`
+        + `\n\nmachine: \`${machineId}\``
+        + `\nfrozen by: \`${hostLabel}\``
+    );
 }
 
 /** Whether we will talk to this machine, coming from this address.
@@ -280,14 +318,23 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
 
     await syncRevocations(sourceURL);
     let unrevokes = await readUnrevokes(sourceURL).catch(() => ({ pairs: new Map(), legacyIds: new Map() }));
-    let allowedAgain = (pair: string) => unrevokes.pairs.has(pair);
+    // An unrevoke is only honoured once it has waited out its hour, exactly as an ssh key's is.
+    let allowedAgain = async (pair: string) => {
+        let unrevokeId = unrevokes.pairs.get(pair);
+        return !!unrevokeId && await unrevokeInEffect(unrevokeId);
+    };
     let revocations = await readMachineRevocations(sourceURL);
     // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
     // ssh key is out everywhere rather than only from the address it was misused from.
-    let revoked = revocations.some(revocation =>
-        revocation.machineId === machineId
-        && !allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))
-    );
+    let revoked = false;
+    for (let revocation of revocations) {
+        if (revocation.machineId !== machineId) {
+            continue;
+        }
+        if (!await allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))) {
+            revoked = true;
+        }
+    }
     if (revoked) {
         return false;
     }
@@ -301,7 +348,7 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
     let pair = pairKey({ fingerprint: machineId, ip });
     let alreadyRecorded = revocations.some(revocation =>
         pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }) === pair);
-    if (!alreadyRecorded && !allowedAgain(pair)) {
+    if (!alreadyRecorded && !await allowedAgain(pair)) {
         await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
     }
     return false;

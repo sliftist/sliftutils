@@ -201,6 +201,12 @@ export async function sendDiscordNotification(message: string) {
     await queueSend(state.webhookURL, message);
 }
 
+/** Whether notifications are set up in this process. For code that may run outside the daemon,
+    where sending is worth doing if it can be and not worth failing over if it cannot. */
+export function areDiscordNotificationsConfigured() {
+    return !!notificationState;
+}
+
 export function stopDiscordNotifications() {
     if (!notificationState) {
         return;

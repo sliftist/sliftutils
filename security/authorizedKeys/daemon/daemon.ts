@@ -44,6 +44,8 @@ import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 //   7. A source changed without its signature being updated, so the change is ignored.
 //   8. A source has a corrupted signature, so its contents are ignored.
 //   9. The webhook file itself changed, reported to the webhook being replaced.
+//  10. A trusted machine talked to us from an address it is not allowed from, so it was frozen
+//      everywhere. Sent by whichever machine wrote that revocation, from machines.ts.
 
 export type DaemonConfig = {
     repoSources: string[];
