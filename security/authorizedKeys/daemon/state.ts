@@ -45,6 +45,11 @@ export type PendingRevocation = {
 export type DaemonState = {
     sources: { [repoURL: string]: SourceState };
     userKeyHashes: { [userName: string]: string };
+    // Held in memory only, never written to disk. Deleting a revocation from the revoke repo does
+    // not bring a key back, because this machine still remembers it - the key that writes
+    // revocations is on every server, so whoever stole one could otherwise erase the record that
+    // shut them out. Restarting the daemon does clear it, which is the way back from a revocation
+    // that should not have happened.
     revocations: { [fingerprint: string]: RevocationState };
     pendingRevocations: PendingRevocation[];
     // The keys we last wrote out. What tells a change we made apart from one somebody else made:
@@ -99,7 +104,11 @@ export async function loadState() {
         return;
     }
     try {
-        state = Object.assign(state, JSON.parse(contents));
+        let loaded = JSON.parse(contents);
+        // Revocations are held in memory only, so whatever an older version left on disk is not
+        // read back in. Starting the daemon is what forgets them.
+        delete loaded.revocations;
+        state = Object.assign(state, loaded);
     } catch (e) {
         // Corrupt state only costs us one duplicate notification, so it is not worth failing over.
         console.log(`Ignoring unreadable state file ${STATE_PATH}. ${e}`);
@@ -107,6 +116,7 @@ export async function loadState() {
 }
 
 export async function saveState() {
+    let { revocations, ...persisted } = state;
     await fs.mkdir(path.dirname(STATE_PATH), { recursive: true });
-    await fs.writeFile(STATE_PATH, JSON.stringify(state, undefined, 4), { mode: 0o600 });
+    await fs.writeFile(STATE_PATH, JSON.stringify(persisted, undefined, 4), { mode: 0o600 });
 }
