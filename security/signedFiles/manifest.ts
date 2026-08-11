@@ -19,7 +19,13 @@ export type Manifest = {
     files: { path: string; size: number; sha256: string }[];
 };
 
-/** Everything in the repo that is not ignored, which is exactly what a clone of it will contain.
+/** Everything in the repo that is not ignored: what is in the index, plus what is not staged yet.
+    Git is asked because git is what knows how to apply the ignore rules.
+
+    What comes back is a hint that a file might be there, not that it is. A file deleted from the
+    working tree stays in the index until that deletion is staged, so git names it and there is
+    nothing to read, which is why each one is checked before it goes in.
+
     The manifest and its signature are left out, since they cannot describe themselves. */
 export async function listRepoFiles(repoPath: string) {
     let result = await spawnPromise({
@@ -33,10 +39,21 @@ export async function listRepoFiles(repoPath: string) {
             + `${(result.stdout + result.stderr).trim()}`
         );
     }
-    return result.stdout.split("\n")
+    let listed = result.stdout.split("\n")
         .map(line => line.trim())
         .filter(line => line && line !== MANIFEST_NAME && line !== SIGNATURE_NAME)
         .sort();
+
+    let present: string[] = [];
+    for (let relativePath of listed) {
+        try {
+            await fs.access(path.join(repoPath, relativePath));
+            present.push(relativePath);
+        } catch (e) {
+            console.log(`Leaving ${relativePath} out of the manifest, it is gone from the working tree`);
+        }
+    }
+    return present;
 }
 
 /** A Windows checkout turns LF into CRLF, so the same commit hashes differently there than it
