@@ -2,7 +2,8 @@ import os from "os";
 import { getOwnIPs } from "../../misc/ownIPs";
 import { describeHost } from "../helpers/remoteSSH";
 import { createRemoteIdentity, Identity, localDomains, localIdentity, remoteIdentity } from "./identity";
-import { getMachines, resolveKeysRepo, setMachines } from "./machines";
+import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
+import { getMachines, setMachines } from "./machines";
 
 const USAGE = `Usage: yarn addmachine <domain> [ip]
 

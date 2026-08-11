@@ -7,6 +7,7 @@ import { findSourceKey, KEYS_DIR_NAME, sourceKeyPath, sourceName, sourceRepoPath
 import { deriveRevokeKey, REVOKE_KEY_LABEL, revokeRepoURL } from "./revokeSource";
 import { legacySourceKeyPath } from "./sources";
 import { revokedKeysInRepo } from "./unrevoke";
+import { resolveKeysRepo } from "./keysRepo";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
 import { describeHost, readRemoteFile, remoteCommandExists, runOverSSH, SUDO_PREAMBLE, THIS_MACHINE, writeRemoteFile } from "../helpers/remoteSSH";
@@ -155,38 +156,15 @@ async function cloneRepoForInspection(config: { repoURL: string; keyPath: string
     return repoPath;
 }
 
-/** With no repo url given, the repo we are standing in is used. It has to actually hold keys
-    before we hand it to a host, so a stray working directory cannot be deployed by accident. */
+/** With no repo url given, the keys repo this machine resolves to is used - the one we are
+    standing in when that holds keys, and this machine's own otherwise. */
 async function resolveRepoURL(passedURL: string | undefined) {
     if (passedURL) {
         return normalizeRepoURL(passedURL);
     }
-    let topLevel = await runLocal({ command: "git", args: ["rev-parse", "--show-toplevel"], allowFailure: true });
-    if (topLevel.status !== 0) {
-        throw new Error(`Expected a repo url, or the current directory to be inside a git repo, it is not.\n${USAGE}`);
-    }
-    let repoPath = topLevel.stdout.trim();
-    try {
-        await readRepoKeys(repoPath);
-    } catch (e) {
-        throw new Error(
-            `Expected a repo url, or the current repo (${repoPath}) to hold keys, it does not.\n${e}\n${USAGE}`
-        );
-    }
-    let origin = await runLocal({
-        command: "git",
-        args: ["remote", "get-url", "origin"],
-        cwd: repoPath,
-        allowFailure: true,
-    });
-    if (origin.status !== 0 || !origin.stdout.trim()) {
-        throw new Error(
-            `Expected the current repo (${repoPath}) to have an origin remote, it has none.`
-            + ` The host clones the source itself, so a local path is no use to it.`
-        );
-    }
-    let repoURL = normalizeRepoURL(origin.stdout.trim());
-    console.log(`No repo url given, using the current repo: ${repoURL}`);
+    let { repoPath, sourceURL } = await resolveKeysRepo();
+    let repoURL = normalizeRepoURL(sourceURL);
+    console.log(`No repo url given, using ${repoPath}: ${repoURL}`);
     return repoURL;
 }
 

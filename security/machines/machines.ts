@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { CONFIG_PATH } from "../authorizedKeys/daemon/paths";
+import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
 import { revokeRepo, syncRepoFiles } from "../authorizedKeys/daemon/repoFiles";
 import { listRepoDir, readRepoFile } from "../authorizedKeys/daemon/repoFiles";
 import { newRevocationId, pairKey, readRevocationFiles, readUnrevokes } from "../authorizedKeys/daemon/revocation";
@@ -9,7 +9,6 @@ import { runGit } from "../authorizedKeys/daemon/git";
 import { ensureRevokeKey } from "../authorizedKeys/daemon/repoFiles";
 import { verifyCheckout } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
-import { sourceRepoPath } from "../authorizedKeys/sources";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
 import { unrevokeInEffect } from "./trustState";
@@ -24,9 +23,6 @@ const REVOCATION_REASON = "a machine talked to us from an unapproved IP";
 // The revoke repo is pulled at most this often. A check happens per request, and a request must
 // not cost a round trip to github.
 const REVOKE_SYNC_INTERVAL = 60 * 1000;
-// Where a Windows machine is expected to keep the repo, relative to the working directory. There
-// is no daemon there to ask, and no /etc to look in.
-const WINDOWS_REPO_PATH = "../authorized_keys";
 
 /** One machine we are willing to talk to, and the addresses it may talk to us from. */
 export type MachineState = {
@@ -120,61 +116,6 @@ async function readMachines(repoPath: string) {
         }
     }
     return machines;
-}
-
-async function isKeysRepo(repoPath: string) {
-    return await pathExists(path.join(repoPath, ".git"))
-        && await pathExists(path.join(repoPath, "authorized_keys"));
-}
-
-async function originOf(repoPath: string) {
-    let origin = await spawnPromise({ command: "git", args: ["remote", "get-url", "origin"], cwd: repoPath });
-    let url = origin.stdout.trim();
-    if (origin.status !== 0 || !url) {
-        throw new Error(`Expected ${repoPath} to have an origin remote, it has none`);
-    }
-    return url;
-}
-
-/** The keys repo this machine answers from, and the one anything editing the machine list edits.
-
-    On a host, that is the checkout the daemon already keeps up to date. On Windows there is no
-    daemon and no /etc, so the repo is expected beside the working directory, which is where a
-    developer working on both would have it.
-
-    Never the directory the command happens to be run from. Which repo this machine trusts is a
-    property of the machine, not of where somebody was standing when they typed something. */
-export async function resolveKeysRepo() {
-    if (os.platform() === "win32") {
-        let repoPath = path.resolve(WINDOWS_REPO_PATH);
-        if (!await isKeysRepo(repoPath)) {
-            throw new Error(
-                `Expected ${repoPath} to be an authorized_keys repo, it is not.\n`
-                + `On Windows the repo is read from there, so clone it beside this one:\n`
-                + `  git clone <your authorized_keys repo> ${repoPath}`
-            );
-        }
-        return { repoPath, sourceURL: await originOf(repoPath) };
-    }
-
-    let config = await fs.readFile(CONFIG_PATH, "utf8").catch(() => "");
-    let sourceURL = config && (JSON.parse(config).repoSources || [])[0] || "";
-    if (!sourceURL) {
-        throw new Error(
-            `Expected this machine to be set up with an authorized_keys repo, ${CONFIG_PATH} names none.\n`
-            + `Set it up first:\n`
-            + `  yarn setupnotify <discord-webhook-url>\n`
-            + `  yarn securessh add <repo-private-key> <repo-url>`
-        );
-    }
-    let repoPath = sourceRepoPath(sourceURL);
-    if (!await isKeysRepo(repoPath)) {
-        throw new Error(
-            `Expected a checkout of ${sourceURL} at ${repoPath}, there is none.\n`
-            + `Run \`yarn securessh update\` to put it back.`
-        );
-    }
-    return { repoPath, sourceURL };
 }
 
 let lastRevokeSync = 0;
