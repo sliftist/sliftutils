@@ -674,7 +674,10 @@ export async function main() {
     // make sense is worth saying so about whoever is running it, and being told to find sudo only
     // to then be told the arguments were wrong is two trips for one mistake.
     let { verb, host, rest } = parseArgs(process.argv.slice(2));
-    requireRoot();
+    // With a host, everything root-owned happens on that host through $SUDO over ssh, so being root here proves nothing and would block running this from a workstation.
+    if (host === THIS_MACHINE) {
+        requireRoot();
+    }
 
     if (verb === "list") {
         await listSources(host);
