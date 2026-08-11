@@ -47,14 +47,16 @@ export function startTrustServer(config: { port: number }) {
                 // Not a rejection of the machine, a packet that does not prove anything about one.
                 return { status: 400, body: { trusted: false, ip, reason: verified.problem } };
             }
-            let trusted = await isMachineAccepted({ machineId: packet.machineId, ip });
+            let verdict = await isMachineAccepted({ machineId: packet.machineId, ip });
             return {
                 status: 200,
                 body: {
-                    trusted,
+                    trusted: verdict.accepted,
                     machineId: packet.machineId,
                     ip,
-                    reason: trusted && "" || "that machine is not trusted from that address",
+                    // Whatever the check itself said. It is the only thing that knows which of the
+                    // ways to be refused this was.
+                    reason: verdict.reason,
                 },
             };
         };

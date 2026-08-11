@@ -299,9 +299,15 @@ async function recordMachineRevocation(config: {
     have, is treated as the same kind of event as a stolen ssh key - it is revoked everywhere, and
     stays revoked until an unrevoke allows that machine from that address.
 
+    Says why when the answer is no, because the three ways to be refused are entirely different
+    things to a person reading it: never trusted at all, trusted but frozen, or trusted and talking
+    from somewhere it should not be.
+
     Throws when the repo itself cannot be read or is not signed, rather than answering false: that
     is a broken installation, not a rejected machine, and the two deserve different handling. */
-export async function isMachineAccepted(config: { machineId: string; ip: string }): Promise<boolean> {
+export type MachineVerdict = { accepted: boolean; reason: string };
+
+export async function isMachineAccepted(config: { machineId: string; ip: string }): Promise<MachineVerdict> {
     let { machineId, ip } = config;
     if (!machineId || !ip) {
         throw new Error(`Expected a machineId and an ip, was ${JSON.stringify(machineId)} and ${JSON.stringify(ip)}`);
@@ -313,7 +319,7 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
 
     let machine = (await readMachines(repoPath)).get(machineId);
     if (!machine) {
-        return false;
+        return { accepted: false, reason: "that machine is not trusted" };
     }
 
     await syncRevocations(sourceURL);
@@ -326,21 +332,24 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
     let revocations = await readMachineRevocations(sourceURL);
     // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
     // ssh key is out everywhere rather than only from the address it was misused from.
-    let revoked = false;
+    let frozenFrom = "";
     for (let revocation of revocations) {
         if (revocation.machineId !== machineId) {
             continue;
         }
         if (!await allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))) {
-            revoked = true;
+            frozenFrom = revocation.ip;
         }
     }
-    if (revoked) {
-        return false;
+    if (frozenFrom) {
+        return {
+            accepted: false,
+            reason: `that machine is frozen, it was used from ${frozenFrom} which it is not allowed from`,
+        };
     }
 
     if (machine.ips.includes(ip)) {
-        return true;
+        return { accepted: true, reason: "" };
     }
 
     // Listed, but talking to us from somewhere it should not be. Recorded once for this machine
@@ -350,6 +359,7 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
         pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }) === pair);
     if (!alreadyRecorded && !await allowedAgain(pair)) {
         await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
+        return { accepted: false, reason: `that machine is not allowed from ${ip}, so it is now frozen everywhere` };
     }
-    return false;
+    return { accepted: false, reason: `that machine is not allowed from ${ip}` };
 }

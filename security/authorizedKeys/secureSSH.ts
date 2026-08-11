@@ -638,6 +638,21 @@ function parseArgs(argv: string[]) {
         host = positional[0];
         positional = positional.slice(1);
     }
+
+    // How many arguments each verb takes, checked here rather than where the verb is acted on, so
+    // that a command which was typed wrong says so before anything else is complained about.
+    if (verb === "list" && positional.length) {
+        throw new Error(`Expected nothing after list, was ${positional.length} argument(s)\n${USAGE}`);
+    }
+    if (verb === "update" && positional.length) {
+        throw new Error(`Expected nothing after update, was ${positional.length} argument(s)\n${USAGE}`);
+    }
+    if (verb === "add" && (!positional.length || positional.length > 2)) {
+        throw new Error(`Expected a private key and optionally a repo url, was ${positional.length} argument(s)\n${USAGE}`);
+    }
+    if (verb === "remove" && positional.length > 1) {
+        throw new Error(`Expected at most a repo url to remove, was ${positional.length} argument(s)\n${USAGE}`);
+    }
     return { verb, host, rest: positional };
 }
 
@@ -655,29 +670,23 @@ function requireRoot() {
 }
 
 export async function main() {
-    requireRoot();
+    // What was typed is checked before anything about this machine is. A command that does not
+    // make sense is worth saying so about whoever is running it, and being told to find sudo only
+    // to then be told the arguments were wrong is two trips for one mistake.
     let { verb, host, rest } = parseArgs(process.argv.slice(2));
+    requireRoot();
 
     if (verb === "list") {
         await listSources(host);
         return;
     }
     if (verb === "update") {
-        if (rest.length) {
-            throw new Error(`Expected nothing after update, was ${rest.length} argument(s)\n${USAGE}`);
-        }
         await updateDaemon(host);
         return;
     }
     if (verb === "add") {
-        if (!rest.length || rest.length > 2) {
-            throw new Error(`Expected a private key and optionally a repo url, was ${rest.length} argument(s)\n${USAGE}`);
-        }
         await addSource({ host, keyPath: expandHome(rest[0]), repoURL: await resolveRepoURL(rest[1]) });
         return;
-    }
-    if (rest.length > 1) {
-        throw new Error(`Expected at most a repo url to remove, was ${rest.length} argument(s)\n${USAGE}`);
     }
     await removeSource({ host, repoURL: await resolveRepoURL(rest[0]) });
 }
