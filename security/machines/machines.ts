@@ -11,7 +11,8 @@ import { verifyCheckout } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
-import { getOwnMachineId } from "../../misc/https/certs";
+import { DEV_getIdentityFilePath, generateCA, getMachineId, getOwnMachineId, IdentityStorageType } from "../../misc/https/certs";
+import { describeHost, runOverSSH, writeRemoteFile } from "../helpers/remoteSSH";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { spawnPromise } from "../helpers/spawn";
@@ -106,6 +107,36 @@ export async function getTrustedMachines(): Promise<MachineState[]> {
         });
     }
     return await trustedMachines();
+}
+
+/** The machine id of a machine reached over ssh, generating and installing an identity for it if
+    it has none under this domain. The private key ends up on that machine and nowhere else. */
+export async function getOrCreateRemoteMachineId(host: string, domain: string): Promise<string> {
+    let fileName = path.basename(DEV_getIdentityFilePath(domain));
+    let home = (await runOverSSH({ host, script: `echo $HOME` })).stdout.trim();
+    if (!home) {
+        throw new Error(`Expected ${host} to report a home directory, it reported nothing`);
+    }
+    let contents = await runOverSSH({ host, script: `cat ${home}/${fileName} 2>/dev/null || true` });
+    if (contents.stdout.trim()) {
+        let stored = JSON.parse(contents.stdout) as IdentityStorageType;
+        return getMachineId(stored.domain, domain);
+    }
+    console.log(`${describeHost(host)} has no identity for ${domain}, generating one`);
+    let generated = generateCA(domain);
+    let stored: IdentityStorageType = {
+        domain: generated.domain,
+        certB64: generated.cert.toString("base64"),
+        keyB64: generated.key.toString("base64"),
+    };
+    await writeRemoteFile({
+        host,
+        filePath: `${home}/${fileName}`,
+        contents: JSON.stringify(stored),
+        fileMode: "600",
+        directoryMode: "700",
+    });
+    return getMachineId(generated.domain, domain);
 }
 
 /** Makes a checkout list exactly these machines: those named are written with the addresses given,

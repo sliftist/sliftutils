@@ -1,16 +1,12 @@
-import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
-import { DEV_getIdentityFilePath, generateCA, getMachineId, getOwnMachineId, IdentityStorageType, loadIdentityCA } from "../../misc/https/certs";
+import { getOwnMachineId, loadIdentityCA } from "../../misc/https/certs";
 import { getOwnIPs } from "../../misc/ownIPs";
-import { describeHost, runOverSSH, writeRemoteFile } from "../helpers/remoteSSH";
 import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
 import { signRepo } from "../signedFiles/signFiles";
-import { getMachines, setMachines } from "./machines";
+import { getMachines, getOrCreateRemoteMachineId, setMachines } from "./machines";
 
 const GIT_KEYWORD = "git";
 const COMMIT_MESSAGE = "trusting a machine";
-// A machine id is the base32 hash of a public key, written with a leading b. Nothing else that can
-// appear in these arguments looks like that, which is what tells it apart from an ssh target.
 const MACHINE_ID = /^b[a-z2-7]{20}$/;
 const USAGE = `Usage:
   yarn addmachine <domain> [${GIT_KEYWORD}]
@@ -29,11 +25,9 @@ It edits the keys repo this machine reads, wherever that is, not whatever direct
 from. With ${GIT_KEYWORD} it signs, commits and pushes; without it nothing else will believe any of
 this until you do.`;
 
-/** A domain, then either nothing, an ssh host, or a machine id and the addresses it may talk from. */
 function parseArgs(argv: string[]) {
     let pushToGit = argv.includes(GIT_KEYWORD);
-    let positional = argv.filter(arg => arg !== GIT_KEYWORD);
-    let [domain, second, ...rest] = positional;
+    let [domain, second, ...rest] = argv.filter(arg => arg !== GIT_KEYWORD);
     if (!domain) {
         throw new Error(`Expected a domain\n${USAGE}`);
     }
@@ -55,73 +49,46 @@ function parseArgs(argv: string[]) {
     return { domain, host: second, machineId: "", addresses: [] as string[], pushToGit };
 }
 
-/** The machine id of a machine reached over ssh, generating and installing an identity for it if
-    it has none under this domain. The private key ends up on that machine and nowhere else. */
-async function getOrCreateRemoteMachineId(host: string, domain: string): Promise<string> {
-    let fileName = path.basename(DEV_getIdentityFilePath(domain));
-    let home = (await runOverSSH({ host, script: `echo $HOME` })).stdout.trim();
-    if (!home) {
-        throw new Error(`Expected ${host} to report a home directory, it reported nothing`);
+/** Which machine to trust, and from which addresses. A named machine and its addresses as given, a
+    machine reached over ssh at the address it was named by, or this machine at its own addresses. */
+async function resolveMachine(config: { domain: string; host: string; machineId: string; addresses: string[] }) {
+    let { domain, host, machineId, addresses } = config;
+    if (machineId) {
+        return { machineId, addresses };
     }
-    let contents = await runOverSSH({ host, script: `cat ${home}/${fileName} 2>/dev/null || true` });
-    if (contents.stdout.trim()) {
-        let stored = JSON.parse(contents.stdout) as IdentityStorageType;
-        return getMachineId(stored.domain, domain);
+    if (host) {
+        return { machineId: await getOrCreateRemoteMachineId(host, domain), addresses: [host] };
     }
-    console.log(`${describeHost(host)} has no identity for ${domain}, generating one`);
-    let generated = generateCA(domain);
-    let stored: IdentityStorageType = {
-        domain: generated.domain,
-        certB64: generated.cert.toString("base64"),
-        keyB64: generated.key.toString("base64"),
-    };
-    await writeRemoteFile({
-        host,
-        filePath: `${home}/${fileName}`,
-        contents: JSON.stringify(stored),
-        fileMode: "600",
-        directoryMode: "700",
-    });
-    return getMachineId(generated.domain, domain);
+    await loadIdentityCA(domain);
+    let ownAddresses = await getOwnIPs();
+    if (!ownAddresses.length) {
+        throw new Error(`Expected this machine to have an address anything else can see, it has none`);
+    }
+    return { machineId: getOwnMachineId(domain), addresses: ownAddresses };
 }
 
 export async function main() {
     let { domain, host, machineId, addresses, pushToGit } = parseArgs(process.argv.slice(2));
-    // The same repo the acceptance check reads. Editing anything else would write a machine list
-    // nothing on this machine ever looks at.
     let { repoPath } = await resolveKeysRepo();
+    let target = await resolveMachine({ domain, host, machineId, addresses });
 
-    if (!machineId && !host) {
-        await loadIdentityCA(domain);
-        machineId = getOwnMachineId(domain);
-        addresses = await getOwnIPs();
-        if (!addresses.length) {
-            throw new Error(`Expected this machine to have an address anything else can see, it has none`);
-        }
-    } else if (host) {
-        machineId = await getOrCreateRemoteMachineId(host, domain);
-        addresses = [host];
-    }
-
-    // The whole list is read and written back, because setting is by the set: writing this one
-    // machine alone would remove every other machine from the repo.
     let machines = await getMachines(repoPath);
-    let existing = machines.find(machine => machine.machineId === machineId);
+    let existing = machines.find(machine => machine.machineId === target.machineId);
     let ips = [...(existing?.ips || [])];
-    let added = addresses.filter(address => !ips.includes(address));
+    let added = target.addresses.filter(address => !ips.includes(address));
     if (existing) {
         existing.ips = [...ips, ...added];
     } else {
-        machines.push({ machineId, ips: [...added], addedAt: "" });
+        machines.push({ machineId: target.machineId, ips: [...added], addedAt: "" });
     }
     await setMachines({ repoPath, machines });
 
-    console.log(`\nTrusting machine ${machineId}`);
+    console.log(`\nTrusting machine ${target.machineId}`);
     console.log(`Allowing IP ${[...ips, ...added].join(", ")}`);
     if (added.length) {
-        console.log(`  added to machines/${machineId}.json: ${added.join(", ")}`);
+        console.log(`  added to machines/${target.machineId}.json: ${added.join(", ")}`);
     } else {
-        console.log(`  already allowed from ${addresses.join(", ")}`);
+        console.log(`  already allowed from ${target.addresses.join(", ")}`);
     }
     console.log(`  in ${repoPath}`);
 
@@ -130,8 +97,6 @@ export async function main() {
         console.log(`\`\`\`\nyarn signfiles ${GIT_KEYWORD}\n\`\`\``);
         return;
     }
-    // Signed here rather than left as a step to remember, the same as unrevoke does it. A machine
-    // list nobody signed is ignored by every machine that reads it.
     await signRepo({ repoPath });
     await runPromise(`git add -A`, { cwd: repoPath });
     await runPromise(`git commit -m "${COMMIT_MESSAGE}"`, { cwd: repoPath });
