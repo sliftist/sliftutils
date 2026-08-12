@@ -96,11 +96,17 @@ async function verifyManifestMatchesFiles(repoPath: string) {
 
     let missing = [...listed.keys()].filter(filePath => !actual.includes(filePath));
     if (missing.length) {
-        throw new Error(`Expected the signed files to be present, ${missing.length} missing, first ${missing[0]}`);
+        throw new Error(
+            `Expected the signed files to be present, ${missing.length} missing, first `
+            + `${path.join(repoPath, missing[0])}`
+        );
     }
     let extra = actual.filter(filePath => !listed.has(filePath));
     if (extra.length) {
-        throw new Error(`Expected only signed files to be present, ${extra.length} extra, first ${extra[0]}`);
+        throw new Error(
+            `Expected only signed files to be present, ${extra.length} extra, first `
+            + `${path.join(repoPath, extra[0])}`
+        );
     }
     for (let filePath of actual) {
         let expected = listed.get(filePath);
@@ -109,11 +115,11 @@ async function verifyManifestMatchesFiles(repoPath: string) {
         }
         let contents = normalizeContent(await fs.readFile(path.join(repoPath, filePath)));
         if (contents.length !== expected.size) {
-            throw new Error(`Expected ${filePath} to be ${expected.size} bytes, was ${contents.length}`);
+            throw new Error(`Expected ${path.join(repoPath, filePath)} to be ${expected.size} bytes, was ${contents.length}`);
         }
         let hash = crypto.createHash("sha256").update(contents).digest("hex");
         if (hash !== expected.sha256) {
-            throw new Error(`Expected ${filePath} to hash to ${expected.sha256}, was ${hash}`);
+            throw new Error(`Expected ${path.join(repoPath, filePath)} to hash to ${expected.sha256}, was ${hash}`);
         }
     }
 }
