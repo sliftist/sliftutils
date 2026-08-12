@@ -1,11 +1,11 @@
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
-import { spawnPromise } from "../../helpers/spawn";
 import { normalizeKeys } from "../authorizedKeys";
 import { sourceRepoPath } from "../sources";
 import { MANIFEST_NAME, normalizeContent, SIGN_NAMESPACE, SIGNATURE_NAME } from "../../signedFiles/manifest";
-import { MAX_ERROR_BODY_LENGTH, SIGNER_CHANGE_DELAY } from "./paths";
+import { verifySSHSIG } from "../../signedFiles/sshsig";
+import { SIGNER_CHANGE_DELAY } from "./paths";
 import { notify } from "./notify";
 import { saveState, sourceState } from "./state";
 
@@ -25,25 +25,6 @@ async function pathExists(filePath: string) {
     }
 }
 
-function readSSHString(buffer: Buffer, offset: number) {
-    let length = buffer.readUInt32BE(offset);
-    return buffer.subarray(offset + 4, offset + 4 + length);
-}
-
-/** The signature carries the public key that made it, so the key itself can be reported rather
-    than only a fingerprint. Returns it in the usual "type base64" form. */
-export function publicKeyFromSignature(signatureText: string) {
-    let body = signatureText.split("\n").filter(line => line && !line.startsWith("-----")).join("");
-    let blob = Buffer.from(body, "base64");
-    if (blob.subarray(0, 6).toString() !== "SSHSIG") {
-        throw new Error(`Expected an SSHSIG signature, started with ${blob.subarray(0, 6).toString()}`);
-    }
-    // The magic, then a uint32 version, then the public key.
-    let publicKey = readSSHString(blob, 6 + 4);
-    let keyType = readSSHString(publicKey, 0).toString();
-    let fingerprint = "SHA256:" + crypto.createHash("sha256").update(publicKey).digest("base64").replace(/=+$/, "");
-    return { publicKey: `${keyType} ${publicKey.toString("base64")}`, fingerprint };
-}
 
 /** Reads one checkout's keys. Prefers a top level authorized_keys file and otherwise concatenates
     every .pub at the top level. */
@@ -99,11 +80,23 @@ function collectSignedFiles(repoPath: string, manifestBytes: Buffer) {
     return { listed };
 }
 
+/** A repo that cannot be trusted, with the message ready for whoever asked. Not every caller
+    treats these the same - a source keeps its last keys, a machine list is just refused - so the
+    kind is carried rather than acted on here. */
+export class SignedRepoError extends Error {
+    constructor(public problem: string, public headline: string, public body: string) {
+        super(`${headline}. ${body}`);
+    }
+}
+
 async function readSignedContent(repoPath: string, listed: Map<string, { size: number; sha256: string }>) {
     let files = new Map<string, Buffer>();
     let actual = await listCheckoutFiles(repoPath);
     for (let filePath of actual) {
         let expected = listed.get(filePath);
+        // A file the signature never mentioned is not tampering, it is just unsigned. It is left
+        // out rather than trusted, and nobody has to be told - an extra file in a working tree is
+        // ordinary.
         if (!expected) {
             console.log(`Ignoring ${path.join(repoPath, filePath)}, it is not in the signed manifest`);
             continue;
@@ -111,14 +104,28 @@ async function readSignedContent(repoPath: string, listed: Map<string, { size: n
         let contents = normalizeContent(await fs.readFile(path.join(repoPath, filePath)));
         let hash = crypto.createHash("sha256").update(contents).digest("hex");
         if (contents.length !== expected.size || hash !== expected.sha256) {
-            console.log(`Ignoring ${path.join(repoPath, filePath)}, it does not match the signature`);
-            continue;
+            // A file the manifest DOES name, but whose content no longer matches, is a signed file
+            // that was changed without re-signing. That is the whole repo being edited out from
+            // under its signature, so it is a problem, not something to quietly drop.
+            throw new SignedRepoError(
+                "stale",
+                `KEY REPO CHANGED WITHOUT BEING SIGNED`,
+                `${path.join(repoPath, filePath)} was changed after it was signed, so the repo is`
+                + ` being ignored and this machine keeps using what it last accepted.`
+                + `\n\nTo make the change take effect, run in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``
+            );
         }
         files.set(filePath, contents);
     }
     for (let filePath of listed.keys()) {
         if (!files.has(filePath)) {
-            console.log(`Signed file ${path.join(repoPath, filePath)} is missing or altered, ignoring it`);
+            throw new SignedRepoError(
+                "stale",
+                `KEY REPO CHANGED WITHOUT BEING SIGNED`,
+                `${path.join(repoPath, filePath)} is signed for but missing, so the repo is being`
+                + ` ignored and this machine keeps using what it last accepted.`
+                + `\n\nTo make the change take effect, run in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``
+            );
         }
     }
     return files;
@@ -150,33 +157,28 @@ async function verifyCheckoutSigner(config: {
     if (!files.manifest && !files.signature) {
         return UNSIGNED;
     }
+    let broken = (detail: string) => new SignedRepoError(
+        "corrupt",
+        `KEY REPO SIGNATURE IS BROKEN`,
+        `The signature on ${repoPath} does not check out, so everything in it is being ignored and`
+        + ` this machine keeps using what it last accepted.\n\n${detail}`
+        + `\n\nTo replace the signature, run in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``
+    );
     if (!files.manifest || !files.signature) {
-        throw new Error(`Expected both ${MANIFEST_NAME} and ${SIGNATURE_NAME}, only one is present`);
+        throw broken(`Only one of ${MANIFEST_NAME} and ${SIGNATURE_NAME} is present.`);
     }
-    let result = await spawnPromise({
-        command: "ssh-keygen",
-        args: ["-Y", "check-novalidate", "-n", SIGN_NAMESPACE, "-s", path.join(repoPath, SIGNATURE_NAME)],
+    try {
         // The signature covers the normalised bytes, so a checkout that arrived with CRLF still
         // verifies rather than looking like tampering.
-        input: normalizeContent(files.manifest).toString("utf8"),
-    });
-    if (result.status !== 0) {
-        throw new Error(
-            `the signature over ${MANIFEST_NAME} does not verify: `
-            + `${(result.stdout + result.stderr).trim().slice(0, MAX_ERROR_BODY_LENGTH)}`
-        );
+        let { publicKey } = verifySSHSIG({
+            signature: files.signature.toString("utf8"),
+            message: normalizeContent(files.manifest),
+            namespace: SIGN_NAMESPACE,
+        });
+        return publicKey;
+    } catch (e) {
+        throw broken(`${e}`);
     }
-    let reported = `${result.stdout} ${result.stderr}`.match(/(SHA256:[A-Za-z0-9+/=]+)/);
-    if (!reported) {
-        throw new Error(`ssh-keygen reported no signer fingerprint, said ${result.stdout.slice(0, MAX_ERROR_BODY_LENGTH)}`);
-    }
-    let { publicKey, fingerprint } = publicKeyFromSignature(files.signature.toString("utf8"));
-    // The key we read out of the signature has to be the one ssh-keygen just checked against,
-    // otherwise we would be reporting an identity that did not sign anything.
-    if (fingerprint !== reported[1]) {
-        throw new Error(`the signing key reads as ${fingerprint} but ssh-keygen verified ${reported[1]}`);
-    }
-    return publicKey;
 }
 
 /** Everything a signed checkout vouches for, in one call: who signed it, and the contents of every
@@ -238,35 +240,12 @@ export async function resolveSourceKeys(repoURL: string) {
         manifestHash = signed.manifestHash;
         signatureHash = signed.signatureHash;
     } catch (e) {
-        let files = await readSignatureFiles(repoPath);
-        // Nothing here is trustworthy, so nothing here is used. Which of the two problems it is
-        // depends on whether the signature is simply the one we already accepted.
-        let unchanged = files.manifestHash === sourceStateValue.acceptedManifestHash
-            && files.signatureHash === sourceStateValue.acceptedSignatureHash;
-        if (unchanged) {
-            await reportProblem({
-                repoURL,
-                problem: "stale",
-                headline: `KEY REPO CHANGED WITHOUT BEING SIGNED`,
-                body: `\`${repoURL}\` changed, but nobody signed the change, so it is being ignored`
-                    + ` and this machine is still using the keys signed by`
-                    + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
-                    + `\n\nTo make the change take effect, run this in that repo:`
-                    + `\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
-            });
-        } else {
-            await reportProblem({
-                repoURL,
-                problem: "corrupt",
-                headline: `KEY REPO SIGNATURE IS BROKEN`,
-                body: `The signature on \`${repoURL}\` does not check out, so everything in it is`
-                    + ` being ignored and this machine is still using the keys signed by`
-                    + ` \`${describeSigner(sourceStateValue.acceptedSigner)}\`.`
-                    + `\n\n${e}`
-                    + `\n\nTo replace the signature, run this in that repo:`
-                    + `\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``,
-            });
+        // The read layer already knows what is wrong and how to say it, so this only forwards it.
+        // Anything that is not a signed repo problem is a real fault and is not swallowed.
+        if (!(e instanceof SignedRepoError)) {
+            throw e;
         }
+        await reportProblem({ repoURL, problem: e.problem, headline: e.headline, body: e.body });
         return sourceStateValue.acceptedKeys;
     }
     if (sourceStateValue.reportedProblem) {
