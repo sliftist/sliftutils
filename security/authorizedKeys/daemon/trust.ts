@@ -47,18 +47,18 @@ export function publicKeyFromSignature(signatureText: string) {
 
 /** Reads one checkout's keys. Prefers a top level authorized_keys file and otherwise concatenates
     every .pub at the top level. */
-export async function readCheckoutKeys(repoPath: string) {
-    let combinedPath = path.join(repoPath, "authorized_keys");
-    if (await pathExists(combinedPath)) {
-        return normalizeKeys(await fs.readFile(combinedPath, "utf8"));
-    }
-    let pubFiles = (await fs.readdir(repoPath)).filter(name => name.endsWith(".pub")).sort();
-    if (!pubFiles.length) {
-        throw new Error(`Expected authorized_keys or at least one .pub file in ${repoPath}, found neither`);
+/** The ssh keys out of the signed files: the combined authorized_keys if it was signed, otherwise
+    every signed top level .pub. Only ever the signed content, since that is all the map holds. */
+function keysFromSignedFiles(files: Map<string, Buffer>) {
+    let combined = files.get("authorized_keys");
+    if (combined) {
+        return normalizeKeys(combined.toString("utf8"));
     }
     let keys: string[] = [];
-    for (let name of pubFiles) {
-        keys.push(...normalizeKeys(await fs.readFile(path.join(repoPath, name), "utf8")));
+    for (let [filePath, contents] of files) {
+        if (filePath.endsWith(".pub") && !filePath.includes("/")) {
+            keys.push(...normalizeKeys(contents.toString("utf8")));
+        }
     }
     return keys;
 }
@@ -84,44 +84,44 @@ async function listCheckoutFiles(repoPath: string, prefix?: string): Promise<str
     return files.sort();
 }
 
-/** The signature only covers the manifest, so the manifest has to be checked against what is
-    actually on disk. Both directions matter: a missing file changes what the keys mean, and an
-    extra unlisted file could add keys nobody signed for. */
-async function verifyManifestMatchesFiles(repoPath: string) {
-    let manifest = JSON.parse(await fs.readFile(path.join(repoPath, MANIFEST_NAME), "utf8"));
+/** The files the manifest actually vouches for: listed in it, present on disk, and hashing to what
+    it says. Anything else on disk is not signed, so it is left out rather than trusted - an extra
+    file could add keys nobody signed for. Every exclusion is warned about, so a file that should
+    have been signed and was not is noticed rather than silently dropped.
+
+    The manifest itself is only worth reading once its signature has been checked, so this is only
+    ever reached through readSignedRepo. */
+function collectSignedFiles(repoPath: string, manifestBytes: Buffer) {
+    let manifest = JSON.parse(manifestBytes.toString("utf8"));
     let listed = new Map<string, { path: string; size: number; sha256: string }>(
         (manifest.files || []).map((file: { path: string }) => [file.path, file])
     );
-    let actual = await listCheckoutFiles(repoPath);
+    return { listed };
+}
 
-    let missing = [...listed.keys()].filter(filePath => !actual.includes(filePath));
-    if (missing.length) {
-        throw new Error(
-            `Expected the signed files to be present, ${missing.length} missing, first `
-            + `${path.join(repoPath, missing[0])}`
-        );
-    }
-    let extra = actual.filter(filePath => !listed.has(filePath));
-    if (extra.length) {
-        throw new Error(
-            `Expected only signed files to be present, ${extra.length} extra, first `
-            + `${path.join(repoPath, extra[0])}`
-        );
-    }
+async function readSignedContent(repoPath: string, listed: Map<string, { size: number; sha256: string }>) {
+    let files = new Map<string, Buffer>();
+    let actual = await listCheckoutFiles(repoPath);
     for (let filePath of actual) {
         let expected = listed.get(filePath);
         if (!expected) {
+            console.log(`Ignoring ${path.join(repoPath, filePath)}, it is not in the signed manifest`);
             continue;
         }
         let contents = normalizeContent(await fs.readFile(path.join(repoPath, filePath)));
-        if (contents.length !== expected.size) {
-            throw new Error(`Expected ${path.join(repoPath, filePath)} to be ${expected.size} bytes, was ${contents.length}`);
-        }
         let hash = crypto.createHash("sha256").update(contents).digest("hex");
-        if (hash !== expected.sha256) {
-            throw new Error(`Expected ${path.join(repoPath, filePath)} to hash to ${expected.sha256}, was ${hash}`);
+        if (contents.length !== expected.size || hash !== expected.sha256) {
+            console.log(`Ignoring ${path.join(repoPath, filePath)}, it does not match the signature`);
+            continue;
+        }
+        files.set(filePath, contents);
+    }
+    for (let filePath of listed.keys()) {
+        if (!files.has(filePath)) {
+            console.log(`Signed file ${path.join(repoPath, filePath)} is missing or altered, ignoring it`);
         }
     }
+    return files;
 }
 
 /** The manifest and signature as they stand, whether or not they are any good. The hashes are
@@ -176,18 +176,32 @@ async function verifyCheckoutSigner(config: {
     if (fingerprint !== reported[1]) {
         throw new Error(`the signing key reads as ${fingerprint} but ssh-keygen verified ${reported[1]}`);
     }
-    await verifyManifestMatchesFiles(repoPath);
     return publicKey;
 }
 
-/** Proves a checkout on disk was signed, and that the files in it are the ones that were signed.
-    Returns the signer, and throws if anything about that does not hold.
+/** Everything a signed checkout vouches for, in one call: who signed it, and the contents of every
+    file the signature actually covers. Files on disk that are not signed are left out (and warned
+    about), so a caller only ever sees what was signed.
 
-    Anything reading a repo for something other than ssh keys goes through this first: the whole
-    checkout is covered by one manifest, so a machine list is exactly as trustworthy as the keys
-    beside it, and neither is worth reading unsigned. */
-export async function verifyCheckout(repoPath: string) {
-    return await verifyCheckoutSigner({ repoPath, files: await readSignatureFiles(repoPath) });
+    UNSIGNED with no files when there is no signature at all. Throws only when a signature is
+    present but does not hold up - that is tampering, not an absence, and the caller keeps whatever
+    it last accepted rather than believing it. */
+export async function readSignedRepo(repoPath: string): Promise<{
+    signer: string;
+    manifestHash: string;
+    signatureHash: string;
+    files: Map<string, Buffer>;
+}> {
+    let sig = await readSignatureFiles(repoPath);
+    let signer = await verifyCheckoutSigner({ repoPath, files: sig });
+    let files = new Map<string, Buffer>();
+    if (signer !== UNSIGNED && sig.manifest) {
+        let { listed } = collectSignedFiles(repoPath, sig.manifest);
+        files = await readSignedContent(repoPath, listed);
+    } else {
+        console.log(`${repoPath} is not signed, ignoring all of its files`);
+    }
+    return { signer, manifestHash: sig.manifestHash, signatureHash: sig.signatureHash, files };
 }
 
 export function describeSigner(signer: string) {
@@ -212,12 +226,19 @@ async function reportProblem(config: { repoURL: string; problem: string; headlin
 export async function resolveSourceKeys(repoURL: string) {
     let sourceStateValue = sourceState(repoURL);
     let repoPath = sourceRepoPath(repoURL);
-    let files = await readSignatureFiles(repoPath);
 
     let signer: string;
+    let signedFiles: Map<string, Buffer>;
+    let manifestHash: string;
+    let signatureHash: string;
     try {
-        signer = await verifyCheckoutSigner({ repoPath, files });
+        let signed = await readSignedRepo(repoPath);
+        signer = signed.signer;
+        signedFiles = signed.files;
+        manifestHash = signed.manifestHash;
+        signatureHash = signed.signatureHash;
     } catch (e) {
+        let files = await readSignatureFiles(repoPath);
         // Nothing here is trustworthy, so nothing here is used. Which of the two problems it is
         // depends on whether the signature is simply the one we already accepted.
         let unchanged = files.manifestHash === sourceStateValue.acceptedManifestHash
@@ -252,14 +273,14 @@ export async function resolveSourceKeys(repoURL: string) {
         sourceStateValue.reportedProblem = "";
         await saveState();
     }
-    let checkoutKeys = await readCheckoutKeys(repoPath);
+    let checkoutKeys = keysFromSignedFiles(signedFiles);
 
     let accept = async () => {
         sourceStateValue.accepted = true;
         sourceStateValue.acceptedSigner = signer;
         sourceStateValue.acceptedKeys = checkoutKeys;
-        sourceStateValue.acceptedManifestHash = files.manifestHash;
-        sourceStateValue.acceptedSignatureHash = files.signatureHash;
+        sourceStateValue.acceptedManifestHash = manifestHash;
+        sourceStateValue.acceptedSignatureHash = signatureHash;
         sourceStateValue.pendingSigner = UNSIGNED;
         sourceStateValue.pendingSince = 0;
         await saveState();

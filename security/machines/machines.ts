@@ -7,7 +7,7 @@ import { listRepoDir, readRepoFile } from "../authorizedKeys/daemon/repoFiles";
 import { newRevocationId, pairKey, readRevocationFiles, readUnrevokes } from "../authorizedKeys/daemon/revocation";
 import { runGit } from "../authorizedKeys/daemon/git";
 import { ensureRevokeKey } from "../authorizedKeys/daemon/repoFiles";
-import { verifyCheckout } from "../authorizedKeys/daemon/trust";
+import { readSignedRepo } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
@@ -73,13 +73,24 @@ export async function getMachines(repoPath?: string): Promise<MachineState[]> {
     return [...(await readMachines(repoPath || (await keysRepo()).repoPath)).values()];
 }
 
-/** Reads the machine list, once its signature has been checked. An unsigned machine list, or one
-    signed over different contents, is not evidence of anything, so this throws rather than
-    quietly trusting nobody. */
+/** The machines the signed files vouch for. Only the machine files covered by the signature are
+    read - an unsigned machines/*.json is not evidence of anything, so readSignedRepo has already
+    left it out. */
 async function readTrustedMachines() {
     let { repoPath } = await keysRepo();
-    await verifyCheckout(repoPath);
-    return await getMachines(repoPath);
+    let { files } = await readSignedRepo(repoPath);
+    let machines: MachineState[] = [];
+    for (let [filePath, contents] of files) {
+        let name = filePath.startsWith(`${MACHINES_DIR}/`) && filePath.slice(MACHINES_DIR.length + 1) || "";
+        if (!name.endsWith(".json") || name.includes("/")) {
+            continue;
+        }
+        let machine = parseMachineFile(name, contents.toString("utf8"));
+        if (machine) {
+            machines.push(machine);
+        }
+    }
+    return machines;
 }
 
 const trustedMachines = lazy(async () => {
@@ -191,7 +202,19 @@ export async function setMachines(config: {
     return written;
 }
 
-/** Every machine the repo lists. */
+function parseMachineFile(name: string, contents: string): MachineState | undefined {
+    try {
+        let parsed = JSON.parse(contents);
+        let machineId = parsed.machineId || name.replace(/\.json$/, "");
+        return { machineId, ips: parsed.ips || [], addedAt: parsed.addedAt || "" };
+    } catch (e) {
+        console.log(`Ignoring unreadable machine file ${name}. ${e}`);
+        return undefined;
+    }
+}
+
+/** Every machine file on disk. For editing the repo, not for deciding trust - trust reads the
+    signed files through readTrustedMachines. */
 async function readMachines(repoPath: string) {
     let machines = new Map<string, MachineState>();
     let directory = path.join(repoPath, MACHINES_DIR);
@@ -200,12 +223,9 @@ async function readMachines(repoPath: string) {
         if (!name.endsWith(".json")) {
             continue;
         }
-        try {
-            let parsed = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
-            let machineId = parsed.machineId || name.replace(/\.json$/, "");
-            machines.set(machineId, { machineId, ips: parsed.ips || [], addedAt: parsed.addedAt || "" });
-        } catch (e) {
-            console.log(`Ignoring unreadable machine file ${name}. ${e}`);
+        let machine = parseMachineFile(name, await fs.readFile(path.join(directory, name), "utf8").catch(() => ""));
+        if (machine) {
+            machines.set(machine.machineId, machine);
         }
     }
     return machines;
