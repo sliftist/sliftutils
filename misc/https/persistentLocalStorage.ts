@@ -3,12 +3,18 @@ import fs from "fs";
 import os from "os";
 import { cache } from "socket-function/src/caching";
 
+// Just used for machine maintenance (finding a key store file on disk, ex to copy it to another
+// machine over ssh). NEVER access this unless explicitly given permission.
+export function DEV_getKeyStorePath(config: { appName: string; key: string }): string {
+    return os.homedir() + `/keystore_${config.appName}_` + config.key + ".json";
+}
+
 export function getKeyStore<T>(appName: string, key: string): {
     get(): T | undefined;
     set(value: T | null): void;
 } {
     if (isNode()) {
-        let path = os.homedir() + `/keystore_${appName}_` + key + ".json";
+        let path = DEV_getKeyStorePath({ appName, key });
         return {
             get() {
                 let contents: string | undefined = undefined;
