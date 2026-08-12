@@ -647,7 +647,7 @@ function requireRoot() {
     }
 }
 
-export async function main() {
+async function main() {
     // What was typed is checked before anything about this machine is. A command that does not
     // make sense is worth saying so about whoever is running it, and being told to find sudo only
     // to then be told the arguments were wrong is two trips for one mistake.
@@ -671,3 +671,8 @@ export async function main() {
     }
     await removeSource({ host, repoURL: await resolveRepoURL(rest[0]) });
 }
+
+main().catch(e => {
+    console.error(`${e}`);
+    process.exitCode = 1;
+}).finally(() => process.exit());
