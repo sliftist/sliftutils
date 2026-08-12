@@ -99,15 +99,14 @@ export class ArchivesRemote implements IArchives {
         }
     }
 
-    // Returns undefined if this machine has access to the account. Otherwise puts in an access request and returns our machineId + ip (so the caller can display them alongside the link, for the approver to match the incoming request) and the link to the grant page.
+    // Returns undefined if this machine has access to the account. Otherwise returns our machineId + ip as the server sees them, and the link to the access page - which shows the single command that grants access.
     public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
         let state = await this.callAuthed(() => this.controller.getAccessState({ account: this.account }));
         if (state.hasAccess) return undefined;
-        let requested = await this.callAuthed(() => this.controller.requestAccess({ account: this.account }));
         return {
             link: `https://${this.parsed.address}:${this.parsed.port}/${this.account}`,
-            machineId: requested.machineId,
-            ip: requested.ip,
+            machineId: state.machineId,
+            ip: state.ip,
         };
     }
 
@@ -116,13 +115,12 @@ export class ArchivesRemote implements IArchives {
         return !!state.hasAccess;
     }
 
-    // Registers our access request server-side (so an admin has a requestId to grant) and logs the grant instructions, at most once a minute
+    // Logs how to get access, at most once a minute. There is nothing to register any more: the server decides from the signed repo, so what it hands back is the command that puts us in it.
     private async registerAccessRequest(): Promise<void> {
-        let requested = await this.callAuthed(() => this.controller.requestAccess({ account: this.account }));
-        if (Date.now() - this.lastDeniedLog > timeInMinute) {
-            this.lastDeniedLog = Date.now();
-            console.log(`No access to storage account ${JSON.stringify(this.account)} on ${this.parsed.address}:${this.parsed.port} (our machine ${requested.machineId}, ip ${requested.ip}). See https://${this.parsed.address}:${this.parsed.port}/${this.account} - or grant it with: ${requested.grantAccessCommand}`);
-        }
+        if (Date.now() - this.lastDeniedLog < timeInMinute) return;
+        let state = await this.callAuthed(() => this.controller.getAccessState({ account: this.account }));
+        this.lastDeniedLog = Date.now();
+        console.log(`No access to storage account ${JSON.stringify(this.account)} on ${this.parsed.address}:${this.parsed.port} (our machine ${state.machineId}, ip ${state.ip}). ${state.reason || ""} Grant it with: ${state.addMachineCommand || ""}`);
     }
 
     // Runs a call, authenticating (and re-authenticating after reconnects) and waiting for account access as needed. With waitForAccess false, denied calls throw immediately instead - but the access request is still registered (in the background), so the denial is grantable.

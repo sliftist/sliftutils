@@ -22,6 +22,14 @@ const REVOCATION_REASON = "a machine talked to us from an unapproved IP";
 // The revoke repo is pulled at most this often. A check happens per request, and a request must
 // not cost a round trip to github.
 const REVOKE_SYNC_INTERVAL = 60 * 1000;
+// And the machine list is re-read from the checkout at most this often, for the same reason. The
+// checkout itself only moves when the daemon pulls it, which is on the same sort of interval, so
+// reading more often than this would only re-read the same bytes.
+const MACHINES_CACHE_TIME = 60 * 1000;
+// How long a failure to find the keys repo is remembered. A long lived process may start before
+// the machine is set up, and should pick it up once it is, without being restarted - but it must
+// not pay for resolving the repo on every request either.
+const REPO_RETRY_DELAY = 15 * 1000;
 
 /** One machine we are willing to talk to, and the addresses it may talk to us from. */
 export type MachineState = {
@@ -43,9 +51,43 @@ function machineFilePath(repoPath: string, machineId: string) {
     return path.join(repoPath, MACHINES_DIR, `${machineId}.json`);
 }
 
-/** Every machine a checkout lists. */
-export async function getMachines(repoPath: string): Promise<MachineState[]> {
-    return [...(await readMachines(repoPath)).values()];
+let repoLookup: Promise<{ repoPath: string; sourceURL: string }> | undefined;
+
+/** This machine's keys repo, worked out once and then remembered.
+
+    A failure is remembered too, but only briefly: a server may well start before the machine has
+    been set up, and should start working when it is, rather than needing a restart. */
+export function keysRepo() {
+    if (!repoLookup) {
+        repoLookup = resolveKeysRepo();
+        repoLookup.catch(() => {
+            setTimeout(() => { repoLookup = undefined; }, REPO_RETRY_DELAY).unref();
+        });
+    }
+    return repoLookup;
+}
+
+/** Every machine a checkout lists. Without a repo, this machine's own. */
+export async function getMachines(repoPath?: string): Promise<MachineState[]> {
+    return [...(await readMachines(repoPath || (await keysRepo()).repoPath)).values()];
+}
+
+let machinesCache: { at: number; machines: MachineState[] } | undefined;
+
+/** The machines this system trusts, as the signed repo lists them.
+
+    Cached, because this is asked per request and the answer only changes when the checkout does.
+    Verified first: an unsigned machine list, or one signed over different contents, is not
+    evidence of anything, and this throws rather than quietly trusting nobody. */
+export async function getTrustedMachines(): Promise<MachineState[]> {
+    if (machinesCache && Date.now() - machinesCache.at < MACHINES_CACHE_TIME) {
+        return machinesCache.machines;
+    }
+    let { repoPath } = await keysRepo();
+    await verifyCheckout(repoPath);
+    let machines = await getMachines(repoPath);
+    machinesCache = { at: Date.now(), machines };
+    return machines;
 }
 
 /** Makes a checkout list exactly these machines: those named are written with the addresses given,
@@ -59,10 +101,13 @@ export async function getMachines(repoPath: string): Promise<MachineState[]> {
     believing any of this, and it takes the hardware key, so `yarn signfiles git` is still yours to
     run afterwards. */
 export async function setMachines(config: {
-    repoPath: string;
+    repoPath?: string;
     machines: { machineId: string; ips: string[] }[];
 }): Promise<MachineState[]> {
-    let { repoPath, machines } = config;
+    let { machines } = config;
+    let repoPath = config.repoPath || (await keysRepo()).repoPath;
+    // Whatever was there is now stale, whoever reads it next.
+    machinesCache = undefined;
     let existing = await readMachines(repoPath);
     let directory = path.join(repoPath, MACHINES_DIR);
     let written: MachineState[] = [];
@@ -158,6 +203,17 @@ async function readMachineRevocations(sourceURL: string) {
     return revocations;
 }
 
+/** What to run to trust a machine that has just been refused.
+
+    Everything in it is already known to whoever is being refused: their machine id, the address we
+    saw them at, and the domain they just talked to. Handing it back saves them working out the
+    parts of a command they have every right to know. Running it still takes the hardware key on
+    the machine that owns the repo, so telling them costs nothing. */
+export function addMachineCommand(config: { machineId: string; ip: string; domain?: string }) {
+    let { machineId, ip, domain } = config;
+    return `To trust it, run: yarn addmachine ${domain || "<domain>"} ${machineId} ${ip} git`;
+}
+
 /** Sends the one notification this file is allowed to send, when it can.
 
     The daemon configures notifications on startup and would simply send. This can also run in some
@@ -247,19 +303,22 @@ async function recordMachineRevocation(config: {
     is a broken installation, not a rejected machine, and the two deserve different handling. */
 export type MachineVerdict = { accepted: boolean; reason: string };
 
-export async function isMachineAccepted(config: { machineId: string; ip: string }): Promise<MachineVerdict> {
-    let { machineId, ip } = config;
+export async function isMachineAccepted(config: {
+    machineId: string;
+    ip: string;
+    // Only used to write a complete command into the refusal. A caller that knows which domain it
+    // is answering as saves whoever is refused from having to guess it.
+    domain?: string;
+}): Promise<MachineVerdict> {
+    let { machineId, ip, domain } = config;
     if (!machineId || !ip) {
         throw new Error(`Expected a machineId and an ip, was ${JSON.stringify(machineId)} and ${JSON.stringify(ip)}`);
     }
-    let { repoPath, sourceURL } = await resolveKeysRepo();
-    // Unsigned, or signed over different contents, means the machine list is not evidence of
-    // anything. Same gate the ssh keys go through.
-    await verifyCheckout(repoPath);
-
-    let machine = (await readMachines(repoPath)).get(machineId);
+    let { sourceURL } = await keysRepo();
+    // Verified before it is believed, and cached, since this is asked once per request.
+    let machine = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
     if (!machine) {
-        return { accepted: false, reason: "that machine is not trusted" };
+        return { accepted: false, reason: `that machine is not trusted. ${addMachineCommand({ machineId, ip, domain })}` };
     }
 
     await syncRevocations(sourceURL);
