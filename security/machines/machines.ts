@@ -324,8 +324,7 @@ export type MachineVerdict = { accepted: boolean; reason: string };
 export async function isMachineAccepted(config: {
     machineId: string;
     ip: string;
-    // Only used to write a complete command into the refusal. A caller that knows which domain it
-    // is answering as saves whoever is refused from having to guess it.
+    // Used for local loopback acceptance, and for better error messages.
     domain?: string;
 }): Promise<MachineVerdict> {
     let { machineId, ip, domain } = config;
