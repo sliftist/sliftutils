@@ -1,36 +1,15 @@
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
-import { normalizeKeys } from "../authorizedKeys";
-import { sourceRepoPath } from "../sources";
 import { MANIFEST_NAME, normalizeContent, SIGN_NAMESPACE, SIGNATURE_NAME } from "../../signedFiles/manifest";
 import { verifySSHSIG } from "../../signedFiles/sshsig";
-import { SIGNER_CHANGE_DELAY } from "./paths";
-import { notify } from "./notify";
-import { saveState, sourceState } from "./state";
 
 // A source that has never been signed reads as this, so losing a signature counts as a change of
 // signer rather than as something to wave through.
-const UNSIGNED = "";
+export const UNSIGNED = "";
 // What fixes both of the signature problems we report, so the message can say so rather than
 // leaving someone to work it out.
 const SIGN_COMMAND = "yarn signfiles git";
-
-/** The ssh keys out of the signed files: the combined authorized_keys if it was signed, otherwise
-    every signed top level .pub. Only ever the signed content, since that is all the map holds. */
-function keysFromSignedFiles(files: Map<string, Buffer>) {
-    let combined = files.get("authorized_keys");
-    if (combined) {
-        return normalizeKeys(combined.toString("utf8"));
-    }
-    let keys: string[] = [];
-    for (let [filePath, contents] of files) {
-        if (filePath.endsWith(".pub") && !filePath.includes("/")) {
-            keys.push(...normalizeKeys(contents.toString("utf8")));
-        }
-    }
-    return keys;
-}
 
 /** A repo that cannot be trusted, with the message ready for whoever asked. Not every caller
     treats these the same - a source keeps its last keys, a machine list is just refused - so the
@@ -143,115 +122,4 @@ export async function readSignedRepo(repoPath: string): Promise<{
     }
 
     return { signer, manifestHash, signatureHash, files };
-}
-
-export function describeSigner(signer: string) {
-    return signer === UNSIGNED && "<no public key>" || signer;
-}
-
-/** Reports a problem with a source's signature, but only when it is not the same problem we
-    already reported, so a fault that persists does not repeat every check. */
-async function reportProblem(config: { repoURL: string; problem: string; headline: string; body: string }) {
-    let { repoURL, problem, headline, body } = config;
-    let sourceStateValue = sourceState(repoURL);
-    if (sourceStateValue.reportedProblem === problem) {
-        return;
-    }
-    sourceStateValue.reportedProblem = problem;
-    await saveState();
-    await notify(headline, body);
-}
-
-/** The keys a source is allowed to contribute right now. A source signed by someone we have not
-    accepted keeps contributing the keys we last accepted, until the delay has passed. */
-export async function resolveSourceKeys(repoURL: string) {
-    let sourceStateValue = sourceState(repoURL);
-    let repoPath = sourceRepoPath(repoURL);
-
-    let signer: string;
-    let signedFiles: Map<string, Buffer>;
-    let manifestHash: string;
-    let signatureHash: string;
-    try {
-        let signed = await readSignedRepo(repoPath);
-        signer = signed.signer;
-        signedFiles = signed.files;
-        manifestHash = signed.manifestHash;
-        signatureHash = signed.signatureHash;
-    } catch (e) {
-        // The read layer already knows what is wrong and how to say it, so this only forwards it.
-        // Anything that is not a signed repo problem is a real fault and is not swallowed.
-        if (!(e instanceof SignedRepoError)) {
-            throw e;
-        }
-        await reportProblem({ repoURL, problem: e.problem, headline: e.headline, body: e.body });
-        return sourceStateValue.acceptedKeys;
-    }
-    if (sourceStateValue.reportedProblem) {
-        sourceStateValue.reportedProblem = "";
-        await saveState();
-    }
-    let checkoutKeys = keysFromSignedFiles(signedFiles);
-
-    let accept = async () => {
-        sourceStateValue.accepted = true;
-        sourceStateValue.acceptedSigner = signer;
-        sourceStateValue.acceptedKeys = checkoutKeys;
-        sourceStateValue.acceptedManifestHash = manifestHash;
-        sourceStateValue.acceptedSignatureHash = signatureHash;
-        sourceStateValue.pendingSigner = UNSIGNED;
-        sourceStateValue.pendingSince = 0;
-        await saveState();
-        return checkoutKeys;
-    };
-
-    // Nothing has ever been accepted from this source, so this is what we start trusting.
-    if (!sourceStateValue.accepted) {
-        console.log(`Trusting ${repoURL} as signed by ${describeSigner(signer)}`);
-        return await accept();
-    }
-
-    if (signer === sourceStateValue.acceptedSigner) {
-        // Back to the signer we already trust, so anything we were waiting on is moot.
-        if (sourceStateValue.pendingSince) {
-            console.log(`${repoURL} is signed by its accepted key again, dropping the pending change`);
-        }
-        return await accept();
-    }
-
-    // Going from nothing to something signed is only ever an improvement, so it does not wait.
-    if (sourceStateValue.acceptedSigner === UNSIGNED) {
-        await notify(`KEY REPO IS NOW SIGNED`,
-            `\`${repoURL}\` was not signed at all before, so this is an improvement and its keys`
-            + ` are being applied right away.`
-            + `\n\nsigned by: \`${signer}\``
-        );
-        return await accept();
-    }
-
-    // A signer we have not accepted. Anything new restarts the wait, so publishing twice in a row
-    // gains an attacker nothing. pendingSince is what marks a wait as running, because an unsigned
-    // checkout is itself a signer value and cannot double as "nothing pending".
-    if (!sourceStateValue.pendingSince || signer !== sourceStateValue.pendingSigner) {
-        sourceStateValue.pendingSigner = signer;
-        sourceStateValue.pendingSince = Date.now();
-        await saveState();
-        await notify(`KEY REPO SIGNED BY A DIFFERENT KEY`,
-            `Somebody else is signing \`${repoURL}\` now. Its keys are NOT being applied, and this`
-            + ` machine is still using the ones it already had. If nothing changes, the new signer`
-            + ` is accepted in 24 hours.`
-            + `\n\nIf that was not you, fix the repo before the 24 hours are up.`
-            + `\n\nsigned by now: \`${describeSigner(signer)}\``
-            + `\nsigned by before: \`${describeSigner(sourceStateValue.acceptedSigner)}\``
-        );
-        return sourceStateValue.acceptedKeys;
-    }
-
-    if (Date.now() - sourceStateValue.pendingSince < SIGNER_CHANGE_DELAY) {
-        return sourceStateValue.acceptedKeys;
-    }
-
-    // Same new signer, 24 hours later, and nobody stopped it.
-    console.log(`Accepting ${describeSigner(signer)} for ${repoURL} after the ${SIGNER_CHANGE_DELAY}ms wait`);
-    return await accept();
 }
