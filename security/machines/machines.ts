@@ -11,6 +11,7 @@ import { verifyCheckout } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
+import { getOwnMachineId } from "../../misc/https/certs";
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll } from "socket-function/src/batching";
 import { spawnPromise } from "../helpers/spawn";
@@ -32,6 +33,7 @@ const MACHINES_REFRESH_INTERVAL = 60 * 1000;
 // the machine is set up, and should pick it up once it is, without being restarted - but it must
 // not pay for resolving the repo on every request either.
 const REPO_RETRY_DELAY = 15 * 1000;
+const LOOPBACK = ["127.0.0.1", "::1", "::ffff:127.0.0.1"];
 
 /** One machine we are willing to talk to, and the addresses it may talk to us from. */
 export type MachineState = {
@@ -329,6 +331,9 @@ export async function isMachineAccepted(config: {
     let { machineId, ip, domain } = config;
     if (!machineId || !ip) {
         throw new Error(`Expected a machineId and an ip, was ${JSON.stringify(machineId)} and ${JSON.stringify(ip)}`);
+    }
+    if (LOOPBACK.includes(ip) && !!domain && machineId === getOwnMachineId(domain)) {
+        return { accepted: true, reason: "" };
     }
     let { sourceURL } = await keysRepo();
     // Verified before it is believed, and cached, since this is asked once per request.
