@@ -19,8 +19,8 @@ const COMMIT_MESSAGE = "unrevoke keys";
 const USAGE = `Usage: yarn unrevoke [keys-repo] [${GIT_KEYWORD}]
 
 Run this in a keys repo, or name one. It reads that repo's revoke repo and writes one unrevoke file
-naming every revocation in it, so the keys are accepted again once each machine's hour long wait
-passes. It signs the result, and with ${GIT_KEYWORD} it commits and pushes it too.
+naming every revocation in it, so the keys are accepted again as each machine picks it up. It signs
+the result, and with ${GIT_KEYWORD} it commits and pushes it too.
 
 Keys that were revoked should normally be deleted from the repo instead. Unrevoking only matters
 for a key you still want.`;
@@ -297,14 +297,12 @@ export async function main() {
     await signRepo({ repoPath });
 
     if (!pushToGit) {
-        console.log(`\nCommit and push it, and each machine will wait an hour after seeing it before`);
-        console.log(`those keys work again:`);
+        console.log(`\nCommit and push it, and those keys work again as each machine picks it up:`);
         console.log(`\`\`\`\ngit add -A\ngit commit -m "${COMMIT_MESSAGE}"\ngit push\n\`\`\``);
         return;
     }
     await runPromise(`git add -A`, { cwd: repoPath });
     await runPromise(`git commit -m "${COMMIT_MESSAGE}"`, { cwd: repoPath });
     await runPromise(`git push`, { cwd: repoPath });
-    console.log(`\nCommitted and pushed. Each machine waits an hour after seeing it before those`);
-    console.log(`keys work again.`);
+    console.log(`\nCommitted and pushed. Those keys work again as each machine picks it up.`);
 }

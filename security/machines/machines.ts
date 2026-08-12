@@ -11,7 +11,6 @@ import { verifyCheckout } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
-import { unrevokeInEffect } from "./trustState";
 import { spawnPromise } from "../helpers/spawn";
 
 // Which machines this system talks to, kept in the same repo as the ssh keys. That repo is already
@@ -226,7 +225,7 @@ async function recordMachineRevocation(config: {
         + `\n\nIt is frozen everywhere now, and nothing accepts it.`
         + `\n\nIf this was an attack, remove \`machines/${machineId}.json\` from \`${sourceURL}\` now.`
         + `\nIf it was legitimate, run \`yarn unrevoke git\` in that repo. It allows ${ip} for that`
-        + ` machine, and takes an hour to reach every machine.`
+        + ` machine, and takes effect as each machine picks it up.`
         + `\n\nmachine: \`${machineId}\``
         + `\nfrozen by: \`${hostLabel}\``
     );
@@ -265,17 +264,10 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
 
     await syncRevocations(sourceURL);
     let unrevokes = await readUnrevokes(sourceURL).catch(() => ({ pairs: new Map(), legacyIds: new Map() }));
-    // An unrevoke is only honoured once it has waited out its hour, exactly as an ssh key's is.
-    // Any of the unrevokes covering the pair having served that hour is enough: a later file
-    // naming the same pair must not restart a wait that has already passed.
-    let allowedAgain = async (pair: string) => {
-        let allowed = false;
-        for (let unrevokeId of unrevokes.pairs.get(pair) || []) {
-            // Every one, not the first that answers, so each has its first sighting recorded.
-            allowed = await unrevokeInEffect(unrevokeId) || allowed;
-        }
-        return allowed;
-    };
+    // An unrevoke counts as soon as it is seen. It is signed, so writing one already takes the
+    // hardware key, and anyone holding that can sign anything at all - a wait before honouring it
+    // guards against an attacker who has no need of it.
+    let allowedAgain = (pair: string) => !!unrevokes.pairs.get(pair)?.length;
     let revocations = await readMachineRevocations(sourceURL);
     // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
     // ssh key is out everywhere rather than only from the address it was misused from.
@@ -284,7 +276,7 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
         if (revocation.machineId !== machineId) {
             continue;
         }
-        if (!await allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))) {
+        if (!allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))) {
             frozenFrom = revocation.ip;
         }
     }
@@ -304,7 +296,7 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
     let pair = pairKey({ fingerprint: machineId, ip });
     let alreadyRecorded = revocations.some(revocation =>
         pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }) === pair);
-    if (!alreadyRecorded && !await allowedAgain(pair)) {
+    if (!alreadyRecorded && !allowedAgain(pair)) {
         await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
         return { accepted: false, reason: `that machine is not allowed from ${ip}, so it is now frozen everywhere` };
     }

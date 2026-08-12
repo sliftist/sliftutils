@@ -35,8 +35,7 @@ export type RevocationState = {
     revokedAt: string;
     revokedBy: string;
     reason: string;
-    // Which unrevoke allowed this key from this address, once one has been seen. When the wait it
-    // started runs out is in unrevokeFirstSeen, which outlives the daemon.
+    // Which unrevoke allowed this key from this address, once one has been seen.
     unrevokeId: string;
     unrevoked: boolean;
     // Whether we have said that this key actually left root's authorized_keys. The removal is the
@@ -63,11 +62,6 @@ export type DaemonState = {
     // shut them out. Restarting the daemon does clear it, which is the way back from a revocation
     // that should not have happened.
     revocations: { [revocationId: string]: RevocationState };
-    // When this machine first saw each unrevoke, by unrevoke id. On disk, unlike the revocations
-    // themselves, because it is what the hour long wait is counted from: measuring from a time the
-    // unrevoke file states would let whoever wrote it backdate the file and skip the wait, and
-    // measuring from process start would restart the wait on every restart.
-    unrevokeFirstSeen: { [unrevokeId: string]: number };
     pendingRevocations: PendingRevocation[];
     // The keys we last wrote out. What tells a change we made apart from one somebody else made:
     // if this still matches what we want, and the file does not, the file was edited behind us.
@@ -81,7 +75,6 @@ let state: DaemonState = {
     sources: {},
     userKeyHashes: {},
     revocations: {},
-    unrevokeFirstSeen: {},
     pendingRevocations: [],
     appliedKeys: [],
     authLogOffset: 0,
@@ -126,6 +119,9 @@ export async function loadState() {
         // Revocations are held in memory only, so whatever an older version left on disk is not
         // read back in. Starting the daemon is what forgets them.
         delete loaded.revocations;
+        // Written by the versions that made an unrevoke wait an hour before it counted. Dropped
+        // rather than carried, so the file stops mentioning something nothing reads.
+        delete loaded.unrevokeFirstSeen;
         state = Object.assign(state, loaded);
     } catch (e) {
         // Corrupt state only costs us one duplicate notification, so it is not worth failing over.
