@@ -11,6 +11,8 @@ import { verifyCheckout } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
+import { lazy } from "socket-function/src/caching";
+import { runInfinitePoll } from "socket-function/src/batching";
 import { spawnPromise } from "../helpers/spawn";
 
 // Which machines this system talks to, kept in the same repo as the ssh keys. That repo is already
@@ -22,10 +24,10 @@ const REVOCATION_REASON = "a machine talked to us from an unapproved IP";
 // The revoke repo is pulled at most this often. A check happens per request, and a request must
 // not cost a round trip to github.
 const REVOKE_SYNC_INTERVAL = 60 * 1000;
-// And the machine list is re-read from the checkout at most this often, for the same reason. The
+// And the machine list is re-read from the checkout on this interval, in the background. The
 // checkout itself only moves when the daemon pulls it, which is on the same sort of interval, so
 // reading more often than this would only re-read the same bytes.
-const MACHINES_CACHE_TIME = 60 * 1000;
+const MACHINES_REFRESH_INTERVAL = 60 * 1000;
 // How long a failure to find the keys repo is remembered. A long lived process may start before
 // the machine is set up, and should pick it up once it is, without being restarted - but it must
 // not pay for resolving the repo on every request either.
@@ -51,43 +53,57 @@ function machineFilePath(repoPath: string, machineId: string) {
     return path.join(repoPath, MACHINES_DIR, `${machineId}.json`);
 }
 
-let repoLookup: Promise<{ repoPath: string; sourceURL: string }> | undefined;
-
 /** This machine's keys repo, worked out once and then remembered.
 
     A failure is remembered too, but only briefly: a server may well start before the machine has
     been set up, and should start working when it is, rather than needing a restart. */
-export function keysRepo() {
-    if (!repoLookup) {
-        repoLookup = resolveKeysRepo();
-        repoLookup.catch(() => {
-            setTimeout(() => { repoLookup = undefined; }, REPO_RETRY_DELAY).unref();
-        });
-    }
-    return repoLookup;
-}
+export const keysRepo = lazy(async () => {
+    let lookup = resolveKeysRepo();
+    lookup.catch(() => {
+        setTimeout(() => keysRepo.reset(), REPO_RETRY_DELAY).unref();
+    });
+    return await lookup;
+});
 
 /** Every machine a checkout lists. Without a repo, this machine's own. */
 export async function getMachines(repoPath?: string): Promise<MachineState[]> {
     return [...(await readMachines(repoPath || (await keysRepo()).repoPath)).values()];
 }
 
-let machinesCache: { at: number; machines: MachineState[] } | undefined;
+/** Reads the machine list, once its signature has been checked. An unsigned machine list, or one
+    signed over different contents, is not evidence of anything, so this throws rather than
+    quietly trusting nobody. */
+async function readTrustedMachines() {
+    let { repoPath } = await keysRepo();
+    await verifyCheckout(repoPath);
+    return await getMachines(repoPath);
+}
+
+const trustedMachines = lazy(async () => {
+    let read = readTrustedMachines();
+    read.catch(() => trustedMachines.reset());
+    return await read;
+});
+
+let refreshing = false;
 
 /** The machines this system trusts, as the signed repo lists them.
 
-    Cached, because this is asked per request and the answer only changes when the checkout does.
-    Verified first: an unsigned machine list, or one signed over different contents, is not
-    evidence of anything, and this throws rather than quietly trusting nobody. */
+    Held rather than read per call, and refreshed in the background, so nobody asking whether a
+    machine is trusted waits for a directory of files to be read and a signature to be checked. A
+    refresh that fails leaves the list we already have: the checkout is only stale, not wrong. */
 export async function getTrustedMachines(): Promise<MachineState[]> {
-    if (machinesCache && Date.now() - machinesCache.at < MACHINES_CACHE_TIME) {
-        return machinesCache.machines;
+    if (!refreshing) {
+        refreshing = true;
+        runInfinitePoll(MACHINES_REFRESH_INTERVAL, async () => {
+            try {
+                trustedMachines.set(Promise.resolve(await readTrustedMachines()));
+            } catch (e) {
+                console.log(`Could not re-read the trusted machines, keeping the ones we have. ${e}`);
+            }
+        });
     }
-    let { repoPath } = await keysRepo();
-    await verifyCheckout(repoPath);
-    let machines = await getMachines(repoPath);
-    machinesCache = { at: Date.now(), machines };
-    return machines;
+    return await trustedMachines();
 }
 
 /** Makes a checkout list exactly these machines: those named are written with the addresses given,
@@ -106,8 +122,8 @@ export async function setMachines(config: {
 }): Promise<MachineState[]> {
     let { machines } = config;
     let repoPath = config.repoPath || (await keysRepo()).repoPath;
-    // Whatever was there is now stale, whoever reads it next.
-    machinesCache = undefined;
+    // Whatever was held is now stale, whoever reads it next.
+    trustedMachines.reset();
     let existing = await readMachines(repoPath);
     let directory = path.join(repoPath, MACHINES_DIR);
     let written: MachineState[] = [];
