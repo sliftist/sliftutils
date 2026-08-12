@@ -4,7 +4,8 @@ import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
-import { buildManifest, formatManifest, MANIFEST_NAME, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
+import { buildManifest, formatManifest, MANIFEST_NAME, normalizeContent, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
+import { verifySSHSIG } from "./sshsig";
 import { revokedKeysInRepo } from "../authorizedKeys/unrevoke";
 import { findKeyProblems, normalizeKeys } from "../authorizedKeys/authorizedKeys";
 
@@ -130,10 +131,13 @@ export async function signRepo(config: { repoPath: string; keyPath?: string }) {
 
     // Signing happens before any git work, so a failed push never costs a second touch of the key.
     await runPromise(`ssh-keygen -Y sign -f ${quote(signingKey)} -n ${SIGN_NAMESPACE} ${quote(stagedManifest)}`);
-    // Checked here rather than left for a machine that has already pulled it to discover.
-    await runPromise(
-        `ssh-keygen -Y check-novalidate -n ${SIGN_NAMESPACE} -s ${quote(stagedSignature)} < ${quote(stagedManifest)}`
-    );
+    // Checked with the same code the daemon verifies with, over the same normalised bytes, so what
+    // is about to be committed is proven to pass the check every other machine will run on it.
+    verifySSHSIG({
+        signature: await fs.readFile(stagedSignature, "utf8"),
+        message: normalizeContent(await fs.readFile(stagedManifest)),
+        namespace: SIGN_NAMESPACE,
+    });
     await fs.copyFile(stagedManifest, path.join(repoPath, MANIFEST_NAME));
     await fs.copyFile(stagedSignature, path.join(repoPath, SIGNATURE_NAME));
     await fs.rm(stagingDirectory, { recursive: true, force: true });
