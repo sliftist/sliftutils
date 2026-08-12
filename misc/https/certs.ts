@@ -18,7 +18,7 @@ import { measureBlock, measureFnc, measureWrap } from "socket-function/src/profi
 import { getNodeIdDomain, getNodeIdDomainMaybeUndefined, getNodeIdLocation } from "socket-function/src/nodeCache";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { resetAllNodeCallFactories } from "socket-function/src/nodeCache";
-import { getKeyStore } from "./persistentLocalStorage";
+import { getKeyStore, DEV_getKeyStorePath } from "./persistentLocalStorage";
 import { ellipsize } from "../strings";
 
 setFlag(require, "node-forge", "allowclient", true);
@@ -33,6 +33,12 @@ export type IdentityStorageType = { domain: string; certB64: string; keyB64: str
 
 function getIdentityStore(domain: string) {
     return getKeyStore<IdentityStorageType>(domain, identityStorageKey);
+}
+
+// Just used for machine maintenance (finding a machine's identity file on disk, ex to copy it to
+// another machine over ssh). NEVER access this unless explicitly given permission.
+export function DEV_getIdentityFilePath(domain: string): string {
+    return DEV_getKeyStorePath({ appName: domain, key: identityStorageKey });
 }
 
 export interface X509KeyPair { domain: string; cert: Buffer; key: Buffer; }
@@ -331,7 +337,7 @@ export function generateKeyPair() {
     });
 }
 
-export function generateTestCA(domain: string) {
+export function generateCA(domain: string) {
     const keyPair = generateKeyPair();
     let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
     let fullDomain = `${caPublicKeyPart}.${domain}`;
@@ -343,12 +349,7 @@ let identityCA = cache((domain: string) => lazy((): X509KeyPair => {
     let caCached = identityCACached.get();
     if (!caCached) {
         console.log(`Generating new identity CA`);
-        const keyPair = generateKeyPair();
-        let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
-        let fullDomain = `${caPublicKeyPart}.${domain}`;
-
-        let value = createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
-
+        let value = generateCA(domain);
         caCached = {
             domain: value.domain,
             certB64: value.cert.toString("base64"),

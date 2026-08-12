@@ -1,8 +1,8 @@
-import os from "os";
+import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
+import { DEV_getIdentityFilePath, generateCA, getMachineId, getOwnMachineId, IdentityStorageType, loadIdentityCA } from "../../misc/https/certs";
 import { getOwnIPs } from "../../misc/ownIPs";
-import { describeHost } from "../helpers/remoteSSH";
-import { createRemoteIdentity, Identity, localDomains, localIdentity, remoteIdentity } from "./identity";
+import { describeHost, runOverSSH, writeRemoteFile } from "../helpers/remoteSSH";
 import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
 import { signRepo } from "../signedFiles/signFiles";
 import { getMachines, setMachines } from "./machines";
@@ -55,46 +55,51 @@ function parseArgs(argv: string[]) {
     return { domain, host: second, machineId: "", addresses: [] as string[], pushToGit };
 }
 
+/** The machine id of a machine reached over ssh, generating and installing an identity for it if
+    it has none under this domain. The private key ends up on that machine and nowhere else. */
+async function getOrCreateRemoteMachineId(host: string, domain: string): Promise<string> {
+    let fileName = path.basename(DEV_getIdentityFilePath(domain));
+    let home = (await runOverSSH({ host, script: `echo $HOME` })).stdout.trim();
+    if (!home) {
+        throw new Error(`Expected ${host} to report a home directory, it reported nothing`);
+    }
+    let contents = await runOverSSH({ host, script: `cat ${home}/${fileName} 2>/dev/null || true` });
+    if (contents.stdout.trim()) {
+        let stored = JSON.parse(contents.stdout) as IdentityStorageType;
+        return getMachineId(stored.domain, domain);
+    }
+    console.log(`${describeHost(host)} has no identity for ${domain}, generating one`);
+    let generated = generateCA(domain);
+    let stored: IdentityStorageType = {
+        domain: generated.domain,
+        certB64: generated.cert.toString("base64"),
+        keyB64: generated.key.toString("base64"),
+    };
+    await writeRemoteFile({
+        host,
+        filePath: `${home}/${fileName}`,
+        contents: JSON.stringify(stored),
+        fileMode: "600",
+        directoryMode: "700",
+    });
+    return getMachineId(generated.domain, domain);
+}
+
 export async function main() {
     let { domain, host, machineId, addresses, pushToGit } = parseArgs(process.argv.slice(2));
     // The same repo the acceptance check reads. Editing anything else would write a machine list
     // nothing on this machine ever looks at.
     let { repoPath } = await resolveKeysRepo();
 
-    let describe = machineId;
-    if (machineId) {
-        // Named outright, so there is nothing to ask anyone. The id is the hash of that machine's
-        // public key, so naming it is enough - it still has to prove it holds the key before any
-        // of this means anything.
-        describe = `${machineId} (named)`;
-    } else if (!host) {
-        let identity = await localIdentity(domain);
-        if (!identity) {
-            throw new Error(
-                `Expected an identity for ${domain} in ${os.homedir()}, this machine has none.\n`
-                + `It has: ${(await localDomains()).join(", ") || "no identities at all"}\n`
-                + `One is generated the first time something runs here under a domain, so run that`
-                + ` first, or name another machine to add instead.`
-            );
-        }
-        machineId = identity.machineId;
-        describe = identity.fullDomain;
+    if (!machineId && !host) {
+        await loadIdentityCA(domain);
+        machineId = getOwnMachineId(domain);
         addresses = await getOwnIPs();
         if (!addresses.length) {
             throw new Error(`Expected this machine to have an address anything else can see, it has none`);
         }
-    } else {
-        // Nothing there under this domain means it gets one. Its own from this point on: the key
-        // is written there and nothing keeps a copy.
-        let found = await remoteIdentity(host, domain);
-        if (!found) {
-            console.log(`${describeHost(host)} has no identity for ${domain}, generating one`);
-        }
-        let identity: Identity = found || await createRemoteIdentity({ host, domain });
-        machineId = identity.machineId;
-        describe = identity.fullDomain;
-        // The address it was named by is the address it talks to us from, which is the one thing
-        // it cannot lie about.
+    } else if (host) {
+        machineId = await getOrCreateRemoteMachineId(host, domain);
         addresses = [host];
     }
 
@@ -118,7 +123,6 @@ export async function main() {
     } else {
         console.log(`  already allowed from ${addresses.join(", ")}`);
     }
-    console.log(`  identity ${describe}`);
     console.log(`  in ${repoPath}`);
 
     if (!pushToGit) {
