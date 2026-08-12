@@ -101,7 +101,7 @@ async function main() {
     await runPromise(`git add -A`, { cwd: repoPath });
     await runPromise(`git commit -m "${COMMIT_MESSAGE}"`, { cwd: repoPath });
     await runPromise(`git push`, { cwd: repoPath });
-    console.log(`\nSigned, committed and pushed. Machines pick it up as they sync.`);
+    console.log(`\nSigned, committed and pushed. Machines will pick it up the next time they poll, within 60 seconds.`);
 }
 
 main().catch(e => {
