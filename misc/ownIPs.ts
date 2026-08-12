@@ -1,6 +1,30 @@
 import os from "os";
 import { getExternalIP } from "socket-function/src/networking";
 
+// Interfaces belonging to containers and virtual machines, by the names the platforms give them:
+// docker bridges and their veth pairs, libvirt and vmware and virtualbox switches, and the
+// Hyper-V switches Windows creates for WSL and its VMs.
+//
+// Their addresses are skipped rather than trusted. An address on one of these is how something we
+// deliberately sandboxed talks to us, so trusting a machine from it would hand the sandbox the
+// access the sandbox exists to withhold - and no outside machine can reach us there anyway, so
+// nothing is lost by leaving them out.
+const VIRTUAL_INTERFACES = [
+    /^docker/i,
+    /^br-/i,
+    /^veth/i,
+    /^virbr/i,
+    /^vmnet/i,
+    /^vboxnet/i,
+    /^vEthernet/i,
+    /wsl/i,
+    /hyper-?v/i,
+];
+
+function isVirtualInterface(name: string) {
+    return VIRTUAL_INTERFACES.some(pattern => pattern.test(name));
+}
+
 /** Every address this machine can be reached at, or seen as.
 
     Both halves, because which one applies depends on who is doing the seeing: something on the
@@ -13,7 +37,11 @@ import { getExternalIP } from "socket-function/src/networking";
     A set, because a machine that is not behind a NAT sees its own address in both halves. */
 export async function getOwnIPs() {
     let addresses = new Set<string>();
-    for (let entries of Object.values(os.networkInterfaces())) {
+    for (let [name, entries] of Object.entries(os.networkInterfaces())) {
+        if (isVirtualInterface(name)) {
+            console.log(`Ignoring ${name}, it belongs to a container or virtual machine`);
+            continue;
+        }
         for (let entry of entries || []) {
             if (!entry.internal && entry.family === "IPv4") {
                 addresses.add(entry.address);
