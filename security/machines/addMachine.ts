@@ -67,7 +67,7 @@ async function resolveMachine(config: { domain: string; host: string; machineId:
     return { machineId: getOwnMachineId(domain), addresses: ownAddresses };
 }
 
-export async function main() {
+async function main() {
     let { domain, host, machineId, addresses, pushToGit } = parseArgs(process.argv.slice(2));
     let { repoPath } = await resolveKeysRepo();
     let target = await resolveMachine({ domain, host, machineId, addresses });
@@ -103,3 +103,8 @@ export async function main() {
     await runPromise(`git push`, { cwd: repoPath });
     console.log(`\nSigned, committed and pushed. Machines pick it up as they sync.`);
 }
+
+main().catch(e => {
+    console.error(`${e}`);
+    process.exitCode = 1;
+}).finally(() => process.exit());

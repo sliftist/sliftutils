@@ -24,7 +24,7 @@ function parseArgs(argv: string[]) {
     return { host, webhookURL, replace };
 }
 
-export async function main() {
+async function main() {
     let { host, webhookURL, replace } = parseArgs(process.argv.slice(2));
     let { outcome, filePath } = await ensureRemoteWebhook({ host, webhookURL, replace });
     if (outcome === "unchanged") {
@@ -36,3 +36,8 @@ export async function main() {
     }
     console.log(`Wrote ${filePath} on ${describeHost(host)} (mode 600), and confirmed on the new webhook.`);
 }
+
+main().catch(e => {
+    console.error(`${e}`);
+    process.exitCode = 1;
+}).finally(() => process.exit());

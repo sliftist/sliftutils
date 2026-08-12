@@ -1,9 +1,5 @@
 #!/usr/bin/env node
 "use strict";
-// Sends one message to a webhook, to prove notifications work.
+// Sends one test Discord message on this machine or a host over ssh.
 require("typenode");
-
-require("../security/notifications/testNotify").main().catch(e => {
-    console.error(`${e}`);
-    process.exitCode = 1;
-}).finally(() => process.exit());
+require("../security/notifications/testNotify");

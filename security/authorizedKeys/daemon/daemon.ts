@@ -47,7 +47,7 @@ import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 //  10. A trusted machine talked to us from an address it is not allowed from, so it was frozen
 //      everywhere. Sent by whichever machine wrote that revocation, from machines.ts.
 
-export type DaemonConfig = {
+type DaemonConfig = {
     repoSources: string[];
     hostLabel: string;
 };
@@ -55,11 +55,11 @@ export type DaemonConfig = {
 let config: DaemonConfig = { repoSources: [], hostLabel: "" };
 let repoFailureCounts: { [repoURL: string]: number } = {};
 
-export function getConfig() {
+function getConfig() {
     return config;
 }
 
-export function setConfig(value: DaemonConfig) {
+function setConfig(value: DaemonConfig) {
     config = value;
     setHostLabel(value.hostLabel);
 }
@@ -96,7 +96,7 @@ async function loadConfig(): Promise<DaemonConfig> {
 /** The union of every source, in source order, with duplicates dropped. A source that cannot be
     read is skipped rather than emptying the merged set, so one broken repo cannot revoke the keys
     that came from the others. */
-export async function readAllowedKeys() {
+async function readAllowedKeys() {
     let keys: string[] = [];
     let seen = new Set<string>();
     for (let repoURL of config.repoSources) {
@@ -311,7 +311,7 @@ function startInterval(config: { intervalTime: number; run: () => Promise<void>;
     return tick;
 }
 
-export async function main() {
+async function main() {
     setConfig(await loadConfig());
     await loadState();
     await configureDiscordNotifications({ filePath: DEFAULT_WEBHOOK_FILE_PATH });
@@ -342,4 +342,11 @@ process.on("unhandledRejection", e => console.log(`Unhandled rejection, staying 
 process.on("SIGTERM", () => {
     console.log("Received SIGTERM, exiting");
     process.exit(0);
+});
+
+// Deliberately without the finally(process.exit) of the other entry points: this daemon is meant
+// to keep running after main resolves, and exiting there would stop it dead on startup.
+main().catch(e => {
+    console.error(`portsecure: failed to start. ${e && e.stack || e}`);
+    process.exit(1);
 });
