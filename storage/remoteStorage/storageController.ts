@@ -15,7 +15,8 @@ import {
     debugGetActiveBucket, activateBucket, getActiveBucketKeys,
 } from "./storageServerState";
 import { debugClearAccountWriteStats } from "./accessStats";
-import { getStorageServerConfig, getTrust, getRequests, assertWritesAllowed } from "./serverConfig";
+import { getStorageServerConfig, assertWritesAllowed } from "./serverConfig";
+import { getTrustedMachines, isMachineAccepted, MachineState } from "../../security/machines/machines";
 import { BlobStore } from "./blobStore";
 import { getRoutingFileResult } from "./bucketDisk";
 import { StorageClientController } from "./storageClientController";
@@ -45,25 +46,15 @@ export type AuthToken = {
     signature: string;
     data: AuthTokenData;
 };
-export type AccessRequest = {
-    requestId: string;
-    account: string;
-    machineId: string;
-    ip: string;
-    time: number;
-};
-export type TrustRecord = {
-    account: string;
-    machineId: string;
-    ip: string;
-    time: number;
-};
 export type AccessState = {
     machineId: string;
     ip: string;
     hasAccess: boolean;
-    grantAccessCommand?: string;
-    trustedMachines?: TrustRecord[];
+    // Why not, and what to run about it, when there is no access.
+    reason?: string;
+    addMachineCommand?: string;
+    // Everything the repo trusts, when there is.
+    trustedMachines?: MachineState[];
 };
 
 const sessions = new Map<string, string>();
@@ -114,22 +105,27 @@ function requireAdmin(): string {
     }
     return machineId;
 }
+/** Who may talk to this server, decided by the signed authorized_keys repo rather than by anything
+    this server keeps for itself.
+
+    The identity is the same machine id it always was - a machine that was trusted here before is
+    trusted the moment its id is in the repo - but the record of who is trusted now lives in one
+    signed place shared by every machine, with revocation and everything else that comes with it.
+    The address is checked too, which the trust store here never did. */
 async function requireAccess(account: string): Promise<string> {
     assertValidName(account, "account");
     let machineId = getCallerMachineId();
     if (isAdmin(machineId)) return machineId;
-    let trust = await getTrust();
-    let trusted = await trust.get(`${account}|${machineId}`);
-    if (!trusted) {
-        let { domain, port } = getStorageServerConfig();
-        throw new Error(`${STORAGE_ACCESS_DENIED} Machine has no access to this account. Machine ${machineId}, account ${JSON.stringify(account)}. Visit https://${domain}:${port}/${account} for access instructions.`);
+    let { rootDomain } = getStorageServerConfig();
+    let ip = getCallerIP();
+    let verdict = await isMachineAccepted({ machineId, ip, domain: rootDomain });
+    if (!verdict.accepted) {
+        throw new Error(
+            `${STORAGE_ACCESS_DENIED} ${verdict.reason}`
+            + ` Machine ${machineId}, address ${ip}, account ${JSON.stringify(account)}.`
+        );
     }
     return machineId;
-}
-
-function getGrantAccessCommand(requestId: string): string {
-    let { sshTarget, serverCommand } = getStorageServerConfig();
-    return `ssh ${sshTarget} '${serverCommand} --requestId ${requestId}'`;
 }
 
 class RemoteStorageControllerBase {
@@ -166,113 +162,36 @@ class RemoteStorageControllerBase {
         return { machineId, ip: getCallerIP() };
     }
 
-    @assertValidArgs
-    async requestAccess(config: { account: string }): Promise<{ machineId: string; ip: string; requestId: string; grantAccessCommand: string }> {
-        let account = config.account;
-        let machineId = getCallerMachineId();
-        let ip = getCallerIP();
-        let requestsStorage = await getRequests();
-        let requests = await requestsStorage.get(ip) || [];
-        let existing = requests.find(x => x.account === account && x.machineId === machineId);
-        if (existing) {
-            existing.time = Date.now();
-        } else {
-            existing = {
-                requestId: Math.random().toString(36).slice(2, 10),
-                account,
-                machineId,
-                ip,
-                time: Date.now(),
-            };
-            requests.push(existing);
-        }
-        while (requests.length > MAX_REQUESTS_PER_IP) requests.shift();
-        await requestsStorage.set(ip, requests);
-        return { machineId, ip, requestId: existing.requestId, grantAccessCommand: getGrantAccessCommand(existing.requestId) };
-    }
+    /** Whether the caller may use this account, and if not, exactly what to run to change that.
 
+        There is nothing to request and nothing to grant here any more: trust lives in the signed
+        authorized_keys repo, so the answer is "run addmachine in that repo", which only somebody
+        holding the hardware key can do. */
     @assertValidArgs
     async getAccessState(config: { account: string }): Promise<AccessState> {
-        let account = config.account;
+        assertValidName(config.account, "account");
         let machineId = getCallerMachineId();
         let ip = getCallerIP();
-        let trust = await getTrust();
-        let hasAccess = isAdmin(machineId) || !!await trust.get(`${account}|${machineId}`);
-        let result: AccessState = { machineId, ip, hasAccess };
-        if (!hasAccess) {
-            let requests = await getRequests();
-            let ownRequest = (await requests.get(ip) || []).find(x => x.account === account && x.machineId === machineId);
-            if (ownRequest) {
-                result.grantAccessCommand = getGrantAccessCommand(ownRequest.requestId);
-            }
-            return result;
+        let { rootDomain } = getStorageServerConfig();
+        if (isAdmin(machineId)) {
+            return { machineId, ip, hasAccess: true, trustedMachines: await getTrustedMachines() };
         }
-
-        let trustedMachines: TrustRecord[] = [];
-        for (let key of await trust.getKeys()) {
-            if (!key.startsWith(`${account}|`)) continue;
-            let record = await trust.get(key);
-            if (record) trustedMachines.push(record);
+        let verdict = await isMachineAccepted({ machineId, ip, domain: rootDomain });
+        if (!verdict.accepted) {
+            return {
+                machineId,
+                ip,
+                hasAccess: false,
+                reason: verdict.reason,
+                addMachineCommand: `yarn addmachine ${rootDomain} ${machineId} ${ip} git`,
+            };
         }
-        result.trustedMachines = trustedMachines;
-        return result;
-    }
-
-    async listRequestsForIP(config: { account: string; ip: string }): Promise<AccessRequest[]> {
-        let requests = await getRequests();
-        return (await requests.get(config.ip) || []).filter(x => x.account === config.account);
-    }
-
-    async grantAccess(config: { requestId: string }): Promise<TrustRecord> {
-        let requestId = config.requestId;
-        let callerMachineId = getCallerMachineId();
-        let trust = await getTrust();
-        let requests = await getRequests();
-        for (let ip of await requests.getKeys()) {
-            for (let request of await requests.get(ip) || []) {
-                if (request.requestId !== requestId) continue;
-                if (!isAdmin(callerMachineId) && !await trust.get(`${request.account}|${callerMachineId}`)) {
-                    throw new Error(`${STORAGE_ACCESS_DENIED} Machine has no access to this account. Machine ${callerMachineId}, account ${JSON.stringify(request.account)}`);
-                }
-                let record: TrustRecord = {
-                    account: request.account,
-                    machineId: request.machineId,
-                    ip: request.ip,
-                    time: Date.now(),
-                };
-                await trust.set(`${request.account}|${request.machineId}`, record);
-                return record;
-            }
-        }
-        throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
+        return { machineId, ip, hasAccess: true, trustedMachines: await getTrustedMachines() };
     }
 
     /** Admin (so only this machine's own processes can call it): the buckets this process has loaded. A deploy successor asks its predecessor for this, so it activates exactly the buckets that are in use instead of every bucket on disk. */
     async adminListActiveBuckets(): Promise<{ account: string; bucketName: string }[]> {
         return getActiveBucketKeys();
-    }
-    async adminListRequests(config: { ip: string }): Promise<AccessRequest[]> {
-        let requests = await getRequests();
-        return await requests.get(config.ip) || [];
-    }
-    async adminGrantAccess(config: { requestId: string }): Promise<TrustRecord> {
-        let requestId = config.requestId;
-        let trust = await getTrust();
-        let requests = await getRequests();
-        for (let ip of await requests.getKeys()) {
-            for (let request of await requests.get(ip) || []) {
-                if (request.requestId !== requestId) continue;
-                let record: TrustRecord = {
-                    account: request.account,
-                    machineId: request.machineId,
-                    ip: request.ip,
-                    time: Date.now(),
-                };
-                await trust.set(`${request.account}|${request.machineId}`, record);
-                return record;
-            }
-        }
-        throw new Error(`No access request found with id ${JSON.stringify(requestId)}. It may have already been granted or expired.`);
     }
 
     @assertValidArgs
@@ -586,13 +505,8 @@ export const RemoteStorageController = SocketFunction.register(
     () => ({
         ping: {},
         authenticate: {},
-        requestAccess: {},
         getAccessState: {},
-        listRequestsForIP: { hooks: [accountAccess] },
-        grantAccess: {},
-        adminListRequests: { hooks: [adminAccess] },
         adminListActiveBuckets: { hooks: [adminAccess] },
-        adminGrantAccess: { hooks: [adminAccess] },
         get2: { hooks: [accountAccess] },
         set: { hooks: [accountAccess] },
         del: { hooks: [accountAccess] },

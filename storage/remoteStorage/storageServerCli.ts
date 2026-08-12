@@ -1,5 +1,6 @@
 import { hostStorageServer } from "./storageServer";
 import { getArg, getFlag } from "./cliArgs";
+import { keysRepo } from "../../security/machines/machines";
 
 // Hosts a storage server from the command line (via the storageserver bin, see package.json).
 
@@ -11,6 +12,19 @@ process.on("uncaughtException", (error) => {
 });
 
 async function main() {
+    // Checked before anything is hosted. Who may talk to this server comes from the authorized_keys
+    // repo, so a machine without one would start up and refuse every caller with an error about a
+    // repo, which is a confusing way to learn the machine was never set up.
+    try {
+        let { repoPath, sourceURL } = await keysRepo();
+        console.log(`Trusting the machines in ${sourceURL} (${repoPath})`);
+    } catch (e) {
+        throw new Error(
+            `This machine has no authorized_keys repo, so it has no way to know which machines to`
+            + ` trust, and every caller would be refused.\n${e}`
+        );
+    }
+
     let url = getArg("url");
     if (!url) throw new Error(`--url is required (ex: --url https://storage.example.com:4444)`);
     let folder = getArg("folder");

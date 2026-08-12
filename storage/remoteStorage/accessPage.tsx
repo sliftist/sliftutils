@@ -6,10 +6,10 @@ import { observer } from "../../render-utils/observer";
 import { isNode } from "socket-function/src/misc";
 import { css } from "typesafecss";
 import { SocketFunction } from "socket-function/SocketFunction";
-import { RemoteStorageController, AccessState, AccessRequest } from "./storageController";
+import { RemoteStorageController, AccessState } from "./storageController";
 import { authenticateStorage } from "./ArchivesRemote";
 
-// The storage server's access page. Visit https://<storageDomain>:<port>/<accountName> to request access to that account for this browser's machine identity. Once granted, lists the machines that have access. To approve someone else's request, the user must type in the requester's IP — pending requests are NEVER shown unsolicited (so a trusted user can't accidentally approve a random machine's request).
+// The storage server's access page. Visit https://<storageDomain>:<port>/<accountName> to see whether this browser's machine identity has access, and if not, the one command that grants it. Nothing is requested or approved here: trust lives in the signed authorized_keys repo, so access is granted by someone running addmachine there with the hardware key, and this page only reports what that repo says.
 
 const REFRESH_INTERVAL = 1000 * 15;
 const COPIED_RESET_DELAY = 2000;
@@ -45,11 +45,6 @@ class AccessPage extends preact.Component {
         account: "",
         state: undefined as AccessState | undefined,
         error: "",
-        lookupIp: "",
-        lookupResults: undefined as { ip: string; requests: AccessRequest[] } | undefined,
-        lookupError: "",
-        looking: false,
-        granting: "",
     });
 
     componentDidMount() {
@@ -82,42 +77,9 @@ class AccessPage extends preact.Component {
     }
     private async refresh(account: string) {
         let controller = await this.controller();
-        await controller.requestAccess({ account });
         this.synced.state = await controller.getAccessState({ account });
         this.synced.error = "";
     }
-
-    private lookupIP = async () => {
-        let ip = this.synced.lookupIp.trim();
-        if (!ip) return;
-        this.synced.looking = true;
-        this.synced.lookupError = "";
-        try {
-            let controller = await this.controller();
-            let requests = await controller.listRequestsForIP({ account: this.synced.account, ip });
-            this.synced.lookupResults = { ip, requests };
-        } catch (e) {
-            this.synced.lookupError = String(e);
-        } finally {
-            this.synced.looking = false;
-        }
-    };
-
-    private approve = async (request: AccessRequest) => {
-        this.synced.granting = request.requestId;
-        try {
-            let controller = await this.controller();
-            await controller.grantAccess({ requestId: request.requestId });
-            if (this.synced.lookupResults) {
-                this.synced.lookupResults.requests = this.synced.lookupResults.requests.filter(r => r.requestId !== request.requestId);
-            }
-            await this.refresh(this.synced.account);
-        } catch (e) {
-            this.synced.lookupError = String(e);
-        } finally {
-            this.synced.granting = "";
-        }
-    };
 
     render() {
         let synced = this.synced;
@@ -125,79 +87,40 @@ class AccessPage extends preact.Component {
         if (!account) {
             return <div className={css.vbox(8).pad2(16)}>
                 <div>Remote storage server.</div>
-                <div>Visit /(account name) to request access to an account for this browser.</div>
+                <div>Visit /(account name) to see whether this browser's machine has access to an account.</div>
             </div>;
         }
         return <div className={css.vbox(12).pad2(16)}>
             <div>Storage account: {account}</div>
             {error && <div>Error: {error}</div>}
-            {!state && !error && <div>Requesting access...</div>}
+            {!state && !error && <div>Checking access...</div>}
             {state && !state.hasAccess && <div className={css.vbox(8)}>
-                <div>This machine ({state.machineId}, ip {state.ip}) does NOT have access yet.</div>
-                <div>An access request has been made. To grant it, run this command:</div>
-                {state.grantAccessCommand && <CopyableCommand command={state.grantAccessCommand} />}
+                <div>This machine ({state.machineId}, ip {state.ip}) does NOT have access.</div>
+                {state.reason && <div>{state.reason}</div>}
+                <div>Run this in the authorized_keys repo, on a machine with the signing key:</div>
+                {state.addMachineCommand && <CopyableCommand command={state.addMachineCommand} />}
                 <div>This page rechecks every {REFRESH_INTERVAL / 1000} seconds.</div>
             </div>}
             {state && state.hasAccess && <div className={css.vbox(16)}>
                 <div>This machine ({state.machineId}, ip {state.ip}) has access.</div>
                 <div className={css.vbox(6)}>
-                    <div>Machines with access:</div>
+                    <div>Trusted machines:</div>
                     <table>
                         <thead>
                             <tr>
                                 <th className={css.pad2(8, 2).textAlign("left")}>Machine</th>
-                                <th className={css.pad2(8, 2).textAlign("left")}>IP</th>
-                                <th className={css.pad2(8, 2).textAlign("left")}>Granted</th>
+                                <th className={css.pad2(8, 2).textAlign("left")}>Allowed from</th>
+                                <th className={css.pad2(8, 2).textAlign("left")}>Added</th>
                             </tr>
                         </thead>
                         <tbody>
                             {(state.trustedMachines || []).map(m => <tr key={m.machineId}>
                                 <td className={css.pad2(8, 2)}>{m.machineId}</td>
-                                <td className={css.pad2(8, 2)}>{m.ip}</td>
-                                <td className={css.pad2(8, 2)}>{new Date(m.time).toLocaleString()}</td>
+                                <td className={css.pad2(8, 2)}>{m.ips.join(", ")}</td>
+                                <td className={css.pad2(8, 2)}>{m.addedAt}</td>
                             </tr>)}
                         </tbody>
                     </table>
-                </div>
-                <div className={css.vbox(6)}>
-                    <div>Approve request</div>
-                    <div className={css.hbox(8).alignItems("center")}>
-                        <input
-                            placeholder="ip"
-                            value={synced.lookupIp}
-                            onInput={e => { synced.lookupIp = (e.currentTarget as HTMLInputElement).value; }}
-                            onKeyDown={e => { if (e.key === "Enter") void this.lookupIP(); }}
-                        />
-                        <button disabled={synced.looking || !synced.lookupIp.trim()} onClick={this.lookupIP}>
-                            search
-                        </button>
-                    </div>
-                    {synced.lookupError && <div>Error: {synced.lookupError}</div>}
-                    {synced.lookupResults && synced.lookupResults.requests.length === 0 && <div>
-                        No pending requests for {synced.lookupResults.ip} on this account.
-                    </div>}
-                    {synced.lookupResults && synced.lookupResults.requests.length > 0 && <table>
-                        <thead>
-                            <tr>
-                                <th className={css.pad2(8, 2).textAlign("left")}>Machine</th>
-                                <th className={css.pad2(8, 2).textAlign("left")}>IP</th>
-                                <th className={css.pad2(8, 2).textAlign("left")}>Requested</th>
-                                <th className={css.pad2(8, 2).textAlign("left")}></th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {synced.lookupResults.requests.map(r => <tr key={r.requestId}>
-                                <td className={css.pad2(8, 2)}>{r.machineId}</td>
-                                <td className={css.pad2(8, 2)}>{r.ip}</td>
-                                <td className={css.pad2(8, 2)}>{new Date(r.time).toLocaleString()}</td>
-                                <td className={css.pad2(8, 2)}>
-                                    <button disabled={!!synced.granting} onClick={async () => this.approve(r)}>
-                                        {synced.granting === r.requestId && "Approving..." || "Approve"}
-                                    </button>
-                                </td>
-                            </tr>)}
-                        </tbody>
-                    </table>}
                 </div>
             </div>}
         </div>;
