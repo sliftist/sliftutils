@@ -266,9 +266,15 @@ export async function isMachineAccepted(config: { machineId: string; ip: string 
     await syncRevocations(sourceURL);
     let unrevokes = await readUnrevokes(sourceURL).catch(() => ({ pairs: new Map(), legacyIds: new Map() }));
     // An unrevoke is only honoured once it has waited out its hour, exactly as an ssh key's is.
+    // Any of the unrevokes covering the pair having served that hour is enough: a later file
+    // naming the same pair must not restart a wait that has already passed.
     let allowedAgain = async (pair: string) => {
-        let unrevokeId = unrevokes.pairs.get(pair);
-        return !!unrevokeId && await unrevokeInEffect(unrevokeId);
+        let allowed = false;
+        for (let unrevokeId of unrevokes.pairs.get(pair) || []) {
+            // Every one, not the first that answers, so each has its first sighting recorded.
+            allowed = await unrevokeInEffect(unrevokeId) || allowed;
+        }
+        return allowed;
     };
     let revocations = await readMachineRevocations(sourceURL);
     // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
