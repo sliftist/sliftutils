@@ -562,6 +562,17 @@ export class ArchivesBackblaze implements IArchives {
         } catch (err: any) {
             if (retries <= 0) throw err;
 
+            // A file that does not exist is an answer, not a failure. It is the one error here that
+            // cannot become anything else by asking again, so it is thrown at once instead of being
+            // slept on twice - callers turn it into undefined, which is what they were asking.
+            if (
+                err.stack.includes(`"not_found"`)
+                || err.stack.includes(`file_not_found`)
+                || err.stack.includes(`"status": 404`)
+            ) {
+                throw err;
+            }
+
             // If it's a 503 and it's been a minute since we last reset, then Wait and reset.
             if (
                 (err.stack.includes(`"status": 503`)
