@@ -16,6 +16,7 @@ export type SignedRequest<T> = {
         // real server, and the middleman cannot write requests of its own because it is not a
         // trusted machine.
         targetId: string;
+        targetIsMachineId?: boolean;
         // The thread certificate that signed this
         cert: string;
         // The machine CA that issued cert - the machineId comes from its common name
@@ -40,12 +41,13 @@ function dataHash(data: unknown) {
     return sha256.sha256(JSON.stringify(data));
 }
 
-export function signRequest<T>(domain: string, config: { targetId: string; data: T }): SignedRequest<T> {
+export function signRequest<T>(domain: string, config: { targetId: string; targetIsMachineId?: boolean; data: T }): SignedRequest<T> {
     let threadKeyCert = getThreadKeyCert(domain);
     let issuer = getIdentityCA(domain);
     let payload: SignedRequest<T>["payload"] = {
         time: Date.now(),
         targetId: config.targetId,
+        targetIsMachineId: config.targetIsMachineId,
         cert: threadKeyCert.cert.toString(),
         certIssuer: issuer.cert.toString(),
         data: config.data,
@@ -96,9 +98,10 @@ export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownId
 }
 
 /** Returns the machineId that replied. Throws if the signature, certificate chain, or time do
-    not check out, or if the reply does not answer the request we actually sent. On node the
-    replying machine must also be one of the trusted machines - the browser has no machine list,
-    so there this check is skipped. */
+    not check out, or if the reply does not answer the request we actually sent. When the request
+    said targetIsMachineId, the machine that replied must be the machine the request was
+    addressed to. On node the replying machine must also be one of the trusted machines - the
+    browser has no machine list, so there that check is skipped. */
 export async function verifyReply(domain: string, request: SignedRequest<unknown>, reply: SignedReply): Promise<{ machineId: string }> {
     let { signature, payload } = reply;
     let signedThreshold = Date.now() - MAX_SIGNED_AGE;
@@ -113,6 +116,9 @@ export async function verifyReply(domain: string, request: SignedRequest<unknown
         throw new Error(`Reply answers a different request than the one we sent`);
     }
     let machineId = getMachineId(getCommonName(payload.certIssuer), domain);
+    if (request.payload.targetIsMachineId && machineId !== request.payload.targetId) {
+        throw new Error(`Reply is from machine ${machineId}, but the request was addressed to machine ${request.payload.targetId}`);
+    }
     if (isNode()) {
         if (!(await getTrustedMachines()).some(machine => machine.machineId === machineId)) {
             throw new Error(`Reply is signed by ${machineId}, which is not a trusted machine`);
