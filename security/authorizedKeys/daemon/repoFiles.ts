@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { deriveRevokeKey, findRevokeKey, REVOKE_KEY_LABEL, revokeKeyPath, revokeRepoPath, revokeRepoURL } from "../revokeSource";
 import { findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
-import { cloneRepo, repoIsUsable, runGit } from "./git";
+import { cloneRepo, repoIsUsable, runGit, setGitRef } from "./git";
 
 /** Reading a repo, made to look like reading a directory. A caller asks for a file and gets its
     contents; keeping a checkout on disk, cloning it once and pulling it since, is this module's
@@ -84,9 +84,7 @@ export async function syncRepoFiles(repo: RepoRef) {
     if (remoteSha && remoteSha === localHead.stdout.trim()) {
         return;
     }
-    await runGit({ args: ["fetch", "--prune", "origin"], cwd: repoPath, keyPath });
-    await runGit({ args: ["reset", "--hard", `origin/${branch}`], cwd: repoPath, keyPath });
-    await runGit({ args: ["clean", "-fdx"], cwd: repoPath, keyPath });
+    await setGitRef({ repoPath, gitRef: `origin/${branch}`, keyPath });
 }
 
 /** Throws when there is no checkout at all. "I have never managed to read this repo" and "this
