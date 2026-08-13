@@ -18,7 +18,7 @@ import { measureBlock, measureFnc, measureWrap } from "socket-function/src/profi
 import { getNodeIdDomain, getNodeIdDomainMaybeUndefined, getNodeIdLocation } from "socket-function/src/nodeCache";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { resetAllNodeCallFactories } from "socket-function/src/nodeCache";
-import { getKeyStore, DEV_getKeyStorePath } from "./persistentLocalStorage";
+import { getKeyStore, DEV_getKeyStorePath, DEV_listKeyStoreApps } from "./persistentLocalStorage";
 import { ellipsize } from "../strings";
 
 setFlag(require, "node-forge", "allowclient", true);
@@ -39,6 +39,11 @@ function getIdentityStore(domain: string) {
 // another machine over ssh). NEVER access this unless explicitly given permission.
 export function DEV_getIdentityFilePath(domain: string): string {
     return DEV_getKeyStorePath({ appName: domain, key: identityStorageKey });
+}
+
+// Every domain this machine has an identity under. Machine maintenance only, like the path above.
+export function DEV_listIdentityDomains(): string[] {
+    return DEV_listKeyStoreApps(identityStorageKey);
 }
 
 export interface X509KeyPair { domain: string; cert: Buffer; key: Buffer; }
