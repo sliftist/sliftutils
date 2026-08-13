@@ -3,11 +3,10 @@ import os from "os";
 import path from "path";
 import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
 import { revokeRepo, syncRepoFiles } from "../authorizedKeys/daemon/repoFiles";
-import { listRepoDir, readRepoFile } from "../authorizedKeys/daemon/repoFiles";
-import { newRevocationId, pairKey, readRevocationFiles, readUnrevokes } from "../authorizedKeys/daemon/revocation";
+import { newRevocationId } from "../authorizedKeys/daemon/revocation";
 import { runGit, syncRepo } from "../authorizedKeys/daemon/git";
 import { ensureRevokeKey } from "../authorizedKeys/daemon/repoFiles";
-import { readSignedRepo } from "../authorizedKeys/daemon/trust";
+import { isIdentityFrozen, isPairRevoked, isPairUnrevoked, noteRevocation, readSignedRepo } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
@@ -81,8 +80,8 @@ export async function getMachines(repoPath?: string): Promise<MachineState[]> {
     read - an unsigned machines/*.json is not evidence of anything, so readSignedRepo has already
     left it out. */
 async function readTrustedMachines() {
-    let { repoPath } = await keysRepo();
-    let { files } = await readSignedRepo(repoPath);
+    let { repoPath, sourceURL } = await keysRepo();
+    let { files } = await readSignedRepo({ repoPath, sourceURL });
     let machines: MachineState[] = [];
     for (let [filePath, contents] of files) {
         let name = filePath.startsWith(`${MACHINES_DIR}/`) && filePath.slice(MACHINES_DIR.length + 1) || "";
@@ -237,43 +236,17 @@ async function readMachines(repoPath: string) {
 
 let lastRevokeSync = 0;
 
-/** Pulled at most once a REVOKE_SYNC_INTERVAL, because this is asked per request. A sync that
-    fails leaves the checkout we already have, which is the safe direction: revocations we know
-    about stay known. */
+/** Pulls the keys repo and its revoke repo, at most once a REVOKE_SYNC_INTERVAL, because this is
+    asked per request. Both, since either changing changes the answer: the keys repo carries the
+    machines and unrevokes, the revoke repo carries the revocations. A sync that fails leaves the
+    checkouts we already have. */
 async function syncRevocations(sourceURL: string) {
     if (Date.now() - lastRevokeSync < REVOKE_SYNC_INTERVAL) {
         return;
     }
     lastRevokeSync = Date.now();
-    try {
-        await syncRepoFiles(revokeRepo(sourceURL));
-    } catch (e) {
-        console.log(`Could not read ${revokeRepoURL(sourceURL)}, using the revocations already here. ${e}`);
-    }
-}
-
-/** Machine revocations, read out of the revoke repo the same way key revocations are. */
-async function readMachineRevocations(sourceURL: string) {
-    let repo = revokeRepo(sourceURL);
-    let revocations: { revocationId: string; machineId: string; ip: string }[] = [];
-    for (let name of await listRepoDir(repo, REVOCATIONS_DIR)) {
-        if (!name.endsWith(".json")) {
-            continue;
-        }
-        try {
-            let parsed = JSON.parse(await readRepoFile(repo, path.join(REVOCATIONS_DIR, name)) || "");
-            if (parsed.machineId) {
-                revocations.push({
-                    revocationId: parsed.revocationId || name.replace(/\.json$/, ""),
-                    machineId: parsed.machineId,
-                    ip: parsed.ip || "",
-                });
-            }
-        } catch (e) {
-            console.log(`Ignoring unreadable revocation ${name}. ${e}`);
-        }
-    }
-    return revocations;
+    await syncRepo(sourceURL).catch(e => console.log(`Could not sync ${sourceURL}, using the checkout already here. ${e}`));
+    await syncRepoFiles(revokeRepo(sourceURL)).catch(e => console.log(`Could not sync ${revokeRepoURL(sourceURL)}, using the revocations already absorbed. ${e}`));
 }
 
 /** What to run to trust a machine that has just been refused.
@@ -342,6 +315,7 @@ async function recordMachineRevocation(config: {
         console.log(`Could not push the revocation of ${machineId} from ${ip}. ${(push.stdout + push.stderr).trim()}`);
         return;
     }
+    noteRevocation(revocationId, machineId, ip);
     console.log(`Revoked ${machineId} from ${ip}, ${revocationId}`);
 
     // Said by whoever wrote the revocation, once, the same as for an ssh key. Machines that only
@@ -396,35 +370,15 @@ export async function isMachineAccepted(config: {
             return { verdict: { accepted: true, reason: "" }, froze: false };
         }
         let { sourceURL } = await keysRepo();
-        // Verified before it is believed, and cached, since this is asked once per request.
+        await syncRevocations(sourceURL);
+        // The list has revocations already applied - readSignedRepo drops frozen machines - so a
+        // machine in it is trusted, and a machine missing from it is either unknown or frozen.
         let machine = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
         if (!machine) {
+            if (isIdentityFrozen(machineId)) {
+                return { verdict: { accepted: false, reason: `that machine is frozen, it was used from an address it is not allowed from` }, froze: false };
+            }
             return { verdict: { accepted: false, reason: `that machine is not trusted. ${addMachineCommand({ machineId, ip, domain })}` }, froze: false };
-        }
-
-        await syncRevocations(sourceURL);
-        let unrevokes = await readUnrevokes(sourceURL).catch(() => ({ pairs: new Map(), legacyIds: new Map() }));
-        // An unrevoke counts as soon as it is seen. It is signed, so writing one already takes the
-        // hardware key, and anyone holding that can sign anything at all - a wait before honouring it
-        // guards against an attacker who has no need of it.
-        let allowedAgain = (pair: string) => !!unrevokes.pairs.get(pair)?.length;
-        let revocations = await readMachineRevocations(sourceURL);
-        // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
-        // ssh key is out everywhere rather than only from the address it was misused from.
-        let frozenFrom = "";
-        for (let revocation of revocations) {
-            if (revocation.machineId !== machineId) {
-                continue;
-            }
-            if (!allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))) {
-                frozenFrom = revocation.ip;
-            }
-        }
-        if (frozenFrom) {
-            return {
-                verdict: { accepted: false, reason: `that machine is frozen, it was used from ${frozenFrom} which it is not allowed from` },
-                froze: false,
-            };
         }
 
         if (machine.ips.includes(ip)) {
@@ -433,10 +387,7 @@ export async function isMachineAccepted(config: {
 
         // Listed, but talking to us from somewhere it should not be. Recorded once for this machine
         // and address, so being talked to repeatedly does not write repeatedly.
-        let pair = pairKey({ fingerprint: machineId, ip });
-        let alreadyRecorded = revocations.some(revocation =>
-            pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }) === pair);
-        if (!alreadyRecorded && !allowedAgain(pair)) {
+        if (!isPairRevoked(machineId, ip) && !isPairUnrevoked(machineId, ip)) {
             await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
             return { verdict: { accepted: false, reason: `that machine is not allowed from ${ip}, so it is now frozen everywhere` }, froze: true };
         }

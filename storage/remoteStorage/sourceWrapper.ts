@@ -171,7 +171,7 @@ export class SourceWrapper {
         let waiting = await remote.waitingForAccess();
         this.accessCache = { hasAccess: !waiting, time: Date.now() };
         if (waiting) {
-            console.warn(`No access to storage account for ${this.config.url} (our machine ${waiting.machineId}, ip ${waiting.ip}). Reading via the public URL form where possible. Grant access at ${waiting.link}`);
+            console.warn(`No access to storage account for ${this.config.url} (our machine ${waiting.machineId}, ip ${waiting.ip}). ${waiting.reason} Reading via the public URL form where possible. ${waiting.addMachineCommand}`);
         }
         return !waiting;
     }
