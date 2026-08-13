@@ -443,20 +443,18 @@ export async function isMachineAccepted(config: {
         return { verdict: { accepted: false, reason: `that machine is not allowed from ${ip}` }, froze: false };
     };
 
-    let attempt = async (secondTry: number): Promise<MachineVerdict> => {
-        let { verdict, froze } = await evaluate();
-        // An accept, or a rejection that just froze the machine, is the final word. So is a second
-        // try - going further would make it a third and never stop.
-        if (verdict.accepted || froze || secondTry === 2) {
-            return verdict;
-        }
-        // Any other rejection might be on a stale list. Re-read it - but read it fresh at most once
-        // a minute, so a burst of bad callers cannot make us re-read on every one of them.
-        if (Date.now() - lastMachinesInvalidation > MACHINES_INVALIDATION_INTERVAL) {
-            lastMachinesInvalidation = Date.now();
-            trustedMachines.reset();
-        }
-        return attempt(2);
-    };
-    return attempt(1);
+    let { verdict, froze } = await evaluate();
+    // An accept, or a rejection that just froze the machine, is the final word. Any other rejection
+    // might just be a stale list - a machine added seconds ago we have not caught up to - so it is
+    // worth one fresh look.
+    if (verdict.accepted || froze) {
+        return verdict;
+    }
+    // Re-read the list at most once a minute, so a burst of bad callers cannot make us re-read on
+    // every one of them, then take whatever the fresh look says as final.
+    if (Date.now() - lastMachinesInvalidation > MACHINES_INVALIDATION_INTERVAL) {
+        lastMachinesInvalidation = Date.now();
+        trustedMachines.reset();
+    }
+    return (await evaluate()).verdict;
 }
