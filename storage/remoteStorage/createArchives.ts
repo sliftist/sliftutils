@@ -419,58 +419,69 @@ export class ArchivesChain implements IArchives {
         let deadline = Date.now() + COVERING_RETRY_TIMEOUT;
         // Sources that failed during this call - with fallbacks, the next attempt covers their routes with the next source holding them instead
         let failed = new Set<SourceWrapper>();
+        // Why each of them failed, kept for the whole call: when the fallbacks run out, the error names every source that was tried and what each one said, not just whichever covering set happened to be last
+        let allFailures = new Map<SourceWrapper, Error>();
         let tries = 0;
         while (true) {
             tries++;
             let state = await this.state.getState();
+            let selected: SourceWrapper[] | undefined;
+            let coverGap: Error | undefined;
+            try {
+                selected = this.selectCoveringSources(state, { fallbacks: config?.fallbacks, exclude: failed });
+            } catch (e) {
+                coverGap = e as Error;
+            }
+            if (!selected) {
+                let described = [...allFailures].map(([source, sourceError]) => `${source.getDebugName()}: ${sourceError.message ?? sourceError}`).join(" | ");
+                let error = new Error(
+                    `${operation} cannot run: ${coverGap!.message}`
+                    + (described ? ` ${allFailures.size} source(s) failed first: ${described}.` : "")
+                    + ` Fallbacks = ${!!config?.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`
+                );
+                // With fallbacks the loop only lands here after every substitute was tried, so waiting will not produce a new source - the caller gets the whole cascade now
+                if (config?.fallbacks && allFailures.size) {
+                    throw error;
+                }
+                if (Date.now() >= deadline) {
+                    throw error;
+                }
+                console.error(`${error.message}. Retrying in ${COVERING_RETRY_DELAY / 1000}s (giving up at ${formatDateTimeDetailed(deadline)}).`);
+                void this.state.recheckAvailability();
+                await delay(COVERING_RETRY_DELAY);
+                continue;
+            }
+            let covering = selected;
             // Errors name the OPERATION and the SPECIFIC sources that failed - "the find failed because source X is unavailable", never an anonymous failure attributed to the whole chain
-            let outcome = await (async (): Promise<{ values: T[] } | { error: Error }> => {
-                let covering: SourceWrapper[];
+            let values: T[] = [];
+            let failures: { source: SourceWrapper; error: Error }[] = [];
+            let time = Date.now();
+            await Promise.all(covering.map(async (source, index) => {
+                let api = source.api;
+                if (!api) {
+                    failures.push({ source, error: new Error(`URL-only access, which cannot serve ${operation}`) });
+                    return;
+                }
                 try {
-                    covering = this.selectCoveringSources(state, { fallbacks: config?.fallbacks, exclude: failed });
+                    values.push(await run(api));
                 } catch (e) {
-                    return { error: new Error(`${operation} cannot run: ${(e as Error).message}`) };
+                    if (!source.isConnected()) source.noteFailure();
+                    failures.push({ source, error: e as Error });
+                    console.log(`Failed after ${formatTime(Date.now() - time)} index ${index} of ${covering.length}`);
                 }
-                let values: T[] = [];
-                let failures: { source: SourceWrapper; error: Error }[] = [];
-                let time = Date.now();
-                await Promise.all(covering.map(async (source, index) => {
-                    let api = source.api;
-                    if (!api) {
-                        failed.add(source);
-                        failures.push({ source, error: new Error(`URL-only access, which cannot serve ${operation}`) });
-                        return;
-                    }
-                    try {
-                        values.push(await run(api));
-                    } catch (e) {
-                        if (!source.isConnected()) source.noteFailure();
-                        failed.add(source);
-                        failures.push({ source, error: e as Error });
-                        console.log(`Failed after ${formatTime(Date.now() - time)} index ${index} of ${covering.length}`);
-                    }
-                }));
-                if (!failures.length) return { values };
-                if (failures.length === 1) {
-                    return { error: new Error(`${operation} failed because source ${failures[0].source.getDebugName()} is unavailable: ${failures[0].error.message ?? failures[0].error}. Fallbacks = ${!!config?.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`) };
-                }
-                return { error: new Error(`${operation} failed because ${failures.length} of the ${covering.length} covering sources are unavailable: ${failures.map(x => `${x.source.getDebugName()}: ${x.error.message ?? x.error}`).join(" | ")}. Fallbacks = ${!!config?.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`) };
-            })();
-            if ("values" in outcome) return outcome.values;
-            let error = outcome.error;
-            // Substitution comes BEFORE the deadline check: a single connect timeout can eat the entire deadline, and giving up then - without ever trying the substitute that fallbacks exist for - throws exactly when falling back matters most. Substitution cannot loop past the deadline forever: every pass adds its failures to `failed`, so the substitutes run out with the sources.
-            if (config?.fallbacks && failed.size) {
-                let substitutable = false;
-                try {
-                    this.selectCoveringSources(state, { fallbacks: true, exclude: failed });
-                    substitutable = true;
-                } catch { }
-                if (substitutable) {
-                    console.warn(`(retrying with fallbacks) ${error.message}`);
-                    continue;
-                }
-                // No substitute covers the failed routes - retry the failed sources themselves after the delay
-                failed.clear();
+            }));
+            if (!failures.length) return values;
+            for (let failure of failures) {
+                failed.add(failure.source);
+                allFailures.set(failure.source, failure.error);
+            }
+            let error = failures.length === 1
+                ? new Error(`${operation} failed because source ${failures[0].source.getDebugName()} is unavailable: ${failures[0].error.message ?? failures[0].error}. Fallbacks = ${!!config?.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`)
+                : new Error(`${operation} failed because ${failures.length} of the ${covering.length} sources covering this attempt are unavailable: ${failures.map(x => `${x.source.getDebugName()}: ${x.error.message ?? x.error}`).join(" | ")}. Fallbacks = ${!!config?.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`);
+            // Substitution comes BEFORE the deadline check: a single connect timeout can eat the entire deadline, and giving up then - without ever trying the substitute that fallbacks exist for - throws exactly when falling back matters most. The loop keeps substituting for as long as a covering set exists; every pass adds its failures to `failed`, so it always terminates at the no-covering branch above, which throws everything collected here.
+            if (config?.fallbacks) {
+                console.warn(`(retrying with fallbacks) ${error.message}`);
+                continue;
             }
             if (Date.now() >= deadline) {
                 throw error;
