@@ -106,14 +106,13 @@ export class ArchivesRemote implements IArchives {
     }
 
     // Returns undefined if this machine has access to the account. Otherwise returns our machineId + ip as the server sees them, why we were refused, and the exact command that grants access.
-    public async waitingForAccess(): Promise<{ machineId: string; ip: string; reason: string; addMachineCommand: string } | undefined> {
+    public async waitingForAccess(): Promise<{ machineId: string; ip: string; reason: string } | undefined> {
         let state = await this.callAuthed(() => this.controller.getAccessState({ account: this.account }));
         if (state.hasAccess) return undefined;
         return {
             machineId: state.machineId,
             ip: state.ip,
             reason: state.reason || "",
-            addMachineCommand: state.addMachineCommand || "",
         };
     }
 
@@ -127,7 +126,7 @@ export class ArchivesRemote implements IArchives {
         if (Date.now() - this.lastDeniedLog < timeInMinute) return;
         let state = await this.callAuthed(() => this.controller.getAccessState({ account: this.account }));
         this.lastDeniedLog = Date.now();
-        console.log(`No access to storage account ${JSON.stringify(this.account)} on ${this.parsed.address}:${this.parsed.port} (our machine ${state.machineId}, ip ${state.ip}). ${state.reason || ""} Grant it with: ${state.addMachineCommand || ""}`);
+        console.log(`No access to storage account ${JSON.stringify(this.account)} on ${this.parsed.address}:${this.parsed.port}. ${state.reason || ""}`);
     }
 
     // Runs a call, authenticating (and re-authenticating after reconnects) and waiting for account access as needed. With waitForAccess false, denied calls throw immediately instead - but the access request is still registered (in the background), so the denial is grantable.

@@ -257,7 +257,7 @@ async function syncRevocations(sourceURL: string) {
     the machine that owns the repo, so telling them costs nothing. */
 export function addMachineCommand(config: { machineId: string; ip: string; domain?: string }) {
     let { machineId, ip, domain } = config;
-    return `To trust it, run: yarn addmachine ${domain || "<domain>"} ${machineId} ${ip} git`;
+    return `To trust ${machineId}, run: yarn addmachine ${domain || "<domain>"} ${machineId} ${ip} git`;
 }
 
 /** Sends the one notification this file is allowed to send, when it can.
@@ -322,13 +322,13 @@ async function recordMachineRevocation(config: {
     // read it later say nothing, or one event would be reported by every machine that saw it.
     await notifyBestEffort(
         `SUSPICIOUS IP ${ip} FROZE MACHINE ${machineId}`,
-        `A machine we trust talked to us from ${ip}, which is not an address it is allowed to talk`
-        + ` from. It proved it holds that machine's key, so either someone else has a copy of it,`
-        + ` or that machine's address changed.`
-        + `\n\nIt is frozen everywhere now, and nothing accepts it.`
+        `Trusted machine ${machineId} talked to us from ${ip}, an address ${machineId} is not`
+        + ` allowed from. The caller proved possession of ${machineId}'s key, so either someone`
+        + ` else has a copy of the key, or the machine's address changed.`
+        + `\n\nMachine ${machineId} is frozen everywhere now, and nothing accepts calls from ${machineId}.`
         + `\n\nIf this was an attack, remove \`machines/${machineId}.json\` from \`${sourceURL}\` now.`
-        + `\nIf it was legitimate, run \`yarn unrevoke git\` in that repo. It allows ${ip} for that`
-        + ` machine, and takes effect as each machine picks it up.`
+        + `\nIf the new address is legitimate, run \`yarn unrevoke git\` in \`${sourceURL}\`. The`
+        + ` unrevoke allows ${machineId} from ${ip}, and takes effect as each machine picks it up.`
         + `\n\nmachine: \`${machineId}\``
         + `\nfrozen by: \`${hostLabel}\``
     );
@@ -376,9 +376,9 @@ export async function isMachineAccepted(config: {
         let machine = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
         if (!machine) {
             if (isIdentityFrozen(machineId)) {
-                return { verdict: { accepted: false, reason: `that machine is frozen, it was used from an address it is not allowed from` }, froze: false };
+                return { verdict: { accepted: false, reason: `Machine ${machineId} is frozen, having been used from an unapproved address.` }, froze: false };
             }
-            return { verdict: { accepted: false, reason: `that machine is not trusted. ${addMachineCommand({ machineId, ip, domain })}` }, froze: false };
+            return { verdict: { accepted: false, reason: `Machine ${machineId} is not trusted. ${addMachineCommand({ machineId, ip, domain })}` }, froze: false };
         }
 
         if (machine.ips.includes(ip)) {
@@ -389,9 +389,9 @@ export async function isMachineAccepted(config: {
         // and address, so being talked to repeatedly does not write repeatedly.
         if (!isPairRevoked(machineId, ip) && !isPairUnrevoked(machineId, ip)) {
             await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
-            return { verdict: { accepted: false, reason: `that machine is not allowed from ${ip}, so it is now frozen everywhere` }, froze: true };
+            return { verdict: { accepted: false, reason: `Machine ${machineId} is not allowed from ${ip}, and is now frozen everywhere.` }, froze: true };
         }
-        return { verdict: { accepted: false, reason: `that machine is not allowed from ${ip}` }, froze: false };
+        return { verdict: { accepted: false, reason: `Machine ${machineId} is not allowed from ${ip}.` }, froze: false };
     };
 
     let { verdict, froze } = await evaluate();

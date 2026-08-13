@@ -51,9 +51,8 @@ export type AccessState = {
     machineId: string;
     ip: string;
     hasAccess: boolean;
-    // Why not, and what to run about it, when there is no access.
+    // Why not, including the command that grants access, when there is no access.
     reason?: string;
-    addMachineCommand?: string;
     // Everything the repo trusts, when there is.
     trustedMachines?: MachineState[];
 };
@@ -123,7 +122,7 @@ async function requireAccess(account: string): Promise<string> {
     if (!verdict.accepted) {
         throw new Error(
             `${STORAGE_ACCESS_DENIED} ${verdict.reason}`
-            + ` Machine ${machineId}, address ${ip}, account ${JSON.stringify(account)}.`
+            + ` Machine ${machineId} was calling from ${ip}, for account ${JSON.stringify(account)}.`
         );
     }
     return machineId;
@@ -185,7 +184,6 @@ class RemoteStorageControllerBase {
                 ip,
                 hasAccess: false,
                 reason: verdict.reason,
-                addMachineCommand: `yarn addmachine ${rootDomain} ${machineId} ${ip} git`,
             };
         }
         return { machineId, ip, hasAccess: true, trustedMachines: await getTrustedMachines() };
