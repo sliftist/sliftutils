@@ -5,36 +5,32 @@ import { getTrustedMachines } from "./machines";
 
 const MAX_SIGNED_AGE = 5 * 60 * 1000;
 
-// A request says who it is from AND who it believes it is talking to. The targetId is whatever
-// both sides use to identify the server - an IP, a machineId, a threadId - and being inside the
-// signed payload is what stops a machine in the middle: a request addressed to someone else cannot
-// be replayed at the real server, and the middleman cannot write requests of its own because it is
-// not a trusted machine.
 export type SignedRequest<T> = {
     signature: string;
     payload: {
+        // When it was signed - anything older than MAX_SIGNED_AGE is refused
         time: number;
+        // Who the sender believes it is talking to: an IP, a machineId, a threadId - whatever
+        // both sides use to name the server. Being inside the signed payload is what stops a
+        // machine in the middle: a request addressed to someone else cannot be replayed at the
+        // real server, and the middleman cannot write requests of its own because it is not a
+        // trusted machine.
         targetId: string;
+        // The thread certificate that signed this
         cert: string;
+        // The machine CA that issued cert - the machineId comes from its common name
         certIssuer: string;
         data: T;
     };
 };
 
-// The reply echoes the request it answers, with the data collapsed to its hash - resending the
-// data would say nothing the hash does not. Signed by the replying thread's certificate, which
-// chains to its machine CA, which is where the machineId comes from.
 export type SignedReply<T> = {
     signature: string;
     payload: {
         time: number;
-        request: {
-            time: number;
-            targetId: string;
-            cert: string;
-            certIssuer: string;
-            dataHash: string;
-        };
+        // The request this reply answers, with the data collapsed to its hash - resending the
+        // data would say nothing the hash does not
+        request: Omit<SignedRequest<unknown>["payload"], "data"> & { dataHash: string };
         cert: string;
         certIssuer: string;
         data: T;
@@ -48,7 +44,7 @@ function dataHash(data: unknown) {
 export function signRequest<T>(domain: string, config: { targetId: string; data: T }): SignedRequest<T> {
     let threadKeyCert = getThreadKeyCert(domain);
     let issuer = getIdentityCA(domain);
-    let payload = {
+    let payload: SignedRequest<T>["payload"] = {
         time: Date.now(),
         targetId: config.targetId,
         cert: threadKeyCert.cert.toString(),
@@ -80,15 +76,10 @@ export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownId
 export function signReply<T>(domain: string, request: SignedRequest<unknown>, data: T): SignedReply<T> {
     let threadKeyCert = getThreadKeyCert(domain);
     let issuer = getIdentityCA(domain);
-    let payload = {
+    let { data: requestData, ...requestRest } = request.payload;
+    let payload: SignedReply<T>["payload"] = {
         time: Date.now(),
-        request: {
-            time: request.payload.time,
-            targetId: request.payload.targetId,
-            cert: request.payload.cert,
-            certIssuer: request.payload.certIssuer,
-            dataHash: dataHash(request.payload.data),
-        },
+        request: { ...requestRest, dataHash: dataHash(requestData) },
         cert: threadKeyCert.cert.toString(),
         certIssuer: issuer.cert.toString(),
         data,
@@ -108,13 +99,9 @@ export async function verifyReply<T>(domain: string, request: SignedRequest<unkn
     }
     verify(payload.cert, signature, payload);
     validateCertificate(domain, payload.cert, payload.certIssuer);
-    let echoed = payload.request;
-    if (echoed.time !== request.payload.time
-        || echoed.targetId !== request.payload.targetId
-        || echoed.cert !== request.payload.cert
-        || echoed.certIssuer !== request.payload.certIssuer
-        || echoed.dataHash !== dataHash(request.payload.data)
-    ) {
+    let { data: requestData, ...requestRest } = request.payload;
+    let expected: SignedReply<T>["payload"]["request"] = { ...requestRest, dataHash: dataHash(requestData) };
+    if (JSON.stringify(payload.request) !== JSON.stringify(expected)) {
         throw new Error(`Reply answers a different request than the one we sent`);
     }
     let machineId = getMachineId(getCommonName(payload.certIssuer), domain);
