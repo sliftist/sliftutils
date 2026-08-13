@@ -24,13 +24,7 @@ import { getTrustedMachines } from "./machines";
 export type SignedRequest<T> = {
     signature: string;
     payload: {
-        // Who the sender believes it is talking to, which should be the resolved IP it dialed.
-        // Being inside the signed payload scopes the request to that one server, and an IP scopes
-        // it better than any name does: an attacker who takes the IP takes it FROM us, so no
-        // legitimate machine answers to it any more and the request they intercepted validates
-        // nowhere - and rewriting it to name a machine that would accept it breaks the signature.
-        // A hostname or a machineId is still legitimately held by the real machine, so a request
-        // naming one can be forwarded there and used.
+        // The ip we are talking to.
         targetId: string;
         // The thread certificate that signed this
         cert: string;
