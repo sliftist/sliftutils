@@ -35,9 +35,7 @@ export function parseStorageUrl(url: string): { address: string; port: number } 
     return { address: u.hostname, port: +u.port || 443 };
 }
 
-// Authenticates a connection to a storage server with this machine's certs.ts identity. Signs with
-// the thread cert, never the CA key itself - the CA only ever signs certificates, the same way
-// changeIdentity does it.
+// Authenticates a connection to a storage server with this machine's certs.ts identity
 export async function authenticateStorage(config: { address: string; port: number; nodeId: string }): Promise<{ machineId: string; ip: string }> {
     // hostServer nodeIds are machine-specific, so connections by domain must target "any server at this address" (which is how browsers always connect)
     SocketFunction.ENABLE_CLIENT_MODE = true;

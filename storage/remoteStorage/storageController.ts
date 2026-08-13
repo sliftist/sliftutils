@@ -150,9 +150,6 @@ class RemoteStorageControllerBase {
         if (tokenDomain !== domain) {
             throw new Error(`Auth token is for server ${JSON.stringify(server)}, but this server is ${JSON.stringify(`${domain}:${port}`)}`);
         }
-        // The full chain check certs.ts already does: the thread cert is signed by the issuer, the
-        // issuer is a valid CA for this domain, and every common name matches its own public key.
-        // The machine id is the issuer's, since the issuer is the machine's identity.
         validateCertificate(rootDomain, token.certPem, token.issuerPem);
         let machineId = getMachineId(getCommonName(token.issuerPem), rootDomain);
         sessions.set(caller.nodeId, machineId);
