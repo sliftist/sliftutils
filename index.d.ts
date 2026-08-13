@@ -2191,6 +2191,10 @@ declare module "sliftutils/storage/IArchives" {
     export declare const MAX_LAST_MODIFIED_FUTURE: number;
     export declare const IMMUTABLE_CACHE_TIME: number;
     export declare function assertValidLastModified(lastModified: number): void;
+    /** Every file-addressed operation checks this at its entry point, so an empty name fails right
+        where it was passed - with the caller in the stack - instead of surfacing as a baffling backend
+        rejection after the retry loops are done with it. */
+    export declare function validateFileName(fileName: string, operation: string): void;
     export type RemoteConfig = {
         version?: number;
         sources: RemoteConfigBase[];

@@ -1,3 +1,21 @@
+/*
+    NOTE: This whole verification process isn't secure if someone man-in-the-middles the IP. There is a way to make it more secure, but right now it is quite a bit of work. Here is the outline, though. 
+
+    a) Use libsodium, do handshake ourself over unsecured websocket (or random self signed websocket), and use ChaCha20 for encryption so it's fast
+        - This lets us use ED25519 certificates. 
+    b) Integrate with socket-function, So we can do everything with regular socket function calls. It's a lot nicer of an interface. We can even have it proxied to Python. As annoying as that is...
+    c) Use github pages to host the site, so we can also host the machine keys
+        - Every time they change, we need to redeploy, and... we don't get revocations without deploying. BUT... it's better than nothing.
+
+    NOTE: Just using real HTTPS certificates isn't really an alternative.
+        - They won't be bound to IPs
+        - Revoking them is a lot more difficult (and they won't be automatically revoked)
+        - Once you reach certain level of machines, you're going to run into problems with different certificates per machine
+        - You're still going to need a way to give servers access to either the certificates or a way to generate the certificates.
+
+    So doing it with our own code isn't about cost or difficulty. The reason we would want to implement it ourselves is because HTTPS wasn't made to create an internal network of trust. It's designed around web browsing, and it works well for that. However, for two-way authentication, there are significantly better systems.
+*/
+
 import sha256 from "js-sha256";
 import { isNode } from "socket-function/src/misc";
 import { secureRandomHex } from "../../misc/random";
