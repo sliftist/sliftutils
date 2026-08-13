@@ -16,7 +16,7 @@ import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
 import { readSignedRepo, SignedRepoError, UNSIGNED } from "./trust";
 import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
-import { absorbRevocations, applyUnrevokes, pairKey, recordRevocation, removeRevokedKeys } from "./revocation";
+import { absorbRevocations, applyUnrevokes, pairKey, recordRevocation, reportRevokedKeys } from "./revocation";
 import { revokeRepo, syncRepoFiles } from "./repoFiles";
 import { revokeRepoURL } from "../revokeSource";
 import { keyFingerprint, normalizeKeys } from "../authorizedKeys";
@@ -286,7 +286,8 @@ async function everyCheck() {
     // written down when it happened, because the revoke repo was unreachable.
     await writeQueuedRevocations();
 
-    await enforceRootKeys(await removeRevokedKeys(mergedKeys));
+    await reportRevokedKeys();
+    await enforceRootKeys(mergedKeys);
     await checkOtherUserKeys();
     await enforceSSHDConfig();
 }
@@ -396,7 +397,7 @@ async function resolveSourceKeys(repoURL: string) {
     let manifestHash: string;
     let signatureHash: string;
     try {
-        let signed = await readSignedRepo(repoPath);
+        let signed = await readSignedRepo({ repoPath, sourceURL: repoURL });
         signer = signed.signer;
         signedFiles = signed.files;
         manifestHash = signed.manifestHash;
