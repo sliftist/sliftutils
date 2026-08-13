@@ -3,7 +3,7 @@ import { delay } from "socket-function/src/batching";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, SourceConfig,
     ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, STORAGE_WRONG_VALID_WINDOW,
-    STORAGE_WRONG_ROUTE, STORAGE_NOT_CONFIGURED, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream,
+    STORAGE_WRONG_ROUTE, STORAGE_NOT_CONFIGURED, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream, validateFileName,
 } from "../IArchives";
 import { copyArchiveFile } from "../archiveHelpers";
 import {
@@ -350,6 +350,7 @@ export class ArchivesChain implements IArchives {
     }
     /** get2, but trying sources in latency order (fastest first) instead of config order. While this is much faster, it might miss immediate writes: the write node is no longer tried first, so a lagging replica may answer with a slightly older value. Exclusive with noFallbacks (which only considers one source - the write node - so there is no order to speed up); passing both throws. */
     public async getFast(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        validateFileName(fileName, "getFast");
         if (config?.sourceUrl) {
             // A specific source leaves nothing for the latency ordering to decide
             return await this.get2(fileName, config);
@@ -363,6 +364,7 @@ export class ArchivesChain implements IArchives {
     }
     /** Always resolves with a url - the authority that answered. A value that doesn't exist is still an answer FROM a server, so it comes back as { url } with no data (never plain undefined); errors from every source throw instead. */
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        validateFileName(fileName, "get2");
         const sourceUrl = config?.sourceUrl;
         if (sourceUrl) {
             return await this.runOnSource(sourceUrl, async archives => {
@@ -379,6 +381,7 @@ export class ArchivesChain implements IArchives {
         });
     }
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url: string } | undefined> {
+        validateFileName(fileName, "getInfo");
         const sourceUrl = config?.sourceUrl;
         if (sourceUrl) {
             return await this.runOnSource(sourceUrl, async archives => {
@@ -549,6 +552,7 @@ export class ArchivesChain implements IArchives {
     }
 
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        validateFileName(fileName, "set");
         if (!data.length) {
             throw new Error(`Empty write refused: set was called with an empty buffer for ${JSON.stringify(fileName)}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
@@ -605,11 +609,13 @@ export class ArchivesChain implements IArchives {
         return ROUTING_FILE;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
+        validateFileName(fileName, "del");
         await this.request({ fallbacks: !!config?.fallbacks, write: true, retries: config?.retries, route: getRoute(fileName), timeout: { uploadBytes: 0, label: `Deletion of ${JSON.stringify(fileName)}` } }, archives => archives.del(fileName, config));
     }
 
     /** See IArchives.undelete: restores a file marked for deletion, dispatched to the write node as SetConfig.undelete (the write node propagates the restore to its peers itself). */
     public async undelete(fileName: string): Promise<void> {
+        validateFileName(fileName, "undelete");
         // set refuses empty buffers, and an undelete carries no data - the byte is ignored
         let placeholder = Buffer.from([1]);
         await this.request({ fallbacks: false, write: true, route: getRoute(fileName), timeout: { uploadBytes: placeholder.length, label: `Undelete of ${JSON.stringify(fileName)}` } }, archives => archives.set(fileName, placeholder, { undelete: true }));
@@ -727,6 +733,7 @@ export class ArchivesChain implements IArchives {
 
     /** A large file is written exactly like a small one - same write node, same wrong-window/route re-resolution, same fallbacks - so a value's SIZE never decides its write semantics (set streams through here past LARGE_SET_THRESHOLD, and a file that grew past it must not suddenly lose the availability its caller asked for). The one difference: every attempt after the first has to rewind the stream, so a config without restartStream gets a single attempt. */
     public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
+        validateFileName(config.path, "setLargeFile");
         if (config.path.includes(VARIABLE_SHARD) && parseVariableRoute(config.path) === undefined) {
             throw new Error(`setLargeFile does not support VARIABLE_SHARD keys (there is no way to return the materialized key); write the file with set, or materialize the key yourself. Key: ${JSON.stringify(config.path)}`);
         }

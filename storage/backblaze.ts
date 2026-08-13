@@ -9,7 +9,7 @@ import debugbreak from "debugbreak";
 import dns from "dns";
 import { getSecret } from "../misc/getSecret";
 import { httpsRequest, HttpsResponseInfo } from "socket-function/src/https";
-import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, SourceConfig, assertValidLastModified, bufferChunkStream, IMMUTABLE_CACHE_TIME } from "./IArchives";
+import { IArchives, ArchivesConfig, ChangesAfterConfig, ArchiveFileInfo, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, SourceConfig, assertValidLastModified, validateFileName, bufferChunkStream, IMMUTABLE_CACHE_TIME } from "./IArchives";
 import { filterChanges } from "./remoteStorage/remoteConfig";
 
 type BackblazeCreds = {
@@ -652,6 +652,7 @@ export class ArchivesBackblaze implements IArchives {
         return result && result.data || undefined;
     }
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number } | undefined> {
+        validateFileName(fileName, "get2");
         let downloading = true;
         try {
             let time = Date.now();
@@ -746,6 +747,7 @@ export class ArchivesBackblaze implements IArchives {
         return false;
     }
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        validateFileName(fileName, "set");
         if (!data.length) {
             throw new Error(`set was called with an empty buffer for ${JSON.stringify(fileName)} on ${this.getDebugName()}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
@@ -779,6 +781,7 @@ export class ArchivesBackblaze implements IArchives {
         return fileName;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
+        validateFileName(fileName, "del");
         if (config?.lastModified) {
             // A synchronized deletion: b2's hide removes the file from listings entirely, so peers scanning the bucket could never learn of it. Instead the tombstone is stored as a REAL empty file (an empty file IS a missing file), which listings show and scans ingest as a deletion. (b2 stamps its own upload time, so the exact deletion time is not preserved here - same as every b2 write.)
             // The comparison ignores noChecks for the same reason as in set: on b2 it IS the ordering guard
@@ -804,6 +807,7 @@ export class ArchivesBackblaze implements IArchives {
 
     // lastModified is accepted but cannot be honored - b2 stamps its own uploadTimestamp, which is what our getInfo/findInfo report as the write time. fallbacks means nothing here: a single bucket has nowhere to fall back to.
     public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
+        validateFileName(config.path, "setLargeFile");
         // Checked before a single byte moves: an upload that is already superseded must not be started at all (a cancelled large upload still costs the transfer)
         if (await this.writeIsSuperseded(config.path, config)) return;
 
@@ -938,6 +942,7 @@ export class ArchivesBackblaze implements IArchives {
     }
 
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; } | undefined> {
+        validateFileName(fileName, "getInfo");
         return await this.apiRetryLogic(`getInfo ${fileName}`, async (api) => {
             try {
                 let file = await api.headFileByName({ bucketName: this.bucketName, fileName });
