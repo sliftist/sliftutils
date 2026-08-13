@@ -2,6 +2,7 @@
 /// <reference types="node" />
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig } from "../IArchives";
 import { ActiveBucketInfo, ServerBucketInfo } from "./storageServerState";
+import { MachineState } from "../../security/machines/machines";
 import { AccessTotals, AccessSummaryState } from "./accessStats";
 import { LogFileInfo } from "../StreamingLogs";
 import type { SummaryEntry } from "../../treeSummary";
@@ -16,28 +17,16 @@ export type AuthTokenData = {
 };
 export type AuthToken = {
     certPem: string;
+    issuerPem: string;
     signature: string;
     data: AuthTokenData;
-};
-export type AccessRequest = {
-    requestId: string;
-    account: string;
-    machineId: string;
-    ip: string;
-    time: number;
-};
-export type TrustRecord = {
-    account: string;
-    machineId: string;
-    ip: string;
-    time: number;
 };
 export type AccessState = {
     machineId: string;
     ip: string;
     hasAccess: boolean;
-    grantAccessCommand?: string;
-    trustedMachines?: TrustRecord[];
+    reason?: string;
+    trustedMachines?: MachineState[];
 };
 export declare function broadcastRoutingChanged(): void;
 export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
@@ -46,34 +35,13 @@ export declare const RemoteStorageController: import("socket-function/SocketFunc
         machineId: string;
         ip: string;
     }>;
-    requestAccess: (config: {
-        account: string;
-    }) => Promise<{
-        machineId: string;
-        ip: string;
-        requestId: string;
-        grantAccessCommand: string;
-    }>;
     getAccessState: (config: {
         account: string;
     }) => Promise<AccessState>;
-    listRequestsForIP: (config: {
-        account: string;
-        ip: string;
-    }) => Promise<AccessRequest[]>;
-    grantAccess: (config: {
-        requestId: string;
-    }) => Promise<TrustRecord>;
     adminListActiveBuckets: () => Promise<{
         account: string;
         bucketName: string;
     }[]>;
-    adminListRequests: (config: {
-        ip: string;
-    }) => Promise<AccessRequest[]>;
-    adminGrantAccess: (config: {
-        requestId: string;
-    }) => Promise<TrustRecord>;
     get2: (config: {
         account: string;
         bucketName: string;

@@ -23,9 +23,9 @@ export declare class ArchivesChain implements IArchives {
     private prepareWrongTargetRetry;
     private request;
     waitingForAccess(): Promise<{
-        link: string;
         machineId: string;
         ip: string;
+        reason: string;
     } | undefined>;
     /** The sources that can serve a file right now, in dispatch order - the first is the write node, the one a plain read asks first. Each entry's url is what GetConfig.sourceUrl / GetInfoConfig.sourceUrl accept, so listing these and then reading with sourceUrl compares the copies the sources actually hold. */
     getFileSources(fileName: string): Promise<SourceConfig[]>;

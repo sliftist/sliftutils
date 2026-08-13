@@ -77,6 +77,8 @@ declare module "sliftutils/misc/https/certs" {
         certB64: string;
         keyB64: string;
     };
+    export declare function DEV_getIdentityFilePath(domain: string): string;
+    export declare function DEV_listIdentityDomains(): string[];
     export interface X509KeyPair {
         domain: string;
         cert: Buffer;
@@ -105,7 +107,7 @@ declare module "sliftutils/misc/https/certs" {
         publicKey: forge.Ed25519PublicKey;
         privateKey: forge.Ed25519PrivateKey;
     };
-    export declare function generateTestCA(domain: string): X509KeyPair;
+    export declare function generateCA(domain: string): X509KeyPair;
     export declare function createCertFromCA(config: {
         CAKeyPair: X509KeyPair;
     }): X509KeyPair;
@@ -125,7 +127,11 @@ declare module "sliftutils/misc/https/certs" {
     export declare function getIdentityCAPromise(domain: string): X509KeyPair;
     export declare function getOwnMachineId(domain: string): string;
     export declare function getOwnThreadId(domain: string): string;
-    /** Part of the machineId comes from the publicKey, so we can use it to verify */
+    /** Part of the machineId comes from the publicKey, so we can use it to verify.
+
+        Fairly weak: it only proves the id names this key, not that the caller holds the key - usually a
+        better workflow should be used, with a back and forth (ex, validateCertificate over a signed
+        exchange). In some cases it is sufficient, such as exposing source maps to the client. */
     export declare function verifyMachineIdForPublicKey(config: {
         machineId: string;
         publicKey: Buffer;
@@ -320,6 +326,11 @@ declare module "sliftutils/misc/https/node-forge-ed25519" {
 }
 
 declare module "sliftutils/misc/https/persistentLocalStorage" {
+    export declare function DEV_getKeyStorePath(config: {
+        appName: string;
+        key: string;
+    }): string;
+    export declare function DEV_listKeyStoreApps(key: string): string[];
     export declare function getKeyStore<T>(appName: string, key: string): {
         get(): T | undefined;
         set(value: T | null): void;
@@ -3382,9 +3393,9 @@ declare module "sliftutils/storage/remoteStorage/ArchivesRemote" {
         private authenticate;
         private callAuthed;
         waitingForAccess(): Promise<{
-            link: string;
             machineId: string;
             ip: string;
+            reason: string;
         } | undefined>;
         hasWriteAccess(): Promise<boolean>;
         private registerAccessRequest;
@@ -4029,9 +4040,9 @@ declare module "sliftutils/storage/remoteStorage/createArchives" {
         private prepareWrongTargetRetry;
         private request;
         waitingForAccess(): Promise<{
-            link: string;
             machineId: string;
             ip: string;
+            reason: string;
         } | undefined>;
         /** The sources that can serve a file right now, in dispatch order - the first is the write node, the one a plain read asks first. Each entry's url is what GetConfig.sourceUrl / GetInfoConfig.sourceUrl accept, so listing these and then reading with sourceUrl compares the copies the sources actually hold. */
         getFileSources(fileName: string): Promise<SourceConfig[]>;
@@ -4192,11 +4203,6 @@ declare module "sliftutils/storage/remoteStorage/deployTakeover" {
 
 }
 
-declare module "sliftutils/storage/remoteStorage/grantAccessCli" {
-    export {};
-
-}
-
 declare module "sliftutils/storage/remoteStorage/intermediateManagement" {
     import { RemoteConfig } from "../IArchives";
     /** Called every time a store applies a routing config to itself (see BlobStore's onRoutingApplied): arms the scans the config's upcoming window boundaries need. Each scan is scheduled once - the key includes the boundary it is for - so re-arming on every config application is harmless. */
@@ -4307,14 +4313,10 @@ declare module "sliftutils/storage/remoteStorage/remoteConfig" {
 }
 
 declare module "sliftutils/storage/remoteStorage/serverConfig" {
-    import type { IStorage } from "../IStorage";
-    import type { AccessRequest, TrustRecord } from "./storageController";
     export type StorageServerConfig = {
         domain: string;
         port: number;
         rootDomain: string;
-        sshTarget: string;
-        serverCommand: string;
         folder: string;
     };
     export declare function setStorageServerConfig(value: StorageServerConfig): void;
@@ -4324,12 +4326,6 @@ declare module "sliftutils/storage/remoteStorage/serverConfig" {
     export declare function getWritesRejectedReason(): string | undefined;
     export declare function assertWritesAllowed(): void;
     export declare function getStorageFolder(): string;
-    export declare function getTrust(): Promise<IStorage<TrustRecord>>;
-    export declare function getRequests(): Promise<IStorage<AccessRequest[]>>;
-    export declare function setTrustedMachines(config: {
-        account: string;
-        machineIds: string[];
-    }): Promise<void>;
     export declare function addExtraListenPort(port: number): void;
     export declare function removeExtraListenPort(port: number): void;
     /** Whether address:port is this server process, including its extra listen ports (a deploy switchover's alternate port is still us). Used to tell which config entries are OUR copy of a bucket - the stores we run - as opposed to peers we synchronize with. Talking to ourselves is not one of the things it prevents: a source that happens to be us is reached over the API like any other. */
@@ -4437,6 +4433,7 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
     /// <reference types="node" />
     import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig } from "../IArchives";
     import { ActiveBucketInfo, ServerBucketInfo } from "./storageServerState";
+    import { MachineState } from "../../security/machines/machines";
     import { AccessTotals, AccessSummaryState } from "./accessStats";
     import { LogFileInfo } from "../StreamingLogs";
     import type { SummaryEntry } from "../../treeSummary";
@@ -4451,28 +4448,16 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
     };
     export type AuthToken = {
         certPem: string;
+        issuerPem: string;
         signature: string;
         data: AuthTokenData;
-    };
-    export type AccessRequest = {
-        requestId: string;
-        account: string;
-        machineId: string;
-        ip: string;
-        time: number;
-    };
-    export type TrustRecord = {
-        account: string;
-        machineId: string;
-        ip: string;
-        time: number;
     };
     export type AccessState = {
         machineId: string;
         ip: string;
         hasAccess: boolean;
-        grantAccessCommand?: string;
-        trustedMachines?: TrustRecord[];
+        reason?: string;
+        trustedMachines?: MachineState[];
     };
     export declare function broadcastRoutingChanged(): void;
     export declare const RemoteStorageController: import("socket-function/SocketFunctionTypes").SocketRegistered<{
@@ -4481,34 +4466,13 @@ declare module "sliftutils/storage/remoteStorage/storageController" {
             machineId: string;
             ip: string;
         }>;
-        requestAccess: (config: {
-            account: string;
-        }) => Promise<{
-            machineId: string;
-            ip: string;
-            requestId: string;
-            grantAccessCommand: string;
-        }>;
         getAccessState: (config: {
             account: string;
         }) => Promise<AccessState>;
-        listRequestsForIP: (config: {
-            account: string;
-            ip: string;
-        }) => Promise<AccessRequest[]>;
-        grantAccess: (config: {
-            requestId: string;
-        }) => Promise<TrustRecord>;
         adminListActiveBuckets: () => Promise<{
             account: string;
             bucketName: string;
         }[]>;
-        adminListRequests: (config: {
-            ip: string;
-        }) => Promise<AccessRequest[]>;
-        adminGrantAccess: (config: {
-            requestId: string;
-        }) => Promise<TrustRecord>;
         get2: (config: {
             account: string;
             bucketName: string;
