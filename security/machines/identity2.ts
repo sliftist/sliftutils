@@ -24,10 +24,13 @@ import { getTrustedMachines } from "./machines";
 export type SignedRequest<T> = {
     signature: string;
     payload: {
-        // Who the sender believes it is talking to: an IP, a machineId, a threadId - whatever
-        // both sides use to name the server. Being inside the signed payload is what scopes the
-        // request to one server: a request signed for one machine cannot be forwarded to another
-        // and used there.
+        // Who the sender believes it is talking to, which should be the resolved IP it dialed.
+        // Being inside the signed payload scopes the request to that one server, and an IP scopes
+        // it better than any name does: an attacker who takes the IP takes it FROM us, so no
+        // legitimate machine answers to it any more and the request they intercepted validates
+        // nowhere - and rewriting it to name a machine that would accept it breaks the signature.
+        // A hostname or a machineId is still legitimately held by the real machine, so a request
+        // naming one can be forwarded there and used.
         targetId: string;
         // The thread certificate that signed this
         cert: string;
@@ -67,8 +70,8 @@ export function signRequest<T>(domain: string, config: { targetId: string; data:
 /** Returns the machineId that signed, the data, and the signed reply to send back - always
     produced, so the caller's only job is to return it. Throws if the signature or certificate
     chain do not check out, or if the request was addressed to someone we are not: ownIdentities
-    is every name this server answers to - its IPs (there are always several, internal and
-    external), its machineId, its threadId - and the signed targetId must be one of them.
+    is every address this server answers to - there are always several, internal and external -
+    and the signed targetId must be one of them.
 
     IMPORTANT! You still need to check the machine with isMachineAccepted if you want to know if
     the machine is trusted. We just verify that they are who they say they are, not that who they
