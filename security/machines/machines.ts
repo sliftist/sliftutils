@@ -237,43 +237,41 @@ async function readMachines(repoPath: string) {
 
 let lastRevokeSync = 0;
 
-/** Pulled at most once a REVOKE_SYNC_INTERVAL, because this is asked per request. A sync that
-    fails leaves the checkout we already have, which is the safe direction: revocations we know
-    about stay known. */
+// Machine revocations, once seen, never leave this map, even if the file disappears from the
+// revoke repo - the key that writes revocations is on every server, so whoever stole one could
+// otherwise erase the record that shut them out. Restarting the process is the way back from a
+// revocation that should not have happened, the same as the daemon's key revocations.
+let machineRevocations = new Map<string, { revocationId: string; machineId: string; ip: string }>();
+
+/** Pulls the revoke repo and absorbs its machine revocations, at most once a REVOKE_SYNC_INTERVAL,
+    because this is asked per request. A sync that fails leaves what we already absorbed. */
 async function syncRevocations(sourceURL: string) {
-    if (Date.now() - lastRevokeSync < REVOKE_SYNC_INTERVAL) {
+    if (Date.now() - lastRevokeSync < REVOKE_SYNC_INTERVAL && machineRevocations.size) {
         return;
     }
     lastRevokeSync = Date.now();
     try {
         await syncRepoFiles(revokeRepo(sourceURL));
     } catch (e) {
-        console.log(`Could not read ${revokeRepoURL(sourceURL)}, using the revocations already here. ${e}`);
+        console.log(`Could not read ${revokeRepoURL(sourceURL)}, using the revocations already absorbed. ${e}`);
     }
-}
-
-/** Machine revocations, read out of the revoke repo the same way key revocations are. */
-async function readMachineRevocations(sourceURL: string) {
     let repo = revokeRepo(sourceURL);
-    let revocations: { revocationId: string; machineId: string; ip: string }[] = [];
-    for (let name of await listRepoDir(repo, REVOCATIONS_DIR)) {
+    for (let name of await listRepoDir(repo, REVOCATIONS_DIR).catch(() => [] as string[])) {
         if (!name.endsWith(".json")) {
             continue;
         }
         try {
             let parsed = JSON.parse(await readRepoFile(repo, path.join(REVOCATIONS_DIR, name)) || "");
             if (parsed.machineId) {
-                revocations.push({
-                    revocationId: parsed.revocationId || name.replace(/\.json$/, ""),
-                    machineId: parsed.machineId,
-                    ip: parsed.ip || "",
-                });
+                let revocationId = parsed.revocationId || name.replace(/\.json$/, "");
+                if (!machineRevocations.has(revocationId)) {
+                    machineRevocations.set(revocationId, { revocationId, machineId: parsed.machineId, ip: parsed.ip || "" });
+                }
             }
         } catch (e) {
             console.log(`Ignoring unreadable revocation ${name}. ${e}`);
         }
     }
-    return revocations;
 }
 
 /** What to run to trust a machine that has just been refused.
@@ -342,6 +340,7 @@ async function recordMachineRevocation(config: {
         console.log(`Could not push the revocation of ${machineId} from ${ip}. ${(push.stdout + push.stderr).trim()}`);
         return;
     }
+    machineRevocations.set(revocationId, { revocationId, machineId, ip });
     console.log(`Revoked ${machineId} from ${ip}, ${revocationId}`);
 
     // Said by whoever wrote the revocation, once, the same as for an ssh key. Machines that only
@@ -408,7 +407,7 @@ export async function isMachineAccepted(config: {
         // hardware key, and anyone holding that can sign anything at all - a wait before honouring it
         // guards against an attacker who has no need of it.
         let allowedAgain = (pair: string) => !!unrevokes.pairs.get(pair)?.length;
-        let revocations = await readMachineRevocations(sourceURL);
+        let revocations = [...machineRevocations.values()];
         // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
         // ssh key is out everywhere rather than only from the address it was misused from.
         let frozenFrom = "";
