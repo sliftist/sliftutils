@@ -58,7 +58,11 @@ export function signRequest<T>(domain: string, config: { targetId: string; data:
     chain, or time do not check out, or if the request was addressed to someone we are not:
     ownIdentities is every name this server answers to - its IPs (there are always several,
     internal and external), its machineId, its threadId - and the signed targetId must be one of
-    them. */
+    them.
+
+    IMPORTANT! You still need to check the machine with isMachineAccepted if you want to know if
+    the machine is trusted. We just verify that they are who they say they are, not that who they
+    say they are is allowed. */
 export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownIdentities: string[]): {
     machineId: string;
     data: T;
