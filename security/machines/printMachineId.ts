@@ -1,18 +1,16 @@
-import { getOwnMachineId, loadIdentityCA } from "../../misc/https/certs";
+import { DEV_listIdentityDomains, getOwnMachineId, loadIdentityCA } from "../../misc/https/certs";
 
-const USAGE = `Usage:
-  yarn printmachineid <domain>
-
-The domain is required: a machine has a different identity, and so a different machine id, under
-every domain it runs under, so there is no such thing as "this machine" without one.`;
-
+// Prints this machine's id under every domain it has an identity for. A machine has a different
+// identity, and so a different machine id, under every domain it runs under.
 async function main() {
-    let [domain] = process.argv.slice(2);
-    if (!domain) {
-        throw new Error(`Expected a domain\n${USAGE}`);
+    let domains = DEV_listIdentityDomains();
+    if (!domains.length) {
+        throw new Error(`This machine has no identities`);
     }
-    await loadIdentityCA(domain);
-    console.log(getOwnMachineId(domain));
+    for (let domain of domains) {
+        await loadIdentityCA(domain);
+        console.log(`${domain} ${getOwnMachineId(domain)}`);
+    }
 }
 
 main().catch(e => {

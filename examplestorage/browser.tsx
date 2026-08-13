@@ -27,7 +27,7 @@ class ExampleStoragePage extends preact.Component {
         content: "",
         contentLoaded: false,
         newFileName: "",
-        access: undefined as { machineId: string; ip: string; reason: string; addMachineCommand: string } | undefined,
+        access: undefined as { machineId: string; ip: string; reason: string } | undefined,
         error: "",
     });
 
@@ -91,7 +91,6 @@ class ExampleStoragePage extends preact.Component {
                 <div>Machine: {synced.access.machineId}</div>
                 <div>IP: {synced.access.ip}</div>
                 <div>{synced.access.reason}</div>
-                <div><code>{synced.access.addMachineCommand}</code></div>
             </div>}
             {synced.loaded && <div className={css.hbox(24).alignItems("flex-start")}>
                 <div className={css.vbox(8)}>

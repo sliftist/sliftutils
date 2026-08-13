@@ -9,6 +9,16 @@ export function DEV_getKeyStorePath(config: { appName: string; key: string }): s
     return os.homedir() + `/keystore_${config.appName}_` + config.key + ".json";
 }
 
+// Every appName that has a store under this key on disk. Machine maintenance only, like the path
+// above, and node only - the browser's localStorage has no appNames to enumerate.
+export function DEV_listKeyStoreApps(key: string): string[] {
+    let prefix = "keystore_";
+    let suffix = `_${key}.json`;
+    return fs.readdirSync(os.homedir())
+        .filter(name => name.startsWith(prefix) && name.endsWith(suffix))
+        .map(name => name.slice(prefix.length, -suffix.length));
+}
+
 export function getKeyStore<T>(appName: string, key: string): {
     get(): T | undefined;
     set(value: T | null): void;

@@ -319,7 +319,7 @@ export class ArchivesChain implements IArchives {
         return await this.run(state, config, run);
     }
 
-    public async waitingForAccess(): Promise<{ machineId: string; ip: string; reason: string; addMachineCommand: string } | undefined> {
+    public async waitingForAccess(): Promise<{ machineId: string; ip: string; reason: string } | undefined> {
         let state = await this.state.getState();
         for (let source of state.sources) {
             // A source whose window has passed is never read or written again, so its access state is irrelevant - and asking a dead intermediate would just hang or throw. Future windows DO matter: access should be granted before their window starts.
