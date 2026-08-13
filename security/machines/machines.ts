@@ -35,6 +35,10 @@ const MACHINES_REFRESH_INTERVAL = 60 * 1000;
 // not pay for resolving the repo on every request either.
 const REPO_RETRY_DELAY = 15 * 1000;
 const LOOPBACK = ["127.0.0.1", "::1", "::ffff:127.0.0.1"];
+// The trusted machine list is re-read at most this often when a check rejects, so a caller that
+// was just added is picked up quickly without letting a flood of rejections re-read every time.
+const MACHINES_INVALIDATION_INTERVAL = 60 * 1000;
+let lastMachinesInvalidation = 0;
 
 /** One machine we are willing to talk to, and the addresses it may talk to us from. */
 export type MachineState = {
@@ -382,53 +386,77 @@ export async function isMachineAccepted(config: {
     if (!machineId || !ip) {
         throw new Error(`Expected a machineId and an ip, was ${JSON.stringify(machineId)} and ${JSON.stringify(ip)}`);
     }
-    if (LOOPBACK.includes(ip) && !!domain && machineId === getOwnMachineId(domain)) {
-        return { accepted: true, reason: "" };
-    }
-    let { sourceURL } = await keysRepo();
-    // Verified before it is believed, and cached, since this is asked once per request.
-    let machine = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
-    if (!machine) {
-        return { accepted: false, reason: `that machine is not trusted. ${addMachineCommand({ machineId, ip, domain })}` };
-    }
 
-    await syncRevocations(sourceURL);
-    let unrevokes = await readUnrevokes(sourceURL).catch(() => ({ pairs: new Map(), legacyIds: new Map() }));
-    // An unrevoke counts as soon as it is seen. It is signed, so writing one already takes the
-    // hardware key, and anyone holding that can sign anything at all - a wait before honouring it
-    // guards against an attacker who has no need of it.
-    let allowedAgain = (pair: string) => !!unrevokes.pairs.get(pair)?.length;
-    let revocations = await readMachineRevocations(sourceURL);
-    // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
-    // ssh key is out everywhere rather than only from the address it was misused from.
-    let frozenFrom = "";
-    for (let revocation of revocations) {
-        if (revocation.machineId !== machineId) {
-            continue;
+    // The whole check, plus whether it froze the machine. A rejection that froze it is final, so
+    // there is nothing to gain from looking again. Any other rejection might just be a stale view -
+    // a machine added seconds ago that our cached list has not caught up to - so it is worth one
+    // fresh look, which is what the retry below does.
+    let evaluate = async (): Promise<{ verdict: MachineVerdict; froze: boolean }> => {
+        if (LOOPBACK.includes(ip) && !!domain && machineId === getOwnMachineId(domain)) {
+            return { verdict: { accepted: true, reason: "" }, froze: false };
         }
-        if (!allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))) {
-            frozenFrom = revocation.ip;
+        let { sourceURL } = await keysRepo();
+        // Verified before it is believed, and cached, since this is asked once per request.
+        let machine = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
+        if (!machine) {
+            return { verdict: { accepted: false, reason: `that machine is not trusted. ${addMachineCommand({ machineId, ip, domain })}` }, froze: false };
         }
-    }
-    if (frozenFrom) {
-        return {
-            accepted: false,
-            reason: `that machine is frozen, it was used from ${frozenFrom} which it is not allowed from`,
-        };
-    }
 
-    if (machine.ips.includes(ip)) {
-        return { accepted: true, reason: "" };
-    }
+        await syncRevocations(sourceURL);
+        let unrevokes = await readUnrevokes(sourceURL).catch(() => ({ pairs: new Map(), legacyIds: new Map() }));
+        // An unrevoke counts as soon as it is seen. It is signed, so writing one already takes the
+        // hardware key, and anyone holding that can sign anything at all - a wait before honouring it
+        // guards against an attacker who has no need of it.
+        let allowedAgain = (pair: string) => !!unrevokes.pairs.get(pair)?.length;
+        let revocations = await readMachineRevocations(sourceURL);
+        // Any revocation nothing has undone keeps the machine out, from everywhere, the way a revoked
+        // ssh key is out everywhere rather than only from the address it was misused from.
+        let frozenFrom = "";
+        for (let revocation of revocations) {
+            if (revocation.machineId !== machineId) {
+                continue;
+            }
+            if (!allowedAgain(pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }))) {
+                frozenFrom = revocation.ip;
+            }
+        }
+        if (frozenFrom) {
+            return {
+                verdict: { accepted: false, reason: `that machine is frozen, it was used from ${frozenFrom} which it is not allowed from` },
+                froze: false,
+            };
+        }
 
-    // Listed, but talking to us from somewhere it should not be. Recorded once for this machine
-    // and address, so being talked to repeatedly does not write repeatedly.
-    let pair = pairKey({ fingerprint: machineId, ip });
-    let alreadyRecorded = revocations.some(revocation =>
-        pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }) === pair);
-    if (!alreadyRecorded && !allowedAgain(pair)) {
-        await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
-        return { accepted: false, reason: `that machine is not allowed from ${ip}, so it is now frozen everywhere` };
-    }
-    return { accepted: false, reason: `that machine is not allowed from ${ip}` };
+        if (machine.ips.includes(ip)) {
+            return { verdict: { accepted: true, reason: "" }, froze: false };
+        }
+
+        // Listed, but talking to us from somewhere it should not be. Recorded once for this machine
+        // and address, so being talked to repeatedly does not write repeatedly.
+        let pair = pairKey({ fingerprint: machineId, ip });
+        let alreadyRecorded = revocations.some(revocation =>
+            pairKey({ fingerprint: revocation.machineId, ip: revocation.ip }) === pair);
+        if (!alreadyRecorded && !allowedAgain(pair)) {
+            await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
+            return { verdict: { accepted: false, reason: `that machine is not allowed from ${ip}, so it is now frozen everywhere` }, froze: true };
+        }
+        return { verdict: { accepted: false, reason: `that machine is not allowed from ${ip}` }, froze: false };
+    };
+
+    let attempt = async (secondTry: number): Promise<MachineVerdict> => {
+        let { verdict, froze } = await evaluate();
+        // An accept, or a rejection that just froze the machine, is the final word. So is a second
+        // try - going further would make it a third and never stop.
+        if (verdict.accepted || froze || secondTry === 2) {
+            return verdict;
+        }
+        // Any other rejection might be on a stale list. Re-read it - but read it fresh at most once
+        // a minute, so a burst of bad callers cannot make us re-read on every one of them.
+        if (Date.now() - lastMachinesInvalidation > MACHINES_INVALIDATION_INTERVAL) {
+            lastMachinesInvalidation = Date.now();
+            trustedMachines.reset();
+        }
+        return attempt(2);
+    };
+    return attempt(1);
 }
