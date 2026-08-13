@@ -12,7 +12,6 @@ import fsSync from "fs";
 import { cache, lazy } from "socket-function/src/caching";
 import { isNode } from "socket-function/src/misc";
 import sha265 from "js-sha256";
-import crypto from "crypto";
 import { trustCertificate } from "socket-function/src/certStore";
 import { measureBlock, measureFnc, measureWrap } from "socket-function/src/profiling/measure";
 import { getNodeIdDomain, getNodeIdDomainMaybeUndefined, getNodeIdLocation } from "socket-function/src/nodeCache";
@@ -49,10 +48,11 @@ export function DEV_listIdentityDomains(): string[] {
 export interface X509KeyPair { domain: string; cert: Buffer; key: Buffer; }
 
 export function getCommonName(cert: Buffer | string) {
-    let subject = new crypto.X509Certificate(cert).subject;
-    let subjectKVPs = new Map(subject.split(",").map(x => x.trim().split("=")).map(x => [x[0], x.slice(1).join("=")]));
-    let commonName = subjectKVPs.get("CN");
-    if (!commonName) throw new Error(`No common name in subject: ${subject}`);
+    let subject = parseCert(cert).subject;
+    let commonName = subject.getField("CN")?.value as string | undefined;
+    if (!commonName) {
+        throw new Error(`No common name in subject: ${subject.attributes.map(x => `${x.shortName || x.name}=${x.value}`).join(", ")}`);
+    }
     return commonName;
 }
 
