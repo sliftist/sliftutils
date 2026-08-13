@@ -5,16 +5,16 @@ import { getTrustedMachines } from "./machines";
 
 const MAX_SIGNED_AGE = 5 * 60 * 1000;
 
-// A request says who it is from AND who it believes it is talking to. The "to" is whatever both
-// sides use to identify the server - an IP, a machineId, a threadId - and being inside the signed
-// payload is what stops a machine in the middle: a request addressed to someone else cannot be
-// replayed at the real server, and the middleman cannot write requests of its own because it is
+// A request says who it is from AND who it believes it is talking to. The targetId is whatever
+// both sides use to identify the server - an IP, a machineId, a threadId - and being inside the
+// signed payload is what stops a machine in the middle: a request addressed to someone else cannot
+// be replayed at the real server, and the middleman cannot write requests of its own because it is
 // not a trusted machine.
 export type SignedRequest<T> = {
     signature: string;
     payload: {
         time: number;
-        to: string;
+        targetId: string;
         cert: string;
         certIssuer: string;
         data: T;
@@ -30,7 +30,7 @@ export type SignedReply<T> = {
         time: number;
         request: {
             time: number;
-            to: string;
+            targetId: string;
             cert: string;
             certIssuer: string;
             dataHash: string;
@@ -45,12 +45,12 @@ function dataHash(data: unknown) {
     return sha256.sha256(JSON.stringify(data));
 }
 
-export function signRequest<T>(domain: string, config: { to: string; data: T }): SignedRequest<T> {
+export function signRequest<T>(domain: string, config: { targetId: string; data: T }): SignedRequest<T> {
     let threadKeyCert = getThreadKeyCert(domain);
     let issuer = getIdentityCA(domain);
     let payload = {
         time: Date.now(),
-        to: config.to,
+        targetId: config.targetId,
         cert: threadKeyCert.cert.toString(),
         certIssuer: issuer.cert.toString(),
         data: config.data,
@@ -61,7 +61,7 @@ export function signRequest<T>(domain: string, config: { to: string; data: T }):
 /** Returns the machineId that signed, and the data. Throws if the signature, certificate chain,
     or time do not check out, or if the request was addressed to someone we are not: ownIdentities
     is every name this server answers to - its IPs (there are always several, internal and
-    external), its machineId, its threadId - and the signed "to" must be one of them. */
+    external), its machineId, its threadId - and the signed targetId must be one of them. */
 export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownIdentities: string[]): { machineId: string; data: T } {
     let { signature, payload } = signed;
     let signedThreshold = Date.now() - MAX_SIGNED_AGE;
@@ -70,8 +70,8 @@ export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownId
     }
     verify(payload.cert, signature, payload);
     validateCertificate(domain, payload.cert, payload.certIssuer);
-    if (!ownIdentities.includes(payload.to)) {
-        throw new Error(`Request is for someone else. It is addressed to ${payload.to}, we are ${ownIdentities.join(", ")}`);
+    if (!ownIdentities.includes(payload.targetId)) {
+        throw new Error(`Request is for someone else. It is addressed to ${payload.targetId}, we are ${ownIdentities.join(", ")}`);
     }
     let machineId = getMachineId(getCommonName(payload.certIssuer), domain);
     return { machineId, data: payload.data };
@@ -84,7 +84,7 @@ export function signReply<T>(domain: string, request: SignedRequest<unknown>, da
         time: Date.now(),
         request: {
             time: request.payload.time,
-            to: request.payload.to,
+            targetId: request.payload.targetId,
             cert: request.payload.cert,
             certIssuer: request.payload.certIssuer,
             dataHash: dataHash(request.payload.data),
@@ -110,7 +110,7 @@ export async function verifyReply<T>(domain: string, request: SignedRequest<unkn
     validateCertificate(domain, payload.cert, payload.certIssuer);
     let echoed = payload.request;
     if (echoed.time !== request.payload.time
-        || echoed.to !== request.payload.to
+        || echoed.targetId !== request.payload.targetId
         || echoed.cert !== request.payload.cert
         || echoed.certIssuer !== request.payload.certIssuer
         || echoed.dataHash !== dataHash(request.payload.data)
