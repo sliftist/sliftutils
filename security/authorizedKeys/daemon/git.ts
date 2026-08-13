@@ -97,8 +97,15 @@ async function ensureSourceRepo(repoURL: string) {
 }
 
 /** Returns what changed, so the caller can report it. A rewritten history is called out
-    separately - it means the remote no longer contains the commits we already had. */
-export async function syncRepo(repoURL: string) {
+    separately - it means the remote no longer contains the commits we already had.
+
+    forceUpdate forces the working tree back to the remote even when the remote has not moved, which
+    is what heals a checkout left dirty - an edited or half-written file that no longer matches its
+    signature. It would be maddening to a developer editing the repo in place, since it stashes their
+    uncommitted work; but make sure nothing that answers this checkout is running on the machine you
+    edit on. If the checkout went dirty because a machine connection triggered a revocation, kill the
+    services on that machine before you touch the trusted machines, or they will just dirty it again. */
+export async function syncRepo(repoURL: string, options?: { forceUpdate?: boolean }) {
     await ensureSourceRepo(repoURL);
     let repoPath = sourceRepoPath(repoURL);
     let keyPath = await findSourceKey(repoURL) || sourceKeyPath(repoURL);
@@ -112,7 +119,7 @@ export async function syncRepo(repoURL: string) {
     if (!remoteSha) {
         throw new Error(`Expected origin to report a sha for ${branch}, listed ${listing.slice(0, MAX_ERROR_BODY_LENGTH)}`);
     }
-    if (remoteSha === localSha && remoteSha === sourceState(repoURL).lastSha) {
+    if (!options?.forceUpdate && remoteSha === localSha && remoteSha === sourceState(repoURL).lastSha) {
         return { changed: false, historyRewritten: false, remoteSha, previousSha: localSha };
     }
 
