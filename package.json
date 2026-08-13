@@ -35,7 +35,8 @@
         "derivekey": "node ./bin/derivekey.js",
         "unrevoke": "node ./bin/unrevoke.js",
         "testnotify": "node ./bin/testnotify.js",
-        "addmachine": "node ./bin/addmachine.js"
+        "addmachine": "node ./bin/addmachine.js",
+        "printmachineid": "node ./bin/printmachineid.js"
     },
     "bin": {
         "filehoster": "./bin/filehoster.js",
@@ -60,7 +61,8 @@
         "portsecuredaemon": "./bin/portsecuredaemon.js",
         "unrevoke": "./bin/unrevoke.js",
         "testnotify": "./bin/testnotify.js",
-        "addmachine": "./bin/addmachine.js"
+        "addmachine": "./bin/addmachine.js",
+        "printmachineid": "./bin/printmachineid.js"
     },
     "dependencies": {
         "@types/chrome": "^0.0.237",
