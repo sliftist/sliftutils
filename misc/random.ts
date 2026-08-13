@@ -43,3 +43,13 @@ export function secureRandom(): number {
     }
     return randomDataF64[0];
 }
+
+export function secureRandomHex(byteLength: number): string {
+    let data = new Uint8Array(byteLength);
+    if (!isNode()) {
+        window.crypto.getRandomValues(data);
+    } else {
+        crypto.getRandomValues(data);
+    }
+    return Array.from(data).map(x => x.toString(16).padStart(2, "0")).join("");
+}
