@@ -135,6 +135,9 @@ class RemoteStorageControllerBase {
         return {};
     }
 
+    // Secure because connections use real certificates on real domain names, so TLS itself stops a
+    // man-in-the-middle. Otherwise one would be possible: the signed token only names the server's
+    // domain, so a middleman on the path to that domain could reuse it against the real server.
     async authenticate(token: AuthToken): Promise<{ machineId: string; ip: string }> {
         let { domain, port, rootDomain } = getStorageServerConfig();
         let caller = SocketFunction.getCaller();
