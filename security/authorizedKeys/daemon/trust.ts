@@ -25,52 +25,6 @@ let absorbedRevocations = new Map<string, { identity: string; ip: string }>();
 let unrevokedPairs = new Set<string>();
 let unrevokedIds = new Set<string>();
 
-async function absorbRevocationFiles(sourceURL: string) {
-    let directory = path.join(revokeRepoPath(sourceURL), REVOCATIONS_DIR);
-    for (let name of (await fs.readdir(directory).catch(() => [] as string[])).sort()) {
-        if (!name.endsWith(".json")) {
-            continue;
-        }
-        try {
-            let parsed = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
-            let identity = parsed.fingerprint || parsed.machineId;
-            if (!identity) {
-                continue;
-            }
-            let revocationId = parsed.revocationId || name.replace(/\.json$/, "");
-            if (!absorbedRevocations.has(revocationId)) {
-                absorbedRevocations.set(revocationId, { identity, ip: parsed.ip || parsed.attempt?.ip || "" });
-            }
-        } catch (e) {
-            console.log(`Ignoring unreadable revocation ${path.join(directory, name)}. ${e}`);
-        }
-    }
-}
-
-function readUnrevokesFromSignedFiles(files: Map<string, Buffer>) {
-    unrevokedPairs = new Set();
-    unrevokedIds = new Set();
-    for (let [filePath, contents] of files) {
-        if (!filePath.startsWith(`${UNREVOKES_DIR}/`) || !filePath.endsWith(".json")) {
-            continue;
-        }
-        try {
-            let parsed = JSON.parse(contents.toString("utf8"));
-            for (let allowed of parsed.allowed || []) {
-                let identity = allowed.fingerprint || allowed.machineId;
-                if (identity && allowed.ip) {
-                    unrevokedPairs.add(`${identity} ${allowed.ip}`);
-                }
-            }
-            for (let revocationId of parsed.revocationIds || []) {
-                unrevokedIds.add(revocationId);
-            }
-        } catch (e) {
-            console.log(`Ignoring unreadable unrevoke ${filePath}. ${e}`);
-        }
-    }
-}
-
 /** Whether an identity - a key fingerprint or a machine id - has a revocation nothing has undone.
     The one meaning of "frozen", used both when stripping repo content and when explaining why. */
 export function isIdentityFrozen(identity: string) {
@@ -103,35 +57,6 @@ export function isPairUnrevoked(identity: string, ip: string) {
     absorb. Sticky like the rest. */
 export function noteRevocation(revocationId: string, identity: string, ip: string) {
     absorbedRevocations.set(revocationId, { identity, ip });
-}
-
-/** Drops everything frozen out of the signed files: revoked keys out of authorized_keys and top
-    level .pub files, and frozen machines' files out of machines/. What comes back is what this
-    machine actually trusts, so no caller can read the list and forget the revocations. */
-function applyRevocations(repoPath: string, files: Map<string, Buffer>) {
-    for (let [filePath, contents] of [...files]) {
-        if (filePath === "authorized_keys" || (filePath.endsWith(".pub") && !filePath.includes("/"))) {
-            let lines = contents.toString("utf8").split("\n");
-            let kept = lines.filter(line => {
-                let fingerprint = keyFingerprint(line);
-                if (fingerprint && isIdentityFrozen(fingerprint)) {
-                    console.log(`Dropping revoked key ${fingerprint} from ${path.join(repoPath, filePath)}`);
-                    return false;
-                }
-                return true;
-            });
-            if (kept.length !== lines.length) {
-                files.set(filePath, Buffer.from(kept.join("\n")));
-            }
-        }
-        if (filePath.startsWith("machines/") && filePath.endsWith(".json")) {
-            let machineId = filePath.slice("machines/".length, -".json".length);
-            if (isIdentityFrozen(machineId)) {
-                console.log(`Dropping frozen machine ${machineId} from ${path.join(repoPath, filePath)}`);
-                files.delete(filePath);
-            }
-        }
-    }
 }
 
 /** A repo that cannot be trusted, with the message ready for whoever asked. Not every caller
@@ -245,9 +170,79 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
         }
     }
 
-    await absorbRevocationFiles(sourceURL);
-    readUnrevokesFromSignedFiles(files);
-    applyRevocations(repoPath, files);
+    // Absorb the revoke repo's files into the sticky map. Once seen a revocation never leaves it,
+    // even if its file disappears - the key that writes revocations is on every server, so whoever
+    // stole one could otherwise erase the record that shut them out.
+    let revocationsDirectory = path.join(revokeRepoPath(sourceURL), REVOCATIONS_DIR);
+    for (let name of (await fs.readdir(revocationsDirectory).catch(() => [] as string[])).sort()) {
+        if (!name.endsWith(".json")) {
+            continue;
+        }
+        try {
+            let parsed = JSON.parse(await fs.readFile(path.join(revocationsDirectory, name), "utf8"));
+            let identity = parsed.fingerprint || parsed.machineId;
+            if (!identity) {
+                continue;
+            }
+            let revocationId = parsed.revocationId || name.replace(/\.json$/, "");
+            if (!absorbedRevocations.has(revocationId)) {
+                absorbedRevocations.set(revocationId, { identity, ip: parsed.ip || parsed.attempt?.ip || "" });
+            }
+        } catch (e) {
+            console.log(`Ignoring unreadable revocation ${path.join(revocationsDirectory, name)}. ${e}`);
+        }
+    }
+
+    // Rebuild the unrevokes from the signed files just read. Unrevokes are signed content, so
+    // removing one must take effect, unlike the sticky revocations.
+    unrevokedPairs = new Set();
+    unrevokedIds = new Set();
+    for (let [filePath, contents] of files) {
+        if (!filePath.startsWith(`${UNREVOKES_DIR}/`) || !filePath.endsWith(".json")) {
+            continue;
+        }
+        try {
+            let parsed = JSON.parse(contents.toString("utf8"));
+            for (let allowed of parsed.allowed || []) {
+                let identity = allowed.fingerprint || allowed.machineId;
+                if (identity && allowed.ip) {
+                    unrevokedPairs.add(`${identity} ${allowed.ip}`);
+                }
+            }
+            for (let revocationId of parsed.revocationIds || []) {
+                unrevokedIds.add(revocationId);
+            }
+        } catch (e) {
+            console.log(`Ignoring unreadable unrevoke ${filePath}. ${e}`);
+        }
+    }
+
+    // Drop everything frozen: revoked keys out of authorized_keys and top level .pub files, and
+    // frozen machines' files out of machines/. What comes back is what this machine actually
+    // trusts, so no caller can read the list and forget the revocations.
+    for (let [filePath, contents] of [...files]) {
+        if (filePath === "authorized_keys" || (filePath.endsWith(".pub") && !filePath.includes("/"))) {
+            let lines = contents.toString("utf8").split("\n");
+            let kept = lines.filter(line => {
+                let fingerprint = keyFingerprint(line);
+                if (fingerprint && isIdentityFrozen(fingerprint)) {
+                    console.log(`Dropping revoked key ${fingerprint} from ${path.join(repoPath, filePath)}`);
+                    return false;
+                }
+                return true;
+            });
+            if (kept.length !== lines.length) {
+                files.set(filePath, Buffer.from(kept.join("\n")));
+            }
+        }
+        if (filePath.startsWith("machines/") && filePath.endsWith(".json")) {
+            let machineId = filePath.slice("machines/".length, -".json".length);
+            if (isIdentityFrozen(machineId)) {
+                console.log(`Dropping frozen machine ${machineId} from ${path.join(repoPath, filePath)}`);
+                files.delete(filePath);
+            }
+        }
+    }
 
     return { signer, manifestHash, signatureHash, files };
 }
