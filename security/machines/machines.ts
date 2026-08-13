@@ -5,7 +5,7 @@ import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
 import { revokeRepo, syncRepoFiles } from "../authorizedKeys/daemon/repoFiles";
 import { listRepoDir, readRepoFile } from "../authorizedKeys/daemon/repoFiles";
 import { newRevocationId, pairKey, readRevocationFiles, readUnrevokes } from "../authorizedKeys/daemon/revocation";
-import { runGit } from "../authorizedKeys/daemon/git";
+import { runGit, syncRepo } from "../authorizedKeys/daemon/git";
 import { ensureRevokeKey } from "../authorizedKeys/daemon/repoFiles";
 import { readSignedRepo } from "../authorizedKeys/daemon/trust";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
@@ -451,9 +451,13 @@ export async function isMachineAccepted(config: {
         return verdict;
     }
     // Re-read the list at most once a minute, so a burst of bad callers cannot make us re-read on
-    // every one of them, then take whatever the fresh look says as final.
+    // every one of them. Force the checkout back to the remote first, so a machine added and signed
+    // seconds ago is picked up even if the checkout was left dirty, then take the fresh look as
+    // final.
     if (Date.now() - lastMachinesInvalidation > MACHINES_INVALIDATION_INTERVAL) {
         lastMachinesInvalidation = Date.now();
+        let { sourceURL } = await keysRepo();
+        await syncRepo(sourceURL, { forceUpdate: true }).catch(e => console.log(`Could not force update ${sourceURL}. ${e}`));
         trustedMachines.reset();
     }
     return (await evaluate()).verdict;
