@@ -1,6 +1,6 @@
 {
     "name": "sliftutils",
-    "version": "1.7.143",
+    "version": "1.7.144",
     "main": "index.js",
     "license": "MIT",
     "files": [
