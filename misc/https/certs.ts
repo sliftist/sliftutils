@@ -471,7 +471,11 @@ export function getOwnThreadId(domain: string) {
     return decodeNodeIdAssert(getThreadKeyCert(domain).domain, domain).threadId;
 }
 
-/** Part of the machineId comes from the publicKey, so we can use it to verify */
+/** Part of the machineId comes from the publicKey, so we can use it to verify.
+
+    Fairly weak: it only proves the id names this key, not that the caller holds the key - usually a
+    better workflow should be used, with a back and forth (ex, validateCertificate over a signed
+    exchange). In some cases it is sufficient, such as exposing source maps to the client. */
 export function verifyMachineIdForPublicKey(config: {
     machineId: string;
     publicKey: Buffer;

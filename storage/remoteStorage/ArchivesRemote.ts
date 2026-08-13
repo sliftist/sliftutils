@@ -1,7 +1,7 @@
 import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
-import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
+import { getIdentityCA, getThreadKeyCert, loadIdentityCA, sign } from "../../misc/https/certs";
 import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SourceConfig, SetConfig, SetLargeFileConfig, LARGE_SET_THRESHOLD, bufferChunkStream } from "../IArchives";
 import { parseHostedUrl, getBucketBaseUrl, buildFileUrl } from "./remoteConfig";
 import {
@@ -41,14 +41,20 @@ export async function authenticateStorage(config: { address: string; port: numbe
     SocketFunction.ENABLE_CLIENT_MODE = true;
     let rootDomain = config.address.split(".").slice(-2).join(".");
     await loadIdentityCA(rootDomain);
-    let ca = getIdentityCA(rootDomain);
+    let threadKeyCert = getThreadKeyCert(rootDomain);
+    let issuer = getIdentityCA(rootDomain);
     let data = {
         purpose: STORAGE_AUTH_PURPOSE,
         time: Date.now(),
         server: `${config.address}:${config.port}`,
     };
-    let signature = sign({ key: ca.key }, data);
-    return await RemoteStorageController.nodes[config.nodeId].authenticate({ certPem: ca.cert.toString(), signature, data });
+    let signature = sign(threadKeyCert, data);
+    return await RemoteStorageController.nodes[config.nodeId].authenticate({
+        certPem: threadKeyCert.cert.toString(),
+        issuerPem: issuer.cert.toString(),
+        signature,
+        data,
+    });
 }
 
 export class ArchivesRemote implements IArchives {
