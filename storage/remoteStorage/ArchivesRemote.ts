@@ -105,14 +105,15 @@ export class ArchivesRemote implements IArchives {
         }
     }
 
-    // Returns undefined if this machine has access to the account. Otherwise returns our machineId + ip as the server sees them, and the link to the access page - which shows the single command that grants access.
-    public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
+    // Returns undefined if this machine has access to the account. Otherwise returns our machineId + ip as the server sees them, why we were refused, and the exact command that grants access.
+    public async waitingForAccess(): Promise<{ machineId: string; ip: string; reason: string; addMachineCommand: string } | undefined> {
         let state = await this.callAuthed(() => this.controller.getAccessState({ account: this.account }));
         if (state.hasAccess) return undefined;
         return {
-            link: `https://${this.parsed.address}:${this.parsed.port}/${this.account}`,
             machineId: state.machineId,
             ip: state.ip,
+            reason: state.reason || "",
+            addMachineCommand: state.addMachineCommand || "",
         };
     }
 
