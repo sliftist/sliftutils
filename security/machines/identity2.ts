@@ -54,11 +54,17 @@ export function signRequest<T>(domain: string, config: { targetId: string; data:
     return { signature: sign(threadKeyCert, payload), payload };
 }
 
-/** Returns the machineId that signed, and the data. Throws if the signature, certificate chain,
-    or time do not check out, or if the request was addressed to someone we are not: ownIdentities
-    is every name this server answers to - its IPs (there are always several, internal and
-    external), its machineId, its threadId - and the signed targetId must be one of them. */
-export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownIdentities: string[]): { machineId: string; data: T } {
+/** Returns the machineId that signed, the data, and reply - which signs a reply to exactly this
+    request, so a reply cannot be produced for a request that was never verified. Throws if the
+    signature, certificate chain, or time do not check out, or if the request was addressed to
+    someone we are not: ownIdentities is every name this server answers to - its IPs (there are
+    always several, internal and external), its machineId, its threadId - and the signed targetId
+    must be one of them. */
+export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownIdentities: string[]): {
+    machineId: string;
+    data: T;
+    reply<R>(data: R): SignedReply<R>;
+} {
     let { signature, payload } = signed;
     let signedThreshold = Date.now() - MAX_SIGNED_AGE;
     if (payload.time < signedThreshold) {
@@ -70,21 +76,23 @@ export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownId
         throw new Error(`Request is for someone else. It is addressed to ${payload.targetId}, we are ${ownIdentities.join(", ")}`);
     }
     let machineId = getMachineId(getCommonName(payload.certIssuer), domain);
-    return { machineId, data: payload.data };
-}
-
-export function signReply<T>(domain: string, request: SignedRequest<unknown>, data: T): SignedReply<T> {
-    let threadKeyCert = getThreadKeyCert(domain);
-    let issuer = getIdentityCA(domain);
-    let { data: requestData, ...requestRest } = request.payload;
-    let payload: SignedReply<T>["payload"] = {
-        time: Date.now(),
-        request: { ...requestRest, dataHash: dataHash(requestData) },
-        cert: threadKeyCert.cert.toString(),
-        certIssuer: issuer.cert.toString(),
-        data,
+    return {
+        machineId,
+        data: payload.data,
+        reply<R>(data: R): SignedReply<R> {
+            let threadKeyCert = getThreadKeyCert(domain);
+            let issuer = getIdentityCA(domain);
+            let { data: requestData, ...requestRest } = payload;
+            let replyPayload: SignedReply<R>["payload"] = {
+                time: Date.now(),
+                request: { ...requestRest, dataHash: dataHash(requestData) },
+                cert: threadKeyCert.cert.toString(),
+                certIssuer: issuer.cert.toString(),
+                data,
+            };
+            return { signature: sign(threadKeyCert, replyPayload), payload: replyPayload };
+        },
     };
-    return { signature: sign(threadKeyCert, payload), payload };
 }
 
 /** Returns the machineId that replied, and the data. Throws if the signature, certificate chain,
@@ -100,8 +108,8 @@ export async function verifyReply<T>(domain: string, request: SignedRequest<unkn
     verify(payload.cert, signature, payload);
     validateCertificate(domain, payload.cert, payload.certIssuer);
     let { data: requestData, ...requestRest } = request.payload;
-    let expected: SignedReply<T>["payload"]["request"] = { ...requestRest, dataHash: dataHash(requestData) };
-    if (JSON.stringify(payload.request) !== JSON.stringify(expected)) {
+    let { dataHash: echoedHash, ...echoedRest } = payload.request;
+    if (echoedHash !== dataHash(requestData) || JSON.stringify(echoedRest) !== JSON.stringify(requestRest)) {
         throw new Error(`Reply answers a different request than the one we sent`);
     }
     let machineId = getMachineId(getCommonName(payload.certIssuer), domain);
