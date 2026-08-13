@@ -1,7 +1,7 @@
 import { SocketFunction } from "socket-function/SocketFunction";
 import { timeInMinute } from "socket-function/src/misc";
 import { delay } from "socket-function/src/batching";
-import { getIdentityCA, loadIdentityCA, sign } from "../../misc/https/certs";
+import { getIdentityCA, getThreadKeyCert, loadIdentityCA, sign } from "../../misc/https/certs";
 import { IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SourceConfig, SetConfig, SetLargeFileConfig, LARGE_SET_THRESHOLD, bufferChunkStream } from "../IArchives";
 import { parseHostedUrl, getBucketBaseUrl, buildFileUrl } from "./remoteConfig";
 import {
@@ -35,20 +35,28 @@ export function parseStorageUrl(url: string): { address: string; port: number } 
     return { address: u.hostname, port: +u.port || 443 };
 }
 
-// Authenticates a connection to a storage server with this machine's certs.ts identity
+// Authenticates a connection to a storage server with this machine's certs.ts identity. Signs with
+// the thread cert, never the CA key itself - the CA only ever signs certificates, the same way
+// changeIdentity does it.
 export async function authenticateStorage(config: { address: string; port: number; nodeId: string }): Promise<{ machineId: string; ip: string }> {
     // hostServer nodeIds are machine-specific, so connections by domain must target "any server at this address" (which is how browsers always connect)
     SocketFunction.ENABLE_CLIENT_MODE = true;
     let rootDomain = config.address.split(".").slice(-2).join(".");
     await loadIdentityCA(rootDomain);
-    let ca = getIdentityCA(rootDomain);
+    let threadKeyCert = getThreadKeyCert(rootDomain);
+    let issuer = getIdentityCA(rootDomain);
     let data = {
         purpose: STORAGE_AUTH_PURPOSE,
         time: Date.now(),
         server: `${config.address}:${config.port}`,
     };
-    let signature = sign({ key: ca.key }, data);
-    return await RemoteStorageController.nodes[config.nodeId].authenticate({ certPem: ca.cert.toString(), signature, data });
+    let signature = sign(threadKeyCert, data);
+    return await RemoteStorageController.nodes[config.nodeId].authenticate({
+        certPem: threadKeyCert.cert.toString(),
+        issuerPem: issuer.cert.toString(),
+        signature,
+        data,
+    });
 }
 
 export class ArchivesRemote implements IArchives {

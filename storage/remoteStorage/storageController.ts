@@ -5,7 +5,7 @@ import { setHTTPResultHeaders, getCurrentHTTPRequest } from "socket-function/src
 import { performLocalCall } from "socket-function/src/callManager";
 import { RequireController } from "socket-function/require/RequireController";
 import { timeInMinute } from "socket-function/src/misc";
-import { getCommonName, getPublicIdentifier, getOwnMachineId, verify, verifyMachineIdForPublicKey } from "../../misc/https/certs";
+import { getCommonName, getMachineId, getOwnMachineId, validateCertificate, verify } from "../../misc/https/certs";
 import { ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, FindConfig, SourceConfig, IMMUTABLE_CACHE_TIME } from "../IArchives";
 import { ROUTING_FILE, getRoute, routeContains } from "./remoteConfig";
 import {
@@ -43,6 +43,7 @@ export type AuthTokenData = {
 };
 export type AuthToken = {
     certPem: string;
+    issuerPem: string;
     signature: string;
     data: AuthTokenData;
 };
@@ -135,7 +136,7 @@ class RemoteStorageControllerBase {
     }
 
     async authenticate(token: AuthToken): Promise<{ machineId: string; ip: string }> {
-        let { domain, port } = getStorageServerConfig();
+        let { domain, port, rootDomain } = getStorageServerConfig();
         let caller = SocketFunction.getCaller();
         verify(token.certPem, token.signature, token.data);
         let { purpose, time, server } = token.data;
@@ -149,10 +150,11 @@ class RemoteStorageControllerBase {
         if (tokenDomain !== domain) {
             throw new Error(`Auth token is for server ${JSON.stringify(server)}, but this server is ${JSON.stringify(`${domain}:${port}`)}`);
         }
-        let machineId = getCommonName(token.certPem).split(".")[0];
-        if (!verifyMachineIdForPublicKey({ machineId, publicKey: getPublicIdentifier(token.certPem) })) {
-            throw new Error(`Certificate common name does not match its public key: ${JSON.stringify(getCommonName(token.certPem))}`);
-        }
+        // The full chain check certs.ts already does: the thread cert is signed by the issuer, the
+        // issuer is a valid CA for this domain, and every common name matches its own public key.
+        // The machine id is the issuer's, since the issuer is the machine's identity.
+        validateCertificate(rootDomain, token.certPem, token.issuerPem);
+        let machineId = getMachineId(getCommonName(token.issuerPem), rootDomain);
         sessions.set(caller.nodeId, machineId);
         while (sessions.size > MAX_SESSIONS) {
             let oldest = sessions.keys().next().value;
