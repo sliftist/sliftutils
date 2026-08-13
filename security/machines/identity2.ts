@@ -24,7 +24,7 @@ export type SignedRequest<T> = {
     };
 };
 
-export type SignedReply<T> = {
+export type SignedReply = {
     signature: string;
     payload: {
         time: number;
@@ -33,7 +33,6 @@ export type SignedReply<T> = {
         request: Omit<SignedRequest<unknown>["payload"], "data"> & { dataHash: string };
         cert: string;
         certIssuer: string;
-        data: T;
     };
 };
 
@@ -54,16 +53,16 @@ export function signRequest<T>(domain: string, config: { targetId: string; data:
     return { signature: sign(threadKeyCert, payload), payload };
 }
 
-/** Returns the machineId that signed, the data, and reply - which signs a reply to exactly this
-    request, so a reply cannot be produced for a request that was never verified. Throws if the
-    signature, certificate chain, or time do not check out, or if the request was addressed to
-    someone we are not: ownIdentities is every name this server answers to - its IPs (there are
-    always several, internal and external), its machineId, its threadId - and the signed targetId
-    must be one of them. */
+/** Returns the machineId that signed, the data, and the signed reply to send back - always
+    produced, so the caller's only job is to return it. Throws if the signature, certificate
+    chain, or time do not check out, or if the request was addressed to someone we are not:
+    ownIdentities is every name this server answers to - its IPs (there are always several,
+    internal and external), its machineId, its threadId - and the signed targetId must be one of
+    them. */
 export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownIdentities: string[]): {
     machineId: string;
     data: T;
-    reply<R>(data: R): SignedReply<R>;
+    reply: SignedReply;
 } {
     let { signature, payload } = signed;
     let signedThreshold = Date.now() - MAX_SIGNED_AGE;
@@ -76,30 +75,27 @@ export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownId
         throw new Error(`Request is for someone else. It is addressed to ${payload.targetId}, we are ${ownIdentities.join(", ")}`);
     }
     let machineId = getMachineId(getCommonName(payload.certIssuer), domain);
+    let threadKeyCert = getThreadKeyCert(domain);
+    let issuer = getIdentityCA(domain);
+    let { data: requestData, ...requestRest } = payload;
+    let replyPayload: SignedReply["payload"] = {
+        time: Date.now(),
+        request: { ...requestRest, dataHash: dataHash(requestData) },
+        cert: threadKeyCert.cert.toString(),
+        certIssuer: issuer.cert.toString(),
+    };
     return {
         machineId,
         data: payload.data,
-        reply<R>(data: R): SignedReply<R> {
-            let threadKeyCert = getThreadKeyCert(domain);
-            let issuer = getIdentityCA(domain);
-            let { data: requestData, ...requestRest } = payload;
-            let replyPayload: SignedReply<R>["payload"] = {
-                time: Date.now(),
-                request: { ...requestRest, dataHash: dataHash(requestData) },
-                cert: threadKeyCert.cert.toString(),
-                certIssuer: issuer.cert.toString(),
-                data,
-            };
-            return { signature: sign(threadKeyCert, replyPayload), payload: replyPayload };
-        },
+        reply: { signature: sign(threadKeyCert, replyPayload), payload: replyPayload },
     };
 }
 
-/** Returns the machineId that replied, and the data. Throws if the signature, certificate chain,
-    or time do not check out, or if the reply does not answer the request we actually sent. On
-    node the replying machine must also be one of the trusted machines - the browser has no
-    machine list, so there this check is skipped. */
-export async function verifyReply<T>(domain: string, request: SignedRequest<unknown>, reply: SignedReply<T>): Promise<{ machineId: string; data: T }> {
+/** Returns the machineId that replied. Throws if the signature, certificate chain, or time do
+    not check out, or if the reply does not answer the request we actually sent. On node the
+    replying machine must also be one of the trusted machines - the browser has no machine list,
+    so there this check is skipped. */
+export async function verifyReply(domain: string, request: SignedRequest<unknown>, reply: SignedReply): Promise<{ machineId: string }> {
     let { signature, payload } = reply;
     let signedThreshold = Date.now() - MAX_SIGNED_AGE;
     if (payload.time < signedThreshold) {
@@ -118,5 +114,5 @@ export async function verifyReply<T>(domain: string, request: SignedRequest<unkn
             throw new Error(`Reply is signed by ${machineId}, which is not a trusted machine`);
         }
     }
-    return { machineId, data: payload.data };
+    return { machineId };
 }
