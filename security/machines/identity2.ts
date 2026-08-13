@@ -1,9 +1,20 @@
 import sha256 from "js-sha256";
 import { isNode } from "socket-function/src/misc";
+import { secureRandomHex } from "../../misc/random";
 import { getCommonName, getIdentityCA, getMachineId, getThreadKeyCert, sign, validateCertificate, verify } from "../../misc/https/certs";
 import { getTrustedMachines } from "./machines";
 
 const MAX_SIGNED_AGE = 5 * 60 * 1000;
+// Clocks disagree, so a payload from slightly ahead is normal - but one from far ahead would
+// never age out, and so would never stop being accepted.
+const MAX_SIGNED_FUTURE = 60 * 60 * 1000;
+const NONCE_BYTES = 16;
+// Nonces of the requests we have accepted, so none of them can be replayed. Cleared wholesale at
+// the limit rather than expired one by one: reaching it takes a million signed requests inside
+// the five minute window, which is a server being hammered - something we would notice for other
+// reasons - and all it buys is one replay of one request.
+const MAX_SEEN_NONCES = 1000 * 1000;
+let seenNonces = new Set<string>();
 
 export type SignedRequest<T> = {
     signature: string;
@@ -17,6 +28,8 @@ export type SignedRequest<T> = {
         // trusted machine.
         targetId: string;
         targetIsMachineId?: boolean;
+        // Makes the request one use only - the server refuses a nonce it has already accepted
+        nonce: string;
         // The thread certificate that signed this
         cert: string;
         // The machine CA that issued cert - the machineId comes from its common name
@@ -41,6 +54,17 @@ function dataHash(data: unknown) {
     return sha256.sha256(JSON.stringify(data));
 }
 
+function assertSignedTime(kind: string, time: number) {
+    let oldest = Date.now() - MAX_SIGNED_AGE;
+    if (time < oldest) {
+        throw new Error(`Signed ${kind} is too old, ${time} < ${oldest}`);
+    }
+    let newest = Date.now() + MAX_SIGNED_FUTURE;
+    if (time > newest) {
+        throw new Error(`Signed ${kind} is too far in the future, ${time} > ${newest}`);
+    }
+}
+
 export function signRequest<T>(domain: string, config: { targetId: string; targetIsMachineId?: boolean; data: T }): SignedRequest<T> {
     let threadKeyCert = getThreadKeyCert(domain);
     let issuer = getIdentityCA(domain);
@@ -48,6 +72,7 @@ export function signRequest<T>(domain: string, config: { targetId: string; targe
         time: Date.now(),
         targetId: config.targetId,
         targetIsMachineId: config.targetIsMachineId,
+        nonce: secureRandomHex(NONCE_BYTES),
         cert: threadKeyCert.cert.toString(),
         certIssuer: issuer.cert.toString(),
         data: config.data,
@@ -71,15 +96,20 @@ export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownId
     reply: SignedReply;
 } {
     let { signature, payload } = signed;
-    let signedThreshold = Date.now() - MAX_SIGNED_AGE;
-    if (payload.time < signedThreshold) {
-        throw new Error(`Signed request too old, ${payload.time} < ${signedThreshold}`);
-    }
+    assertSignedTime("request", payload.time);
     verify(payload.cert, signature, payload);
     validateCertificate(domain, payload.cert, payload.certIssuer);
     if (!ownIdentities.includes(payload.targetId)) {
         throw new Error(`Request is for someone else. It is addressed to ${payload.targetId}, we are ${ownIdentities.join(", ")}`);
     }
+    // After the signature, so only a real signer can take up a slot
+    if (seenNonces.has(payload.nonce)) {
+        throw new Error(`Request ${payload.nonce} was already used, so it is being refused as a replay`);
+    }
+    if (seenNonces.size >= MAX_SEEN_NONCES) {
+        seenNonces.clear();
+    }
+    seenNonces.add(payload.nonce);
     let machineId = getMachineId(getCommonName(payload.certIssuer), domain);
     let threadKeyCert = getThreadKeyCert(domain);
     let issuer = getIdentityCA(domain);
@@ -104,10 +134,7 @@ export function verifyRequest<T>(domain: string, signed: SignedRequest<T>, ownId
     browser has no machine list, so there that check is skipped. */
 export async function verifyReply(domain: string, request: SignedRequest<unknown>, reply: SignedReply): Promise<{ machineId: string }> {
     let { signature, payload } = reply;
-    let signedThreshold = Date.now() - MAX_SIGNED_AGE;
-    if (payload.time < signedThreshold) {
-        throw new Error(`Signed reply too old, ${payload.time} < ${signedThreshold}`);
-    }
+    assertSignedTime("reply", payload.time);
     verify(payload.cert, signature, payload);
     validateCertificate(domain, payload.cert, payload.certIssuer);
     let { data: requestData, ...requestRest } = request.payload;
