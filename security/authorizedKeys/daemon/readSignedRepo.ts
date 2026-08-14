@@ -5,6 +5,8 @@ import { MANIFEST_NAME, normalizeContent, SIGN_NAMESPACE, SIGNATURE_NAME } from 
 import { verifySSHSIG } from "../../signedFiles/sshsig";
 import { keyFingerprint } from "../authorizedKeys";
 import { revokeRepoPath } from "../revokeSource";
+import { spawnPromise } from "../../helpers/spawn";
+import { GIT_TIMEOUT } from "./paths";
 
 // A source that has never been signed reads as this, so losing a signature counts as a change of
 // signer rather than as something to wave through.
@@ -14,6 +16,25 @@ export const UNSIGNED = "";
 const SIGN_COMMAND = "yarn signfiles git";
 const REVOCATIONS_DIR = "revocations";
 const UNREVOKES_DIR = "unrevoked";
+
+/** What the last commit holds for a file, whatever the working tree has done to it since.
+
+    Only ever consulted when what is on disk does not match the signature, so the normal case costs
+    no git at all. The content still has to match the manifest to be used, so a checkout that is
+    not a git repo, a path that was never committed, and content mangled on its way out of git all
+    end the same way: no match, and the file is left out. */
+async function committedContents(repoPath: string, filePath: string) {
+    let result = await spawnPromise({
+        command: "git",
+        args: ["show", `HEAD:${filePath.split(path.sep).join("/")}`],
+        cwd: repoPath,
+        timeoutTime: GIT_TIMEOUT,
+    });
+    if (result.error || result.status !== 0) {
+        return undefined;
+    }
+    return Buffer.from(result.stdout, "utf8");
+}
 
 // Every revocation this process has ever seen, keyed by revocation id. Once absorbed a revocation
 // never leaves, even if its file disappears from the revoke repo - the key that writes revocations
@@ -86,15 +107,6 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
     files: Map<string, Buffer>;
 }> {
     let { repoPath, sourceURL } = config;
-    let manifestBytes = await fs.readFile(path.join(repoPath, MANIFEST_NAME)).catch(() => undefined);
-    let signatureBytes = await fs.readFile(path.join(repoPath, SIGNATURE_NAME)).catch(() => undefined);
-    let manifestHash = manifestBytes && crypto.createHash("sha256").update(manifestBytes).digest("hex") || "";
-    let signatureHash = signatureBytes && crypto.createHash("sha256").update(signatureBytes).digest("hex") || "";
-
-    if (!manifestBytes && !signatureBytes) {
-        console.log(`${repoPath} is not signed, ignoring all of its files`);
-        return { signer: UNSIGNED, manifestHash, signatureHash, files: new Map() };
-    }
 
     let broken = (detail: string) => new SignedRepoError(
         "corrupt",
@@ -103,22 +115,57 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
         + ` this machine keeps using what it last accepted.\n\n${detail}`
         + `\n\nTo replace the signature, run in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``
     );
-    if (!manifestBytes || !signatureBytes) {
-        throw broken(`Only one of ${MANIFEST_NAME} and ${SIGNATURE_NAME} is present.`);
+
+    // The signature covers the normalised bytes, so a checkout that arrived with CRLF still
+    // verifies rather than looking like tampering.
+    let verifyPair = (manifest: Buffer | undefined, signature: Buffer | undefined) => {
+        if (!manifest || !signature) {
+            return undefined;
+        }
+        try {
+            return {
+                signer: verifySSHSIG({
+                    signature: signature.toString("utf8"),
+                    message: normalizeContent(manifest),
+                    namespace: SIGN_NAMESPACE,
+                }).publicKey,
+                manifest,
+                manifestHash: crypto.createHash("sha256").update(manifest).digest("hex"),
+                signatureHash: crypto.createHash("sha256").update(signature).digest("hex"),
+            };
+        } catch (e) {
+            return undefined;
+        }
+    };
+
+    let diskManifest = await fs.readFile(path.join(repoPath, MANIFEST_NAME)).catch(() => undefined);
+    let diskSignature = await fs.readFile(path.join(repoPath, SIGNATURE_NAME)).catch(() => undefined);
+    // What the working tree holds is what we want, when it holds something that verifies.
+    let signed = verifyPair(diskManifest, diskSignature);
+    // Otherwise the last commit, which is the state somebody actually signed and pushed. An edit
+    // in progress, or one abandoned half way, then costs nothing: it is simply not what we read.
+    if (!signed) {
+        signed = verifyPair(
+            await committedContents(repoPath, MANIFEST_NAME),
+            await committedContents(repoPath, SIGNATURE_NAME)
+        );
+        if (signed) {
+            console.log(`${path.join(repoPath, MANIFEST_NAME)} does not verify as it is here, reading the committed one instead`);
+        }
     }
 
-    let signer: string;
-    try {
-        // The signature covers the normalised bytes, so a checkout that arrived with CRLF still
-        // verifies rather than looking like tampering.
-        signer = verifySSHSIG({
-            signature: signatureBytes.toString("utf8"),
-            message: normalizeContent(manifestBytes),
-            namespace: SIGN_NAMESPACE,
-        }).publicKey;
-    } catch (e) {
-        throw broken(`${e}`);
+    if (!signed) {
+        if (!diskManifest && !diskSignature) {
+            console.log(`${repoPath} is not signed, ignoring all of its files`);
+            return { signer: UNSIGNED, manifestHash: "", signatureHash: "", files: new Map() };
+        }
+        if (!diskManifest || !diskSignature) {
+            throw broken(`Only one of ${MANIFEST_NAME} and ${SIGNATURE_NAME} is present.`);
+        }
+        throw broken(`Neither the ${MANIFEST_NAME} here nor the committed one verifies.`);
     }
+    let { signer, manifestHash, signatureHash } = signed;
+    let manifestBytes = signed.manifest;
 
     // The manifest is the list of files, so it is the only thing we read. Whatever else is in the
     // checkout is never opened and never mentioned - a working tree full of node_modules is not
@@ -130,19 +177,39 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
     let manifest = JSON.parse(manifestBytes.toString("utf8"));
     let listed = (manifest.files || []) as { path: string; size: number; sha256: string }[];
 
+    let matchesManifest = (contents: Buffer | undefined, expected: { size: number; sha256: string }) => {
+        if (!contents) {
+            return undefined;
+        }
+        let normalized = normalizeContent(contents);
+        if (normalized.length !== expected.size) {
+            return undefined;
+        }
+        if (crypto.createHash("sha256").update(normalized).digest("hex") !== expected.sha256) {
+            return undefined;
+        }
+        return normalized;
+    };
+
     let files = new Map<string, Buffer>();
     for (let expected of listed) {
-        let contents = await fs.readFile(path.join(repoPath, expected.path)).catch(() => undefined);
+        let contents = matchesManifest(
+            await fs.readFile(path.join(repoPath, expected.path)).catch(() => undefined),
+            expected
+        );
+        // Same as for the manifest: what the working tree holds is preferred, and the committed
+        // file is what we fall back to. A file edited but not signed, or deleted by accident, then
+        // goes on working from the last state anybody signed.
         if (!contents) {
-            console.log(`${path.join(repoPath, expected.path)} is in the signed manifest, but is not here`);
-            continue;
+            contents = matchesManifest(await committedContents(repoPath, expected.path), expected);
+            if (contents) {
+                console.log(`${path.join(repoPath, expected.path)} does not match the manifest as it is here, using the committed one`);
+            }
         }
-        contents = normalizeContent(contents);
-        let hash = crypto.createHash("sha256").update(contents).digest("hex");
-        if (contents.length !== expected.size || hash !== expected.sha256) {
+        if (!contents) {
             console.log(
-                `Ignoring ${path.join(repoPath, expected.path)}, it was changed after it was signed.`
-                + ` Run ${SIGN_COMMAND} in that repo to sign it as it now is.`
+                `Ignoring ${path.join(repoPath, expected.path)}, neither it nor the committed version`
+                + ` matches the manifest. Run ${SIGN_COMMAND} in that repo to sign it as it now is.`
             );
             continue;
         }
