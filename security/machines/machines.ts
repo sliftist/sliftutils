@@ -191,18 +191,9 @@ export async function setMachines(config: {
             ips,
             addedAt: existing.get(machine.machineId)?.addedAt || new Date().toISOString(),
         };
-        written.push(state);
-        // Setting is by the whole list, so every machine comes through here whether it changed or
-        // not. Writing a file whose bytes are already what we would write changes nothing and
-        // costs plenty: it shows up as an edit in the repo, and an edit is a file that no longer
-        // matches the signed manifest until somebody signs again.
-        let filePath = machineFilePath(repoPath, state.machineId);
-        let contents = JSON.stringify(state, undefined, 4) + "\n";
-        if (await fs.readFile(filePath, "utf8").catch(() => undefined) === contents) {
-            continue;
-        }
         await fs.mkdir(directory, { recursive: true });
-        await fs.writeFile(filePath, contents);
+        await fs.writeFile(machineFilePath(repoPath, state.machineId), JSON.stringify(state, undefined, 4) + "\n");
+        written.push(state);
     }
 
     // Whatever the repo had and the caller did not name is no longer trusted.
