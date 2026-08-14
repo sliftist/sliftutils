@@ -59,9 +59,9 @@ export function noteRevocation(revocationId: string, identity: string, ip: strin
     absorbedRevocations.set(revocationId, { identity, ip });
 }
 
-/** A repo that cannot be trusted, with the message ready for whoever asked. Not every caller
-    treats these the same - a source keeps its last keys, a machine list is just refused - so the
-    kind is carried rather than acted on here. */
+/** A repo whose signature does not check out, with the message ready for whoever asked. Not every
+    caller treats it the same - a source keeps its last keys, a machine list is just refused - so
+    the kind is carried rather than acted on here. */
 export class SignedRepoError extends Error {
     constructor(public problem: string, public headline: string, public body: string) {
         super(`${headline}. ${body}`);
@@ -71,11 +71,14 @@ export class SignedRepoError extends Error {
 /** Everything a signed checkout vouches for, in one call: who signed it, and the contents of every
     file the signature actually covers.
 
-    UNSIGNED with no files when there is no signature at all. Throws a SignedRepoError when a
-    signature is present but does not hold up, or when a file it signed for was changed or removed
-    without re-signing - either way the caller keeps whatever it last accepted rather than believing
-    a repo that no longer matches what was signed. A file not in the manifest is just unsigned, so
-    it is left out and warned about rather than treated as tampering. */
+    UNSIGNED with no files when there is no signature at all. Throws a SignedRepoError only when the
+    signature over the manifest does not hold up, since then nothing in the repo can be believed and
+    the caller keeps whatever it last accepted.
+
+    Individual files are included or left out one at a time, and a file being left out never affects
+    the others: a file the manifest does not name, a file whose contents no longer match what was
+    signed, and a file the manifest names that is not on disk are all simply files we hold no
+    signature for. */
 export async function readSignedRepo(config: { repoPath: string; sourceURL: string }): Promise<{
     signer: string;
     manifestHash: string;
@@ -117,13 +120,6 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
         throw broken(`${e}`);
     }
 
-    let stale = (detail: string) => new SignedRepoError(
-        "stale",
-        `KEY REPO CHANGED WITHOUT BEING SIGNED`,
-        `${detail}, so the repo is being ignored and this machine keeps using what it last accepted.`
-        + `\n\nTo make the change take effect, run in that repo:\n\`\`\`\n${SIGN_COMMAND}\n\`\`\``
-    );
-
     // Every file on disk, other than git's own directory and the two signature files, which cannot
     // describe themselves.
     let listCheckoutFiles = async (prefix?: string): Promise<string[]> => {
@@ -146,27 +142,32 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
         (manifest.files || []).map((file: { path: string; size: number; sha256: string }) => [file.path, file])
     );
 
+    // A file counts only if the manifest names it AND its contents still match. Anything else is
+    // left out, one file at a time: an unsigned file, a file edited after signing, and a file the
+    // manifest names that is not here are all just files we have no signature for. None of them
+    // says anything about the files that DO match, so none of them takes the rest of the repo down
+    // with it - the signature over the manifest is the only thing that can do that.
     let files = new Map<string, Buffer>();
     for (let filePath of await listCheckoutFiles()) {
         let expected = listed.get(filePath);
-        // A file the signature never mentioned is not tampering, it is just unsigned - left out
-        // rather than trusted. An extra file in a working tree is ordinary, so it is only a note.
         if (!expected) {
             console.log(`Ignoring ${path.join(repoPath, filePath)}, it is not in the signed manifest`);
             continue;
         }
         let contents = normalizeContent(await fs.readFile(path.join(repoPath, filePath)));
         let hash = crypto.createHash("sha256").update(contents).digest("hex");
-        // A file the manifest DOES name, but whose content no longer matches, is a signed file
-        // changed without re-signing - the repo being edited out from under its signature.
         if (contents.length !== expected.size || hash !== expected.sha256) {
-            throw stale(`${path.join(repoPath, filePath)} was changed after it was signed`);
+            console.log(
+                `Ignoring ${path.join(repoPath, filePath)}, it was changed after it was signed.`
+                + ` Run ${SIGN_COMMAND} in that repo to sign it as it now is.`
+            );
+            continue;
         }
         files.set(filePath, contents);
     }
     for (let filePath of listed.keys()) {
         if (!files.has(filePath)) {
-            throw stale(`${path.join(repoPath, filePath)} is signed for but missing`);
+            console.log(`${path.join(repoPath, filePath)} is in the signed manifest, but there is nothing here that matches it`);
         }
     }
 

@@ -42,11 +42,12 @@ import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 //   4. A source's history was rewritten.
 //   5. A source started being signed by a different key, so its new keys are being held.
 //   6. A source is now signed when it was not before, applied right away.
-//   7. A source changed without its signature being updated, so the change is ignored.
-//   8. A source has a corrupted signature, so its contents are ignored.
-//   9. The webhook file itself changed, reported to the webhook being replaced.
-//  10. A trusted machine talked to us from an address it is not allowed from, so it was frozen
+//   7. A source has a corrupted signature, so its contents are ignored.
+//   8. The webhook file itself changed, reported to the webhook being replaced.
+//   9. A trusted machine talked to us from an address it is not allowed from, so it was frozen
 //      everywhere. Sent by whichever machine wrote that revocation, from machines.ts.
+// A file that does not match the manifest is NOT on this list. It is one file we hold no
+// signature for, it is logged where it is skipped, and the rest of the repo is unaffected.
 
 type DaemonConfig = {
     repoSources: string[];
