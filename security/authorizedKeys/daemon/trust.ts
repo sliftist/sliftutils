@@ -120,55 +120,33 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
         throw broken(`${e}`);
     }
 
-    // Every file on disk, other than git's own directory and the two signature files, which cannot
-    // describe themselves.
-    let listCheckoutFiles = async (prefix?: string): Promise<string[]> => {
-        let found: string[] = [];
-        for (let entry of await fs.readdir(path.join(repoPath, prefix || ""), { withFileTypes: true })) {
-            let relativePath = prefix && `${prefix}/${entry.name}` || entry.name;
-            if (entry.name === ".git") continue;
-            if (!prefix && (entry.name === MANIFEST_NAME || entry.name === SIGNATURE_NAME)) continue;
-            if (entry.isDirectory()) {
-                found.push(...await listCheckoutFiles(relativePath));
-                continue;
-            }
-            found.push(relativePath);
-        }
-        return found.sort();
-    };
-
+    // The manifest is the list of files, so it is the only thing we read. Whatever else is in the
+    // checkout is never opened and never mentioned - a working tree full of node_modules is not
+    // something to report on, it is simply not what was signed.
+    //
+    // A file counts only if its contents still match what the manifest says. One that does not is
+    // left out on its own: it is a file we hold no signature for, and it says nothing about the
+    // files that DO match. Only the signature over the manifest can discredit the whole repo.
     let manifest = JSON.parse(manifestBytes.toString("utf8"));
-    let listed = new Map<string, { size: number; sha256: string }>(
-        (manifest.files || []).map((file: { path: string; size: number; sha256: string }) => [file.path, file])
-    );
+    let listed = (manifest.files || []) as { path: string; size: number; sha256: string }[];
 
-    // A file counts only if the manifest names it AND its contents still match. Anything else is
-    // left out, one file at a time: an unsigned file, a file edited after signing, and a file the
-    // manifest names that is not here are all just files we have no signature for. None of them
-    // says anything about the files that DO match, so none of them takes the rest of the repo down
-    // with it - the signature over the manifest is the only thing that can do that.
     let files = new Map<string, Buffer>();
-    for (let filePath of await listCheckoutFiles()) {
-        let expected = listed.get(filePath);
-        if (!expected) {
-            console.log(`Ignoring ${path.join(repoPath, filePath)}, it is not in the signed manifest`);
+    for (let expected of listed) {
+        let contents = await fs.readFile(path.join(repoPath, expected.path)).catch(() => undefined);
+        if (!contents) {
+            console.log(`${path.join(repoPath, expected.path)} is in the signed manifest, but is not here`);
             continue;
         }
-        let contents = normalizeContent(await fs.readFile(path.join(repoPath, filePath)));
+        contents = normalizeContent(contents);
         let hash = crypto.createHash("sha256").update(contents).digest("hex");
         if (contents.length !== expected.size || hash !== expected.sha256) {
             console.log(
-                `Ignoring ${path.join(repoPath, filePath)}, it was changed after it was signed.`
+                `Ignoring ${path.join(repoPath, expected.path)}, it was changed after it was signed.`
                 + ` Run ${SIGN_COMMAND} in that repo to sign it as it now is.`
             );
             continue;
         }
-        files.set(filePath, contents);
-    }
-    for (let filePath of listed.keys()) {
-        if (!files.has(filePath)) {
-            console.log(`${path.join(repoPath, filePath)} is in the signed manifest, but there is nothing here that matches it`);
-        }
+        files.set(expected.path, contents);
     }
 
     // Absorb the revoke repo's files into the sticky map. Once seen a revocation never leaves it,
