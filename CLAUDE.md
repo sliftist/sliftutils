@@ -9,6 +9,7 @@ from `.cursor/rules/*.mdc` so Claude reads them automatically.
 - Don't run shell commands when you need to create or move small code files. Use tool calls. Use tool calls to make files within folders — you don't need to make the folder, just make the file, the folder will be created automatically.
 - If you need to add a dependency, don't just edit `package.json`. Use `yarn add` so you get the latest version, unless the user specifies a version.
 - Use tool calls to read and write files and directories, as opposed to shell commands running `ls`, `dir`, etc.
+- Almost never run shell commands. Prefer a `yarn` command — if one doesn't exist for what you need, write it: a reusable script (an entry point in `bin/`, wired up in `package.json`) that anyone can run again, rather than a one-off shell invocation that only existed in your terminal.
   
 
 ## Coding styles
