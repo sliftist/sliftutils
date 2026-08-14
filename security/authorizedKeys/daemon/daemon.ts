@@ -14,7 +14,7 @@ import { notify, setHostLabel } from "./notify";
 import { enforceRootKeys } from "./rootKeys";
 import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
-import { readSignedRepo, SignedRepoError, UNSIGNED } from "./trust";
+import { readSignedRepo, SignedRepoError, UNSIGNED } from "./readSignedRepo";
 import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
 import { absorbRevocations, applyUnrevokes, pairKey, recordRevocation, reportRevokedKeys } from "./revocation";
 import { revokeRepo, syncRepoFiles } from "./repoFiles";
