@@ -39,7 +39,6 @@ export async function getOwnIPs() {
     let addresses = new Set<string>();
     for (let [name, entries] of Object.entries(os.networkInterfaces())) {
         if (isVirtualInterface(name)) {
-            console.log(`Ignoring ${name}, it belongs to a container or virtual machine`);
             continue;
         }
         for (let entry of entries || []) {

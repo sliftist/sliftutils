@@ -8,10 +8,16 @@ export declare function sourceName(repoURL: string): string;
 export declare function sourceKeyPath(repoURL: string): string;
 export declare function legacySourceKeyPath(repoURL: string): string;
 export declare function sourceRepoPath(repoURL: string): string;
-/** The key for a source, wherever it happens to be. The user folder is where they go now, and the
-    old location is still read so a host that predates the move keeps working. */
 export declare function findKey(config: {
     current: string;
     legacy: string;
 }): Promise<string>;
+/** What is at each place the key could be, for whoever has to be told it was not found. "No such
+    file" is a lie when a directory of that name is sitting right there, and it is the one case
+    where saying so is the whole answer. */
+export declare function describeMissingKey(config: {
+    current: string;
+    legacy: string;
+}): Promise<string>;
 export declare function findSourceKey(repoURL: string): Promise<string>;
+export declare function describeMissingSourceKey(repoURL: string): Promise<string>;

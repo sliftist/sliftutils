@@ -9,9 +9,9 @@ export declare function isPairUnrevoked(identity: string, ip: string): boolean;
 /** For whoever just wrote a revocation, so it holds here immediately rather than on the next
     absorb. Sticky like the rest. */
 export declare function noteRevocation(revocationId: string, identity: string, ip: string): void;
-/** A repo that cannot be trusted, with the message ready for whoever asked. Not every caller
-    treats these the same - a source keeps its last keys, a machine list is just refused - so the
-    kind is carried rather than acted on here. */
+/** A repo whose signature does not check out, with the message ready for whoever asked. Not every
+    caller treats it the same - a source keeps its last keys, a machine list is just refused - so
+    the kind is carried rather than acted on here. */
 export declare class SignedRepoError extends Error {
     problem: string;
     headline: string;
@@ -21,11 +21,14 @@ export declare class SignedRepoError extends Error {
 /** Everything a signed checkout vouches for, in one call: who signed it, and the contents of every
     file the signature actually covers.
 
-    UNSIGNED with no files when there is no signature at all. Throws a SignedRepoError when a
-    signature is present but does not hold up, or when a file it signed for was changed or removed
-    without re-signing - either way the caller keeps whatever it last accepted rather than believing
-    a repo that no longer matches what was signed. A file not in the manifest is just unsigned, so
-    it is left out and warned about rather than treated as tampering. */
+    UNSIGNED with no files when there is no signature at all. Throws a SignedRepoError only when the
+    signature over the manifest does not hold up, since then nothing in the repo can be believed and
+    the caller keeps whatever it last accepted.
+
+    Individual files are included or left out one at a time, and a file being left out never affects
+    the others: a file the manifest does not name, a file whose contents no longer match what was
+    signed, and a file the manifest names that is not on disk are all simply files we hold no
+    signature for. */
 export declare function readSignedRepo(config: {
     repoPath: string;
     sourceURL: string;
