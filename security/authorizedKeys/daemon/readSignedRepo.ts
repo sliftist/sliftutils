@@ -40,15 +40,23 @@ async function committedContents(repoPath: string, filePath: string) {
 // never leaves, even if its file disappears from the revoke repo - the key that writes revocations
 // is on every server, so whoever stole one could otherwise erase the record that shut them out.
 // Restarting the process is the way back from a revocation that should not have happened.
-let absorbedRevocations = new Map<string, { identity: string; ip: string }>();
+export type Revocation = {
+    identity: string;
+    ip: string;
+    revokedAt: string;
+    revokedBy: string;
+};
+let absorbedRevocations = new Map<string, Revocation>();
 // The pairs the signed unrevokes allow, and the legacy revocation ids they name. Rebuilt on every
 // read, since unrevokes are signed content and removing one must take effect.
 let unrevokedPairs = new Set<string>();
 let unrevokedIds = new Set<string>();
 
-/** Whether an identity - a key fingerprint or a machine id - has a revocation nothing has undone.
-    The one meaning of "frozen", used both when stripping repo content and when explaining why. */
-export function isIdentityFrozen(identity: string) {
+/** The revocation freezing an identity - a key fingerprint or a machine id - or nothing if it is
+    not frozen. The one meaning of "frozen", used both when stripping repo content and when
+    explaining why, and it hands back the revocation rather than a bare yes so that whoever has to
+    explain it can say which address it was, and when, instead of "an unapproved address". */
+export function identityFrozenBy(identity: string) {
     for (let [revocationId, revocation] of absorbedRevocations) {
         if (revocation.identity !== identity) {
             continue;
@@ -56,9 +64,19 @@ export function isIdentityFrozen(identity: string) {
         if (unrevokedIds.has(revocationId) || unrevokedPairs.has(`${identity} ${revocation.ip}`)) {
             continue;
         }
-        return true;
+        return { ...revocation, revocationId };
     }
-    return false;
+    return undefined;
+}
+
+/** Every revocation this process has absorbed, and whether an unrevoke has since forgiven it. For
+    anything showing the whole picture rather than asking about one identity. */
+export function listRevocations() {
+    return [...absorbedRevocations].map(([revocationId, revocation]) => ({
+        ...revocation,
+        revocationId,
+        forgiven: unrevokedIds.has(revocationId) || unrevokedPairs.has(`${revocation.identity} ${revocation.ip}`),
+    }));
 }
 
 export function isPairRevoked(identity: string, ip: string) {
@@ -76,8 +94,8 @@ export function isPairUnrevoked(identity: string, ip: string) {
 
 /** For whoever just wrote a revocation, so it holds here immediately rather than on the next
     absorb. Sticky like the rest. */
-export function noteRevocation(revocationId: string, identity: string, ip: string) {
-    absorbedRevocations.set(revocationId, { identity, ip });
+export function noteRevocation(revocationId: string, revocation: Revocation) {
+    absorbedRevocations.set(revocationId, revocation);
 }
 
 /** A repo whose signature does not check out, with the message ready for whoever asked. Not every
@@ -232,7 +250,12 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
             }
             let revocationId = parsed.revocationId || name.replace(/\.json$/, "");
             if (!absorbedRevocations.has(revocationId)) {
-                absorbedRevocations.set(revocationId, { identity, ip: parsed.ip || parsed.attempt?.ip || "" });
+                absorbedRevocations.set(revocationId, {
+                    identity,
+                    ip: parsed.ip || parsed.attempt?.ip || "",
+                    revokedAt: parsed.revokedAt || "",
+                    revokedBy: parsed.revokedBy || "",
+                });
             }
         } catch (e) {
             console.log(`Ignoring unreadable revocation ${path.join(revocationsDirectory, name)}. ${e}`);
@@ -271,8 +294,9 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
             let lines = contents.toString("utf8").split("\n");
             let kept = lines.filter(line => {
                 let fingerprint = keyFingerprint(line);
-                if (fingerprint && isIdentityFrozen(fingerprint)) {
-                    console.log(`Dropping revoked key ${fingerprint} from ${path.join(repoPath, filePath)}`);
+                let frozen = fingerprint && identityFrozenBy(fingerprint);
+                if (frozen) {
+                    console.log(`Dropping revoked key ${fingerprint} from ${path.join(repoPath, filePath)}, used from ${frozen.ip}`);
                     return false;
                 }
                 return true;
@@ -283,8 +307,9 @@ export async function readSignedRepo(config: { repoPath: string; sourceURL: stri
         }
         if (filePath.startsWith("machines/") && filePath.endsWith(".json")) {
             let machineId = filePath.slice("machines/".length, -".json".length);
-            if (isIdentityFrozen(machineId)) {
-                console.log(`Dropping frozen machine ${machineId} from ${path.join(repoPath, filePath)}`);
+            let frozen = identityFrozenBy(machineId);
+            if (frozen) {
+                console.log(`Dropping frozen machine ${machineId} from ${path.join(repoPath, filePath)}, used from ${frozen.ip}`);
                 files.delete(filePath);
             }
         }
