@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { deriveRevokeKey, findRevokeKey, REVOKE_KEY_LABEL, revokeKeyPath, revokeRepoPath, revokeRepoURL } from "../revokeSource";
-import { findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
+import { describeMissingSourceKey, findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, repoIsUsable, runGit, setGitRef } from "./git";
 
 /** Reading a repo, made to look like reading a directory. A caller asks for a file and gets its
@@ -42,9 +42,15 @@ export async function ensureRevokeKey(sourceURL: string) {
     }
     let sourceKey = await findSourceKey(sourceURL);
     if (!sourceKey) {
-        throw new Error(`Expected a key for ${sourceURL} at ${sourceKeyPath(sourceURL)}, no such file exists`);
+        throw new Error(
+            `Expected the private key for ${sourceURL} to be one of these files, and it is neither:`
+            + ` ${await describeMissingSourceKey(sourceURL)}`
+        );
     }
-    let derived = deriveRevokeKey(await fs.readFile(sourceKey, "utf8"));
+    let sourceKeyContents = await fs.readFile(sourceKey, "utf8").catch(e => {
+        throw new Error(`Expected to read the private key for ${sourceURL} from ${sourceKey}, ${e}`);
+    });
+    let derived = deriveRevokeKey(sourceKeyContents);
     let keyPath = revokeKeyPath(sourceURL);
     await fs.mkdir(path.dirname(keyPath), { recursive: true, mode: 0o700 });
     await fs.writeFile(keyPath, derived.privateKeyFile, { mode: 0o600 });

@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import os from "os";
 import { configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../../notifications/discord";
-import { findSourceKey, legacySourceKeyPath, sourceKeyPath, sourceRepoPath } from "../sources";
+import { describeMissingSourceKey, findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, syncRepo } from "./git";
 import {
     CHECK_INTERVAL,
@@ -82,8 +82,8 @@ async function loadConfig(): Promise<DaemonConfig> {
     for (let repoURL of parsed.repoSources) {
         if (!await findSourceKey(repoURL)) {
             console.error(
-                `portsecure: expected the private key for ${repoURL} at ${sourceKeyPath(repoURL)}`
-                + ` or ${legacySourceKeyPath(repoURL)}, neither exists`
+                `portsecure: expected the private key for ${repoURL} to be one of these files, and`
+                + ` it is neither: ${await describeMissingSourceKey(repoURL)}`
             );
             process.exit(1);
         }
