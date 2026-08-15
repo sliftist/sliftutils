@@ -1,6 +1,7 @@
 import { DEV_listIdentityDomains, getOwnMachineId, loadIdentityCA } from "../../misc/https/certs";
 import { resolveKeysRepo } from "../authorizedKeys/keysRepo";
-import { readSignedRepo } from "../authorizedKeys/daemon/readSignedRepo";
+import { listRevocations, readSignedRepo } from "../authorizedKeys/daemon/readSignedRepo";
+import { revokeRepo, syncRepoFiles } from "../authorizedKeys/daemon/repoFiles";
 import { MACHINES_DIR } from "./machines";
 
 // Who this machine is, and who it believes everyone else is. One command, because working out
@@ -36,6 +37,14 @@ async function printRepo(ownIds: string[]) {
     console.log(`\nKeys repo ${repoPath}`);
     console.log(`    from ${sourceURL}`);
 
+    // Pulled first, or a revocation another machine wrote minutes ago is missing from a picture
+    // whose whole purpose is to explain why something is being refused.
+    try {
+        await syncRepoFiles(revokeRepo(sourceURL));
+    } catch (e) {
+        console.log(`    Could not pull the revocations, showing the ones already here. ${e}`);
+    }
+
     let files;
     try {
         files = (await readSignedRepo({ repoPath, sourceURL })).files;
@@ -66,6 +75,30 @@ async function printRepo(ownIds: string[]) {
     for (let machine of machines) {
         let us = ownIds.includes(machine.machineId) && "  <- this machine" || "";
         console.log(`    ${machine.machineId}  ${machine.ips.join(", ") || "(no addresses, so it is never accepted)"}${us}`);
+    }
+
+    // Frozen machines are already gone from the list above, which is exactly why they have to be
+    // named here - otherwise a machine being refused everywhere simply is not mentioned anywhere.
+    let revocations = listRevocations();
+    let frozen = revocations.filter(revocation => !revocation.forgiven);
+    console.log(`\nFrozen (${frozen.length}), refused everywhere until unrevoked:`);
+    for (let revocation of frozen) {
+        let us = ownIds.includes(revocation.identity) && "  <- this machine" || "";
+        console.log(`    ${revocation.identity}  used from ${revocation.ip || "an unrecorded address"}`
+            + `${revocation.revokedAt && ` at ${revocation.revokedAt}` || ""}`
+            + `${revocation.revokedBy && `, noticed by ${revocation.revokedBy}` || ""}${us}`);
+        console.log(`        ${revocation.revocationId}`);
+    }
+    if (!frozen.length) {
+        console.log(`    (nothing is frozen)`);
+    }
+
+    let forgiven = revocations.filter(revocation => revocation.forgiven);
+    if (forgiven.length) {
+        console.log(`\nRevoked, then allowed again (${forgiven.length}):`);
+        for (let revocation of forgiven) {
+            console.log(`    ${revocation.identity}  from ${revocation.ip || "an unrecorded address"}`);
+        }
     }
 
     console.log(`\nSigned files (${files.size}):`);

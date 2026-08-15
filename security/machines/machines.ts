@@ -6,7 +6,7 @@ import { revokeRepo, syncRepoFiles } from "../authorizedKeys/daemon/repoFiles";
 import { newRevocationId } from "../authorizedKeys/daemon/revocation";
 import { runGit, syncRepo } from "../authorizedKeys/daemon/git";
 import { ensureRevokeKey } from "../authorizedKeys/daemon/repoFiles";
-import { isIdentityFrozen, isPairRevoked, isPairUnrevoked, noteRevocation, readSignedRepo } from "../authorizedKeys/daemon/readSignedRepo";
+import { identityFrozenBy, isPairRevoked, isPairUnrevoked, noteRevocation, readSignedRepo } from "../authorizedKeys/daemon/readSignedRepo";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
@@ -303,13 +303,14 @@ async function recordMachineRevocation(config: {
     let repoPath = revokeRepoPath(sourceURL);
     let keyPath = await ensureRevokeKey(sourceURL);
     let revocationId = newRevocationId(machineId);
+    let revokedAt = new Date().toISOString();
     let directory = path.join(repoPath, REVOCATIONS_DIR);
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(directory, `${revocationId}.json`), JSON.stringify({
         revocationId,
         machineId,
         ip,
-        revokedAt: new Date().toISOString(),
+        revokedAt,
         revokedBy: hostLabel,
         reason: REVOCATION_REASON,
     }, undefined, 4) + "\n");
@@ -325,7 +326,7 @@ async function recordMachineRevocation(config: {
         console.log(`Could not push the revocation of ${machineId} from ${ip}. ${(push.stdout + push.stderr).trim()}`);
         return false;
     }
-    noteRevocation(revocationId, machineId, ip);
+    noteRevocation(revocationId, { identity: machineId, ip, revokedAt, revokedBy: hostLabel });
     console.log(`Revoked ${machineId} from ${ip}, ${revocationId}`);
 
     // Said by whoever wrote the revocation, once, the same as for an ssh key. Machines that only
@@ -386,8 +387,20 @@ export async function isMachineAccepted(config: {
         // machine in it is trusted, and a machine missing from it is either unknown or frozen.
         let machine = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
         if (!machine) {
-            if (isIdentityFrozen(machineId)) {
-                return { verdict: { accepted: false, reason: `Machine ${machineId} is frozen, having been used from an unapproved address.` }, froze: false };
+            let frozen = identityFrozenBy(machineId);
+            if (frozen) {
+                return {
+                    verdict: {
+                        accepted: false,
+                        reason:
+                            `Machine ${machineId} is frozen: it was used from ${frozen.ip || "an address nothing recorded"}`
+                            + `${frozen.revokedAt && `, at ${frozen.revokedAt}` || ""}`
+                            + `${frozen.revokedBy && `, noticed by ${frozen.revokedBy}` || ""}`
+                            + `, which is not an address it is allowed from (revocation ${frozen.revocationId}).`
+                            + ` To allow ${machineId} from ${frozen.ip}, run: yarn unrevoke ${domain || "<domain>"} git`,
+                    },
+                    froze: false,
+                };
             }
             return { verdict: { accepted: false, reason: `Machine ${machineId} is not trusted. ${addMachineCommand({ machineId, ip, domain })}` }, froze: false };
         }
