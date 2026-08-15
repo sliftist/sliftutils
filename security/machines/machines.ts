@@ -397,7 +397,7 @@ export async function isMachineAccepted(config: {
                             + `${frozen.revokedAt && `, at ${frozen.revokedAt}` || ""}`
                             + `${frozen.revokedBy && `, noticed by ${frozen.revokedBy}` || ""}`
                             + `, which is not an address it is allowed from (revocation ${frozen.revocationId}).`
-                            + ` To allow ${machineId} from ${frozen.ip}, run: yarn unrevoke ${domain || "<domain>"} git`,
+                            + ` To give it access again, run in the keys repo: yarn unrevoke git`,
                     },
                     froze: false,
                 };
