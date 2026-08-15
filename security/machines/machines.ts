@@ -290,6 +290,16 @@ async function recordMachineRevocation(config: {
     hostLabel: string;
 }) {
     let { sourceURL, machineId, ip, hostLabel } = config;
+    // Clones it if it is not here yet, which is the usual state of a machine that has never had to
+    // revoke anything. Without this the mkdir below would build the directory anyway and git would
+    // then be run somewhere that is not a checkout, so the revocation was written where nothing
+    // would ever read it.
+    try {
+        await syncRepoFiles(revokeRepo(sourceURL));
+    } catch (e) {
+        console.error(`Cannot record the revocation of ${machineId}, ${revokeRepoURL(sourceURL)} could not be read. ${e}`);
+        return false;
+    }
     let repoPath = revokeRepoPath(sourceURL);
     let keyPath = await ensureRevokeKey(sourceURL);
     let revocationId = newRevocationId(machineId);
@@ -313,7 +323,7 @@ async function recordMachineRevocation(config: {
     if (push.status !== 0) {
         // Another machine most likely recorded the same thing first, and the next read picks it up.
         console.log(`Could not push the revocation of ${machineId} from ${ip}. ${(push.stdout + push.stderr).trim()}`);
-        return;
+        return false;
     }
     noteRevocation(revocationId, machineId, ip);
     console.log(`Revoked ${machineId} from ${ip}, ${revocationId}`);
@@ -332,6 +342,7 @@ async function recordMachineRevocation(config: {
         + `\n\nmachine: \`${machineId}\``
         + `\nfrozen by: \`${hostLabel}\``
     );
+    return true;
 }
 
 /** Whether we will talk to this machine, coming from this address.
@@ -388,8 +399,13 @@ export async function isMachineAccepted(config: {
         // Listed, but talking to us from somewhere it should not be. Recorded once for this machine
         // and address, so being talked to repeatedly does not write repeatedly.
         if (!isPairRevoked(machineId, ip) && !isPairUnrevoked(machineId, ip)) {
-            await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
-            return { verdict: { accepted: false, reason: `Machine ${machineId} is not allowed from ${ip}, and is now frozen everywhere.` }, froze: true };
+            // Only the machine that actually wrote the revocation may say it froze anything. One
+            // that could not reach the revoke repo has refused this call and nothing more.
+            let froze = await recordMachineRevocation({ sourceURL, machineId, ip, hostLabel: os.hostname() });
+            let reason = froze
+                && `Machine ${machineId} is not allowed from ${ip}, and is now frozen everywhere.`
+                || `Machine ${machineId} is not allowed from ${ip}. It could not be frozen, ${revokeRepoURL(sourceURL)} could not be written.`;
+            return { verdict: { accepted: false, reason }, froze };
         }
         return { verdict: { accepted: false, reason: `Machine ${machineId} is not allowed from ${ip}.` }, froze: false };
     };
