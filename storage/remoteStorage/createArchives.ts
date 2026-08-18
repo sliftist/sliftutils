@@ -31,21 +31,41 @@ const PRIMARY_RETRY_TIMEOUT = 30 * 1000;
 const PRIMARY_RETRY_DELAY = 2 * 1000;
 const COVERING_RETRY_TIMEOUT = 30 * 1000;
 const COVERING_RETRY_DELAY = 5 * 1000;
-// Smart timeouts: an attempt gets this long to produce anything before we probe getInfo for the file's size (and the probe itself gets the same window)
-const SMART_TIMEOUT_PROBE = 60 * 1000;
-// Very generous assumed transfer rates - the resulting deadline exists to catch stuck sources, not slow ones
-const SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND = 512 * 1024;
+// A read waits this long for its FIRST chunk, and the window grows to CHUNK_TIMEOUT_MAX as the
+// download goes on - the further in we are, the more a restart costs, so the more patience is
+// worth it. Not size based: the window covers one chunk, and finishing a chunk resets it.
+const CHUNK_TIMEOUT_START = 60 * 1000;
+const CHUNK_TIMEOUT_MAX = 5 * 60 * 1000;
+// How many chunks the window takes to grow from START to MAX, linearly
+const CHUNK_TIMEOUT_RAMP = 10;
+// The first read asks for this much. Anything smaller coming back IS the whole file, so a small
+// file costs exactly one request and never touches getInfo.
+const CHUNK_FIRST_SIZE = 1024 * 1024;
+// Chunks double from CHUNK_FIRST_SIZE up to this, so a big file stops paying per-request latency
+const CHUNK_MAX_SIZE = 32 * 1024 * 1024;
+// A file rewritten under us is read again from the start. After this many it is not worth chasing,
+// and the plain unranged read - one request, one version, no assembly - is the way to get it.
+const MAX_MODIFIED_RETRIES = 3;
+// Uploads still get one deadline sized from the bytes they carry: a flat base plus the transfer
+// at a very generous assumed rate, so a tiny upload still gets the full base window
+const SMART_TIMEOUT_UPLOAD_BASE = 60 * 1000;
 const SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND = 256 * 1024;
-// Marker in smart-timeout errors, so the read loop can log them and continue with the other sources (a connected source's other errors still throw)
+// Marker in timeout errors, so the read loop can log them and continue with the other sources (a connected source's other errors still throw)
 const SMART_TIMEOUT_MARKER = "ARCHIVES_SMART_TIMEOUT_c41a9d";
 
-// Sizes a generous per-attempt deadline. Get-style calls pass path: the size is only fetched (via getInfo) when the call turns out to be slow. Set-style calls pass uploadBytes, which they already know.
+// Sizes a generous per-attempt deadline for a set-style call, from the bytes it already knows it is sending.
 type SmartTimeout = {
-    path?: string;
     uploadBytes?: number;
     // Names the operation in timeout errors - without it a deletion (a tombstone write, uploadBytes 0) reads as "Upload of 0 bytes", which looks like a bug rather than a delete
     label?: string;
 };
+
+/** The window for the chunk at this index: CHUNK_TIMEOUT_START, growing linearly to
+    CHUNK_TIMEOUT_MAX over CHUNK_TIMEOUT_RAMP chunks. */
+function chunkTimeout(chunkIndex: number) {
+    let ramp = Math.min(chunkIndex, CHUNK_TIMEOUT_RAMP) / CHUNK_TIMEOUT_RAMP;
+    return CHUNK_TIMEOUT_START + (CHUNK_TIMEOUT_MAX - CHUNK_TIMEOUT_START) * ramp;
+}
 
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
@@ -257,38 +277,47 @@ export class ArchivesChain implements IArchives {
         let abandon = () => void callPromise.then(() => { }, () => { });
         if (timeout.uploadBytes !== undefined) {
             // A flat base plus the predicted transfer time, so tiny uploads still get the full base window
-            let allowed = SMART_TIMEOUT_PROBE + timeout.uploadBytes / SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND * 1000;
+            let allowed = SMART_TIMEOUT_UPLOAD_BASE + timeout.uploadBytes / SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND * 1000;
             let result = await Promise.race([callPromise.then(value => ({ value })), delay(allowed).then(() => undefined)]);
             if (result) return result.value;
             abandon();
-            throw new Error(`${SMART_TIMEOUT_MARKER} Upload timed out. ${timeout.label || `Upload of ${timeout.uploadBytes} bytes`} to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_PROBE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
+            throw new Error(`${SMART_TIMEOUT_MARKER} Upload timed out. ${timeout.label || `Upload of ${timeout.uploadBytes} bytes`} to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_UPLOAD_BASE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
         }
-        const path = timeout.path;
-        if (path === undefined) return await callPromise;
-        let first = await Promise.race([callPromise.then(value => ({ value })), delay(SMART_TIMEOUT_PROBE).then(() => undefined)]);
-        if (first) return first.value;
-        let probeError: string | undefined;
-        let info: { size: number } | undefined;
-        try {
-            info = await Promise.race([
-                source.read(archives => archives.getInfo(path)).then(x => ({ size: x && x.size || 0 })),
-                delay(SMART_TIMEOUT_PROBE).then(() => undefined),
-            ]);
-        } catch (e) {
-            probeError = String((e as Error).stack ?? e);
+        return await callPromise;
+    }
+
+    /** Runs one call under a window that can be pushed back while it runs. The window covers the
+        next piece of work rather than the whole call, so nothing has to guess how long a transfer
+        "should" take from its size: as long as pieces keep landing, the call keeps its time.
+
+        The waiting is a loop rather than one race, because a refresh that arrives while we are
+        already waiting has to move the deadline we are waiting on. */
+    private async applyRefreshableTimeout<T>(
+        config: { label: string; sourceUrl: string; windowMs: number },
+        call: (refresh: (windowMs: number) => void) => Promise<T>,
+    ): Promise<T> {
+        let start = Date.now();
+        let windowMs = config.windowMs;
+        let deadline = Date.now() + windowMs;
+        let refresh = (nextWindowMs: number) => {
+            windowMs = nextWindowMs;
+            deadline = Date.now() + nextWindowMs;
+        };
+        let callPromise = call(refresh);
+        // An abandoned call must not surface an unhandled rejection when it eventually fails
+        let abandon = () => void callPromise.then(() => { }, () => { });
+        while (true) {
+            let remaining = deadline - Date.now();
+            if (remaining <= 0) {
+                abandon();
+                throw new Error(
+                    `${SMART_TIMEOUT_MARKER} ${config.label} from ${config.sourceUrl} timed out after`
+                    + ` ${Date.now() - start}ms: nothing arrived within the last ${Math.round(windowMs)}ms`
+                );
+            }
+            let result = await Promise.race([callPromise.then(value => ({ value })), delay(remaining).then(() => undefined)]);
+            if (result) return result.value;
         }
-        if (!info) {
-            abandon();
-            throw new Error(`${SMART_TIMEOUT_MARKER} Read timed out with no size probe. Read of ${JSON.stringify(path)} from ${source.getDebugName()}: no result after ${Date.now() - start}ms, and getInfo ${probeError && `failed (${probeError})` || `could not answer within ${SMART_TIMEOUT_PROBE}ms either`}`);
-        }
-        let allowed = Math.max(SMART_TIMEOUT_PROBE, info.size / SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND * 1000);
-        let remaining = start + allowed - Date.now();
-        if (remaining > 0) {
-            let second = await Promise.race([callPromise.then(value => ({ value })), delay(remaining).then(() => undefined)]);
-            if (second) return second.value;
-        }
-        abandon();
-        throw new Error(`${SMART_TIMEOUT_MARKER} Read timed out. Read of ${JSON.stringify(path)} (${info.size} bytes) from ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms from the call's start, at an assumed ${SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND} bytes/s)`);
     }
 
     private lastConfigRefresh = 0;
@@ -355,12 +384,16 @@ export class ArchivesChain implements IArchives {
             // A specific source leaves nothing for the latency ordering to decide
             return await this.get2(fileName, config);
         }
-        return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries, fast: true, timeout: { path: fileName } }, async (archives, url) => {
-            let result = await archives.get2(fileName, config);
-            // Empty data is a tombstone, not content - see get2
-            if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
-            return { data: result.data, writeTime: result.writeTime, size: result.size, url };
-        });
+        if (config?.range) {
+            return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries, fast: true }, async (archives, url) => {
+                let result = await archives.get2(fileName, config);
+                // Empty data is a tombstone, not content - see get2
+                if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+                return { data: result.data, writeTime: result.writeTime, size: result.size, url };
+            });
+        }
+        // Latency order decides who serves the FIRST chunk; the rest follow it, like any other read
+        return await this.readInChunks(fileName, config, { fast: true });
     }
     /** Always resolves with a url - the authority that answered. A value that doesn't exist is still an answer FROM a server, so it comes back as { url } with no data (never plain undefined); errors from every source throw instead. */
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
@@ -373,13 +406,91 @@ export class ArchivesChain implements IArchives {
                 return { data: result.data, writeTime: result.writeTime, size: result.size, url: sourceUrl };
             });
         }
-        return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries, timeout: { path: fileName } }, async (archives, url) => {
+        // A caller that named its own range asked for exactly those bytes, so it is one request.
+        if (config?.range) {
+            return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries }, async (archives, url) => {
+                let result = await archives.get2(fileName, config);
+                // Empty data is a tombstone, not content (unless the caller asked for tombstones) - a ranged read of a REAL file can legitimately be empty though (range past EOF), which the total size distinguishes
+                if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+                return { data: result.data, writeTime: result.writeTime, size: result.size, url };
+            });
+        }
+        return await this.readInChunks(fileName, config);
+    }
+
+    /** Reads a whole file as a series of ranged reads, so a big one arrives in pieces instead of
+        as one request nobody can see inside of.
+
+        The first read asks for CHUNK_FIRST_SIZE. Less than that coming back IS the whole file, so
+        a small file costs exactly one request - and because every backend reports the file's FULL
+        size alongside a ranged read, a big one already knows its size from that same answer and
+        never needs a getInfo to find out.
+
+        Every chunk after the first goes to the source that served the first, so the pieces cannot
+        be assembled out of two different versions living on two replicas. Finishing a chunk pushes
+        the timeout back, so the deadline covers one chunk rather than the whole transfer. */
+    private async readInChunks(fileName: string, config?: GetConfig, options?: { fast?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        for (let attempt = 1; attempt <= MAX_MODIFIED_RETRIES; attempt++) {
+            let first = await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries, fast: options?.fast }, async (archives, url) => {
+                let result = await this.applyRefreshableTimeout(
+                    { label: `The first ${CHUNK_FIRST_SIZE} bytes of ${JSON.stringify(fileName)}`, sourceUrl: url, windowMs: chunkTimeout(0) },
+                    async () => await archives.get2(fileName, { ...config, range: { start: 0, end: CHUNK_FIRST_SIZE } }),
+                );
+                if (!result || !result.data || !result.data.length && !config?.includeTombstones && !result.size) return { url };
+                return { data: result.data, writeTime: result.writeTime, size: result.size, url };
+            });
+            if (!first.data) return first;
+            // The whole file fit in the first read, so there is nothing else to fetch and nothing
+            // that could have changed underneath us
+            if (first.data.length >= first.size) {
+                return first;
+            }
+
+            let url = first.url;
+            let pieces = [first.data];
+            let offset = first.data.length;
+            let chunkSize = CHUNK_FIRST_SIZE;
+            let torn = false;
+            for (let chunkIndex = 1; offset < first.size; chunkIndex++) {
+                chunkSize = Math.min(chunkSize * 2, CHUNK_MAX_SIZE);
+                let end = Math.min(offset + chunkSize, first.size);
+                let start = offset;
+                let piece = await this.applyRefreshableTimeout(
+                    { label: `Bytes ${start}-${end} of ${JSON.stringify(fileName)}`, sourceUrl: url, windowMs: chunkTimeout(chunkIndex) },
+                    async () => await this.runOnSource(url, archives => archives.get2(fileName, { ...config, range: { start, end } })),
+                );
+                // The file shrank under us, so what we have is already a mix of two versions
+                if (!piece || !piece.data || !piece.data.length) {
+                    torn = true;
+                    break;
+                }
+                pieces.push(piece.data);
+                offset += piece.data.length;
+            }
+
+            // Read back to back rather than watched per chunk: one call at the end says whether
+            // everything we just assembled came from the same version of the file.
+            let after = !torn && await this.runOnSource(url, archives => archives.getInfo(fileName, config));
+            if (!torn && after && after.writeTime === first.writeTime && after.size === first.size) {
+                return { data: Buffer.concat(pieces), writeTime: first.writeTime, size: first.size, url };
+            }
+            console.warn(
+                `${JSON.stringify(fileName)} was written while we were reading it from ${url}`
+                + ` (${first.size} bytes at ${first.writeTime}, now ${after && `${after.size} bytes at ${after.writeTime}` || "gone"}).`
+                + ` Reading it again, attempt ${attempt} of ${MAX_MODIFIED_RETRIES}.`
+            );
+        }
+
+        // Whatever is rewriting it is faster than we can read it in pieces, so take it in one
+        // request: no assembly, no chance of two versions, and no ranged reads to keep in step.
+        console.warn(`${JSON.stringify(fileName)} kept changing while being read in chunks, reading it in one request instead`);
+        return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries }, async (archives, url) => {
             let result = await archives.get2(fileName, config);
-            // Empty data is a tombstone, not content (unless the caller asked for tombstones) - a ranged read of a REAL file can legitimately be empty though (range past EOF), which the total size distinguishes
-            if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+            if (!result || !result.data || !result.data.length && !config?.includeTombstones) return { url };
             return { data: result.data, writeTime: result.writeTime, size: result.size, url };
         });
     }
+
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url: string } | undefined> {
         validateFileName(fileName, "getInfo");
         const sourceUrl = config?.sourceUrl;
