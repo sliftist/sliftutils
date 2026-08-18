@@ -31,14 +31,22 @@ const MIN_BUCKET_CACHE_TIME = 60 * 1000;
 const LARGE_FILE_MIN_CHUNK_SIZE = 32 * 1024 * 1024;
 
 // A B2 download/HEAD response's headers carry the file's metadata. content-range's total wins over content-length for ranged responses (which only report the slice's length).
-function parseFileMetadataHeaders(response: HttpsResponseInfo): { size: number; uploadTimestamp: number } {
+function parseFileMetadataHeaders(response: HttpsResponseInfo): { size: number; writeTime: number } {
     let size = Number(response.headers["content-length"] || 0);
     let contentRange = response.headers["content-range"];
     let total = contentRange && Number(contentRange.split("/")[1]);
     if (total && Number.isFinite(total)) {
         size = total;
     }
-    return { size, uploadTimestamp: Number(response.headers["x-bz-upload-timestamp"] || 0) };
+    let uploadTimestamp = Number(response.headers["x-bz-upload-timestamp"] || 0);
+    return { size, writeTime: preservedWriteTime(response.headers["x-bz-info-src_last_modified_millis"], uploadTimestamp) };
+}
+
+// Files written before src_last_modified_millis was sent (and copies, which deliberately omit it) fall back to b2's own uploadTimestamp - the exact value every reader used before, so old files keep behaving identically.
+function preservedWriteTime(srcLastModifiedMillis: string | number | undefined, uploadTimestamp: number): number {
+    let value = Number(srcLastModifiedMillis);
+    if (value > 0) return value;
+    return uploadTimestamp;
 }
 
 const getAPI = lazy(async () => {
@@ -185,7 +193,7 @@ const getAPI = lazy(async () => {
     }
 
     /** A file's metadata by name, without the body: HEAD on the download URL, which is a class B (download-priced) transaction - b2_list_file_names is class C at 10x the price, and b2_get_file_info needs a fileId we don't have. Returns undefined for missing (or hidden) files. */
-    async function headFileByName(config: { bucketName: string; fileName: string }): Promise<{ size: number; uploadTimestamp: number } | undefined> {
+    async function headFileByName(config: { bucketName: string; fileName: string }): Promise<{ size: number; writeTime: number } | undefined> {
         let fileName = encodePath(config.fileName);
         let response: HttpsResponseInfo = { headers: {} };
         try {
@@ -224,17 +232,19 @@ const getAPI = lazy(async () => {
         bucketId: string;
         fileName: string;
         data: Buffer;
+        lastModified?: number;
     }) {
         let getUploadUrl = await getUploadURL(config.bucketId);
 
         await httpsRequest(getUploadUrl.uploadUrl, config.data, "POST", undefined, {
-            headers: {
+            headers: Object.fromEntries(Object.entries({
                 Authorization: getUploadUrl.authorizationToken,
                 "X-Bz-File-Name": encodePath(config.fileName),
                 "Content-Type": "b2/x-auto",
                 "X-Bz-Content-Sha1": "do_not_verify",
                 "Content-Length": config.data.length + "",
-            }
+                "X-Bz-Info-src_last_modified_millis": config.lastModified && String(config.lastModified) || undefined,
+            }).filter(x => x[1] !== undefined)) as { [key: string]: string },
         });
     }
 
@@ -255,7 +265,7 @@ const getAPI = lazy(async () => {
         contentSha1: string;
         contentType: string;
         fileInfo: {
-            src_last_modified_millis: number;
+            src_last_modified_millis?: string | number;
         };
         action: string;
         uploadTimestamp: number;
@@ -277,7 +287,7 @@ const getAPI = lazy(async () => {
             contentSha1: string;
             contentType: string;
             fileInfo: {
-                src_last_modified_millis: number;
+                src_last_modified_millis?: string | number;
             };
             action: string;
             uploadTimestamp: number;
@@ -289,6 +299,9 @@ const getAPI = lazy(async () => {
         sourceFileId: string;
         fileName: string;
         destinationBucketId: string;
+        metadataDirective?: "COPY" | "REPLACE";
+        contentType?: string;
+        fileInfo?: { [key: string]: string };
     }, {}>("b2_copy_file", "POST", "noAccountId");
 
     const startLargeFile = createB2Function<{
@@ -695,7 +708,7 @@ export class ArchivesBackblaze implements IArchives {
                     return undefined;
                 }
                 let meta = parseFileMetadataHeaders(response);
-                return { data, writeTime: meta.uploadTimestamp, size: data.length };
+                return { data, writeTime: meta.writeTime, size: data.length };
             });
             if (!result) return undefined;
             let timeStr = formatTime(Date.now() - time);
@@ -740,7 +753,7 @@ export class ArchivesBackblaze implements IArchives {
         // This comparison deliberately IGNORES noChecks: backblaze has no server of ours to enforce only-take-the-latest (unlike hosted targets, where the receiving store re-checks), so this comparison IS the ordering guard. Skipping it lets a stale push land over a newer value or tombstone - and because b2 stamps its own upload times, the stale data then becomes the newest-timestamped copy in the whole system, resurrecting globally through everyone's scans. includeTombstones: a deletion on b2 is a real size-0 file and must win this comparison too.
         let existing = await this.getInfo(fileName, { includeTombstones: true });
         if (!existing) return false;
-        // An older write never overwrites a newer one (see IArchives.set). B2 stamps its own upload time, so the exact lastModified is not preserved on the stored file.
+        // An older write never overwrites a newer one (see IArchives.set). lastModified is preserved on the stored file as src_last_modified_millis, so this compares real write times.
         if (config.lastModified < existing.writeTime) return true;
         // Immutability wins: a synchronization push never overwrites an existing path on an immutable bucket (see SetConfig.forceSetImmutable)
         if (config.forceSetImmutable && this.config.immutable) return true;
@@ -763,7 +776,7 @@ export class ArchivesBackblaze implements IArchives {
         this.log(`backblaze upload (${formatNumber(data.length)}B) ${fileName}`);
         let f = fileName;
         await this.apiRetryLogic(`uploadFile ${fileName}`, async (api) => {
-            await api.uploadFile({ bucketId: this.bucketId, fileName, data: data, });
+            await api.uploadFile({ bucketId: this.bucketId, fileName, data: data, lastModified: config?.lastModified });
         });
         if (!config?.noChecks) {
             let existsChecks = 30;
@@ -783,13 +796,13 @@ export class ArchivesBackblaze implements IArchives {
     public async del(fileName: string, config?: DelConfig): Promise<void> {
         validateFileName(fileName, "del");
         if (config?.lastModified) {
-            // A synchronized deletion: b2's hide removes the file from listings entirely, so peers scanning the bucket could never learn of it. Instead the tombstone is stored as a REAL empty file (an empty file IS a missing file), which listings show and scans ingest as a deletion. (b2 stamps its own upload time, so the exact deletion time is not preserved here - same as every b2 write.)
+            // A synchronized deletion: b2's hide removes the file from listings entirely, so peers scanning the bucket could never learn of it. Instead the tombstone is stored as a REAL empty file (an empty file IS a missing file), which listings show and scans ingest as a deletion, carrying the original deletion time as src_last_modified_millis so ordering survives.
             // The comparison ignores noChecks for the same reason as in set: on b2 it IS the ordering guard
             let existing = await this.getInfo(fileName, { includeTombstones: true });
             if (existing && config.lastModified < existing.writeTime) return;
             this.log(`backblaze tombstone upload ${fileName}`);
             await this.apiRetryLogic(`del ${fileName}`, async (api) => {
-                await api.uploadFile({ bucketId: this.bucketId, fileName, data: Buffer.alloc(0) });
+                await api.uploadFile({ bucketId: this.bucketId, fileName, data: Buffer.alloc(0), lastModified: config.lastModified });
             });
             return;
         }
@@ -805,7 +818,7 @@ export class ArchivesBackblaze implements IArchives {
         // NOTE: Deletion SEEMS to work. This DOES break if we delete a file which keeps being recreated, ex, the heartbeat. let existsChecks = 10; while (existsChecks > 0) { let exists = await this.getInfo(fileName); if (!exists) break; await delay(1000); existsChecks--; } if (existsChecks === 0) { let exists = await this.getInfo(fileName); devDebugbreak(); console.warn(`File ${fileName} was deleted, but was still found afterwards`); exists = await this.getInfo(fileName); }
     }
 
-    // lastModified is accepted but cannot be honored - b2 stamps its own uploadTimestamp, which is what our getInfo/findInfo report as the write time. fallbacks means nothing here: a single bucket has nowhere to fall back to.
+    // lastModified is preserved as src_last_modified_millis (b2 still stamps its own uploadTimestamp, which readers only fall back to when the info field is absent). fallbacks means nothing here: a single bucket has nowhere to fall back to.
     public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
         validateFileName(config.path, "setLargeFile");
         // Checked before a single byte moves: an upload that is already superseded must not be started at all (a cancelled large upload still costs the transfer)
@@ -857,11 +870,15 @@ export class ArchivesBackblaze implements IArchives {
 
 
             let uploadInfo = await this.apiRetryLogic(`startLargeFile ${fileName}`, async (api) => {
+                let fileInfo: { [key: string]: string } = {};
+                if (config.lastModified) {
+                    fileInfo.src_last_modified_millis = String(config.lastModified);
+                }
                 return await api.startLargeFile({
                     bucketId: this.bucketId,
                     fileName: fileName,
                     contentType: "b2/x-auto",
-                    fileInfo: {},
+                    fileInfo,
                 });
             });
             onError.push(async () => {
@@ -952,7 +969,7 @@ export class ArchivesBackblaze implements IArchives {
                 }
                 this.log(`Backblaze file exists ${fileName}`);
                 return {
-                    writeTime: file.uploadTimestamp,
+                    writeTime: file.writeTime,
                     size: file.size,
                 };
             } catch (e: any) {
@@ -998,14 +1015,15 @@ export class ArchivesBackblaze implements IArchives {
                     delimiter: config?.shallow ? "/" : undefined,
                 });
                 for (let file of result.files) {
+                    let createTime = preservedWriteTime(file.fileInfo?.src_last_modified_millis, file.uploadTimestamp);
                     if (file.action === "upload" && config?.type !== "folders") {
-                        files.set(file.fileName, { path: file.fileName, createTime: file.uploadTimestamp, size: file.contentLength });
+                        files.set(file.fileName, { path: file.fileName, createTime, size: file.contentLength });
                     } else if (file.action === "folder" && config?.type === "folders") {
                         let folder = file.fileName;
                         if (folder.endsWith("/")) {
                             folder = folder.slice(0, -1);
                         }
-                        files.set(folder, { path: folder, createTime: file.uploadTimestamp, size: file.contentLength });
+                        files.set(folder, { path: folder, createTime, size: file.contentLength });
                     }
 
                 }
@@ -1050,10 +1068,14 @@ export class ArchivesBackblaze implements IArchives {
                 let info = await api.listFileNames({ bucketId: this.bucketId, prefix: path, maxFileCount: 10 });
                 let file = info.files.find(x => x.fileName === path);
                 if (!file) throw new Error(`File not found to copy: ${path}`);
+                // REPLACE drops the source's src_last_modified_millis, so readers fall back to the copy's uploadTimestamp - the fresh write time move requires (a COPY directive would carry the old time forward now that we honor it)
                 await api.copyFile({
                     sourceFileId: file.fileId,
                     fileName: targetPath,
                     destinationBucketId: targetBucketId,
+                    metadataDirective: "REPLACE",
+                    contentType: "b2/x-auto",
+                    fileInfo: {},
                 });
             });
             return;

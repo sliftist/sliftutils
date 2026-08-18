@@ -19,6 +19,13 @@ export declare class ArchivesChain implements IArchives {
     private runPrimary;
     /** Races call against a size-based deadline. Uploads know their size upfront; gets are given SMART_TIMEOUT_PROBE to produce anything, and only then is the file's info fetched (from the same source, itself time-limited) to size the deadline - measured from the call's start, so a source that was slow before the probe doesn't get the full allowance again. Timed-out calls keep running in the background (they cannot be cancelled) but their eventual result is ignored. */
     private applySmartTimeout;
+    /** Runs one call under a window that can be pushed back while it runs. The window covers the
+        next piece of work rather than the whole call, so nothing has to guess how long a transfer
+        "should" take from its size: as long as pieces keep landing, the call keeps its time.
+
+        The waiting is a loop rather than one race, because a refresh that arrives while we are
+        already waiting has to move the deadline we are waiting on. */
+    private applyRefreshableTimeout;
     private lastConfigRefresh;
     private prepareWrongTargetRetry;
     private request;
@@ -55,6 +62,18 @@ export declare class ArchivesChain implements IArchives {
         size?: undefined;
         url: string;
     }>;
+    /** Reads a whole file as a series of ranged reads, so a big one arrives in pieces instead of
+        as one request nobody can see inside of.
+
+        The first read asks for CHUNK_FIRST_SIZE. Less than that coming back IS the whole file, so
+        a small file costs exactly one request - and because every backend reports the file's FULL
+        size alongside a ranged read, a big one already knows its size from that same answer and
+        never needs a getInfo to find out.
+
+        Every chunk after the first goes to the source that served the first, so the pieces cannot
+        be assembled out of two different versions living on two replicas. Finishing a chunk pushes
+        the timeout back, so the deadline covers one chunk rather than the whole transfer. */
+    private readInChunks;
     getInfo(fileName: string, config?: GetInfoConfig): Promise<{
         writeTime: number;
         size: number;
