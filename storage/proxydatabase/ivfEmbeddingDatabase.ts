@@ -62,6 +62,19 @@ function rankCellsByCloseness(embedding: StoredEmbedding, centroids: Map<string,
     return ranked.map(entry => entry.cellId);
 }
 
+// Synced functions rerun (and are predicted client-side), so the rebalance roll must be identical on every run of the same call — derive it from the inserted items instead of Math.random(). FNV-1a over each ref plus its embedding hash, mapped to [0, 1).
+function seededRandomFromItems(items: EmbeddingInput[]): number {
+    let hash = 2166136261;
+    for (const item of items) {
+        const key = item.ref + hashEmbedding(item.embedding);
+        for (let index = 0; index < key.length; index++) {
+            hash ^= key.charCodeAt(index);
+            hash = Math.imul(hash, 16777619);
+        }
+    }
+    return (hash >>> 0) / 2 ** 32;
+}
+
 // Per-write chance of a full rebuild. Zero at/under the target size, then rises (cubically) past it so cells stay roughly between target and ~2x target.
 function rebalanceProbability(fillRatio: number): number {
     if (fillRatio <= 1) {
@@ -316,10 +329,10 @@ export function insertEmbeddings(
             }
         }
         const averageFill = newCount / Math.max(1, centroids.size) / config.cellTargetSize;
-        if (Math.random() < rebalanceProbability(averageFill)) {
-            rebuildStructure(database);
+        if (seededRandomFromItems(items) < rebalanceProbability(averageFill)) {
+            return true;
         }
-        return true;
+        return false;
     };
     if (shouldRegenerate(database)) {
         rebuildStructure(database);
