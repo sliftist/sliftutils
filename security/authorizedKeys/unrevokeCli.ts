@@ -6,7 +6,7 @@ import { revokeRepoURL } from "./revokeSource";
 import { signRepo } from "../signedFiles/signFiles";
 import { getMachines, setMachines } from "../machines/machines";
 import { resolveKeysRepo } from "./keysRepo";
-import { readRemoteRevocations, Revocation, revocationIdentity, revocationIP, UNREVOKES_DIR } from "./unrevoke";
+import { readRemoteRevocations, readUnrevokedInRepo, Revocation, revocationIdentity, revocationIP, stillRevokedBy, UNREVOKES_DIR } from "./unrevoke";
 
 const GIT_KEYWORD = "git";
 const COMMIT_MESSAGE = "unrevoke keys";
@@ -101,6 +101,18 @@ async function main() {
     let revocations = await readRemoteRevocations({ sourceURL: originURL });
     if (!revocations.length) {
         console.log(`${revokeRepoURL(originURL)} lists no revocations, so there is nothing to undo.`);
+        return;
+    }
+
+    // Only what this repo has not already forgiven. Revocations are never deleted from the revoke
+    // repo, so without this every run writes a fresh unrevoke naming every revocation that ever
+    // happened - the same entries listed and re-signed each time, which reads as though unrevoking
+    // does nothing at all.
+    let alreadyUnrevoked = await readUnrevokedInRepo(repoPath);
+    revocations = stillRevokedBy(revocations, alreadyUnrevoked);
+    if (!revocations.length) {
+        console.log(`Everything ${revokeRepoURL(originURL)} lists is already unrevoked here.`);
+        console.log(`Nothing to do, and nothing was written.`);
         return;
     }
 
