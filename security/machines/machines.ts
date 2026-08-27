@@ -405,7 +405,12 @@ export async function isMachineAccepted(config: {
             return { verdict: { accepted: false, reason: `Machine ${machineId} is not trusted. ${addMachineCommand({ machineId, ip, domain })}` }, froze: false };
         }
 
-        if (machine.ips.includes(ip)) {
+        // Loopback is always an allowed address. The machine still has to be trusted - an unknown
+        // or frozen one was already refused above - but no ip list can describe a machine talking
+        // to itself: a machine is listed under the address others reach it at, never 127.0.0.1,
+        // so checking loopback against that list rejects every local call and then freezes the
+        // machine everywhere for making it.
+        if (machine.ips.includes(ip) || LOOPBACK.includes(ip)) {
             return { verdict: { accepted: true, reason: "" }, froze: false };
         }
 
