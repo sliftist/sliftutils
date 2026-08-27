@@ -79,11 +79,12 @@ export async function readRemoteRevocations(config: { sourceURL: string }) {
     return revocations;
 }
 
-/** Which keys in a repo are revoked. What signfiles and securessh refuse over. */
-export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: string }) {
-    let { repoPath, sourceURL } = config;
-    let revocations = await readRemoteRevocations({ sourceURL });
-    let revokedFingerprints = new Set(revocations.map(revocation => revocation.fingerprint));
+/** What the unrevokes already in a repo allow: "<identity> <address>" for each pair, plus the bare
+    revocation ids the older format named.
+
+    Read out of the repo rather than out of the daemon's absorbed state, because whoever runs a cli
+    is looking at a checkout and has no daemon in the process to ask. */
+export async function readUnrevokedInRepo(repoPath: string) {
     let unrevoked = new Set<string>();
     try {
         let directory = path.join(repoPath, UNREVOKES_DIR);
@@ -93,7 +94,10 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
             }
             let parsed = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
             for (let allowed of parsed.allowed || []) {
-                unrevoked.add(`${allowed.fingerprint || allowed.machineId} ${allowed.ip}`);
+                let identity = allowed.fingerprint || allowed.machineId;
+                if (identity && allowed.ip) {
+                    unrevoked.add(`${identity} ${allowed.ip}`);
+                }
             }
             // Named ids, for the unrevokes written before this was about pairs.
             for (let revocationId of parsed.revocationIds || []) {
@@ -103,8 +107,27 @@ export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: s
     } catch (e) {
         // Nothing has been unrevoked.
     }
-    let stillRevoked = revocations.filter(revocation => !unrevoked.has(revocation.revocationId)
-        && !unrevoked.has(`${revocation.fingerprint} ${revocationIP(revocation)}`));
+    return unrevoked;
+}
+
+/** The revocations those unrevokes have not already undone.
+
+    Matched on revocationIdentity, not on fingerprint: a machine revocation carries a machineId and
+    no fingerprint, so comparing fingerprints leaves every machine looking revoked forever no matter
+    how many times it is unrevoked. */
+export function stillRevokedBy(revocations: Revocation[], unrevoked: Set<string>) {
+    return revocations.filter(revocation =>
+        !unrevoked.has(revocation.revocationId)
+        && !unrevoked.has(`${revocationIdentity(revocation)} ${revocationIP(revocation)}`)
+    );
+}
+
+/** Which keys in a repo are revoked. What signfiles and securessh refuse over. */
+export async function revokedKeysInRepo(config: { repoPath: string; sourceURL: string }) {
+    let { repoPath, sourceURL } = config;
+    let revocations = await readRemoteRevocations({ sourceURL });
+    let unrevoked = await readUnrevokedInRepo(repoPath);
+    let stillRevoked = stillRevokedBy(revocations, unrevoked);
     let keys = normalizeKeys(await fs.readFile(path.join(repoPath, "authorized_keys"), "utf8").catch(() => ""));
     return stillRevoked
         .filter(revocation => keys.some(key => keyFingerprint(key) === revocation.fingerprint))
