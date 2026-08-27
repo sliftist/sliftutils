@@ -32,7 +32,8 @@ async function main() {
     await signRepo({ repoPath, keyPath });
 
     if (!pushToGit) {
-        console.log(`Commit and push ${MANIFEST_NAME} and ${SIGNATURE_NAME} for anything to see them.`);
+        console.log(`Commit and push ${MANIFEST_NAME} and ${SIGNATURE_NAME} for anything to see them:`);
+        console.log(`\`\`\`\ncd ${repoPath}\ngit add -A\ngit commit -m "${COMMIT_MESSAGE}"\ngit push\n\`\`\``);
         return;
     }
     await runPromise(`git add -A`, { cwd: repoPath });

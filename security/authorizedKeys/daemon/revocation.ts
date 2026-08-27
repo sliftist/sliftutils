@@ -3,6 +3,7 @@ import path from "path";
 import { randomBytes } from "crypto";
 import { keyFingerprint, keyNiceName, summarizeKey } from "../authorizedKeys";
 import { revokeRepoPath, revokeRepoURL } from "../revokeSource";
+import { sourceRepoPath } from "../sources";
 import { runGit } from "./git";
 import { ensureRevokeKey, listRepoDir, readRepoFile, revokeRepo, sourceRepo, syncRepoFiles } from "./repoFiles";
 import { messageTimestamp } from "../../notifications/discord";
@@ -225,8 +226,9 @@ export async function recordRevocation(config: {
             + ` addresses changed.`
             + `\n\nThe key is frozen on every machine now, and works nowhere.${ended}`
             + `\n\nIf this was an attack, remove that key from \`${sourceURL}\` now.`
-            + `\nIf it was you, run \`yarn unrevoke git\` in that repo. It allows ${attempt.ip} on`
-            + ` that key, and takes an hour to reach every machine.`
+            + `\nIf it was you, run:`
+            + `\n\`\`\`\ncd ${sourceRepoPath(sourceURL)}\nyarn unrevoke git\n\`\`\``
+            + `\nIt allows ${attempt.ip} on that key, and takes an hour to reach every machine.`
             + `\n\nkey: \`${keyLine && summarizeKey(keyLine) || fingerprint}\``
             + `\ntried to log in as: \`${attempt.user}\``
             + `\nallowed only from: \`${attempt.required}\``,

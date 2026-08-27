@@ -90,7 +90,8 @@ async function printRepo(ownIds: string[]) {
         console.log(`        ${revocation.revocationId}`);
     }
     if (frozen.length) {
-        console.log(`    To give these access again, run in ${repoPath}: yarn unrevoke git`);
+        console.log(`    To give these access again, run:`);
+        console.log(`\`\`\`\ncd ${repoPath}\nyarn unrevoke git\n\`\`\``);
     } else {
         console.log(`    (nothing is frozen)`);
     }

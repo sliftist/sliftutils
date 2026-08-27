@@ -93,8 +93,8 @@ async function main() {
     console.log(`  in ${repoPath}`);
 
     if (!pushToGit) {
-        console.log(`\nNothing believes this until it is signed. In that repo, run:`);
-        console.log(`\`\`\`\nyarn signfiles ${GIT_KEYWORD}\n\`\`\``);
+        console.log(`\nNothing believes this until it is signed. Run:`);
+        console.log(`\`\`\`\ncd ${repoPath}\nyarn signfiles ${GIT_KEYWORD}\n\`\`\``);
         return;
     }
     await signRepo({ repoPath });

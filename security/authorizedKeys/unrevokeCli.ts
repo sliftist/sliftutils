@@ -189,7 +189,10 @@ async function main() {
 
     if (!pushToGit) {
         console.log(`\nCommit and push it, and those keys work again as each machine picks it up:`);
-        console.log(`\`\`\`\ngit add -A\ngit commit -m "${COMMIT_MESSAGE}"\ngit push\n\`\`\``);
+        // The cd is part of the block on purpose. These commands only do the right thing inside
+        // the keys repo, and whoever reads this is almost never sitting in it - pasting the git
+        // lines alone commits whatever repo their terminal happened to be in, or nothing at all.
+        console.log(`\`\`\`\ncd ${repoPath}\ngit add -A\ngit commit -m "${COMMIT_MESSAGE}"\ngit push\n\`\`\``);
         return;
     }
     await runPromise(`git add -A`, { cwd: repoPath });

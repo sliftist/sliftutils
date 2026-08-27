@@ -8,6 +8,7 @@ import { runGit, syncRepo } from "../authorizedKeys/daemon/git";
 import { ensureRevokeKey } from "../authorizedKeys/daemon/repoFiles";
 import { identityFrozenBy, isPairRevoked, isPairUnrevoked, noteRevocation, readSignedRepo } from "../authorizedKeys/daemon/readSignedRepo";
 import { revokeRepoPath, revokeRepoURL } from "../authorizedKeys/revokeSource";
+import { sourceRepoPath } from "../authorizedKeys/sources";
 import { notify } from "../authorizedKeys/daemon/notify";
 import { areDiscordNotificationsConfigured, configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../notifications/discord";
 import { DEV_getIdentityFilePath, generateCA, getMachineId, getOwnMachineId, IdentityStorageType } from "../../misc/https/certs";
@@ -338,8 +339,9 @@ async function recordMachineRevocation(config: {
         + ` else has a copy of the key, or the machine's address changed.`
         + `\n\nMachine ${machineId} is frozen everywhere now, and nothing accepts calls from ${machineId}.`
         + `\n\nIf this was an attack, remove \`machines/${machineId}.json\` from \`${sourceURL}\` now.`
-        + `\nIf the new address is legitimate, run \`yarn unrevoke git\` in \`${sourceURL}\`. The`
-        + ` unrevoke allows ${machineId} from ${ip}, and takes effect as each machine picks it up.`
+        + `\nIf the new address is legitimate, run:`
+        + `\n\`\`\`\ncd ${sourceRepoPath(sourceURL)}\nyarn unrevoke git\n\`\`\``
+        + `\nThe unrevoke allows ${machineId} from ${ip}, and takes effect as each machine picks it up.`
         + `\n\nmachine: \`${machineId}\``
         + `\nfrozen by: \`${hostLabel}\``
     );
@@ -397,7 +399,7 @@ export async function isMachineAccepted(config: {
                             + `${frozen.revokedAt && `, at ${frozen.revokedAt}` || ""}`
                             + `${frozen.revokedBy && `, noticed by ${frozen.revokedBy}` || ""}`
                             + `, which is not an address it is allowed from (revocation ${frozen.revocationId}).`
-                            + ` To give it access again, run in the keys repo: yarn unrevoke git`,
+                            + ` To give it access again, run: cd ${sourceRepoPath(sourceURL)} && yarn unrevoke git`,
                     },
                     froze: false,
                 };
