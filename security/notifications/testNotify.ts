@@ -9,7 +9,7 @@ Sends one message to a webhook, to prove it works. With no host it uses this mac
 ${DEFAULT_WEBHOOK_FILE_PATH}. With a host it reads that host's webhook and sends to that instead,
 which is how you check a machine you have just set up.`;
 
-export async function main() {
+async function main() {
     let argv = process.argv.slice(2);
     if (argv.length > 1) {
         throw new Error(`Expected at most a host, was ${argv.length} argument(s)\n${USAGE}`);
@@ -46,3 +46,8 @@ export async function main() {
     });
     console.log(`Sent a test message to the webhook ${source} uses.`);
 }
+
+main().catch(e => {
+    console.error(`${e}`);
+    process.exitCode = 1;
+}).finally(() => process.exit());

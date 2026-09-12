@@ -66,6 +66,25 @@ export async function currentBranch(config: { repoPath: string; keyPath: string 
     return (await runGit({ args: ["rev-parse", "--abbrev-ref", "HEAD"], ...config })).stdout.trim();
 }
 
+/** Forces a checkout's working tree to a ref. Anything local - an edited file, or a stray untracked
+    one - is staged and stashed rather than deleted, so the tree comes out clean but nothing is lost
+    for good: it sits in a stash if it is ever wanted. */
+export async function setGitRef(config: { repoPath: string; gitRef: string; keyPath: string }) {
+    let { repoPath, gitRef, keyPath } = config;
+    // Staging the untracked files first is what lets the stash carry them off, so the reset lands
+    // on a genuinely clean tree.
+    await runGit({ args: ["add", "--all"], cwd: repoPath, keyPath, allowFailure: true });
+    // A checkout with nothing to stash makes git stash exit non-zero, which is harmless here - the
+    // reset below is what actually forces the tree.
+    await runGit({ args: ["stash"], cwd: repoPath, keyPath, allowFailure: true });
+    await runGit({ args: ["fetch", "--prune", "origin"], cwd: repoPath, keyPath });
+    await runGit({ args: ["reset", "--hard", gitRef], cwd: repoPath, keyPath });
+    // Drops objects nothing references any more, so a file committed by mistake cannot bloat the
+    // checkout forever. Reflogs keep the just-replaced commit reachable, so a history rewrite is
+    // still detectable right after this.
+    await runGit({ args: ["prune"], cwd: repoPath, keyPath, allowFailure: true });
+}
+
 async function ensureSourceRepo(repoURL: string) {
     let repoPath = sourceRepoPath(repoURL);
     let keyPath = await findSourceKey(repoURL) || sourceKeyPath(repoURL);
@@ -78,8 +97,15 @@ async function ensureSourceRepo(repoURL: string) {
 }
 
 /** Returns what changed, so the caller can report it. A rewritten history is called out
-    separately - it means the remote no longer contains the commits we already had. */
-export async function syncRepo(repoURL: string) {
+    separately - it means the remote no longer contains the commits we already had.
+
+    forceUpdate forces the working tree back to the remote even when the remote has not moved, which
+    is what heals a checkout left dirty - an edited or half-written file that no longer matches its
+    signature. It would be maddening to a developer editing the repo in place, since it stashes their
+    uncommitted work; but make sure nothing that answers this checkout is running on the machine you
+    edit on. If the checkout went dirty because a machine connection triggered a revocation, kill the
+    services on that machine before you touch the trusted machines, or they will just dirty it again. */
+export async function syncRepo(repoURL: string, options?: { forceUpdate?: boolean }) {
     await ensureSourceRepo(repoURL);
     let repoPath = sourceRepoPath(repoURL);
     let keyPath = await findSourceKey(repoURL) || sourceKeyPath(repoURL);
@@ -93,14 +119,15 @@ export async function syncRepo(repoURL: string) {
     if (!remoteSha) {
         throw new Error(`Expected origin to report a sha for ${branch}, listed ${listing.slice(0, MAX_ERROR_BODY_LENGTH)}`);
     }
-    if (remoteSha === localSha && remoteSha === sourceState(repoURL).lastSha) {
+    if (!options?.forceUpdate && remoteSha === localSha && remoteSha === sourceState(repoURL).lastSha) {
         return { changed: false, historyRewritten: false, remoteSha, previousSha: localSha };
     }
 
-    await runGit({ args: ["fetch", "--prune", "origin", branch], cwd: repoPath, keyPath });
+    // The remote has moved, or we have not applied it yet, so force the checkout to it.
+    let previousSha = sourceState(repoURL).lastSha || localSha;
+    await setGitRef({ repoPath, gitRef: `origin/${branch}`, keyPath });
     remoteSha = (await runGit({ args: ["rev-parse", `origin/${branch}`], cwd: repoPath, keyPath })).stdout.trim();
 
-    let previousSha = sourceState(repoURL).lastSha || localSha;
     let historyRewritten = false;
     if (previousSha && previousSha !== remoteSha) {
         // If what we already had is no longer an ancestor of the remote tip, commits were removed
@@ -113,7 +140,5 @@ export async function syncRepo(repoURL: string) {
         });
         historyRewritten = ancestry.status !== 0;
     }
-    await runGit({ args: ["reset", "--hard", `origin/${branch}`], cwd: repoPath, keyPath });
-    await runGit({ args: ["clean", "-fdx"], cwd: repoPath, keyPath });
     return { changed: true, historyRewritten, remoteSha, previousSha };
 }

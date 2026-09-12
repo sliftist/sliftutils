@@ -3,7 +3,7 @@ import { delay } from "socket-function/src/batching";
 import {
     IArchives, RemoteConfig, RemoteConfigBase, SourceConfig,
     ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig, FindConfig, GetConfig, GetInfoConfig, MoveFileConfig, SetConfig, SetLargeFileConfig, STORAGE_WRONG_VALID_WINDOW,
-    STORAGE_WRONG_ROUTE, STORAGE_NOT_CONFIGURED, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream,
+    STORAGE_WRONG_ROUTE, STORAGE_NOT_CONFIGURED, FULL_ROUTE, VARIABLE_SHARD, LARGE_SET_THRESHOLD, bufferChunkStream, validateFileName,
 } from "../IArchives";
 import { copyArchiveFile } from "../archiveHelpers";
 import {
@@ -31,21 +31,41 @@ const PRIMARY_RETRY_TIMEOUT = 30 * 1000;
 const PRIMARY_RETRY_DELAY = 2 * 1000;
 const COVERING_RETRY_TIMEOUT = 30 * 1000;
 const COVERING_RETRY_DELAY = 5 * 1000;
-// Smart timeouts: an attempt gets this long to produce anything before we probe getInfo for the file's size (and the probe itself gets the same window)
-const SMART_TIMEOUT_PROBE = 60 * 1000;
-// Very generous assumed transfer rates - the resulting deadline exists to catch stuck sources, not slow ones
-const SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND = 1024 * 1024;
-const SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND = 512 * 1024;
-// Marker in smart-timeout errors, so the read loop can log them and continue with the other sources (a connected source's other errors still throw)
+// A read waits this long for its FIRST chunk, and the window grows to CHUNK_TIMEOUT_MAX as the
+// download goes on - the further in we are, the more a restart costs, so the more patience is
+// worth it. Not size based: the window covers one chunk, and finishing a chunk resets it.
+const CHUNK_TIMEOUT_START = 60 * 1000;
+const CHUNK_TIMEOUT_MAX = 5 * 60 * 1000;
+// How many chunks the window takes to grow from START to MAX, linearly
+const CHUNK_TIMEOUT_RAMP = 10;
+// The first read asks for this much. Anything smaller coming back IS the whole file, so a small
+// file costs exactly one request and never touches getInfo.
+const CHUNK_FIRST_SIZE = 1024 * 1024;
+// Chunks double from CHUNK_FIRST_SIZE up to this, so a big file stops paying per-request latency
+const CHUNK_MAX_SIZE = 32 * 1024 * 1024;
+// A file rewritten under us is read again from the start. After this many it is not worth chasing,
+// and the plain unranged read - one request, one version, no assembly - is the way to get it.
+const MAX_MODIFIED_RETRIES = 3;
+// Uploads still get one deadline sized from the bytes they carry: a flat base plus the transfer
+// at a very generous assumed rate, so a tiny upload still gets the full base window
+const SMART_TIMEOUT_UPLOAD_BASE = 60 * 1000;
+const SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND = 256 * 1024;
+// Marker in timeout errors, so the read loop can log them and continue with the other sources (a connected source's other errors still throw)
 const SMART_TIMEOUT_MARKER = "ARCHIVES_SMART_TIMEOUT_c41a9d";
 
-// Sizes a generous per-attempt deadline. Get-style calls pass path: the size is only fetched (via getInfo) when the call turns out to be slow. Set-style calls pass uploadBytes, which they already know.
+// Sizes a generous per-attempt deadline for a set-style call, from the bytes it already knows it is sending.
 type SmartTimeout = {
-    path?: string;
     uploadBytes?: number;
     // Names the operation in timeout errors - without it a deletion (a tombstone write, uploadBytes 0) reads as "Upload of 0 bytes", which looks like a bug rather than a delete
     label?: string;
 };
+
+/** The window for the chunk at this index: CHUNK_TIMEOUT_START, growing linearly to
+    CHUNK_TIMEOUT_MAX over CHUNK_TIMEOUT_RAMP chunks. */
+function chunkTimeout(chunkIndex: number) {
+    let ramp = Math.min(chunkIndex, CHUNK_TIMEOUT_RAMP) / CHUNK_TIMEOUT_RAMP;
+    return CHUNK_TIMEOUT_START + (CHUNK_TIMEOUT_MAX - CHUNK_TIMEOUT_START) * ramp;
+}
 
 /** The address, port, account, and bucket name a bucket routing URL addresses. Throws when the URL isn't a hosted bucket routing URL (https://host:port/file/<account>/<bucketName>/storage/storagerouting.json). */
 export { parseHostedUrl, parseBackblazeUrl, getBucketBaseUrl } from "./remoteConfig";
@@ -83,7 +103,7 @@ function coverRoutes(candidates: SourceWrapper[]): SourceWrapper[] | undefined {
     return chosen;
 }
 
-/** READS ONLY. Drops sources that recently failed while disconnected - unless that would leave nothing, in which case a down source is still better than no source, and we retry it immediately. Never applies to writes (or noFallbacks reads of the write target): the write node is strictly the FIRST source matching the route and valid window, regardless of connectivity - a client's flaky view of the network must never scatter writes across the chain (spec: client writes are consistent, client reads are redundant). */
+/** READS ONLY. Drops sources that recently failed while disconnected - unless that would leave nothing, in which case a down source is still better than no source, and we retry it immediately. Never applies to writes (or fallbacks:false reads of the write target): the write node is strictly the FIRST source matching the route and valid window, regardless of connectivity - a client's flaky view of the network must never scatter writes across the chain (spec: client writes are consistent, client reads are redundant). */
 function preferUsable(sources: SourceWrapper[]): SourceWrapper[] {
     let usable = sources.filter(x => !x.isOnCooldown());
     return usable.length && usable || sources;
@@ -106,12 +126,12 @@ export class ArchivesChain implements IArchives {
         return `chain ${urls.join(", ")}`;
     }
 
-    // The ONE dispatch for every operation: no fallbacks (all writes by default, and noFallbacks reads) -> the primary node only, via runPrimary; everything else -> the shared fallback loop, trying sources in config order (or latency order for fast reads) and only moving on when one fails. Writes in the loop differ from reads only in calling source.write.
-    private async run<T>(state: ChainState, config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fallbacks?: boolean; retries?: number; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
-        if (config.fast && config.noFallbacks) {
-            throw new Error(`fast and noFallbacks are mutually exclusive for ${this.getDebugName()}: noFallbacks only considers one source (the write node), so there is no order to speed up`);
+    // The ONE dispatch for every operation, on ONE flag: fallbacks false -> the primary node only, via runPrimary; fallbacks true -> the shared fallback loop, trying sources in config order (or latency order for fast reads) and moving on whenever one fails. Every caller sets fallbacks unconditionally - reads turn it on unless the caller said noFallbacks, writes turn it off unless the caller said fallbacks. Writes in the loop differ from reads only in calling source.write.
+    private async run<T>(state: ChainState, config: { fallbacks: boolean; apiOnly?: boolean; write?: boolean; route?: number; retries?: number; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
+        if (config.fast && !config.fallbacks) {
+            throw new Error(`fast requires fallbacks for ${this.getDebugName()}: without fallbacks only one source (the write node) is considered, so there is no order to speed up`);
         }
-        if (config.noFallbacks || config.write && !config.fallbacks) {
+        if (!config.fallbacks) {
             return await this.runPrimary(config, run);
         }
         let retries = config.retries;
@@ -163,16 +183,11 @@ export class ArchivesChain implements IArchives {
                         await this.prepareWrongTargetRetry(state, message.includes(STORAGE_WRONG_VALID_WINDOW) && "window" || message.includes(STORAGE_WRONG_ROUTE) && "route" || "unconfigured");
                         break;
                     }
-                    // fallbacks means availability above everything: ANY failing source - down, misconfigured, rejecting, mid-switchover - is skipped and the next covering source takes the call. Only every source failing throws (below). Without fallbacks, a CONNECTED source's error is a real answer and throws.
-                    if (config.fallbacks) {
-                        console.error(`Source failed for ${this.getDebugName()}, falling back to the next source: ${message}`);
-                        if (!source.isConnected()) source.noteFailure();
-                        errors.push(message);
-                        continue;
-                    }
-                    if (source.isConnected()) throw e;
-                    source.noteFailure();
+                    // fallbacks means availability above everything: ANY failing source - down, misconfigured, rejecting, mid-switchover - is skipped and the next covering source takes the call. Only every source failing throws (below).
+                    console.error(`Source failed for ${this.getDebugName()}, falling back to the next source: ${message}`);
+                    if (!source.isConnected()) source.noteFailure();
                     errors.push(message);
+                    continue;
                 }
             }
             if (wrongTarget) {
@@ -198,7 +213,7 @@ export class ArchivesChain implements IArchives {
         }
     }
 
-    // Writes and noFallbacks reads are the same case: take the authoritative node - strictly the first source matching the route and valid window, whether it is up or down - and use it, never falling back to another node. It's important that writing always accesses the same node everywhere, even if that node is down - otherwise we're just writing into the void, and who knows if the writes will even be accepted, or clobbered, or what; and noFallbacks reads want the same node precisely because it is the one writes target. A slow call is almost always better than throwing, so a failing primary is retried (the SAME node, re-resolved each attempt since a config refresh can change which source is primary) until the deadline, then throws.
+    // Writes and fallbacks:false reads are the same case: take the authoritative node - strictly the first source matching the route and valid window, whether it is up or down - and use it, never falling back to another node. It's important that writing always accesses the same node everywhere, even if that node is down - otherwise we're just writing into the void, and who knows if the writes will even be accepted, or clobbered, or what; and fallbacks:false reads want the same node precisely because it is the one writes target. A slow call is almost always better than throwing, so a failing primary is retried (the SAME node, re-resolved each attempt since a config refresh can change which source is primary) until the deadline, then throws.
     private async runPrimary<T>(config: { write?: boolean; route?: number; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let retriedWrongWindow = false;
         let retriedWrongRoute = false;
@@ -262,38 +277,47 @@ export class ArchivesChain implements IArchives {
         let abandon = () => void callPromise.then(() => { }, () => { });
         if (timeout.uploadBytes !== undefined) {
             // A flat base plus the predicted transfer time, so tiny uploads still get the full base window
-            let allowed = SMART_TIMEOUT_PROBE + timeout.uploadBytes / SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND * 1000;
+            let allowed = SMART_TIMEOUT_UPLOAD_BASE + timeout.uploadBytes / SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND * 1000;
             let result = await Promise.race([callPromise.then(value => ({ value })), delay(allowed).then(() => undefined)]);
             if (result) return result.value;
             abandon();
-            throw new Error(`${SMART_TIMEOUT_MARKER} Upload timed out. ${timeout.label || `Upload of ${timeout.uploadBytes} bytes`} to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_PROBE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
+            throw new Error(`${SMART_TIMEOUT_MARKER} Upload timed out. ${timeout.label || `Upload of ${timeout.uploadBytes} bytes`} to ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms: ${SMART_TIMEOUT_UPLOAD_BASE}ms base plus transfer at an assumed ${SMART_TIMEOUT_UPLOAD_BYTES_PER_SECOND} bytes/s)`);
         }
-        const path = timeout.path;
-        if (path === undefined) return await callPromise;
-        let first = await Promise.race([callPromise.then(value => ({ value })), delay(SMART_TIMEOUT_PROBE).then(() => undefined)]);
-        if (first) return first.value;
-        let probeError: string | undefined;
-        let info: { size: number } | undefined;
-        try {
-            info = await Promise.race([
-                source.read(archives => archives.getInfo(path)).then(x => ({ size: x && x.size || 0 })),
-                delay(SMART_TIMEOUT_PROBE).then(() => undefined),
-            ]);
-        } catch (e) {
-            probeError = String((e as Error).stack ?? e);
+        return await callPromise;
+    }
+
+    /** Runs one call under a window that can be pushed back while it runs. The window covers the
+        next piece of work rather than the whole call, so nothing has to guess how long a transfer
+        "should" take from its size: as long as pieces keep landing, the call keeps its time.
+
+        The waiting is a loop rather than one race, because a refresh that arrives while we are
+        already waiting has to move the deadline we are waiting on. */
+    private async applyRefreshableTimeout<T>(
+        config: { label: string; sourceUrl: string; windowMs: number },
+        call: (refresh: (windowMs: number) => void) => Promise<T>,
+    ): Promise<T> {
+        let start = Date.now();
+        let windowMs = config.windowMs;
+        let deadline = Date.now() + windowMs;
+        let refresh = (nextWindowMs: number) => {
+            windowMs = nextWindowMs;
+            deadline = Date.now() + nextWindowMs;
+        };
+        let callPromise = call(refresh);
+        // An abandoned call must not surface an unhandled rejection when it eventually fails
+        let abandon = () => void callPromise.then(() => { }, () => { });
+        while (true) {
+            let remaining = deadline - Date.now();
+            if (remaining <= 0) {
+                abandon();
+                throw new Error(
+                    `${SMART_TIMEOUT_MARKER} ${config.label} from ${config.sourceUrl} timed out after`
+                    + ` ${Date.now() - start}ms: nothing arrived within the last ${Math.round(windowMs)}ms`
+                );
+            }
+            let result = await Promise.race([callPromise.then(value => ({ value })), delay(remaining).then(() => undefined)]);
+            if (result) return result.value;
         }
-        if (!info) {
-            abandon();
-            throw new Error(`${SMART_TIMEOUT_MARKER} Read timed out with no size probe. Read of ${JSON.stringify(path)} from ${source.getDebugName()}: no result after ${Date.now() - start}ms, and getInfo ${probeError && `failed (${probeError})` || `could not answer within ${SMART_TIMEOUT_PROBE}ms either`}`);
-        }
-        let allowed = Math.max(SMART_TIMEOUT_PROBE, info.size / SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND * 1000);
-        let remaining = start + allowed - Date.now();
-        if (remaining > 0) {
-            let second = await Promise.race([callPromise.then(value => ({ value })), delay(remaining).then(() => undefined)]);
-            if (second) return second.value;
-        }
-        abandon();
-        throw new Error(`${SMART_TIMEOUT_MARKER} Read timed out. Read of ${JSON.stringify(path)} (${info.size} bytes) from ${source.getDebugName()} timed out after ${Date.now() - start}ms (allowed ${Math.round(allowed)}ms from the call's start, at an assumed ${SMART_TIMEOUT_DOWNLOAD_BYTES_PER_SECOND} bytes/s)`);
     }
 
     private lastConfigRefresh = 0;
@@ -314,12 +338,12 @@ export class ArchivesChain implements IArchives {
         await this.state.refreshActiveConfig();
     }
 
-    private async request<T>(config: { apiOnly?: boolean; write?: boolean; route?: number; noFallbacks?: boolean; fallbacks?: boolean; retries?: number; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
+    private async request<T>(config: { fallbacks: boolean; apiOnly?: boolean; write?: boolean; route?: number; retries?: number; fast?: boolean; timeout?: SmartTimeout }, run: (archives: IArchives, sourceUrl: string) => Promise<T>): Promise<T> {
         let state = await this.state.getState();
         return await this.run(state, config, run);
     }
 
-    public async waitingForAccess(): Promise<{ link: string; machineId: string; ip: string } | undefined> {
+    public async waitingForAccess(): Promise<{ machineId: string; ip: string; reason: string } | undefined> {
         let state = await this.state.getState();
         for (let source of state.sources) {
             // A source whose window has passed is never read or written again, so its access state is irrelevant - and asking a dead intermediate would just hang or throw. Future windows DO matter: access should be granted before their window starts.
@@ -355,19 +379,25 @@ export class ArchivesChain implements IArchives {
     }
     /** get2, but trying sources in latency order (fastest first) instead of config order. While this is much faster, it might miss immediate writes: the write node is no longer tried first, so a lagging replica may answer with a slightly older value. Exclusive with noFallbacks (which only considers one source - the write node - so there is no order to speed up); passing both throws. */
     public async getFast(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        validateFileName(fileName, "getFast");
         if (config?.sourceUrl) {
             // A specific source leaves nothing for the latency ordering to decide
             return await this.get2(fileName, config);
         }
-        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, retries: config?.retries, fast: true, timeout: { path: fileName } }, async (archives, url) => {
-            let result = await archives.get2(fileName, config);
-            // Empty data is a tombstone, not content - see get2
-            if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
-            return { data: result.data, writeTime: result.writeTime, size: result.size, url };
-        });
+        if (config?.range) {
+            return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries, fast: true }, async (archives, url) => {
+                let result = await archives.get2(fileName, config);
+                // Empty data is a tombstone, not content - see get2
+                if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+                return { data: result.data, writeTime: result.writeTime, size: result.size, url };
+            });
+        }
+        // Latency order decides who serves the FIRST chunk; the rest follow it, like any other read
+        return await this.readInChunks(fileName, config, { fast: true });
     }
     /** Always resolves with a url - the authority that answered. A value that doesn't exist is still an answer FROM a server, so it comes back as { url } with no data (never plain undefined); errors from every source throw instead. */
     public async get2(fileName: string, config?: GetConfig): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        validateFileName(fileName, "get2");
         const sourceUrl = config?.sourceUrl;
         if (sourceUrl) {
             return await this.runOnSource(sourceUrl, async archives => {
@@ -376,14 +406,93 @@ export class ArchivesChain implements IArchives {
                 return { data: result.data, writeTime: result.writeTime, size: result.size, url: sourceUrl };
             });
         }
-        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, retries: config?.retries, timeout: { path: fileName } }, async (archives, url) => {
+        // A caller that named its own range asked for exactly those bytes, so it is one request.
+        if (config?.range) {
+            return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries }, async (archives, url) => {
+                let result = await archives.get2(fileName, config);
+                // Empty data is a tombstone, not content (unless the caller asked for tombstones) - a ranged read of a REAL file can legitimately be empty though (range past EOF), which the total size distinguishes
+                if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+                return { data: result.data, writeTime: result.writeTime, size: result.size, url };
+            });
+        }
+        return await this.readInChunks(fileName, config);
+    }
+
+    /** Reads a whole file as a series of ranged reads, so a big one arrives in pieces instead of
+        as one request nobody can see inside of.
+
+        The first read asks for CHUNK_FIRST_SIZE. Less than that coming back IS the whole file, so
+        a small file costs exactly one request - and because every backend reports the file's FULL
+        size alongside a ranged read, a big one already knows its size from that same answer and
+        never needs a getInfo to find out.
+
+        Every chunk after the first goes to the source that served the first, so the pieces cannot
+        be assembled out of two different versions living on two replicas. Finishing a chunk pushes
+        the timeout back, so the deadline covers one chunk rather than the whole transfer. */
+    private async readInChunks(fileName: string, config?: GetConfig, options?: { fast?: boolean }): Promise<{ data: Buffer; writeTime: number; size: number; url: string } | { data?: undefined; writeTime?: undefined; size?: undefined; url: string }> {
+        for (let attempt = 1; attempt <= MAX_MODIFIED_RETRIES; attempt++) {
+            let first = await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries, fast: options?.fast }, async (archives, url) => {
+                let result = await this.applyRefreshableTimeout(
+                    { label: `The first ${CHUNK_FIRST_SIZE} bytes of ${JSON.stringify(fileName)}`, sourceUrl: url, windowMs: chunkTimeout(0) },
+                    async () => await archives.get2(fileName, { ...config, range: { start: 0, end: CHUNK_FIRST_SIZE } }),
+                );
+                if (!result || !result.data || !result.data.length && !config?.includeTombstones && !result.size) return { url };
+                return { data: result.data, writeTime: result.writeTime, size: result.size, url };
+            });
+            if (!first.data) return first;
+            // The whole file fit in the first read, so there is nothing else to fetch and nothing
+            // that could have changed underneath us
+            if (first.data.length >= first.size) {
+                return first;
+            }
+
+            let url = first.url;
+            let pieces = [first.data];
+            let offset = first.data.length;
+            let chunkSize = CHUNK_FIRST_SIZE;
+            let torn = false;
+            for (let chunkIndex = 1; offset < first.size; chunkIndex++) {
+                chunkSize = Math.min(chunkSize * 2, CHUNK_MAX_SIZE);
+                let end = Math.min(offset + chunkSize, first.size);
+                let start = offset;
+                let piece = await this.applyRefreshableTimeout(
+                    { label: `Bytes ${start}-${end} of ${JSON.stringify(fileName)}`, sourceUrl: url, windowMs: chunkTimeout(chunkIndex) },
+                    async () => await this.runOnSource(url, archives => archives.get2(fileName, { ...config, range: { start, end } })),
+                );
+                // The file shrank under us, so what we have is already a mix of two versions
+                if (!piece || !piece.data || !piece.data.length) {
+                    torn = true;
+                    break;
+                }
+                pieces.push(piece.data);
+                offset += piece.data.length;
+            }
+
+            // Read back to back rather than watched per chunk: one call at the end says whether
+            // everything we just assembled came from the same version of the file.
+            let after = !torn && await this.runOnSource(url, archives => archives.getInfo(fileName, config));
+            if (!torn && after && after.writeTime === first.writeTime && after.size === first.size) {
+                return { data: Buffer.concat(pieces), writeTime: first.writeTime, size: first.size, url };
+            }
+            console.warn(
+                `${JSON.stringify(fileName)} was written while we were reading it from ${url}`
+                + ` (${first.size} bytes at ${first.writeTime}, now ${after && `${after.size} bytes at ${after.writeTime}` || "gone"}).`
+                + ` Reading it again, attempt ${attempt} of ${MAX_MODIFIED_RETRIES}.`
+            );
+        }
+
+        // Whatever is rewriting it is faster than we can read it in pieces, so take it in one
+        // request: no assembly, no chance of two versions, and no ranged reads to keep in step.
+        console.warn(`${JSON.stringify(fileName)} kept changing while being read in chunks, reading it in one request instead`);
+        return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries }, async (archives, url) => {
             let result = await archives.get2(fileName, config);
-            // Empty data is a tombstone, not content (unless the caller asked for tombstones) - a ranged read of a REAL file can legitimately be empty though (range past EOF), which the total size distinguishes
-            if (!result || !result.data || !result.data.length && !config?.includeTombstones && !(config?.range && result.size)) return { url };
+            if (!result || !result.data || !result.data.length && !config?.includeTombstones) return { url };
             return { data: result.data, writeTime: result.writeTime, size: result.size, url };
         });
     }
+
     public async getInfo(fileName: string, config?: GetInfoConfig): Promise<{ writeTime: number; size: number; url: string } | undefined> {
+        validateFileName(fileName, "getInfo");
         const sourceUrl = config?.sourceUrl;
         if (sourceUrl) {
             return await this.runOnSource(sourceUrl, async archives => {
@@ -391,15 +500,15 @@ export class ArchivesChain implements IArchives {
                 return result && { ...result, url: sourceUrl } || undefined;
             });
         }
-        return await this.request({ route: getRoute(fileName), noFallbacks: config?.noFallbacks, retries: config?.retries }, async (archives, url) => {
+        return await this.request({ fallbacks: !config?.noFallbacks, route: getRoute(fileName), retries: config?.retries }, async (archives, url) => {
             let result = await archives.getInfo(fileName, config);
             return result && { ...result, url } || undefined;
         });
     }
 
     // Without fallbacks: the AUTHORITATIVE covering ONLY - the first source per route in config order (the same node every write and read targets), down or not. It is NEVER excluded and NEVER substituted, so a listing that can't reach its write nodes retries those same nodes until the deadline and then fails, rather than quietly reading second-hand data off a replica or backblaze. exclude/cooldown/substitution apply ONLY when the caller opted into fallbacks.
-    private selectCoveringSources(state: ChainState, config?: { fallbacks?: boolean; exclude?: Set<SourceWrapper> }): SourceWrapper[] {
-        if (config?.fallbacks) {
+    private selectCoveringSources(state: ChainState, config: { fallbacks: boolean; exclude?: Set<SourceWrapper> }): SourceWrapper[] {
+        if (config.fallbacks) {
             let candidates = state.sources.filter(x => configWindowCurrent(x.config) && x.api && !config.exclude?.has(x));
             let usable = candidates.filter(x => !x.isOnCooldown());
             let chosen = coverRoutes(usable) || coverRoutes(candidates);
@@ -414,63 +523,74 @@ export class ArchivesChain implements IArchives {
         return chosen;
     }
 
-    private async runOnCovering<T>(operation: string, run: (archives: IArchives) => Promise<T>, config?: { fallbacks?: boolean }): Promise<T[]> {
+    private async runOnCovering<T>(operation: string, run: (archives: IArchives) => Promise<T>, config: { fallbacks: boolean }): Promise<T[]> {
         let startTime = Date.now();
         let deadline = Date.now() + COVERING_RETRY_TIMEOUT;
         // Sources that failed during this call - with fallbacks, the next attempt covers their routes with the next source holding them instead
         let failed = new Set<SourceWrapper>();
+        // Why each of them failed, kept for the whole call: when the fallbacks run out, the error names every source that was tried and what each one said, not just whichever covering set happened to be last
+        let allFailures = new Map<SourceWrapper, Error>();
         let tries = 0;
         while (true) {
             tries++;
             let state = await this.state.getState();
+            let selected: SourceWrapper[] | undefined;
+            let coverGap: Error | undefined;
+            try {
+                selected = this.selectCoveringSources(state, { fallbacks: config.fallbacks, exclude: failed });
+            } catch (e) {
+                coverGap = e as Error;
+            }
+            if (!selected) {
+                let described = [...allFailures].map(([source, sourceError]) => `${source.getDebugName()}: ${sourceError.message ?? sourceError}`).join(" | ");
+                let error = new Error(
+                    `${operation} cannot run: ${coverGap!.message}`
+                    + (described ? ` ${allFailures.size} source(s) failed first: ${described}.` : "")
+                    + ` Fallbacks = ${config.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`
+                );
+                // With fallbacks the loop only lands here after every substitute was tried, so waiting will not produce a new source - the caller gets the whole cascade now
+                if (config.fallbacks && allFailures.size) {
+                    throw error;
+                }
+                if (Date.now() >= deadline) {
+                    throw error;
+                }
+                console.error(`${error.message}. Retrying in ${COVERING_RETRY_DELAY / 1000}s (giving up at ${formatDateTimeDetailed(deadline)}).`);
+                void this.state.recheckAvailability();
+                await delay(COVERING_RETRY_DELAY);
+                continue;
+            }
+            let covering = selected;
             // Errors name the OPERATION and the SPECIFIC sources that failed - "the find failed because source X is unavailable", never an anonymous failure attributed to the whole chain
-            let outcome = await (async (): Promise<{ values: T[] } | { error: Error }> => {
-                let covering: SourceWrapper[];
+            let values: T[] = [];
+            let failures: { source: SourceWrapper; error: Error }[] = [];
+            let time = Date.now();
+            await Promise.all(covering.map(async (source, index) => {
+                let api = source.api;
+                if (!api) {
+                    failures.push({ source, error: new Error(`URL-only access, which cannot serve ${operation}`) });
+                    return;
+                }
                 try {
-                    covering = this.selectCoveringSources(state, { fallbacks: config?.fallbacks, exclude: failed });
+                    values.push(await run(api));
                 } catch (e) {
-                    return { error: new Error(`${operation} cannot run: ${(e as Error).message}`) };
+                    if (!source.isConnected()) source.noteFailure();
+                    failures.push({ source, error: e as Error });
+                    console.log(`Failed after ${formatTime(Date.now() - time)} index ${index} of ${covering.length}`);
                 }
-                let values: T[] = [];
-                let failures: { source: SourceWrapper; error: Error }[] = [];
-                let time = Date.now();
-                await Promise.all(covering.map(async (source, index) => {
-                    let api = source.api;
-                    if (!api) {
-                        failed.add(source);
-                        failures.push({ source, error: new Error(`URL-only access, which cannot serve ${operation}`) });
-                        return;
-                    }
-                    try {
-                        values.push(await run(api));
-                    } catch (e) {
-                        if (!source.isConnected()) source.noteFailure();
-                        failed.add(source);
-                        failures.push({ source, error: e as Error });
-                        console.log(`Failed after ${formatTime(Date.now() - time)} index ${index} of ${covering.length}`);
-                    }
-                }));
-                if (!failures.length) return { values };
-                if (failures.length === 1) {
-                    return { error: new Error(`${operation} failed because source ${failures[0].source.getDebugName()} is unavailable: ${failures[0].error.message ?? failures[0].error}. Fallbacks = ${!!config?.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`) };
-                }
-                return { error: new Error(`${operation} failed because ${failures.length} of the ${covering.length} covering sources are unavailable: ${failures.map(x => `${x.source.getDebugName()}: ${x.error.message ?? x.error}`).join(" | ")}. Fallbacks = ${!!config?.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`) };
-            })();
-            if ("values" in outcome) return outcome.values;
-            let error = outcome.error;
-            // Substitution comes BEFORE the deadline check: a single connect timeout can eat the entire deadline, and giving up then - without ever trying the substitute that fallbacks exist for - throws exactly when falling back matters most. Substitution cannot loop past the deadline forever: every pass adds its failures to `failed`, so the substitutes run out with the sources.
-            if (config?.fallbacks && failed.size) {
-                let substitutable = false;
-                try {
-                    this.selectCoveringSources(state, { fallbacks: true, exclude: failed });
-                    substitutable = true;
-                } catch { }
-                if (substitutable) {
-                    console.warn(`(retrying with fallbacks) ${error.message}`);
-                    continue;
-                }
-                // No substitute covers the failed routes - retry the failed sources themselves after the delay
-                failed.clear();
+            }));
+            if (!failures.length) return values;
+            for (let failure of failures) {
+                failed.add(failure.source);
+                allFailures.set(failure.source, failure.error);
+            }
+            let error = failures.length === 1
+                ? new Error(`${operation} failed because source ${failures[0].source.getDebugName()} is unavailable: ${failures[0].error.message ?? failures[0].error}. Fallbacks = ${config.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`)
+                : new Error(`${operation} failed because ${failures.length} of the ${covering.length} sources covering this attempt are unavailable: ${failures.map(x => `${x.source.getDebugName()}: ${x.error.message ?? x.error}`).join(" | ")}. Fallbacks = ${config.fallbacks}. Tries = ${tries}, Took ${formatTime(Date.now() - startTime)}`);
+            // Substitution comes BEFORE the deadline check: a single connect timeout can eat the entire deadline, and giving up then - without ever trying the substitute that fallbacks exist for - throws exactly when falling back matters most. The loop keeps substituting for as long as a covering set exists; every pass adds its failures to `failed`, so it always terminates at the no-covering branch above, which throws everything collected here.
+            if (config.fallbacks) {
+                console.warn(`(retrying with fallbacks) ${error.message}`);
+                continue;
             }
             if (Date.now() >= deadline) {
                 throw error;
@@ -485,7 +605,7 @@ export class ArchivesChain implements IArchives {
         return (await this.findInfo(prefix, config)).map(x => x.path);
     }
     public async findInfo(prefix: string, config?: FindConfig): Promise<ArchiveFileInfo[]> {
-        let results = await this.runOnCovering(`The find of ${JSON.stringify(prefix)}`, archives => archives.findInfo(prefix, config), { fallbacks: config?.fallbacks });
+        let results = await this.runOnCovering(`The find of ${JSON.stringify(prefix)}`, archives => archives.findInfo(prefix, config), { fallbacks: !!config?.fallbacks });
         let byPath = new Map<string, ArchiveFileInfo>();
         for (let list of results) {
             for (let file of list) {
@@ -500,7 +620,7 @@ export class ArchivesChain implements IArchives {
         return merged;
     }
     public async getChangesAfter2(config: ChangesAfterConfig): Promise<ArchiveFileInfo[]> {
-        let results = await this.runOnCovering(`The changes listing since ${formatDateTimeDetailed(config.time)}`, archives => archives.getChangesAfter2(config));
+        let results = await this.runOnCovering(`The changes listing since ${formatDateTimeDetailed(config.time)}`, archives => archives.getChangesAfter2(config), { fallbacks: false });
         let byPath = new Map<string, ArchiveFileInfo>();
         for (let list of results) {
             for (let file of list) {
@@ -520,7 +640,7 @@ export class ArchivesChain implements IArchives {
                 throw new Error(`getSyncStatus is not supported: ${archives.getDebugName()} does not implement it`);
             }
             return await archives.getSyncStatus();
-        });
+        }, { fallbacks: false });
         return {
             allScansComplete: statuses.every(x => x.allScansComplete),
             indexSize: statuses.reduce((sum, x) => sum + x.indexSize, 0),
@@ -530,7 +650,7 @@ export class ArchivesChain implements IArchives {
     public async getConfig(): Promise<ArchivesConfig> {
         let state = await this.state.getState();
         if (!state.sources.some(x => x.api)) return { remoteConfig: state.config };
-        let config = await this.run(state, { apiOnly: true }, archives => archives.getConfig());
+        let config = await this.run(state, { fallbacks: true, apiOnly: true }, archives => archives.getConfig());
         return { ...config, remoteConfig: state.config };
     }
     public async hasWriteAccess(): Promise<boolean> {
@@ -543,6 +663,7 @@ export class ArchivesChain implements IArchives {
     }
 
     public async set(fileName: string, data: Buffer, config?: SetConfig): Promise<string> {
+        validateFileName(fileName, "set");
         if (!data.length) {
             throw new Error(`Empty write refused: set was called with an empty buffer for ${JSON.stringify(fileName)}: an empty file IS a deletion in this system and would read back as missing - call del instead`);
         }
@@ -557,7 +678,7 @@ export class ArchivesChain implements IArchives {
             await this.setLargeFile({ path: fileName, ...config, ...bufferChunkStream(data) });
             return fileName;
         }
-        await this.request({ write: true, fallbacks: config?.fallbacks, retries: config?.retries, route: getRoute(fileName), timeout: { uploadBytes: data.length, label: `Upload of ${JSON.stringify(fileName)} (${data.length} bytes)` } }, archives => archives.set(fileName, data, config));
+        await this.request({ fallbacks: !!config?.fallbacks, write: true, retries: config?.retries, route: getRoute(fileName), timeout: { uploadBytes: data.length, label: `Upload of ${JSON.stringify(fileName)} (${data.length} bytes)` } }, archives => archives.set(fileName, data, config));
         return fileName;
     }
 
@@ -599,14 +720,16 @@ export class ArchivesChain implements IArchives {
         return ROUTING_FILE;
     }
     public async del(fileName: string, config?: DelConfig): Promise<void> {
-        await this.request({ write: true, fallbacks: config?.fallbacks, retries: config?.retries, route: getRoute(fileName), timeout: { uploadBytes: 0, label: `Deletion of ${JSON.stringify(fileName)}` } }, archives => archives.del(fileName, config));
+        validateFileName(fileName, "del");
+        await this.request({ fallbacks: !!config?.fallbacks, write: true, retries: config?.retries, route: getRoute(fileName), timeout: { uploadBytes: 0, label: `Deletion of ${JSON.stringify(fileName)}` } }, archives => archives.del(fileName, config));
     }
 
     /** See IArchives.undelete: restores a file marked for deletion, dispatched to the write node as SetConfig.undelete (the write node propagates the restore to its peers itself). */
     public async undelete(fileName: string): Promise<void> {
+        validateFileName(fileName, "undelete");
         // set refuses empty buffers, and an undelete carries no data - the byte is ignored
         let placeholder = Buffer.from([1]);
-        await this.request({ write: true, route: getRoute(fileName), timeout: { uploadBytes: placeholder.length, label: `Undelete of ${JSON.stringify(fileName)}` } }, archives => archives.set(fileName, placeholder, { undelete: true }));
+        await this.request({ fallbacks: false, write: true, route: getRoute(fileName), timeout: { uploadBytes: placeholder.length, label: `Undelete of ${JSON.stringify(fileName)}` } }, archives => archives.set(fileName, placeholder, { undelete: true }));
     }
 
     /** See IArchives.move. When one node is the write target for BOTH paths, that node moves the file itself - the bytes never come through us - with the same wrong-window/route re-resolution as any write. When the paths route to different shards no single node holds both, so the move degrades to a copy through us plus a delete, CONFIRMED at the destination before the source is touched. No smart timeout on the node-side move: it can be a big file's worth of node-side work, which the upload-sized deadlines would misjudge. */
@@ -620,7 +743,7 @@ export class ArchivesChain implements IArchives {
         let state = await this.state.getState();
         let target = state.sources.find(x => configWindowCurrent(x.config) && routeContains(x.config.route, fromRoute));
         if (target && routeContains(target.config.route, toRoute)) {
-            await this.request({ write: true, route: fromRoute }, async archives => {
+            await this.request({ fallbacks: false, write: true, route: fromRoute }, async archives => {
                 if (!archives.move) {
                     throw new Error(`Move is not supported by this source: ${archives.getDebugName()} (moving ${JSON.stringify(config.fromPath)} to ${JSON.stringify(config.toPath)})`);
                 }
@@ -721,6 +844,7 @@ export class ArchivesChain implements IArchives {
 
     /** A large file is written exactly like a small one - same write node, same wrong-window/route re-resolution, same fallbacks - so a value's SIZE never decides its write semantics (set streams through here past LARGE_SET_THRESHOLD, and a file that grew past it must not suddenly lose the availability its caller asked for). The one difference: every attempt after the first has to rewind the stream, so a config without restartStream gets a single attempt. */
     public async setLargeFile(config: SetLargeFileConfig): Promise<void> {
+        validateFileName(config.path, "setLargeFile");
         if (config.path.includes(VARIABLE_SHARD) && parseVariableRoute(config.path) === undefined) {
             throw new Error(`setLargeFile does not support VARIABLE_SHARD keys (there is no way to return the materialized key); write the file with set, or materialize the key yourself. Key: ${JSON.stringify(config.path)}`);
         }
@@ -731,7 +855,7 @@ export class ArchivesChain implements IArchives {
             return;
         }
         let attempt = 0;
-        await this.request({ write: true, fallbacks: config.fallbacks, retries: config.retries, route }, async archives => {
+        await this.request({ fallbacks: !!config.fallbacks, write: true, retries: config.retries, route }, async archives => {
             attempt++;
             // The previous attempt consumed some (or all) of the stream, and this source needs the file from its first byte
             if (attempt > 1) await restartStream();

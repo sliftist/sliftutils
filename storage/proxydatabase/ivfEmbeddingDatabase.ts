@@ -2,6 +2,7 @@ import cborx from "cbor-x";
 import { Database, namespaceDatabase } from "./Database";
 import { TransactionSetStore, transactionRead, transactionMutate, transactionDelete, replayTransactionStore } from "./transactionSet";
 import { StoredEmbedding, EmbeddingFormat, getCloseness, embeddingToFloat32, releaseFloat32, encodeEmbedding, hashEmbedding } from "../embeddingFormats";
+import { magenta } from "socket-function/src/formatting/logColors";
 
 export type IvfConfig = {
     model: string;
@@ -42,6 +43,8 @@ const STEP_IVF = "ivf";
 // On delete, the member's exact cell plus this many nearby cells are checked, in case a rebuild left it non-optimal.
 const DELETE_FALLBACK_CELLS = 10;
 const REBALANCE_ITERATIONS = 4;
+// A rebuild re-clusters the entire set and blocks whoever triggered it — usually an ordinary insert that happened to draw the rebalance probability, which is why it is worth saying loudly that it is happening. Progress is only worth printing once it has gone on long enough to be the reason something feels stuck.
+const REBUILD_PROGRESS_INTERVAL_MS = 5000;
 
 function flatStore(database: Database<IvfEmbeddingRoot>): Database<TransactionSetStore<StoredEmbedding>> {
     return namespaceDatabase(database, root => root.flat);
@@ -62,6 +65,19 @@ function rankCellsByCloseness(embedding: StoredEmbedding, centroids: Map<string,
     return ranked.map(entry => entry.cellId);
 }
 
+// Synced functions rerun (and are predicted client-side), so the rebalance roll must be identical on every run of the same call — derive it from the inserted items instead of Math.random(). FNV-1a over each ref plus its embedding hash, mapped to [0, 1).
+function seededRandomFromItems(items: EmbeddingInput[]): number {
+    let hash = 2166136261;
+    for (const item of items) {
+        const key = item.ref + hashEmbedding(item.embedding);
+        for (let index = 0; index < key.length; index++) {
+            hash ^= key.charCodeAt(index);
+            hash = Math.imul(hash, 16777619);
+        }
+    }
+    return (hash >>> 0) / 2 ** 32;
+}
+
 // Per-write chance of a full rebuild. Zero at/under the target size, then rises (cubically) past it so cells stay roughly between target and ~2x target.
 function rebalanceProbability(fillRatio: number): number {
     if (fillRatio <= 1) {
@@ -72,7 +88,7 @@ function rebalanceProbability(fillRatio: number): number {
 }
 
 // k-means. Decodes every member to a pooled float32 buffer ONCE, then assigns with a plain internal float dot (no getCloseness call — comparing two float vectors is trivial) and keeps centroids as float means, encoding them to StoredEmbedding only at the end. Releases the borrowed buffers when done.
-function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfConfig): { centroid: StoredEmbedding; members: CellEntry[] }[] {
+function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfConfig, onProgress?: (iteration: number) => void): { centroid: StoredEmbedding; members: CellEntry[] }[] {
     const memberFloats: Float32Array[] = [];
     for (const member of members) {
         memberFloats.push(embeddingToFloat32(member.embedding, true));
@@ -132,6 +148,7 @@ function clusterMembers(members: CellEntry[], clusterCount: number, config: IvfC
         }
         centroids = nextCentroids;
         groups = nextGroups;
+        onProgress?.(iteration + 1);
     }
     const result: { centroid: StoredEmbedding; members: CellEntry[] }[] = [];
     for (let clusterIndex = 0; clusterIndex < centroids.length; clusterIndex++) {
@@ -178,7 +195,16 @@ export function rebuildStructure(database: Database<IvfEmbeddingRoot>): void {
     if (!allMembers.length) return;
 
     const clusterCount = Math.max(1, Math.round(allMembers.length / config.cellTargetSize));
-    const clusters = clusterMembers(allMembers, clusterCount, config);
+    const startTime = Date.now();
+    const upgrading = !steps[STEP_IVF];
+    console.log(magenta(`Rebuilding embedding index: ${allMembers.length} embeddings into ${clusterCount} cells (target ${config.cellTargetSize} each, was ${oldCellIds.length} cells), model ${config.model}, format ${config.format}${upgrading && ", upgrading from the flat tier" || ""}`));
+    let lastProgressTime = startTime;
+    const clusters = clusterMembers(allMembers, clusterCount, config, iteration => {
+        let now = Date.now();
+        if (now - lastProgressTime < REBUILD_PROGRESS_INTERVAL_MS) return;
+        lastProgressTime = now;
+        console.log(magenta(`Rebuilding embedding index: k-means pass ${iteration}/${REBALANCE_ITERATIONS} of ${allMembers.length} embeddings, ${((now - startTime) / 1000).toFixed(1)}s so far`));
+    });
 
     const newCellIds = new Set<string>();
     const centroidWrites: { key: string; value: StoredEmbedding | undefined }[] = [];
@@ -199,6 +225,7 @@ export function rebuildStructure(database: Database<IvfEmbeddingRoot>): void {
     transactionMutate(centroidStore(database), centroidWrites);
     database.writeData(root => root.count, allMembers.length);
     database.writeData(root => root.steps[STEP_IVF], true);
+    console.log(magenta(`Rebuilt embedding index: ${allMembers.length} embeddings in ${clusters.length} cells, ${((Date.now() - startTime) / 1000).toFixed(1)}s`));
 }
 
 export function searchEmbeddings(
@@ -316,10 +343,10 @@ export function insertEmbeddings(
             }
         }
         const averageFill = newCount / Math.max(1, centroids.size) / config.cellTargetSize;
-        if (Math.random() < rebalanceProbability(averageFill)) {
-            rebuildStructure(database);
+        if (seededRandomFromItems(items) < rebalanceProbability(averageFill)) {
+            return true;
         }
-        return true;
+        return false;
     };
     if (shouldRegenerate(database)) {
         rebuildStructure(database);

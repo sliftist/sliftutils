@@ -1,19 +1,13 @@
 import path from "path";
-import { getFileStorageNested2 } from "../FileFolderAPI";
-import { TransactionStorage } from "../TransactionStorage";
-import { JSONStorage } from "../JSONStorage";
-import type { IStorage } from "../IStorage";
-import type { AccessRequest, TrustRecord } from "./storageController";
 import { getArg } from "./cliArgs";
 
-// The storage server's process-level identity and system state: which server we are (config, extra ports), whether writes are allowed, and the trust/request stores.
+// The storage server's process-level identity and system state: which server we are (config, extra
+// ports), and whether writes are allowed.
 
 export type StorageServerConfig = {
     domain: string;
     port: number;
     rootDomain: string;
-    sshTarget: string;
-    serverCommand: string;
     folder: string;
 };
 
@@ -52,46 +46,10 @@ export function getStorageFolder(): string {
     return path.resolve(folder);
 }
 
-const systemStorages = new Map<string, Promise<IStorage<unknown>>>();
-function getSystemStorage<T>(name: string): Promise<IStorage<T>> {
-    let storage = systemStorages.get(name);
-    if (!storage) {
-        storage = (async () => {
-            let root = await getFileStorageNested2(getStorageFolder());
-            let system = await root.folder.getStorage("system2");
-            let transactionName = "storage" + name[0].toUpperCase() + name.slice(1);
-            return new JSONStorage<unknown>(new TransactionStorage(await system.folder.getStorage(name), transactionName));
-        })();
-        systemStorages.set(name, storage);
-    }
-    return storage as Promise<IStorage<T>>;
-}
-export function getTrust(): Promise<IStorage<TrustRecord>> {
-    return getSystemStorage<TrustRecord>("trust");
-}
-export function getRequests(): Promise<IStorage<AccessRequest[]>> {
-    return getSystemStorage<AccessRequest[]>("requests");
-}
-
-export async function setTrustedMachines(config: { account: string; machineIds: string[] }): Promise<void> {
-    let trust = await getTrust();
-    let prefix = `${config.account}|`;
-    let desired = new Set(config.machineIds);
-    for (let key of await trust.getKeys()) {
-        if (!key.startsWith(prefix)) continue;
-        let machineId = key.slice(prefix.length);
-        if (desired.has(machineId)) {
-            desired.delete(machineId);
-            continue;
-        }
-        console.log(`Removing trust for machine ${machineId} on account ${config.account}`);
-        await trust.remove(key);
-    }
-    for (let machineId of desired) {
-        console.log(`Adding trust for machine ${machineId} on account ${config.account}`);
-        await trust.set(`${prefix}${machineId}`, { account: config.account, machineId, ip: "", time: Date.now() });
-    }
-}
+// Which machines this server trusts is not kept here any more. It lives in the signed
+// authorized_keys repo, read through security/machines, so every machine shares one list, with
+// revocation and address checking that a per-server store never had. setTrustedMachines, the trust
+// store and the access request store all went with it.
 
 const extraListenPorts = new Set<number>();
 export function addExtraListenPort(port: number): void {

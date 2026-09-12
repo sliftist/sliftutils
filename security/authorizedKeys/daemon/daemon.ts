@@ -1,24 +1,25 @@
 import fs from "fs/promises";
 import os from "os";
 import { configureDiscordNotifications, DEFAULT_WEBHOOK_FILE_PATH } from "../../notifications/discord";
-import { findSourceKey, legacySourceKeyPath, sourceKeyPath, sourceRepoPath } from "../sources";
+import { describeMissingSourceKey, findSourceKey, sourceKeyPath, sourceRepoPath } from "../sources";
 import { cloneRepo, syncRepo } from "./git";
 import {
     CHECK_INTERVAL,
     CONFIG_PATH,
     MAX_REPO_FAILURES_BEFORE_RECLONE,
     ROOT_AUTHORIZED_KEYS,
+    SIGNER_CHANGE_DELAY,
 } from "./paths";
 import { notify, setHostLabel } from "./notify";
 import { enforceRootKeys } from "./rootKeys";
 import { enforceSSHDConfig } from "./sshdConfig";
 import { getState, loadState, saveState, sourceState } from "./state";
-import { resolveSourceKeys } from "./trust";
+import { readSignedRepo, SignedRepoError, UNSIGNED } from "./readSignedRepo";
 import { parseAuthLog, readNewAuthLog, watchAuthLog } from "./authLog";
-import { absorbRevocations, applyUnrevokes, pairKey, recordRevocation, removeRevokedKeys } from "./revocation";
+import { absorbRevocations, applyUnrevokes, pairKey, recordRevocation, reportRevokedKeys } from "./revocation";
 import { revokeRepo, syncRepoFiles } from "./repoFiles";
 import { revokeRepoURL } from "../revokeSource";
-import { keyFingerprint } from "../authorizedKeys";
+import { keyFingerprint, normalizeKeys } from "../authorizedKeys";
 import { addChangeReason } from "./changes";
 import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 
@@ -41,13 +42,14 @@ import { checkOtherUserKeys, seedUserKeys } from "./userKeys";
 //   4. A source's history was rewritten.
 //   5. A source started being signed by a different key, so its new keys are being held.
 //   6. A source is now signed when it was not before, applied right away.
-//   7. A source changed without its signature being updated, so the change is ignored.
-//   8. A source has a corrupted signature, so its contents are ignored.
-//   9. The webhook file itself changed, reported to the webhook being replaced.
-//  10. A trusted machine talked to us from an address it is not allowed from, so it was frozen
+//   7. A source has a corrupted signature, so its contents are ignored.
+//   8. The webhook file itself changed, reported to the webhook being replaced.
+//   9. A trusted machine talked to us from an address it is not allowed from, so it was frozen
 //      everywhere. Sent by whichever machine wrote that revocation, from machines.ts.
+// A file that does not match the manifest is NOT on this list. It is one file we hold no
+// signature for, it is logged where it is skipped, and the rest of the repo is unaffected.
 
-export type DaemonConfig = {
+type DaemonConfig = {
     repoSources: string[];
     hostLabel: string;
 };
@@ -55,11 +57,11 @@ export type DaemonConfig = {
 let config: DaemonConfig = { repoSources: [], hostLabel: "" };
 let repoFailureCounts: { [repoURL: string]: number } = {};
 
-export function getConfig() {
+function getConfig() {
     return config;
 }
 
-export function setConfig(value: DaemonConfig) {
+function setConfig(value: DaemonConfig) {
     config = value;
     setHostLabel(value.hostLabel);
 }
@@ -80,8 +82,8 @@ async function loadConfig(): Promise<DaemonConfig> {
     for (let repoURL of parsed.repoSources) {
         if (!await findSourceKey(repoURL)) {
             console.error(
-                `portsecure: expected the private key for ${repoURL} at ${sourceKeyPath(repoURL)}`
-                + ` or ${legacySourceKeyPath(repoURL)}, neither exists`
+                `portsecure: expected the private key for ${repoURL} to be one of these files, and`
+                + ` it is neither: ${await describeMissingSourceKey(repoURL)}`
             );
             process.exit(1);
         }
@@ -96,7 +98,7 @@ async function loadConfig(): Promise<DaemonConfig> {
 /** The union of every source, in source order, with duplicates dropped. A source that cannot be
     read is skipped rather than emptying the merged set, so one broken repo cannot revoke the keys
     that came from the others. */
-export async function readAllowedKeys() {
+async function readAllowedKeys() {
     let keys: string[] = [];
     let seen = new Set<string>();
     for (let repoURL of config.repoSources) {
@@ -285,7 +287,8 @@ async function everyCheck() {
     // written down when it happened, because the revoke repo was unreachable.
     await writeQueuedRevocations();
 
-    await enforceRootKeys(await removeRevokedKeys(mergedKeys));
+    await reportRevokedKeys();
+    await enforceRootKeys(mergedKeys);
     await checkOtherUserKeys();
     await enforceSSHDConfig();
 }
@@ -311,7 +314,7 @@ function startInterval(config: { intervalTime: number; run: () => Promise<void>;
     return tick;
 }
 
-export async function main() {
+async function main() {
     setConfig(await loadConfig());
     await loadState();
     await configureDiscordNotifications({ filePath: DEFAULT_WEBHOOK_FILE_PATH });
@@ -343,3 +346,137 @@ process.on("SIGTERM", () => {
     console.log("Received SIGTERM, exiting");
     process.exit(0);
 });
+
+// Deliberately without the finally(process.exit) of the other entry points: this daemon is meant
+// to keep running after main resolves, and exiting there would stop it dead on startup.
+main().catch(e => {
+    console.error(`portsecure: failed to start. ${e && e.stack || e}`);
+    process.exit(1);
+});
+/** The ssh keys out of the signed files: the combined authorized_keys if it was signed, otherwise
+    every signed top level .pub. Only ever the signed content, since that is all the map holds. */
+function keysFromSignedFiles(files: Map<string, Buffer>) {
+    let combined = files.get("authorized_keys");
+    if (combined) {
+        return normalizeKeys(combined.toString("utf8"));
+    }
+    let keys: string[] = [];
+    for (let [filePath, contents] of files) {
+        if (filePath.endsWith(".pub") && !filePath.includes("/")) {
+            keys.push(...normalizeKeys(contents.toString("utf8")));
+        }
+    }
+    return keys;
+}
+
+
+function describeSigner(signer: string) {
+    return signer === UNSIGNED && "<no public key>" || signer;
+}
+
+/** Reports a problem with a source's signature, but only when it is not the same problem we
+    already reported, so a fault that persists does not repeat every check. */
+async function reportProblem(config: { repoURL: string; problem: string; headline: string; body: string }) {
+    let { repoURL, problem, headline, body } = config;
+    let sourceStateValue = sourceState(repoURL);
+    if (sourceStateValue.reportedProblem === problem) {
+        return;
+    }
+    sourceStateValue.reportedProblem = problem;
+    await saveState();
+    await notify(headline, body);
+}
+
+/** The keys a source is allowed to contribute right now. A source signed by someone we have not
+    accepted keeps contributing the keys we last accepted, until the delay has passed. */
+async function resolveSourceKeys(repoURL: string) {
+    let sourceStateValue = sourceState(repoURL);
+    let repoPath = sourceRepoPath(repoURL);
+
+    let signer: string;
+    let signedFiles: Map<string, Buffer>;
+    let manifestHash: string;
+    let signatureHash: string;
+    try {
+        let signed = await readSignedRepo({ repoPath, sourceURL: repoURL });
+        signer = signed.signer;
+        signedFiles = signed.files;
+        manifestHash = signed.manifestHash;
+        signatureHash = signed.signatureHash;
+    } catch (e) {
+        // The read layer already knows what is wrong and how to say it, so this only forwards it.
+        // Anything that is not a signed repo problem is a real fault and is not swallowed.
+        if (!(e instanceof SignedRepoError)) {
+            throw e;
+        }
+        await reportProblem({ repoURL, problem: e.problem, headline: e.headline, body: e.body });
+        return sourceStateValue.acceptedKeys;
+    }
+    if (sourceStateValue.reportedProblem) {
+        sourceStateValue.reportedProblem = "";
+        await saveState();
+    }
+    let checkoutKeys = keysFromSignedFiles(signedFiles);
+
+    let accept = async () => {
+        sourceStateValue.accepted = true;
+        sourceStateValue.acceptedSigner = signer;
+        sourceStateValue.acceptedKeys = checkoutKeys;
+        sourceStateValue.acceptedManifestHash = manifestHash;
+        sourceStateValue.acceptedSignatureHash = signatureHash;
+        sourceStateValue.pendingSigner = UNSIGNED;
+        sourceStateValue.pendingSince = 0;
+        await saveState();
+        return checkoutKeys;
+    };
+
+    // Nothing has ever been accepted from this source, so this is what we start trusting.
+    if (!sourceStateValue.accepted) {
+        console.log(`Trusting ${repoURL} as signed by ${describeSigner(signer)}`);
+        return await accept();
+    }
+
+    if (signer === sourceStateValue.acceptedSigner) {
+        // Back to the signer we already trust, so anything we were waiting on is moot.
+        if (sourceStateValue.pendingSince) {
+            console.log(`${repoURL} is signed by its accepted key again, dropping the pending change`);
+        }
+        return await accept();
+    }
+
+    // Going from nothing to something signed is only ever an improvement, so it does not wait.
+    if (sourceStateValue.acceptedSigner === UNSIGNED) {
+        await notify(`KEY REPO IS NOW SIGNED`,
+            `\`${repoURL}\` was not signed at all before, so this is an improvement and its keys`
+            + ` are being applied right away.`
+            + `\n\nsigned by: \`${signer}\``
+        );
+        return await accept();
+    }
+
+    // A signer we have not accepted. Anything new restarts the wait, so publishing twice in a row
+    // gains an attacker nothing. pendingSince is what marks a wait as running, because an unsigned
+    // checkout is itself a signer value and cannot double as "nothing pending".
+    if (!sourceStateValue.pendingSince || signer !== sourceStateValue.pendingSigner) {
+        sourceStateValue.pendingSigner = signer;
+        sourceStateValue.pendingSince = Date.now();
+        await saveState();
+        await notify(`KEY REPO SIGNED BY A DIFFERENT KEY`,
+            `Somebody else is signing \`${repoURL}\` now. Its keys are NOT being applied, and this`
+            + ` machine is still using the ones it already had. If nothing changes, the new signer`
+            + ` is accepted in 24 hours.`
+            + `\n\nIf that was not you, fix the repo before the 24 hours are up.`
+            + `\n\nsigned by now: \`${describeSigner(signer)}\``
+            + `\nsigned by before: \`${describeSigner(sourceStateValue.acceptedSigner)}\``
+        );
+        return sourceStateValue.acceptedKeys;
+    }
+
+    if (Date.now() - sourceStateValue.pendingSince < SIGNER_CHANGE_DELAY) {
+        return sourceStateValue.acceptedKeys;
+    }
+
+    // Same new signer, 24 hours later, and nobody stopped it.
+    console.log(`Accepting ${describeSigner(signer)} for ${repoURL} after the ${SIGNER_CHANGE_DELAY}ms wait`);
+    return await accept();
+}

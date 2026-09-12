@@ -10,6 +10,8 @@ export type IdentityStorageType = {
     certB64: string;
     keyB64: string;
 };
+export declare function DEV_getIdentityFilePath(domain: string): string;
+export declare function DEV_listIdentityDomains(): string[];
 export interface X509KeyPair {
     domain: string;
     cert: Buffer;
@@ -38,7 +40,7 @@ export declare function generateKeyPair(): {
     publicKey: forge.Ed25519PublicKey;
     privateKey: forge.Ed25519PrivateKey;
 };
-export declare function generateTestCA(domain: string): X509KeyPair;
+export declare function generateCA(domain: string): X509KeyPair;
 export declare function createCertFromCA(config: {
     CAKeyPair: X509KeyPair;
 }): X509KeyPair;
@@ -58,7 +60,11 @@ export declare function getIdentityCA(domain: string): X509KeyPair;
 export declare function getIdentityCAPromise(domain: string): X509KeyPair;
 export declare function getOwnMachineId(domain: string): string;
 export declare function getOwnThreadId(domain: string): string;
-/** Part of the machineId comes from the publicKey, so we can use it to verify */
+/** Part of the machineId comes from the publicKey, so we can use it to verify.
+
+    Fairly weak: it only proves the id names this key, not that the caller holds the key - usually a
+    better workflow should be used, with a back and forth (ex, validateCertificate over a signed
+    exchange). In some cases it is sufficient, such as exposing source maps to the client. */
 export declare function verifyMachineIdForPublicKey(config: {
     machineId: string;
     publicKey: Buffer;

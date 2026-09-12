@@ -18,9 +18,6 @@ export const MAX_ERROR_BODY_LENGTH = 500;
 // A source that starts being signed by someone new is held at arm's length for this long, so a
 // stolen signing key cannot push keys onto a machine before anyone notices the warning.
 export const SIGNER_CHANGE_DELAY = 24 * 60 * 60 * 1000;
-// An unrevoke waits this long before taking effect, so a compromised signing key cannot instantly
-// undo the revocation that locked it out.
-export const UNREVOKE_DELAY = 60 * 60 * 1000;
 // After this many consecutive failures a repo is thrown away and cloned from scratch, which
 // recovers from corruption and interrupted fetches. Counted in checks, so about a quarter hour.
 export const MAX_REPO_FAILURES_BEFORE_RECLONE = 15;

@@ -65,7 +65,9 @@ export function publicKeyFromSeed(seed: Buffer) {
         type: "pkcs8",
     });
     // The spki wrapper is a fixed 12 byte header followed by the raw key.
-    return crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" }).subarray(12);
+    // The cast is because some @types/node versions don't accept a KeyObject here, even though the
+    // runtime always has. Consumers compile us with their own @types/node, so this has to not fail.
+    return crypto.createPublicKey(privateKey as any).export({ format: "der", type: "spki" }).subarray(12);
 }
 
 export function parseOpenSSHPrivateKey(contents: string) {

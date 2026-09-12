@@ -1,10 +1,5 @@
 #!/usr/bin/env node
 "use strict";
-// Signs the files of the repo in the current directory, so a machine pulling it can tell who
-// published what it is about to trust.
+// Signs the files of a keys repo, so a machine pulling it can tell who published what it trusts.
 require("typenode");
-
-require("../security/signedFiles/signFiles").main().catch(e => {
-    console.error(`${e}`);
-    process.exitCode = 1;
-}).finally(() => process.exit());
+require("../security/signedFiles/signFilesCli");

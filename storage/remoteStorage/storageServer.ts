@@ -36,7 +36,7 @@ function getInternalIP(): string {
     return candidates.find(ip => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip)) || candidates[0];
 }
 
-// The remote storage server, as a library function: consumers call hostStorageServer() from their own process to start hosting (or use the storageserver bin, see storageServerCli.ts). The grantAccess.js bootstrap (next to this file) is what the access page's shown SSH command points at.
+// The remote storage server, as a library function: consumers call hostStorageServer() from their own process to start hosting (or use the storageserver bin, see storageServerCli.ts). Who may talk to it comes from the signed authorized_keys repo, read through security/machines - there is nothing to grant here.
 
 export type HostStorageServerConfig = {
     // Full URL of this storage server, e.g. "https://1-2-3-4.example.com:4444". The subdomain must be an ip domain - this machine's external IP with dashes, or 127-0-0-1 for local testing (see the validation in hostStorageServer). The domain and port are extracted from it (bucket routing URLs clients use look like
@@ -82,11 +82,6 @@ async function checkDiskSpace(config: { folder: string; threshold: number }): Pr
     }
 }
 
-// Full path to the grantAccess CLI bootstrap that lives next to this file. The SSH command shown on the access page invokes it via `node <path> ...` (found through __dirname so consumers don't have to know where our source lives).
-function getGrantAccessCliPath(): string {
-    return path.join(__dirname, "grantAccess.js");
-}
-
 export async function hostStorageServer(config: HostStorageServerConfig): Promise<void> {
     let { url, folder } = config;
     let { address: domain, port } = parseStorageUrl(url);
@@ -104,8 +99,6 @@ export async function hostStorageServer(config: HostStorageServerConfig): Promis
         domain,
         port,
         rootDomain,
-        sshTarget: `${os.userInfo().username}@${ip}`,
-        serverCommand: `node ${getGrantAccessCliPath()} --url ${url}`,
         folder: path.resolve(folder),
     });
 

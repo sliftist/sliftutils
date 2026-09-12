@@ -4,22 +4,16 @@ import path from "path";
 import { runPromise } from "socket-function/src/runPromise";
 import { expandHome } from "../helpers/paths";
 import { spawnPromise } from "../helpers/spawn";
-import { buildManifest, formatManifest, MANIFEST_NAME, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
+import { buildManifest, formatManifest, MANIFEST_NAME, normalizeContent, SIGNATURE_NAME, SIGN_NAMESPACE } from "./manifest";
+import { verifySSHSIG } from "./sshsig";
 import { revokedKeysInRepo } from "../authorizedKeys/unrevoke";
 import { findKeyProblems, normalizeKeys } from "../authorizedKeys/authorizedKeys";
 
 // A hardware backed key is the entire point. A key sitting on disk is compromised the moment the
 // machine is, and then the signature proves nothing, so this is what we make when asked to make one.
-const DEFAULT_KEY_TYPE = "ed25519-sk";
-const DEFAULT_KEY_PATH = "~/.ssh/signfiles_ed25519_sk";
-const GIT_KEYWORD = "git";
-const COMMIT_MESSAGE = "deploying signed files";
+export const DEFAULT_KEY_TYPE = "ed25519-sk";
+export const DEFAULT_KEY_PATH = "~/.ssh/signfiles_ed25519_sk";
 const MAX_ERROR_BODY_LENGTH = 500;
-const USAGE = `Usage: yarn signfiles [signing-key] [${GIT_KEYWORD}]
-
-Signs the files of the repo in the current directory. With no key, a hardware backed
-${DEFAULT_KEY_TYPE} key at ${DEFAULT_KEY_PATH} is used, and created if it does not exist.
-Pass ${GIT_KEYWORD} to also commit and push the result.`;
 
 /** runPromise takes a command line rather than an argument list, so anything holding a path has to
     survive the shell. Double quotes work on both cmd and posix shells. */
@@ -112,15 +106,6 @@ async function refuseRevokedKeys(repoPath: string) {
     );
 }
 
-function parseArgs(argv: string[]) {
-    let pushToGit = argv.includes(GIT_KEYWORD);
-    let positional = argv.filter(arg => arg !== GIT_KEYWORD);
-    if (positional.length > 1) {
-        throw new Error(`Expected at most a signing key, was ${positional.length} argument(s): ${positional.join(" ")}\n${USAGE}`);
-    }
-    return { keyPath: positional[0], pushToGit };
-}
-
 /** Writes the manifest and its signature into a repo. Separate from the command so anything that
     changes a keys repo can leave it signed, rather than telling someone to go and do it. */
 export async function signRepo(config: { repoPath: string; keyPath?: string }) {
@@ -146,45 +131,15 @@ export async function signRepo(config: { repoPath: string; keyPath?: string }) {
 
     // Signing happens before any git work, so a failed push never costs a second touch of the key.
     await runPromise(`ssh-keygen -Y sign -f ${quote(signingKey)} -n ${SIGN_NAMESPACE} ${quote(stagedManifest)}`);
-    // Checked here rather than left for a machine that has already pulled it to discover.
-    await runPromise(
-        `ssh-keygen -Y check-novalidate -n ${SIGN_NAMESPACE} -s ${quote(stagedSignature)} < ${quote(stagedManifest)}`
-    );
+    // Checked with the same code the daemon verifies with, over the same normalised bytes, so what
+    // is about to be committed is proven to pass the check every other machine will run on it.
+    verifySSHSIG({
+        signature: await fs.readFile(stagedSignature, "utf8"),
+        message: normalizeContent(await fs.readFile(stagedManifest)),
+        namespace: SIGN_NAMESPACE,
+    });
     await fs.copyFile(stagedManifest, path.join(repoPath, MANIFEST_NAME));
     await fs.copyFile(stagedSignature, path.join(repoPath, SIGNATURE_NAME));
     await fs.rm(stagingDirectory, { recursive: true, force: true });
     console.log(`Signed with ${await publicKeyOf(signingKey)}`);
-}
-
-export async function main() {
-    let { keyPath, pushToGit } = parseArgs(process.argv.slice(2));
-
-    // Read for its value, so stdout has to be on its own. runPromise joins it with stderr, and a
-    // git warning glued to the front of this becomes a directory that does not exist.
-    let topLevel = await spawnPromise({ command: "git", args: ["rev-parse", "--show-toplevel"] });
-    let repoPath = topLevel.stdout.trim();
-    if (topLevel.status !== 0 || !repoPath) {
-        throw new Error(
-            `Expected the current directory to be inside a git repo, it is not.\n`
-            + `${(topLevel.stdout + topLevel.stderr).trim()}\n${USAGE}`
-        );
-    }
-    await signRepo({ repoPath, keyPath });
-
-    if (!pushToGit) {
-        console.log(`Commit and push ${MANIFEST_NAME} and ${SIGNATURE_NAME} for anything to see them.`);
-        return;
-    }
-    await runPromise(`git add -A`, { cwd: repoPath });
-    // Nothing staged is not worth stopping on. git commit calls that a failure, but it only means
-    // the signature matches the one already committed, so there is nothing to deploy.
-    let status = await spawnPromise({ command: "git", args: ["status", "--porcelain"], cwd: repoPath });
-    let staged = status.stdout;
-    if (!staged.trim()) {
-        console.log(`Nothing changed, ${MANIFEST_NAME} and ${SIGNATURE_NAME} are already committed.`);
-        return;
-    }
-    await runPromise(`git commit -m ${quote(COMMIT_MESSAGE)}`, { cwd: repoPath });
-    await runPromise(`git push`, { cwd: repoPath });
-    console.log(`Committed and pushed.`);
 }

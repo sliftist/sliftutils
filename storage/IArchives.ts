@@ -12,6 +12,15 @@ export function assertValidLastModified(lastModified: number): void {
     }
 }
 
+/** Every file-addressed operation checks this at its entry point, so an empty name fails right
+    where it was passed - with the caller in the stack - instead of surfacing as a baffling backend
+    rejection after the retry loops are done with it. */
+export function validateFileName(fileName: string, operation: string): void {
+    if (!fileName) {
+        throw new Error(`${operation} was called with an empty file name`);
+    }
+}
+
 
 export type RemoteConfig = {
     // NOTE: Version is used when updating the configuration. The newer version is always taken. A missing version counts as version -1.

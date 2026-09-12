@@ -1,0 +1,15 @@
+export declare const CONFIG_PATH = "/etc/portsecure/daemon.json";
+export declare const STATE_PATH = "/var/lib/portsecure/state.json";
+export declare const KEYS_HISTORY_PATH = "/var/lib/portsecure/authorized-keys-history";
+export declare const ROOT_AUTHORIZED_KEYS = "/root/.ssh/authorized_keys";
+export declare const SSHD_CONFIG_PATH = "/etc/ssh/sshd_config";
+export declare const SSHD_DROPIN_DIR = "/etc/ssh/sshd_config.d";
+export declare const SSHD_DROPIN_PATH = "/etc/ssh/sshd_config.d/00-portsecure.conf";
+export declare const PASSWD_PATH = "/etc/passwd";
+export declare const AUTH_LOG_PATH = "/var/log/auth.log";
+export declare const CHECK_INTERVAL: number;
+export declare const WEBHOOK_CHECK_INTERVAL: number;
+export declare const GIT_TIMEOUT: number;
+export declare const MAX_ERROR_BODY_LENGTH = 500;
+export declare const SIGNER_CHANGE_DELAY: number;
+export declare const MAX_REPO_FAILURES_BEFORE_RECLONE = 15;

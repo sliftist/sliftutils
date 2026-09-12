@@ -12,13 +12,12 @@ import fsSync from "fs";
 import { cache, lazy } from "socket-function/src/caching";
 import { isNode } from "socket-function/src/misc";
 import sha265 from "js-sha256";
-import crypto from "crypto";
 import { trustCertificate } from "socket-function/src/certStore";
 import { measureBlock, measureFnc, measureWrap } from "socket-function/src/profiling/measure";
 import { getNodeIdDomain, getNodeIdDomainMaybeUndefined, getNodeIdLocation } from "socket-function/src/nodeCache";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { resetAllNodeCallFactories } from "socket-function/src/nodeCache";
-import { getKeyStore } from "./persistentLocalStorage";
+import { getKeyStore, DEV_getKeyStorePath, DEV_listKeyStoreApps } from "./persistentLocalStorage";
 import { ellipsize } from "../strings";
 
 setFlag(require, "node-forge", "allowclient", true);
@@ -35,13 +34,25 @@ function getIdentityStore(domain: string) {
     return getKeyStore<IdentityStorageType>(domain, identityStorageKey);
 }
 
+// Just used for machine maintenance (finding a machine's identity file on disk, ex to copy it to
+// another machine over ssh). NEVER access this unless explicitly given permission.
+export function DEV_getIdentityFilePath(domain: string): string {
+    return DEV_getKeyStorePath({ appName: domain, key: identityStorageKey });
+}
+
+// Every domain this machine has an identity under. Machine maintenance only, like the path above.
+export function DEV_listIdentityDomains(): string[] {
+    return DEV_listKeyStoreApps(identityStorageKey);
+}
+
 export interface X509KeyPair { domain: string; cert: Buffer; key: Buffer; }
 
 export function getCommonName(cert: Buffer | string) {
-    let subject = new crypto.X509Certificate(cert).subject;
-    let subjectKVPs = new Map(subject.split(",").map(x => x.trim().split("=")).map(x => [x[0], x.slice(1).join("=")]));
-    let commonName = subjectKVPs.get("CN");
-    if (!commonName) throw new Error(`No common name in subject: ${subject}`);
+    let subject = parseCert(cert).subject;
+    let commonName = subject.getField("CN")?.value as string | undefined;
+    if (!commonName) {
+        throw new Error(`No common name in subject: ${subject.attributes.map(x => `${x.shortName || x.name}=${x.value}`).join(", ")}`);
+    }
     return commonName;
 }
 
@@ -331,7 +342,7 @@ export function generateKeyPair() {
     });
 }
 
-export function generateTestCA(domain: string) {
+export function generateCA(domain: string) {
     const keyPair = generateKeyPair();
     let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
     let fullDomain = `${caPublicKeyPart}.${domain}`;
@@ -343,12 +354,7 @@ let identityCA = cache((domain: string) => lazy((): X509KeyPair => {
     let caCached = identityCACached.get();
     if (!caCached) {
         console.log(`Generating new identity CA`);
-        const keyPair = generateKeyPair();
-        let caPublicKeyPart = getDomainPartFromPublicKey(keyPair.publicKey);
-        let fullDomain = `${caPublicKeyPart}.${domain}`;
-
-        let value = createX509({ domain: fullDomain, issuer: "self", keyPair, lifeSpan: timeInDay * 365 * 20 });
-
+        let value = generateCA(domain);
         caCached = {
             domain: value.domain,
             certB64: value.cert.toString("base64"),
@@ -470,7 +476,11 @@ export function getOwnThreadId(domain: string) {
     return decodeNodeIdAssert(getThreadKeyCert(domain).domain, domain).threadId;
 }
 
-/** Part of the machineId comes from the publicKey, so we can use it to verify */
+/** Part of the machineId comes from the publicKey, so we can use it to verify.
+
+    Fairly weak: it only proves the id names this key, not that the caller holds the key - usually a
+    better workflow should be used, with a back and forth (ex, validateCertificate over a signed
+    exchange). In some cases it is sufficient, such as exposing source maps to the client. */
 export function verifyMachineIdForPublicKey(config: {
     machineId: string;
     publicKey: Buffer;
