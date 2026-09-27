@@ -9,9 +9,9 @@ A build system and utility library for MobX + Preact projects.
 The first thing you should do is call the setup function. They will give you a lot of boilerplate code which you can delete or keep (I recommend commiting first, so you can pick which boilerplate changes you want):
 
 ```bash
-npx slift-setup
+yarn slift-setup
 # or
-npx sliftsetup
+yarn sliftsetup
 ```
 
 ### 2. Build or Watch
@@ -20,18 +20,18 @@ After setup, you can either **build** your project or **watch** for changes:
 
 #### Build Commands
 ```bash
-npx build-nodejs      # Build Node.js application
-npx build-web         # Build web application
-npx build-extension   # Build browser extension
-npx build-electron    # Build Electron application
+yarn build-nodejs      # Build Node.js application
+yarn build-web         # Build web application
+yarn build-extension   # Build browser extension
+yarn build-electron    # Build Electron application
 ```
 
 #### Watch Commands
 ```bash
-npx slift-watch --port 9876 "nodejs/*.ts" "nodejs/*.tsx" "yarn build-nodejs"
-npx slift-watch --port 9877 "web/*.ts" "web/*.tsx" "yarn build-web"
-npx slift-watch --port 9878 "extension/*.ts" "extension/*.tsx" "yarn build-extension"
-npx slift-watch --port 9879 "electron/*.ts" "electron/*.tsx" "yarn build-electron"
+yarn slift-watch --port 9876 "nodejs/*.ts" "nodejs/*.tsx" "yarn build-nodejs"
+yarn slift-watch --port 9877 "web/*.ts" "web/*.tsx" "yarn build-web"
+yarn slift-watch --port 9878 "extension/*.ts" "extension/*.tsx" "yarn build-extension"
+yarn slift-watch --port 9879 "electron/*.ts" "electron/*.tsx" "yarn build-electron"
 ```
 
 ### 3. Run
