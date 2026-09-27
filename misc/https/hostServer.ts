@@ -67,7 +67,7 @@ export async function hostServer(config: HostServerConfig): Promise<string> {
         }
     }
 
-    let keyCert = await getFreshHTTPSCert(domain, config.selfSigned);
+    let keyCert = await getFreshHTTPSCert(rootDomain, config.selfSigned);
     let certListeners: ((value: { key: string; cert: string }) => void)[] = [];
     void runCertRenewalLoop(domain, config.selfSigned, newKeyCert => {
         keyCert = newKeyCert;
