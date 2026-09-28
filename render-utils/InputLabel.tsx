@@ -116,7 +116,6 @@ export class InputLabel extends preact.Component<InputLabelProps> {
         }
 
         let label = props.label || props.children;
-        (props as any).title = props.tooltip;
         if ("value" in props) {
             props.value = props.value ?? "";
         }
@@ -243,7 +242,7 @@ export class InputLabel extends preact.Component<InputLabelProps> {
             </span>;
         }
         return (
-            <label onClick={onClick} className={
+            <label onClick={onClick} title={props.tooltip} className={
                 css.hbox(5).relative
                 + " trigger-hover "
                 + props.outerClass
