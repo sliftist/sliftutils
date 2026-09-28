@@ -5,6 +5,9 @@ export declare class URLParam<T = unknown> {
     valueSeqNum: {
         value: number;
     };
+    private tickCache;
+    private setTickCache;
+    clearTickCache(): void;
     get(): T;
     set(value: T): void;
     reset(): void;

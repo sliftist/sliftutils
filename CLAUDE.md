@@ -48,6 +48,7 @@ from `.cursor/rules/*.mdc` so Claude reads them automatically.
 - `import { keyBy, keyByArray } from "socket-function/src/misc";` for building lookups.
 - Never use `alert`. Throw instead.
 - Always use the helper functions for potentially large numbers (> 1000), and time spans. For time spans, it takes the time in terms of milliseconds. For example, 5,000 would be formatted as 5 seconds. `import { formatNumber, formatTime } from "socket-function/src/formatting/format";`
+- NEVER use "abstract" classes. Don't abuse inheritance. should almost never be used. It is bad. Inheritance is only used for things such as PReact component because the framework requires it. 
 
 ## MobX state
 

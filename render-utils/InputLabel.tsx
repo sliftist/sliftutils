@@ -216,7 +216,11 @@ export class InputLabel extends preact.Component<InputLabelProps> {
                 if (props.edit) {
                     this.synced.editInputValue = e.currentTarget.value;
                 }
-                props.onInput?.(e);
+                if (props.onInput) {
+                    props.onInput(e);
+                } else if (props.hot) {
+                    props.onChange?.(e);
+                }
             }}
         />;
 

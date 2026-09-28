@@ -3,24 +3,61 @@ process.env.NODE_ENV = "production";
 import { isNode } from "typesafecss";
 import { observable } from "mobx";
 import { throttleFunction } from "socket-function/src/misc";
+import { createSingleton } from "socket-function/src/createSingleton";
 import { niceParse, niceStringify } from "./niceStringify";
 
-let urlParamLookup = new Map<string, URLParam<unknown>>();
+const shared = createSingleton("sliftutils.URLParam", 1, () => ({
+    urlParamLookup: new Map<string, URLParam<unknown>>(),
+    allURLParams: new Set<URLParam<unknown>>(),
+    tickCacheClearScheduled: false,
+    urlBackSeqNum: observable({ value: 1 }),
+    popstateListenerAdded: false,
+})).get();
+const urlParamLookup = shared.urlParamLookup;
+const urlBackSeqNum = shared.urlBackSeqNum;
 let pauseUpdate = false;
+
+function clearAllTickCaches() {
+    for (const param of shared.allURLParams) {
+        param.clearTickCache();
+    }
+}
+function scheduleTickCacheClear() {
+    if (shared.tickCacheClearScheduled) return;
+    shared.tickCacheClearScheduled = true;
+    setTimeout(() => {
+        shared.tickCacheClearScheduled = false;
+        clearAllTickCaches();
+    }, 0);
+}
 
 export class URLParam<T = unknown> {
     constructor(public readonly key: string, private defaultValue: T = "" as any) {
         urlParamLookup.set(key, this);
+        shared.allURLParams.add(this);
     }
     valueSeqNum = observable({ value: 1 });
+    private tickCache: { value: T } | undefined;
+    private setTickCache(value: T) {
+        this.tickCache = { value };
+        scheduleTickCacheClear();
+    }
+    public clearTickCache() {
+        this.tickCache = undefined;
+    }
     public get(): T {
         urlBackSeqNum.value;
         this.valueSeqNum.value;
-        let value = new URL(getCurrentUrl()).searchParams.get(this.key);
-        if (value === null) {
-            return this.defaultValue;
+        if (this.tickCache) {
+            return this.tickCache.value;
         }
-        return niceParse(value) as T;
+        let rawValue = new URL(getCurrentUrl()).searchParams.get(this.key);
+        let value = this.defaultValue;
+        if (rawValue !== null) {
+            value = niceParse(rawValue) as T;
+        }
+        this.setTickCache(value);
+        return value;
     }
     public set(value: T) {
         let url = new URL(getCurrentUrl());
@@ -29,6 +66,7 @@ export class URLParam<T = unknown> {
         } else {
             url.searchParams.set(this.key, niceStringify(value));
         }
+        this.setTickCache(value);
         if (!pauseUpdate) {
             void throttledUrlPush(url.toString());
             this.valueSeqNum.value++;
@@ -37,6 +75,7 @@ export class URLParam<T = unknown> {
     public reset() {
         let url = new URL(getCurrentUrl());
         url.searchParams.delete(this.key);
+        this.setTickCache(this.defaultValue);
         if (!pauseUpdate) {
             void throttledUrlPush(url.toString());
             this.valueSeqNum.value++;
@@ -94,9 +133,10 @@ const throttledUrlPushBase = throttleFunction(1000, (url: string) => {
     history.pushState({}, "", url);
 });
 
-let urlBackSeqNum = observable({ value: 1 });
-if (!isNode()) {
+if (!isNode() && !shared.popstateListenerAdded) {
+    shared.popstateListenerAdded = true;
     window.addEventListener("popstate", () => {
+        clearAllTickCaches();
         urlBackSeqNum.value++;
     });
 }

@@ -813,6 +813,9 @@ declare module "sliftutils/render-utils/URLParam" {
         valueSeqNum: {
             value: number;
         };
+        private tickCache;
+        private setTickCache;
+        clearTickCache(): void;
         get(): T;
         set(value: T): void;
         reset(): void;
