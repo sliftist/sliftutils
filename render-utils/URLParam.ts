@@ -1,7 +1,5 @@
-process.env.NODE_ENV = "production";
-
 import { isNode } from "typesafecss";
-import { observable } from "mobx";
+import { observable } from "./mobxTyped";
 import { throttleFunction } from "socket-function/src/misc";
 import { createSingleton } from "socket-function/src/createSingleton";
 import { niceParse, niceStringify } from "./niceStringify";

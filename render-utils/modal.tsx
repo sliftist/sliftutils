@@ -1,8 +1,5 @@
-process.env.NODE_ENV = "production";
-
 import preact from "preact";
-import { observable } from "mobx";
-import * as mobx from "mobx";
+import { observable } from "./mobxTyped";
 import { observer } from "./observer";
 import { lazy } from "socket-function/src/caching";
 import { nextId } from "socket-function/src/misc";

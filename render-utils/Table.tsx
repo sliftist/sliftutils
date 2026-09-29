@@ -1,12 +1,10 @@
-process.env.NODE_ENV = "production";
-
 import preact from "preact";
 import { css } from "typesafecss";
 import { formatValue, JSXFormatter, toSpaceCase } from "./GenericFormat";
 import { observer } from "./observer";
 import { canHaveChildren } from "socket-function/src/types";
 import { showFullscreenModal } from "./FullscreenModal";
-import { observable } from "mobx";
+import { observable } from "./mobxTyped";
 
 // Null means the column is removed
 export type ColumnType<T = unknown, Row extends RowType = RowType> = undefined | null | {

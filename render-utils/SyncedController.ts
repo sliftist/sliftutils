@@ -1,12 +1,10 @@
-process.env.NODE_ENV = "production";
-
 import { SocketFunction } from "socket-function/SocketFunction";
 import { SocketRegistered } from "socket-function/SocketFunctionTypes";
 import { onHotReload } from "socket-function/hot/HotReloadController";
 import { cache } from "socket-function/src/caching";
 import { nextId } from "socket-function/src/misc";
 import { MaybePromise } from "socket-function/src/types";
-import { observable } from "mobx";
+import { observable } from "./mobxTyped";
 import { formatTime } from "socket-function/src/formatting/format";
 import { isNode } from "typesafecss";
 import { delay } from "socket-function/src/batching";

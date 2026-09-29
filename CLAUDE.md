@@ -56,7 +56,7 @@ We use MobX. Components store local state in a field called `synced`, which is a
 
 ```tsx
 import preact from "preact";
-import { observable } from "mobx";
+import { observable } from "sliftutils/render-utils/mobxTyped";
 import { observer } from "sliftutils/render-utils/observer";
 
 @observer

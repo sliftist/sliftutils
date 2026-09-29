@@ -1,6 +1,4 @@
-process.env.NODE_ENV = "production";
-
-import { observable } from "mobx";
+import { observable } from "../render-utils/mobxTyped";
 import { list } from "socket-function/src/misc";
 import { css } from "typesafecss";
 import { URLParam } from "../render-utils/URLParam";

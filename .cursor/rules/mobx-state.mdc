@@ -11,7 +11,7 @@ For example:
 
 ```tsx
 import preact from "preact";
-import { observable } from "mobx";
+import { observable } from "sliftutils/render-utils/mobxTyped";
 
 @observer
 class Example extends preact.Component {

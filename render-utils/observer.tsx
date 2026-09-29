@@ -1,9 +1,5 @@
-process.env.NODE_ENV = "production";
-
 import * as preact from "preact";
-import { observable, Reaction } from "mobx";
-import { setFlag } from "socket-function/require/compileFlags";
-setFlag(require, "mobx", "allowclient", true);
+import { observable, Reaction } from "./mobxTyped";
 import { measureBlock } from "socket-function/src/profiling/measure";
 
 let globalConstructOrder = 1;

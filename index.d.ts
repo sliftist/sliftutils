@@ -852,7 +852,8 @@ declare module "sliftutils/render-utils/colors" {
 }
 
 declare module "sliftutils/render-utils/mobxTyped" {
-    export { observable, runInAction, computed, autorun, onBecomeObserved, onBecomeUnobserved } from "mobx";
+    import { observable, runInAction, computed, autorun, onBecomeObserved, onBecomeUnobserved, Reaction } from "mobx";
+    export { observable, runInAction, computed, autorun, onBecomeObserved, onBecomeUnobserved, Reaction };
     export declare function configureMobxNextFrameScheduler(): void;
 
 }
@@ -880,7 +881,7 @@ declare module "sliftutils/render-utils/niceStringify" {
 
 declare module "sliftutils/render-utils/observer" {
     import * as preact from "preact";
-    import { Reaction } from "mobx";
+    import { Reaction } from "./mobxTyped";
     export declare function observer<T extends {
         new (...args: any[]): {
             render(): preact.ComponentChild;

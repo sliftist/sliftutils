@@ -1,7 +1,5 @@
-process.env.NODE_ENV = "production";
-
 import preact from "preact";
-import { observable } from "mobx";
+import { observable } from "./mobxTyped";
 import { observer } from "./observer";
 import { css } from "typesafecss";
 import { LengthOrPercentage, LengthOrPercentageOrAuto } from "typesafecss/cssTypes";

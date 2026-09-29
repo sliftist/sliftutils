@@ -1,7 +1,5 @@
-process.env.NODE_ENV = "production";
-
 import preact from "preact";
-import { observable } from "mobx";
+import { observable } from "../render-utils/mobxTyped";
 import { observer } from "../render-utils/observer";
 import { isNode } from "socket-function/src/misc";
 import { css } from "typesafecss";

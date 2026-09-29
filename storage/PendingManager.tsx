@@ -1,7 +1,5 @@
-process.env.NODE_ENV = "production";
-
 import { throttleFunction } from "socket-function/src/misc";
-import { observable } from "mobx";
+import { observable } from "../render-utils/mobxTyped";
 import preact from "preact";
 import { css } from "typesafecss";
 import { observer } from "../render-utils/observer";

@@ -1,6 +1,4 @@
-process.env.NODE_ENV = "production";
-
-import { observable } from "mobx";
+import { observable } from "../render-utils/mobxTyped";
 import { deepFreezeObject, freezeObject, isDefined } from "../misc/types";
 import { IStorage, IStorageSync } from "./IStorage";
 import { PromiseObj } from "socket-function/src/misc";

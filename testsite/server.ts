@@ -1,4 +1,3 @@
-process.env.NODE_ENV = "production";
 import path from "path";
 import { SocketFunction } from "socket-function/SocketFunction";
 import { RequireController } from "socket-function/require/RequireController";

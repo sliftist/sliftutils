@@ -1,11 +1,9 @@
-process.env.NODE_ENV = "production";
-
 import preact from "preact";
 import { Input } from "./Input";
 import { css } from "typesafecss";
 import { lazy } from "socket-function/src/caching";
 import { observer } from "./observer";
-import { observable } from "mobx";
+import { observable } from "./mobxTyped";
 
 // IMPORTANT! InputProps is in both InputLabel.tsx and Input.tsx, so the types export correctly
 export type InputProps = (

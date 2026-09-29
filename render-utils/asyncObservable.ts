@@ -1,6 +1,4 @@
-process.env.NODE_ENV = "production";
-
-import { observable } from "mobx";
+import { observable } from "./mobxTyped";
 
 export function asyncCache<Args, T>(getValue: (args: Args) => Promise<T>): {
     (args: Args): T | undefined;

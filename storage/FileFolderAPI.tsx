@@ -1,8 +1,6 @@
-process.env.NODE_ENV = "production";
-
 import preact from "preact";
 import { findGrantedPointerHandle, getFileSystemPointer, storeFileSystemPointer } from "./fileSystemPointer";
-import { observable } from "mobx";
+import { observable } from "../render-utils/mobxTyped";
 import { observer } from "../render-utils/observer";
 import { cache, lazy } from "socket-function/src/caching";
 import { css, isNode } from "typesafecss";

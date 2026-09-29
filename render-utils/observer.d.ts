@@ -1,5 +1,5 @@
 import * as preact from "preact";
-import { Reaction } from "mobx";
+import { Reaction } from "./mobxTyped";
 export declare function observer<T extends {
     new (...args: any[]): {
         render(): preact.ComponentChild;
