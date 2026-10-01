@@ -60,6 +60,7 @@ declare module "sliftutils/misc/getSecret" {
 }
 
 declare module "sliftutils/misc/helpers" {
+    export declare function throwDetached(error: unknown): void;
     export declare function waitForDiskCollectionFlush(): Promise<void>;
 
 }
@@ -3023,6 +3024,9 @@ declare module "sliftutils/storage/backblaze" {
         private getBucketAPI;
         private currentReset;
         private last503Reset;
+        private lastAPIReset;
+        private consecutiveFailures;
+        private resetAPIs;
         private apiRetryLogic;
         get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
         get2(fileName: string, config?: GetConfig): Promise<{

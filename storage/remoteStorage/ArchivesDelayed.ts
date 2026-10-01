@@ -1,4 +1,5 @@
 import { runInfinitePoll } from "socket-function/src/batching";
+import { throwDetached } from "../../misc/helpers";
 import {
     IArchives, ArchiveFileInfo, ArchivesConfig, ArchivesSyncStatus, ChangesAfterConfig, DelConfig,
     FindConfig, GetConfig, GetInfoConfig, SetConfig, SetLargeFileConfig, SourceConfig,
@@ -105,8 +106,13 @@ export class ArchivesDelayed implements IArchives {
         let deadlineReached = force || this.deadlinePassed();
         for (let [fileName, entry] of [...this.pending]) {
             if (!deadlineReached && entry.dueAt > now) continue;
+            try {
+                await this.write(fileName, entry);
+            } catch (e) {
+                throwDetached(new Error(`Flushing ${JSON.stringify(fileName)} (${entry.data.length} bytes, writeTime ${entry.writeTime}) to ${this.inner.getDebugName()} failed, it stays pending: ${(e as Error).stack ?? e}`));
+                continue;
+            }
             // Only drop it if it wasn't overwritten while we were writing
-            await this.write(fileName, entry);
             if (this.pending.get(fileName) === entry) {
                 this.pending.delete(fileName);
             }

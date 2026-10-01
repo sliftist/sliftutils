@@ -21,6 +21,9 @@ export declare class ArchivesBackblaze implements IArchives {
     private getBucketAPI;
     private currentReset;
     private last503Reset;
+    private lastAPIReset;
+    private consecutiveFailures;
+    private resetAPIs;
     private apiRetryLogic;
     get(fileName: string, config?: GetConfig): Promise<Buffer | undefined>;
     get2(fileName: string, config?: GetConfig): Promise<{

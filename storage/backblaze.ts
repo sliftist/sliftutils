@@ -29,6 +29,9 @@ let backblazeCreds = lazy(async (): Promise<BackblazeCreds> => {
 const MIN_BUCKET_CACHE_TIME = 60 * 1000;
 // Backblaze requires 5MB chunks for large files, but larger is more efficient for us (and their "last part" size check misbehaves on retries, which chunks this big sidestep - see setLargeFile)
 const LARGE_FILE_MIN_CHUNK_SIZE = 32 * 1024 * 1024;
+const CONSECUTIVE_FAILURES_BEFORE_RESET = 10;
+const MIN_API_RESET_INTERVAL = 1000;
+const CONNECTION_DEAD_MARKERS = ["TLS", "ECONNRESET", "ECONNREFUSED", "EPIPE", "socket hang up", "socket disconnected"];
 
 // A B2 download/HEAD response's headers carry the file's metadata. content-range's total wins over content-length for ranged responses (which only report the slice's length).
 function parseFileMetadataHeaders(response: HttpsResponseInfo): { size: number; writeTime: number } {
@@ -562,6 +565,17 @@ export class ArchivesBackblaze implements IArchives {
 
     // Keep track of when we last reset because of a 503
     private last503Reset = 0;
+    private lastAPIReset = 0;
+    private consecutiveFailures = 0;
+
+    private resetAPIs(context: string, reason: string, err: Error) {
+        if (Date.now() - this.lastAPIReset < MIN_API_RESET_INTERVAL) return;
+        this.lastAPIReset = Date.now();
+        console.warn(`[${context}] Resetting getAPI and getBucketAPI for ${this.getDebugName()} (${reason}, ${this.consecutiveFailures} consecutive failures): ${err.message}`);
+        getAPI.reset();
+        this.getBucketAPI.reset();
+        this.consecutiveFailures = 0;
+    }
     // IMPORTANT! We must always CATCH AROUND the apiRetryLogic, NEVER inside of fnc. Otherwise we won't be able to recreate the auth token. `context` is a short label (verb + file path) included in every retry/error log so a stuck silent-retry loop is identifiable from the logs.
     private async apiRetryLogic<T>(
         context: string,
@@ -571,10 +585,10 @@ export class ArchivesBackblaze implements IArchives {
         let api: B2Api | undefined;
         try {
             api = await this.getBucketAPI();
-            return await fnc(api);
+            let result = await fnc(api);
+            this.consecutiveFailures = 0;
+            return result;
         } catch (err: any) {
-            if (retries <= 0) throw err;
-
             // A file that does not exist is an answer, not a failure. It is the one error here that
             // cannot become anything else by asking again, so it is thrown at once instead of being
             // slept on twice - callers turn it into undefined, which is what they were asking.
@@ -583,8 +597,20 @@ export class ArchivesBackblaze implements IArchives {
                 || err.stack.includes(`file_not_found`)
                 || err.stack.includes(`"status": 404`)
             ) {
+                this.consecutiveFailures = 0;
                 throw err;
             }
+
+            this.consecutiveFailures++;
+            if (!api) {
+                this.resetAPIs(context, "acquiring the api failed, so the lazy holds a rejected promise", err);
+            } else if (CONNECTION_DEAD_MARKERS.some(marker => err.stack.includes(marker))) {
+                this.resetAPIs(context, "connection level error", err);
+            } else if (this.consecutiveFailures >= CONSECUTIVE_FAILURES_BEFORE_RESET) {
+                this.resetAPIs(context, `${CONSECUTIVE_FAILURES_BEFORE_RESET} calls in a row failed`, err);
+            }
+
+            if (retries <= 0) throw err;
 
             // If it's a 503 and it's been a minute since we last reset, then Wait and reset.
             if (
