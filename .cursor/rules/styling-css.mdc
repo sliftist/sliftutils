@@ -34,7 +34,7 @@ className={css
     + (conditionalExample && css.opacity(0.5))
 }
 ```
-Specifically, it should be a value that you check for, and then the value. Don't use ternary, don't do `|| ""`. If you have multiple values, chain them with `||` and `&&`. Keep the CSS simple, don't add too much, because it's easier to add than to remove.
+Specifically, it should be a value that you check for, and then the value. Don't do `|| ""`. If you have multiple values, chain them with `||` and `&&`. Keep the CSS simple, don't add too much, because it's easier to add than to remove.
 
 ## Aliases and Helpers
 

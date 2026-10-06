@@ -14,7 +14,6 @@ alwaysApply: true
 - When functions have more than one primitive parameter, such that you could confuse them (even something as simple as start time and end time), you should put them inside of an object and call that object `config`, so the function only has a single parameter.
 - Never use return codes, always prefer to throw on error. Include a lot of context information in the error. If any values might be extremely large, such as parsing a file, limit them (ex, to 500 characters).
 - Use double quotes, not single quotes.
-- Never use the ternary operator. Instead, do this: `x ? y : z` => `x && y || z`.
 - Never use non-null assertion operator, instead check the value, and if necessary (because it is accessed in nested functions), use a `const` variable to preserve the type.
 - Errors should almost always use a template string to include the expected value, and the actual value, as in: `throw new Error(\`Expected X, was \${Y}\`);`
 - Don't use switch statements. Use if/else statements instead.

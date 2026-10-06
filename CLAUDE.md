@@ -102,7 +102,7 @@ className={css.size(100, 100).hbox(4)
 }
 ```
 
-Conditionals come after, never as a ternary:
+Conditionals come after:
 
 ```tsx
 className={css
