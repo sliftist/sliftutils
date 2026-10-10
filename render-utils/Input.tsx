@@ -3,6 +3,22 @@ import { css } from "typesafecss";
 import { observer } from "./observer";
 import { throttleFunction } from "socket-function/src/misc";
 
+const ARROW_KEY_SHIFT_FACTOR = 10;
+
+export function roundToDecimals(value: number, decimals: number) {
+    return Math.round(value * 10 ** decimals) / 10 ** decimals;
+}
+
+function countDecimals(value: number) {
+    let text = String(value);
+    if (text.includes("e-")) {
+        return Number(text.split("e-")[1]);
+    }
+    let dot = text.indexOf(".");
+    if (dot < 0) return 0;
+    return text.length - dot - 1;
+}
+
 // TODO: Autogrow mode while typing
 
 // NOTE: "value" is optional. If you don't pass "value", we will preserve the value.
@@ -201,13 +217,11 @@ export class Input extends preact.Component<InputProps> {
                 }
                 if (this.elem && props.type === "number") {
                     let delta = 0;
-                    let magnitude = 1;
+                    let magnitude = Number(props.step) || 1;
                     if (e.shiftKey) {
-                        if (props.integer) {
-                            magnitude = 10;
-                        } else {
-                            magnitude = 0.1;
-                        }
+                        magnitude *= ARROW_KEY_SHIFT_FACTOR;
+                    } else if (e.ctrlKey && !props.integer) {
+                        magnitude /= ARROW_KEY_SHIFT_FACTOR;
                     }
                     if (e.code === "ArrowUp") {
                         delta = magnitude;
@@ -219,7 +233,8 @@ export class Input extends preact.Component<InputProps> {
                     }
                     if (delta !== 0) {
                         e.preventDefault();
-                        let newValue = Math.round(((+this.elem.value || 0) + delta) * 100) / 100;
+                        let decimals = Math.max(countDecimals(magnitude), countDecimals(+this.elem.value || 0));
+                        let newValue = roundToDecimals((+this.elem.value || 0) + delta, decimals);
                         e.currentTarget.value = newValue.toString();
                         callback?.(e as unknown as preact.JSX.TargetedInputEvent<HTMLInputElement>);
                     }

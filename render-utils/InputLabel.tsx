@@ -1,5 +1,5 @@
 import preact from "preact";
-import { Input } from "./Input";
+import { Input, roundToDecimals } from "./Input";
 import { css } from "typesafecss";
 import { lazy } from "socket-function/src/caching";
 import { observer } from "./observer";
@@ -67,10 +67,6 @@ export type InputLabelProps = Omit<InputProps, "label" | "title"> & {
 
     useDateUI?: boolean;
 };
-
-function roundToDecimals(value: number, decimals: number) {
-    return Math.round(value * 10 ** decimals) / 10 ** decimals;
-}
 
 export const startGuessDateRange = +new Date(2010, 0, 1).getTime();
 export const endGuessDateRange = +new Date(2050, 0, 1).getTime();
