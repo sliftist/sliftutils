@@ -554,6 +554,7 @@ declare module "sliftutils/render-utils/GenericFormat" {
 
 declare module "sliftutils/render-utils/Input" {
     import preact from "preact";
+    export declare function roundToDecimals(value: number, decimals: number): number;
     export type InputProps = (preact.JSX.HTMLAttributes<HTMLInputElement> & {
         /** ONLY throttles onChangeValue */
         throttle?: number;
