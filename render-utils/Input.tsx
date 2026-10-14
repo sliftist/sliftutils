@@ -237,6 +237,11 @@ export class Input extends preact.Component<InputProps> {
                         let newValue = roundToDecimals((+this.elem.value || 0) + delta, decimals);
                         e.currentTarget.value = newValue.toString();
                         callback?.(e as unknown as preact.JSX.TargetedInputEvent<HTMLInputElement>);
+                        if (!hot) {
+                            props.onChange?.(e as unknown as preact.JSX.TargetedEvent<HTMLInputElement>);
+                        }
+                        props.onChangeValue?.(e.currentTarget.value);
+                        this.lastValue = e.currentTarget.value;
                     }
                 }
                 let { noEnterKeyBlur, onInput, onChange } = props;
