@@ -43,13 +43,13 @@ export declare function unrevokesFor(unrevokes: Unrevokes, revocation: {
 
     Deduplication is on the pair. The same key from a second address is a second event and gets its
     own revocation, because an unrevoke only ever forgives the pair it names. */
-export declare function recordRevocation(config: {
+export declare const recordRevocation: (config: {
     sourceURL: string;
     fingerprint: string;
     keyLine: string;
     attempt: Attempt;
     hostLabel: string;
-}): Promise<boolean>;
+}) => Promise<boolean>;
 /** Takes everything the revoke repos list into local state. Once here a revocation never leaves,
     even if the file is deleted: the key that writes revocations is on every server, so an attacker
     holding it could otherwise erase the record that locked them out. */

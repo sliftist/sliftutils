@@ -10,6 +10,7 @@ import { messageTimestamp } from "../../notifications/discord";
 import { addChangeReason, addLeadingChangeReason } from "./changes";
 import { describeAllEnded, endAllSSHSessions } from "./sessions";
 import { getState, saveState } from "./state";
+import { runInSerial } from "socket-function/src/batching";
 
 // A revocation says: this key, used from this address, is no longer accepted. An unrevoke says the
 // opposite about one pair: this key is allowed from this address. They cancel out when both halves
@@ -145,13 +146,13 @@ export function unrevokesFor(unrevokes: Unrevokes, revocation: { revocationId: s
 
     Deduplication is on the pair. The same key from a second address is a second event and gets its
     own revocation, because an unrevoke only ever forgives the pair it names. */
-export async function recordRevocation(config: {
+export const recordRevocation = runInSerial(async (config: {
     sourceURL: string;
     fingerprint: string;
     keyLine: string;
     attempt: Attempt;
     hostLabel: string;
-}) {
+}) => {
     let { sourceURL, fingerprint, keyLine, attempt, hostLabel } = config;
     let state = getState();
     let pair = pairKey({ fingerprint, ip: attempt.ip });
@@ -234,7 +235,7 @@ export async function recordRevocation(config: {
             + `\nallowed only from: \`${attempt.required}\``,
     });
     return true;
-}
+});
 
 /** Takes everything the revoke repos list into local state. Once here a revocation never leaves,
     even if the file is deleted: the key that writes revocations is on every server, so an attacker

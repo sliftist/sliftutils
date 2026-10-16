@@ -59,6 +59,7 @@ export declare function addMachineCommand(config: {
     ip: string;
     domain?: string;
 }): string;
+export declare function describeThisMachine(domain?: string): string;
 /** Whether we will talk to this machine, coming from this address.
 
     Both halves are required and neither is a guess: the caller knows the machine id because the

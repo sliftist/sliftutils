@@ -16,7 +16,7 @@ import {
 } from "./storageServerState";
 import { debugClearAccountWriteStats } from "./accessStats";
 import { getStorageServerConfig, assertWritesAllowed } from "./serverConfig";
-import { getTrustedMachines, isMachineAccepted, MachineState } from "../../security/machines/machines";
+import { describeThisMachine, getTrustedMachines, isMachineAccepted, MachineState } from "../../security/machines/machines";
 import { BlobStore } from "./blobStore";
 import { getRoutingFileResult } from "./bucketDisk";
 import { StorageClientController } from "./storageClientController";
@@ -123,6 +123,7 @@ async function requireAccess(account: string): Promise<string> {
         throw new Error(
             `${STORAGE_ACCESS_DENIED} ${verdict.reason}`
             + ` Machine ${machineId} was calling from ${ip}, for account ${JSON.stringify(account)}.`
+            + ` Refused by ${describeThisMachine(rootDomain)}.`
         );
     }
     return machineId;

@@ -66,14 +66,21 @@ export async function readRemoteRevocations(config: { sourceURL: string }) {
     }
     let revocations: Revocation[] = [];
     let directory = path.join(repoPath, REVOCATIONS_DIR);
+    let names: string[] = [];
     try {
-        for (let name of (await fs.readdir(directory)).sort()) {
-            if (name.endsWith(".json")) {
-                revocations.push(JSON.parse(await fs.readFile(path.join(directory, name), "utf8")));
-            }
-        }
+        names = (await fs.readdir(directory)).sort();
     } catch (e) {
         // No revocations directory at all just means nothing has ever been revoked.
+    }
+    for (let name of names) {
+        if (!name.endsWith(".json")) {
+            continue;
+        }
+        try {
+            revocations.push(JSON.parse(await fs.readFile(path.join(directory, name), "utf8")));
+        } catch (e) {
+            console.log(`Ignoring unreadable revocation ${REVOCATIONS_DIR}/${name} in ${revokeRepoURL(sourceURL)}. ${(e as Error).stack ?? e}`);
+        }
     }
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
     return revocations;
