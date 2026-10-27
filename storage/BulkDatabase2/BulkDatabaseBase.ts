@@ -111,6 +111,7 @@ export type MergeSkipReason =
     | "tabLockHeld"
     // Another process holds the cross-process .merge-lock file (or won the settle race for it).
     | "fileLockHeld"
+    | "fileLockUnwritable"
     // compact() only: the collection has no files on disk.
     | "nothingToMerge";
 
@@ -689,7 +690,7 @@ export class BulkDatabaseBase<T extends { key: string }> {
         try {
             await this.tryMergeThrottled();
         } catch (e) {
-            console.warn(`${this.name}: background merge failed: ${(e as Error).message}`);
+            console.warn(`${this.name}: background merge failed:`, (e as Error).stack ?? e);
         }
     }
 
@@ -714,7 +715,14 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (this.mergeInFlight) return await this.mergeSkip("mergeInFlight");
         if (!tryAcquireMergeLock(this.name, writerId)) return await this.mergeSkip("tabLockHeld");
         const storage = await this.storage();
-        const haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
+        let haveFileLock: boolean;
+        try {
+            haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
+        } catch (e) {
+            releaseMergeLock(this.name, writerId);
+            console.warn(`${blue(this.name)} ${magenta("merge")} skipped: fileLockUnwritable, writer ${writerId} could not write .merge-lock:`, (e as Error).stack ?? e);
+            return { merged: false, skipReason: "fileLockUnwritable" };
+        }
         if (!haveFileLock) {
             releaseMergeLock(this.name, writerId);
             return await this.mergeSkip("fileLockHeld");

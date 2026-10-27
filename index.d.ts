@@ -1182,7 +1182,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     export type BulkDatabase2Config = {
         maxTriggerThrottleMs?: number;
     };
-    export type MergeSkipReason = "mergeInFlight" | "tabLockHeld" | "fileLockHeld" | "nothingToMerge";
+    export type MergeSkipReason = "mergeInFlight" | "tabLockHeld" | "fileLockHeld" | "fileLockUnwritable" | "nothingToMerge";
     export type MergeAttemptResult = {
         merged: boolean;
         skipReason?: MergeSkipReason;
