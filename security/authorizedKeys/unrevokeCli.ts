@@ -6,13 +6,13 @@ import { revokeRepoURL } from "./revokeSource";
 import { signRepo } from "../signedFiles/signFiles";
 import { getMachines, setMachines } from "../machines/machines";
 import { resolveKeysRepo } from "./keysRepo";
-import { readRemoteRevocations, readUnrevokedInRepo, Revocation, revocationIdentity, revocationIP, stillRevokedBy, UNREVOKES_DIR } from "./unrevoke";
+import { readRemoteRevocations, readUnrevokedInRepo, removeUnreadableRevocations,Revocation, revocationIdentity, revocationIP, stillRevokedBy, UNREVOKES_DIR } from "./unrevoke";
 
 const GIT_KEYWORD = "git";
 const COMMIT_MESSAGE = "unrevoke keys";
 const USAGE = `Usage: yarn unrevoke [keys-repo] [${GIT_KEYWORD}]
 
-Run this in a keys repo, or name one. It reads that repo's revoke repo and writes one unrevoke file
+Run this in a keys repo, or name one. It deletes any revocation file in that repo's revoke repo that is not valid JSON, pushing that straight away. It reads the revoke repo and writes one unrevoke file
 naming every revocation in it, so the keys are accepted again as each machine picks it up. It signs
 the result, and with ${GIT_KEYWORD} it commits and pushes it too.
 
@@ -97,6 +97,12 @@ async function main() {
         throw new Error(`Expected at most a keys repo, was ${positional.length} argument(s)\n${USAGE}`);
     }
     let { repoPath, sourceURL: originURL } = await resolveKeysRepo(positional[0]);
+
+    try {
+        await removeUnreadableRevocations({ sourceURL: originURL });
+    } catch (e) {
+        console.log(`Could not remove the unreadable revocations from ${revokeRepoURL(originURL)}, unrevoking anyway.`, (e as Error).stack ?? e);
+    }
 
     let revocations = await readRemoteRevocations({ sourceURL: originURL });
     if (!revocations.length) {

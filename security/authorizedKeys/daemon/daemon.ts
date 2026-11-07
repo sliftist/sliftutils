@@ -247,7 +247,6 @@ async function pollSource(repoURL: string) {
     // Said when the file is written, and only if it came out different. A commit that does not
     // touch the keys is not worth telling anyone about.
     addChangeReason(`The key repo \`${repoURL}\` moved to \`${result.remoteSha.slice(0, 12)}\`.`);
-    sourceState(repoURL).lastSha = result.remoteSha;
     return true;
 }
 

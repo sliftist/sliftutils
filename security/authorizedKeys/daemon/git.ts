@@ -71,12 +71,14 @@ export async function currentBranch(config: { repoPath: string; keyPath: string 
     for good: it sits in a stash if it is ever wanted. */
 export async function setGitRef(config: { repoPath: string; gitRef: string; keyPath: string }) {
     let { repoPath, gitRef, keyPath } = config;
-    // Staging the untracked files first is what lets the stash carry them off, so the reset lands
-    // on a genuinely clean tree.
-    await runGit({ args: ["add", "--all"], cwd: repoPath, keyPath, allowFailure: true });
-    // A checkout with nothing to stash makes git stash exit non-zero, which is harmless here - the
-    // reset below is what actually forces the tree.
-    await runGit({ args: ["stash"], cwd: repoPath, keyPath, allowFailure: true });
+    let dirty = (await runGit({ args: ["status", "--porcelain"], cwd: repoPath, keyPath })).stdout.trim();
+    if (dirty) {
+        console.log(`[pid ${process.pid}] Stashing local changes in ${repoPath} before resetting it to ${gitRef}:\n${dirty.slice(0, MAX_ERROR_BODY_LENGTH)}`);
+        // Staging the untracked files first is what lets the stash carry them off, so the reset lands
+        // on a genuinely clean tree.
+        await runGit({ args: ["add", "--all"], cwd: repoPath, keyPath, allowFailure: true });
+        await runGit({ args: ["stash"], cwd: repoPath, keyPath, allowFailure: true });
+    }
     await runGit({ args: ["fetch", "--prune", "origin"], cwd: repoPath, keyPath });
     await runGit({ args: ["reset", "--hard", gitRef], cwd: repoPath, keyPath });
     // Drops objects nothing references any more, so a file committed by mistake cannot bloat the
@@ -140,5 +142,6 @@ export async function syncRepo(repoURL: string, options?: { forceUpdate?: boolea
         });
         historyRewritten = ancestry.status !== 0;
     }
+    sourceState(repoURL).lastSha = remoteSha;
     return { changed: true, historyRewritten, remoteSha, previousSha };
 }

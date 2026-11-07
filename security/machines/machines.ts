@@ -16,6 +16,7 @@ import { describeHost, runOverSSH, writeRemoteFile } from "../helpers/remoteSSH"
 import { lazy } from "socket-function/src/caching";
 import { runInfinitePoll, runInSerial } from "socket-function/src/batching";
 import { spawnPromise } from "../helpers/spawn";
+import { formatTime } from "socket-function/src/formatting/format";
 
 // Which machines this system talks to, kept in the same repo as the ssh keys. That repo is already
 // signed, already distributed to every machine, and already has somewhere to record a rejection,
@@ -26,6 +27,9 @@ const REVOCATION_REASON = "a machine talked to us from an unapproved IP";
 // The revoke repo is pulled at most this often. A check happens per request, and a request must
 // not cost a round trip to github.
 const REVOKE_SYNC_INTERVAL = 60 * 1000;
+const SLOW_REVOKE_SYNC_TIME = 10 * 1000;
+const REVOKE_SYNC_RETRY_INTERVAL = 5 * 60 * 1000;
+const ACCEPTED_SYNC_WAIT = 5 * 1000;
 // And the machine list is re-read from the checkout on this interval, in the background. The
 // checkout itself only moves when the daemon pulls it, which is on the same sort of interval, so
 // reading more often than this would only re-read the same bytes.
@@ -235,19 +239,56 @@ async function readMachines(repoPath: string) {
     return machines;
 }
 
-let lastRevokeSync = 0;
+let nextRevokeSyncTime = 0;
+let revokeSyncFailing = false;
+let revokeSyncInFlight: Promise<boolean> | undefined;
 
 /** Pulls the keys repo and its revoke repo, at most once a REVOKE_SYNC_INTERVAL, because this is
     asked per request. Both, since either changing changes the answer: the keys repo carries the
     machines and unrevokes, the revoke repo carries the revocations. A sync that fails leaves the
     checkouts we already have. */
-async function syncRevocations(sourceURL: string) {
-    if (Date.now() - lastRevokeSync < REVOKE_SYNC_INTERVAL) {
-        return;
+function startRevocationSync(sourceURL: string) {
+    if (revokeSyncInFlight || Date.now() < nextRevokeSyncTime) {
+        return revokeSyncInFlight;
     }
-    lastRevokeSync = Date.now();
-    await syncRepo(sourceURL).catch(e => console.log(`Could not sync ${sourceURL}, using the checkout already here. ${e}`));
-    await syncRepoFiles(revokeRepo(sourceURL)).catch(e => console.log(`Could not sync ${revokeRepoURL(sourceURL)}, using the revocations already absorbed. ${e}`));
+    nextRevokeSyncTime = Date.now() + REVOKE_SYNC_INTERVAL;
+    revokeSyncInFlight = (async () => {
+        let start = Date.now();
+        let succeeded = true;
+        await syncRepo(sourceURL).catch(e => {
+            succeeded = false;
+            console.log(`[pid ${process.pid}] Could not sync ${sourceURL}, using the checkout already here. ${(e as Error).stack ?? e}`);
+        });
+        await syncRepoFiles(revokeRepo(sourceURL)).catch(e => {
+            succeeded = false;
+            console.log(`[pid ${process.pid}] Could not sync ${revokeRepoURL(sourceURL)}, using the revocations already absorbed. ${(e as Error).stack ?? e}`);
+        });
+        let elapsed = Date.now() - start;
+        if (elapsed > SLOW_REVOKE_SYNC_TIME) {
+            console.log(`[pid ${process.pid}] Syncing ${sourceURL} and ${revokeRepoURL(sourceURL)} took ${formatTime(elapsed)}, over ${formatTime(SLOW_REVOKE_SYNC_TIME)}`);
+        }
+        if (!succeeded) {
+            nextRevokeSyncTime = Date.now() + REVOKE_SYNC_RETRY_INTERVAL;
+            if (!revokeSyncFailing) {
+                console.log(`[pid ${process.pid}] Syncing ${sourceURL} failed, retrying every ${formatTime(REVOKE_SYNC_RETRY_INTERVAL)} instead of every ${formatTime(REVOKE_SYNC_INTERVAL)} until it works`);
+            }
+            revokeSyncFailing = true;
+            return false;
+        }
+        if (revokeSyncFailing) {
+            console.log(`[pid ${process.pid}] Syncing ${sourceURL} works again, back to every ${formatTime(REVOKE_SYNC_INTERVAL)}`);
+        }
+        revokeSyncFailing = false;
+        try {
+            trustedMachines.set(Promise.resolve(await readTrustedMachines()));
+        } catch (e) {
+            console.log(`[pid ${process.pid}] Could not re-read the trusted machines after syncing, keeping the ones we have. ${(e as Error).stack ?? e}`);
+        }
+        return true;
+    })().finally(() => {
+        revokeSyncInFlight = undefined;
+    });
+    return revokeSyncInFlight;
 }
 
 /** What to run to trust a machine that has just been refused.
@@ -390,12 +431,34 @@ export async function isMachineAccepted(config: {
     // there is nothing to gain from looking again. Any other rejection might just be a stale view -
     // a machine added seconds ago that our cached list has not caught up to - so it is worth one
     // fresh look, which is what the retry below does.
-    let evaluate = async (): Promise<{ verdict: MachineVerdict; froze: boolean }> => {
-        if (LOOPBACK.includes(ip) && !!domain && machineId === getOwnMachineId(domain)) {
-            return { verdict: { accepted: true, reason: "" }, froze: false };
+    if (LOOPBACK.includes(ip) && !!domain && machineId === getOwnMachineId(domain)) {
+        return { accepted: true, reason: "" };
+    }
+    let { sourceURL } = await keysRepo();
+    let syncing = startRevocationSync(sourceURL);
+    if (syncing) {
+        let checkouts = await Promise.all([sourceRepoPath(sourceURL), revokeRepoPath(sourceURL)].map(repoPath =>
+            fs.access(path.join(repoPath, ".git")).then(() => true, () => false)
+        ));
+        let acceptedNow = false;
+        if (checkouts.every(exists => exists)) {
+            let listed = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
+            acceptedNow = !!listed && (listed.ips.includes(ip) || LOOPBACK.includes(ip));
         }
-        let { sourceURL } = await keysRepo();
-        await syncRevocations(sourceURL);
+        if (!acceptedNow) {
+            await syncing;
+        } else {
+            let synced = await Promise.race([
+                syncing,
+                new Promise<boolean>(resolve => setTimeout(() => resolve(false), ACCEPTED_SYNC_WAIT)),
+            ]);
+            if (!synced) {
+                return { accepted: true, reason: "" };
+            }
+        }
+    }
+
+    let evaluate = async (): Promise<{ verdict: MachineVerdict; froze: boolean }> => {
         // The list has revocations already applied - readSignedRepo drops frozen machines - so a
         // machine in it is trusted, and a machine missing from it is either unknown or frozen.
         let machine = (await getTrustedMachines()).find(entry => entry.machineId === machineId);
@@ -456,7 +519,7 @@ export async function isMachineAccepted(config: {
     // final.
     if (Date.now() - lastMachinesInvalidation > MACHINES_INVALIDATION_INTERVAL) {
         lastMachinesInvalidation = Date.now();
-        let { sourceURL } = await keysRepo();
+        await revokeSyncInFlight;
         await syncRepo(sourceURL, { forceUpdate: true }).catch(e => console.log(`Could not force update ${sourceURL}. ${e}`));
         trustedMachines.reset();
     }

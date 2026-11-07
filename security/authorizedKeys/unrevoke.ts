@@ -8,6 +8,7 @@ import { spawnPromise } from "../helpers/spawn";
 
 export const UNREVOKES_DIR = "unrevoked";
 const REVOCATIONS_DIR = "revocations";
+const MAX_LOGGED_CONTENTS = 500;
 
 /** One revocation event. Either an ssh key used from an address it is not allowed from, or a
     machine that talked to us from one. Both are the same shape - an identity and an address - and
@@ -38,25 +39,20 @@ export function revocationIdentity(revocation: Revocation) {
     return revocation.fingerprint || revocation.machineId || "";
 }
 
-/** Every revocation the revoke repo lists. Cloned read only into a temp directory.
-
-    A person running this has their own access to the repo, so their credentials are what is used.
-    On a machine that is already a portsecure host there may be no such credentials, but the source
-    deploy key is right there, and the key derived from it is one that repo definitely accepts. */
-export async function readRemoteRevocations(config: { sourceURL: string }) {
+async function cloneRevokeRepo(config: { sourceURL: string }) {
     let { sourceURL } = config;
     let temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "unrevoke-"));
     let repoPath = path.join(temporaryDirectory, "repo");
-    let cloneArgs = ["clone", "--depth", "1", revokeRepoURL(sourceURL), repoPath];
+    let gitConfig: string[] = [];
     let sourceKey = await findSourceKey(sourceURL);
     if (sourceKey) {
         let derived = deriveRevokeKey(await fs.readFile(sourceKey, "utf8"));
         let derivedKeyPath = path.join(temporaryDirectory, "key");
         await fs.writeFile(derivedKeyPath, derived.privateKeyFile, { mode: 0o600 });
         let sshCommand = `ssh -i ${derivedKeyPath} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`;
-        cloneArgs = ["-c", `core.sshCommand=${sshCommand}`, ...cloneArgs];
+        gitConfig = ["-c", `core.sshCommand=${sshCommand}`];
     }
-    let clone = await spawnPromise({ command: "git", args: cloneArgs });
+    let clone = await spawnPromise({ command: "git", args: [...gitConfig, "clone", "--depth", "1", revokeRepoURL(sourceURL), repoPath] });
     if (clone.status !== 0) {
         await fs.rm(temporaryDirectory, { recursive: true, force: true });
         throw new Error(
@@ -64,18 +60,63 @@ export async function readRemoteRevocations(config: { sourceURL: string }) {
             + `${(clone.stdout + clone.stderr).trim()}`
         );
     }
-    let revocations: Revocation[] = [];
-    let directory = path.join(repoPath, REVOCATIONS_DIR);
-    let names: string[] = [];
+    return { temporaryDirectory, repoPath, gitConfig };
+}
+
+async function listRevocationFiles(repoPath: string) {
     try {
-        names = (await fs.readdir(directory)).sort();
+        return (await fs.readdir(path.join(repoPath, REVOCATIONS_DIR))).filter(name => name.endsWith(".json")).sort();
     } catch (e) {
         // No revocations directory at all just means nothing has ever been revoked.
+        return [];
     }
-    for (let name of names) {
-        if (!name.endsWith(".json")) {
-            continue;
+}
+
+/** Deletes the revocation files in the revoke repo that are not JSON at all, and pushes that.
+    Nothing is lost: a file that does not parse names no key and no address, so every machine
+    already ignores it, and all it does is print the same complaint on every read forever.
+
+    Judged on a fresh clone, never on a machine's own checkout, so a file only goes if the repo
+    itself holds it broken. */
+export async function removeUnreadableRevocations(config: { sourceURL: string }) {
+    let { sourceURL } = config;
+    let { temporaryDirectory, repoPath, gitConfig } = await cloneRevokeRepo({ sourceURL });
+    try {
+        let removed: string[] = [];
+        for (let name of await listRevocationFiles(repoPath)) {
+            let relativePath = `${REVOCATIONS_DIR}/${name}`;
+            let contents = await fs.readFile(path.join(repoPath, REVOCATIONS_DIR, name), "utf8");
+            try {
+                JSON.parse(contents);
+                continue;
+            } catch (e) {
+                console.log(`Removing unreadable revocation ${relativePath} from ${revokeRepoURL(sourceURL)}, ${contents.length} characters: ${JSON.stringify(contents.slice(0, MAX_LOGGED_CONTENTS))}. ${e}`);
+            }
+            await fs.rm(path.join(repoPath, REVOCATIONS_DIR, name));
+            removed.push(relativePath);
         }
+        if (!removed.length) return;
+        let git = async (args: string[]) => {
+            let result = await spawnPromise({ command: "git", args: [...gitConfig, ...args], cwd: repoPath });
+            if (result.status !== 0) {
+                throw new Error(`Expected git ${args.join(" ")} to succeed in a clone of ${revokeRepoURL(sourceURL)}, exited ${result.status}.\n${(result.stdout + result.stderr).trim()}`);
+            }
+        };
+        await git(["add", "-A"]);
+        await git(["-c", "user.email=portsecure@localhost", "-c", "user.name=portsecure", "commit", "-m", `remove ${removed.length} unreadable revocation(s)`]);
+        await git(["push", "origin", "HEAD"]);
+        console.log(`Removed ${removed.length} unreadable revocation(s) from ${revokeRepoURL(sourceURL)}: ${removed.join(", ")}`);
+    } finally {
+        await fs.rm(temporaryDirectory, { recursive: true, force: true });
+    }
+}
+
+export async function readRemoteRevocations(config: { sourceURL: string }) {
+    let { sourceURL } = config;
+    let { temporaryDirectory, repoPath } = await cloneRevokeRepo({ sourceURL });
+    let revocations: Revocation[] = [];
+    let directory = path.join(repoPath, REVOCATIONS_DIR);
+    for (let name of await listRevocationFiles(repoPath)) {
         try {
             revocations.push(JSON.parse(await fs.readFile(path.join(directory, name), "utf8")));
         } catch (e) {
