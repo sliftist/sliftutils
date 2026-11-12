@@ -23,6 +23,7 @@ from `.cursor/rules/*.mdc` so Claude reads them automatically.
 - Almost never check for `undefined`/`null` specifically — just check truthiness.
 - When a function has more than one primitive parameter that could be confused (e.g. start and end time), put them inside a single object parameter called `config`.
 - Never use return codes — always throw. Include context (expected vs actual). If values could be huge (e.g. file parsing), limit to ~500 characters.
+- Never use `instanceof` to check what kind of error was caught. Check the text of the full `err.stack` instead (e.g. `String((err as Error)?.stack ?? err).includes("ENOENT")`), so rethrown and nested errors, which carry the original error's text in their stack but are a different class, are still handled correctly.
 - Use double quotes, not single quotes.
 - Never use the non-null assertion operator (`!`). Check the value; if needed in nested closures, copy into a `const` to preserve narrowed type.
 - Errors use template strings that include the actual offending value and the expected one: `throw new Error(\`Expected X, was \${y}\`);`
