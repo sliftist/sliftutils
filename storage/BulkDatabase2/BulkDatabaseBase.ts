@@ -13,12 +13,12 @@ import {
 } from "./BulkDatabaseFormat";
 import { runPlannedMerge } from "./BulkDatabaseMerge";
 import { blockCache, encodeCompressedBlocks } from "./blockCache";
-import { formatNumber, formatTime } from "socket-function/src/formatting/format";
+import { formatDateTimeDetailed, formatNumber, formatTime } from "socket-function/src/formatting/format";
 import { blue, magenta } from "socket-function/src/formatting/logColors";
 import { STREAM_EXTENSION, frameDeletes, frameRows, streamReaderFromEntries } from "./streamLog";
 import { broadcast as syncBroadcast, broadcastSeal as syncBroadcastSeal, connect as syncConnect, isSyncSupported, queryLiveWriters, registerWriterId, RemoteWrite } from "./syncClient";
 import { DELETED } from "./WriteOverlay";
-import { MergeLockInfo, peekMergeFileLock, peekMergeLock, releaseMergeFileLock, releaseMergeLock, startMergeFileLockHeartbeat, tryAcquireMergeFileLock, tryAcquireMergeLock } from "./mergeLock";
+import { describeMergeFileLockAttempt, MergeFileLockAttempt, MergeLockInfo, peekMergeLock, releaseMergeFileLock, releaseMergeLock, startMergeFileLockHeartbeat, tryAcquireMergeFileLock, tryAcquireMergeLock } from "./mergeLock";
 import { markerExclusions, processDeleteMarkers, readDeleteMarkers, writeDeleteMarker } from "./mergeMarkers";
 import {
     BulkFileInfo,
@@ -112,6 +112,8 @@ export type MergeSkipReason =
     // Another process holds the cross-process .merge-lock file (or won the settle race for it).
     | "fileLockHeld"
     | "fileLockUnwritable"
+    | "fileLockUnreadableAfterWrite"
+    | "fileLockMissingAfterWrite"
     // compact() only: the collection has no files on disk.
     | "nothingToMerge";
 
@@ -699,13 +701,11 @@ export class BulkDatabaseBase<T extends { key: string }> {
         let lock: MergeLockInfo | undefined;
         if (reason === "tabLockHeld") {
             lock = peekMergeLock(this.name);
-        } else if (reason === "fileLockHeld") {
-            lock = await peekMergeFileLock(await this.storage());
         }
         if (Date.now() - this.lastMergeSkipLogMs >= MERGE_SKIP_LOG_INTERVAL_MS) {
             this.lastMergeSkipLogMs = Date.now();
             const detail = lock && ` (held by ${lock.holderId}, expires in ${formatTime(Math.max(0, lock.expiresInMs))})` || "";
-            console.log(`${blue(this.name)} ${magenta("merge")} skipped: ${reason}${detail}`);
+            console.log(`${blue(this.name)} ${magenta("merge")} skipped: ${reason}${detail}, we are ${writerId}, checked at ${formatDateTimeDetailed(Date.now())}`);
         }
         return { merged: false, skipReason: reason, lockHolderId: lock?.holderId, lockExpiresInMs: lock?.expiresInMs };
     }
@@ -715,17 +715,32 @@ export class BulkDatabaseBase<T extends { key: string }> {
         if (this.mergeInFlight) return await this.mergeSkip("mergeInFlight");
         if (!tryAcquireMergeLock(this.name, writerId)) return await this.mergeSkip("tabLockHeld");
         const storage = await this.storage();
-        let haveFileLock: boolean;
+        const lockPath = `${storage.isRemote && "remote " || ""}${BULK_ROOT_FOLDER}/${this.name}/.merge-lock`;
+        let attempt: MergeFileLockAttempt;
         try {
-            haveFileLock = await tryAcquireMergeFileLock(storage, writerId);
+            attempt = await tryAcquireMergeFileLock(storage, writerId, lockPath);
         } catch (e) {
             releaseMergeLock(this.name, writerId);
-            console.warn(`${blue(this.name)} ${magenta("merge")} skipped: fileLockUnwritable, writer ${writerId} could not write .merge-lock:`, (e as Error).stack ?? e);
+            console.warn(`${blue(this.name)} ${magenta("merge")} skipped: fileLockUnwritable, writer ${writerId} could not write ${lockPath} at ${formatDateTimeDetailed(Date.now())}:`, (e as Error).stack ?? e);
             return { merged: false, skipReason: "fileLockUnwritable" };
         }
-        if (!haveFileLock) {
+        if (!attempt.acquired) {
             releaseMergeLock(this.name, writerId);
-            return await this.mergeSkip("fileLockHeld");
+            const holder = attempt.after?.token || attempt.before.token;
+            let reason: MergeSkipReason = "fileLockHeld";
+            let explanation = `another writer, ${holder?.holderId}, holds it`;
+            if (attempt.after?.error) {
+                reason = "fileLockUnreadableAfterWrite";
+                explanation = `nobody is known to hold it: we wrote our lock but could not read it back after the settle wait`;
+            } else if (attempt.after && !attempt.after.token) {
+                reason = "fileLockMissingAfterWrite";
+                explanation = `nobody is known to hold it: we wrote our lock but after the settle wait the file was ${attempt.after.raw === undefined && "gone" || "empty or unparseable"}`;
+            }
+            if (Date.now() - this.lastMergeSkipLogMs >= MERGE_SKIP_LOG_INTERVAL_MS) {
+                this.lastMergeSkipLogMs = Date.now();
+                console.log(`${blue(this.name)} ${magenta("merge")} skipped: ${reason}, ${explanation}\n${describeMergeFileLockAttempt(attempt)}`);
+            }
+            return { merged: false, skipReason: reason, lockHolderId: holder?.holderId, lockExpiresInMs: holder && holder.time + attempt.ttlMs - Date.now() };
         }
         this.mergeInFlight = true;
         const stopHeartbeat = startMergeFileLockHeartbeat(storage, writerId);

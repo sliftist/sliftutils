@@ -1182,7 +1182,7 @@ declare module "sliftutils/storage/BulkDatabase2/BulkDatabaseBase" {
     export type BulkDatabase2Config = {
         maxTriggerThrottleMs?: number;
     };
-    export type MergeSkipReason = "mergeInFlight" | "tabLockHeld" | "fileLockHeld" | "fileLockUnwritable" | "nothingToMerge";
+    export type MergeSkipReason = "mergeInFlight" | "tabLockHeld" | "fileLockHeld" | "fileLockUnwritable" | "fileLockUnreadableAfterWrite" | "fileLockMissingAfterWrite" | "nothingToMerge";
     export type MergeAttemptResult = {
         merged: boolean;
         skipReason?: MergeSkipReason;
@@ -1826,8 +1826,28 @@ declare module "sliftutils/storage/BulkDatabase2/mergeLock" {
     export declare function tryAcquireMergeLock(collection: string, holderId: string): boolean;
     export declare function peekMergeLock(collection: string): MergeLockInfo | undefined;
     export declare function releaseMergeLock(collection: string, holderId: string): void;
+    export type MergeFileLockRead = {
+        readAt: number;
+        token?: {
+            holderId: string;
+            time: number;
+        };
+        raw?: string;
+        error?: string;
+    };
     export declare function peekMergeFileLock(storage: FileStorage): Promise<MergeLockInfo | undefined>;
-    export declare function tryAcquireMergeFileLock(storage: FileStorage, holderId: string): Promise<boolean>;
+    export type MergeFileLockAttempt = {
+        acquired: boolean;
+        holderId: string;
+        lockPath: string;
+        ttlMs: number;
+        settleMs: number;
+        before: MergeFileLockRead;
+        wroteAt?: number;
+        after?: MergeFileLockRead;
+    };
+    export declare function describeMergeFileLockAttempt(attempt: MergeFileLockAttempt): string;
+    export declare function tryAcquireMergeFileLock(storage: FileStorage, holderId: string, lockPath: string): Promise<MergeFileLockAttempt>;
     export declare function startMergeFileLockHeartbeat(storage: FileStorage, holderId: string): () => void;
     export declare function releaseMergeFileLock(storage: FileStorage, holderId: string): Promise<void>;
 

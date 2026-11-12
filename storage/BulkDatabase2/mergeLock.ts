@@ -3,6 +3,7 @@
 // File-lock layer (see acquireMergeFileLock at the bottom): for cross-PROCESS safety (different browsers, different machines pointing at the same remote storage), we ALSO write a `.merge-lock` file inside the collection's storage with our ID. The protocol is check-write-wait-recheck — last writer wins after the 15s settle window. The localStorage lock above covers same-origin tabs; this covers everything else (separate processes, remote shared storage).
 
 import type { FileStorage } from "../FileFolderAPI";
+import { formatDateTimeDetailed, formatTime } from "socket-function/src/formatting/format";
 
 const LOCK_TTL_MS = 30 * 1000;
 
@@ -69,18 +70,31 @@ const FILE_LOCK_KEY = ".merge-lock";
 const FILE_LOCK_TTL_MS = 5 * 60 * 1000;
 const FILE_LOCK_SETTLE_MS = 15 * 1000;
 const FILE_LOCK_HEARTBEAT_MS = 2 * 60 * 1000;
+const MAX_LOGGED_LOCK_CONTENTS = 500;
 
-async function readMergeFileLock(storage: FileStorage): Promise<{ holderId: string; time: number } | undefined> {
+export type MergeFileLockRead = {
+    readAt: number;
+    token?: { holderId: string; time: number };
+    raw?: string;
+    error?: string;
+};
+
+async function readMergeFileLock(storage: FileStorage): Promise<MergeFileLockRead> {
+    const readAt = Date.now();
+    let buf: Buffer | undefined;
     try {
-        const buf = await storage.get(FILE_LOCK_KEY);
-        if (!buf) return undefined;
-        return parseLockToken(buf.toString("utf8"));
-    } catch { return undefined; }
+        buf = await storage.get(FILE_LOCK_KEY);
+    } catch (e) {
+        return { readAt, error: String((e as Error)?.stack ?? e) };
+    }
+    if (!buf) return { readAt };
+    const raw = buf.toString("utf8");
+    return { readAt, raw, token: parseLockToken(raw) };
 }
 
 // Non-mutating look at the cross-process lock file (see peekMergeLock).
 export async function peekMergeFileLock(storage: FileStorage): Promise<MergeLockInfo | undefined> {
-    const existing = await readMergeFileLock(storage);
+    const existing = (await readMergeFileLock(storage)).token;
     if (!existing) return undefined;
     return { holderId: existing.holderId, expiresInMs: existing.time + FILE_LOCK_TTL_MS - Date.now() };
 }
@@ -89,15 +103,66 @@ async function writeMergeFileLock(storage: FileStorage, holderId: string, time: 
     await storage.set(FILE_LOCK_KEY, Buffer.from(`${holderId}:${time}`, "utf8") as Buffer);
 }
 
-// Acquire the cross-process file lock. Resolves to true ONLY if, after writing our ID and waiting FILE_LOCK_SETTLE_MS for concurrent writers to settle, the file still names us. Caller must releaseMergeFileLock() on the same storage + holderId when done.
-export async function tryAcquireMergeFileLock(storage: FileStorage, holderId: string): Promise<boolean> {
-    const now = Date.now();
-    const existing = await readMergeFileLock(storage);
-    if (existing && existing.holderId !== holderId && now - existing.time < FILE_LOCK_TTL_MS) return false;
-    await writeMergeFileLock(storage, holderId, now);
+export type MergeFileLockAttempt = {
+    acquired: boolean;
+    holderId: string;
+    lockPath: string;
+    ttlMs: number;
+    settleMs: number;
+    before: MergeFileLockRead;
+    wroteAt?: number;
+    after?: MergeFileLockRead;
+};
+
+function describeLockRead(read: MergeFileLockRead, ourHolderId: string): string {
+    const parts = [`read at ${formatDateTimeDetailed(read.readAt)}`];
+    if (read.error) {
+        parts.push(`read FAILED: ${read.error}`);
+    } else if (read.raw === undefined) {
+        parts.push("no lock file");
+    } else if (!read.token) {
+        parts.push(`unparseable contents ${JSON.stringify(read.raw.slice(0, MAX_LOGGED_LOCK_CONTENTS))} (${read.raw.length} chars)`);
+    } else {
+        const ageMs = read.readAt - read.token.time;
+        parts.push(
+            `holder ${read.token.holderId}${read.token.holderId === ourHolderId && " (us)" || ""}`,
+            `stamped ${formatDateTimeDetailed(read.token.time)} (${read.token.time})`,
+            `age ${formatTime(ageMs)} (${ageMs}ms)`,
+            `stale at ${formatDateTimeDetailed(read.token.time + FILE_LOCK_TTL_MS)}`,
+            ageMs < FILE_LOCK_TTL_MS && "fresh" || "STALE",
+        );
+    }
+    return parts.join(", ");
+}
+
+// Every value the acquire looked at, for logging why a merge was or wasn't allowed.
+export function describeMergeFileLockAttempt(attempt: MergeFileLockAttempt): string {
+    const lines = [
+        `${attempt.acquired && "acquired" || "NOT acquired"} ${attempt.lockPath} as ${attempt.holderId} (pid ${typeof process !== "undefined" && process.pid || "?"}), ttl ${formatTime(attempt.ttlMs)}, settle ${formatTime(attempt.settleMs)}`,
+        `  before: ${describeLockRead(attempt.before, attempt.holderId)}`,
+    ];
+    if (attempt.wroteAt === undefined) {
+        lines.push(`  did not write: another holder's lock was fresh`);
+    } else {
+        lines.push(`  wrote ${attempt.holderId}:${attempt.wroteAt} at ${formatDateTimeDetailed(attempt.wroteAt)}`);
+    }
+    if (attempt.after) {
+        lines.push(`  after settle: ${describeLockRead(attempt.after, attempt.holderId)}`);
+    }
+    return lines.join("\n");
+}
+
+// Acquire the cross-process file lock. acquired is true ONLY if, after writing our ID and waiting FILE_LOCK_SETTLE_MS for concurrent writers to settle, the file still names us. Caller must releaseMergeFileLock() on the same storage + holderId when done.
+export async function tryAcquireMergeFileLock(storage: FileStorage, holderId: string, lockPath: string): Promise<MergeFileLockAttempt> {
+    const attempt: MergeFileLockAttempt = { acquired: false, holderId, lockPath, ttlMs: FILE_LOCK_TTL_MS, settleMs: FILE_LOCK_SETTLE_MS, before: await readMergeFileLock(storage) };
+    const existing = attempt.before.token;
+    if (existing && existing.holderId !== holderId && attempt.before.readAt - existing.time < FILE_LOCK_TTL_MS) return attempt;
+    attempt.wroteAt = Date.now();
+    await writeMergeFileLock(storage, holderId, attempt.wroteAt);
     await new Promise(r => setTimeout(r, FILE_LOCK_SETTLE_MS));
-    const after = await readMergeFileLock(storage);
-    return !!after && after.holderId === holderId;
+    attempt.after = await readMergeFileLock(storage);
+    attempt.acquired = attempt.after.token?.holderId === holderId;
+    return attempt;
 }
 
 // Keep the lock fresh. The merge might run longer than FILE_LOCK_TTL_MS; without periodic re-stamping, another process would see the lock as stale and acquire it. Returns a stop function the caller calls in `finally`. Heartbeat is best-effort: a failed write is logged but not propagated.
@@ -111,7 +176,7 @@ export function startMergeFileLockHeartbeat(storage: FileStorage, holderId: stri
 
 export async function releaseMergeFileLock(storage: FileStorage, holderId: string): Promise<void> {
     try {
-        const existing = await readMergeFileLock(storage);
+        const existing = (await readMergeFileLock(storage)).token;
         if (existing && existing.holderId === holderId) await storage.remove(FILE_LOCK_KEY);
     } catch { /* ignore */ }
 }

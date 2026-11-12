@@ -28,7 +28,7 @@ export type StorageFactory = (path: string) => Promise<FileStorage>;
 export type BulkDatabase2Config = {
     maxTriggerThrottleMs?: number;
 };
-export type MergeSkipReason = "mergeInFlight" | "tabLockHeld" | "fileLockHeld" | "fileLockUnwritable" | "nothingToMerge";
+export type MergeSkipReason = "mergeInFlight" | "tabLockHeld" | "fileLockHeld" | "fileLockUnwritable" | "fileLockUnreadableAfterWrite" | "fileLockMissingAfterWrite" | "nothingToMerge";
 export type MergeAttemptResult = {
     merged: boolean;
     skipReason?: MergeSkipReason;
