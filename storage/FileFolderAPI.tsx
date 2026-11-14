@@ -11,6 +11,8 @@ import { getRemoteDirectoryHandle, testRemoteConnection, RemoteOptions } from ".
 import fs from "fs";
 import path from "path";
 
+const MAX_ROOT_ENTRIES_FOR_COLLECTIONS = 100;
+
 declare global {
     interface Window {
         showSaveFilePicker(config?: {
@@ -538,6 +540,24 @@ export const getFileStorageNested = cache(async function getFileStorage(path: st
     }
     return wrapHandle(base);
 });
+const getCollectionsRoot = lazy(async function getCollectionsRoot(): Promise<DirectoryWrapper> {
+    const base = await getDirectoryHandle();
+    // Skip the "find data subdir" hack under OPFS — that's for picked directories where the user might have selected a folder with unrelated files; OPFS is a clean root we own end-to-end.
+    if (opfsEnabled) return base;
+    const data = await base.getDirectoryHandle("data").catch(() => undefined);
+    if (data) return data;
+    const git = await base.getDirectoryHandle(".git").catch(() => undefined);
+    if (git) return await base.getDirectoryHandle("data", { create: true });
+    let entryCount = 0;
+    for await (const _ of base) {
+        entryCount++;
+        // HACK: If there are enough files, it's almost certainly not a directory that contains collections. It's probably the user's data instead
+        if (entryCount > MAX_ROOT_ENTRIES_FOR_COLLECTIONS) {
+            return await base.getDirectoryHandle("data", { create: true });
+        }
+    }
+    return base;
+});
 // Supports if the user selects the folder that contains the data folder or the data folder directly. If pathStr is an absolute path (and we're in nodejs) we use it directly.
 export const getFileStorageNested2 = cache(async function getFileStorage(pathStr: string): Promise<FileStorage> {
     let base: DirectoryWrapper;
@@ -548,22 +568,7 @@ export const getFileStorageNested2 = cache(async function getFileStorage(pathStr
         }
         base = new NodeJSDirectoryHandleWrapper(path.resolve("./data/"));
     } else {
-        base = await getDirectoryHandle();
-        // Skip the "find data subdir" hack under OPFS — that's for picked directories where the user might have selected a folder with unrelated files; OPFS is a clean root we own end-to-end.
-        if (!opfsEnabled) {
-            let dirs: string[] = [];
-            let alls: string[] = [];
-            for await (const [name, entry] of base) {
-                if (entry.kind === "directory") {
-                    dirs.push(name);
-                }
-                alls.push(name);
-            }
-            // HACK: If there are enough files, it's almost certainly not a directory that contains collections. It's probably the user's data instead
-            if (dirs.includes(".git") || dirs.includes("data") || alls.length > 100) {
-                base = await base.getDirectoryHandle("data", { create: true });
-            }
-        }
+        base = await getCollectionsRoot();
     }
     for (let part of pathStr.split("/")) {
         if (!part) continue;
