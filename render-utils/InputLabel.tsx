@@ -211,7 +211,7 @@ export class InputLabel extends preact.Component<InputLabelProps> {
                 }
                 if (props.onInput) {
                     props.onInput(e);
-                } else if (props.hot) {
+                } else if (props.hot && props.type !== "checkbox") {
                     props.onChange?.(e);
                 }
             }}

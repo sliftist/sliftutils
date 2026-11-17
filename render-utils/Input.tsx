@@ -82,8 +82,9 @@ export class Input extends preact.Component<InputProps> {
 
     render() {
         let flavorOverrides: preact.JSX.CSSProperties = {};
-        const { flavor, textarea, hot, inputKey, fillWidth, ...nativeProps } = this.props;
+        const { flavor, textarea, hot: hotProp, inputKey, fillWidth, ...nativeProps } = this.props;
         let props = { ...nativeProps } as preact.RenderableProps<InputProps>;
+        const hot = hotProp || props.type === "checkbox";
 
         if (props.onChangeValue) {
             let throttle = this.props.throttle;
