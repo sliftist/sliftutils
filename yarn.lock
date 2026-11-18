@@ -1937,10 +1937,10 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^1.3.10:
-  version "1.3.10"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.3.10.tgz#d8c936271fedd708e54a00713a43d99e79eabe46"
-  integrity sha512-7yZJ7bP3U2g5FYFG+DcwHzPASZNTWprR+cghLXUT5CevEWa2Iggto/B0NSjKBx2oyPUdhRaNIaHriZHQDX7few==
+socket-function@^1.3.11:
+  version "1.3.11"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.3.11.tgz#474ab22ae7cfd32644b2964913d7311591a0d85c"
+  integrity sha512-W0jiVxDtXVigU5b/j76MxSei5rNDDu2iG9V+f7gSusyDttZNHLfCmhALICQDHuQs2ZuqjVEN1JnFMeUoBoMhug==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"
@@ -1949,7 +1949,7 @@ socket-function@^1.3.10:
     pako "^2.1.0"
     preact "10.24.3"
     typedev "^0.4.0"
-    typenode "^6.0.1"
+    typenode "^6.6.2"
     ws "^8.21.0"
   optionalDependencies:
     lmdb "^3.5.1"
@@ -2079,19 +2079,19 @@ typedev@^0.4.0:
     debugbreak "^0.11.0"
     eslint "^8.18.0"
 
-typenode@^6.0.1:
-  version "6.0.1"
-  resolved "https://registry.yarnpkg.com/typenode/-/typenode-6.0.1.tgz#bff58967341704babab8e95437f0b9242bd8aeba"
-  integrity sha512-Nvul74JuBeioAZNZaGkLXVuDBNK/fEM+iJGErxPCrZbxpxIvJrXWAk1tW5KVbDZqde7JnC96OC/G7nNphw9fTw==
+typenode@^6.6.1:
+  version "6.6.1"
+  resolved "https://registry.yarnpkg.com/typenode/-/typenode-6.6.1.tgz#a7236a618bca1e2dc8c7126ddf303349388a7a38"
+  integrity sha512-gFvy6F3dUE7WivTDrtZvgKH5aRrDORXeO2+4RtSVf3k4SKTHHUlh8wvsMi6aE9hYOgjmb9X03fKDvUDlC9T4PA==
   dependencies:
     "@types/pegjs" "^0.10.3"
     source-map-support "https://github.com/7rulnik/node-source-map-support"
     typescript "5.3.3"
 
-typenode@^6.6.1:
-  version "6.6.1"
-  resolved "https://registry.yarnpkg.com/typenode/-/typenode-6.6.1.tgz#a7236a618bca1e2dc8c7126ddf303349388a7a38"
-  integrity sha512-gFvy6F3dUE7WivTDrtZvgKH5aRrDORXeO2+4RtSVf3k4SKTHHUlh8wvsMi6aE9hYOgjmb9X03fKDvUDlC9T4PA==
+typenode@^6.6.2:
+  version "6.6.2"
+  resolved "https://registry.yarnpkg.com/typenode/-/typenode-6.6.2.tgz#cdb96e34b2d316f338e5a67d41733d2363d4746a"
+  integrity sha512-5d1KZGEqWtfeLdDhqVnrZDLvdNCbunjHjiXh144q7liAKGVRRcQ/2ADzbIvIqModfVBD+LPfUGlr7NcGK56qSQ==
   dependencies:
     "@types/pegjs" "^0.10.3"
     source-map-support "https://github.com/7rulnik/node-source-map-support"
