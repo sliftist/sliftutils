@@ -1937,10 +1937,10 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^1.3.8:
-  version "1.3.8"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.3.8.tgz#c3778baa9bb9d184265d0d17a748419c180e1cba"
-  integrity sha512-FfBtgYCCxahLBJ+H63MbTfY1CVik3XNVF/Asch9DplX+ci7M8bz8n9KIIad2ovxMwEitXmuqM+Z/RSnX2g01sw==
+socket-function@^1.3.10:
+  version "1.3.10"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.3.10.tgz#d8c936271fedd708e54a00713a43d99e79eabe46"
+  integrity sha512-7yZJ7bP3U2g5FYFG+DcwHzPASZNTWprR+cghLXUT5CevEWa2Iggto/B0NSjKBx2oyPUdhRaNIaHriZHQDX7few==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"
