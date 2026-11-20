@@ -475,7 +475,9 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
 
         const pickLocal = async () => {
             try {
+                // This line might wait for the user to confirm it, or it might just never come back.
                 const handle = await window.showDirectoryPicker();
+                // This line might wait for the user to confirm it, or it might just never come back.
                 await handle.requestPermission({ mode: "readwrite" });
                 const storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
                 localStorage.setItem(getFileAPIKey(), storedId);
@@ -511,6 +513,7 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
                 console.info(`[FileFolderAPI] click, restoring stored folder ${storedId} (navigator.userActivation.isActive ${navigator.userActivation?.isActive})`);
                 showOptions("Approve existing access or pick a new directory");
                 try {
+                    // This line might wait for the user to confirm it, or it might just never come back.
                     const handle = await tryToLoadPointer(storedId);
                     if (handle) {
                         console.info(`[FileFolderAPI] restored stored folder ${storedId} (${handle.name})`);
@@ -847,6 +850,7 @@ export async function tryToLoadPointer(pointer: string) {
         console.info(`[FileFolderAPI] tryToLoadPointer ${pointer}: the pointer is not stored, returning undefined`);
         return;
     }
+    // This line might wait for the user to confirm it, or it might just never come back.
     let handle = await result?.onUserActivation();
     if (!handle) {
         console.info(`[FileFolderAPI] tryToLoadPointer ${pointer}: onUserActivation gave no handle, returning undefined`);

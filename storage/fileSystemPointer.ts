@@ -7,6 +7,7 @@ const db = lazy(async () => {
     db.addEventListener("upgradeneeded", () => {
         db.result.createObjectStore(objectStoreName, {});
     });
+    // This line might just never come back: it only waits for success, so an open that errors or is blocked waits forever.
     await new Promise(resolve => db.addEventListener("success", resolve));
     return db.result;
 });
@@ -40,6 +41,7 @@ export async function storeFileSystemPointer(config: {
     mode: "read" | "readwrite";
     handle: FileSystemFileHandle | FileSystemDirectoryHandle;
 }): Promise<FileSystemPointer> {
+    // This line might wait for the user to confirm it, or it might just never come back.
     await (config.handle as any).requestPermission({ mode: config.mode });
     let key = nextId() + "_" + config.mode;
     await write(key, config.handle);
@@ -76,6 +78,7 @@ export async function findGrantedPointerHandle(mode: "read" | "readwrite"): Prom
         .sort((a, b) => b.time - a.time);
     for (let entry of entries) {
         if (entry.value.kind !== "directory") continue;
+        // This line might just never come back.
         let state = await (entry.value as any).queryPermission({ mode });
         if (state === "granted") return entry.value;
     }
@@ -103,6 +106,7 @@ export async function getFileSystemPointer(config: {
             if (!navigator.userActivation?.isActive) {
                 console.info(`[fileSystemPointer] ${config.pointer} (${handle.kind} ${handle.name}): querying ${mode} permission`);
                 try {
+                    // This line might just never come back.
                     testMode = await (handle as any).queryPermission({ mode: mode });
                 } catch (err) {
                     console.info(`[fileSystemPointer] ${config.pointer} (${handle.name}): queryPermission ${mode} threw:`, (err as Error)?.stack ?? err);
@@ -115,6 +119,7 @@ export async function getFileSystemPointer(config: {
                 console.info(`[file access] ${handle.name}: before requestPermission ${requestMode}`);
                 let requested: unknown;
                 try {
+                    // This line might wait for the user to confirm it, or it might just never come back.
                     requested = await (handle as any).requestPermission({ mode: requestMode });
                 } catch (err) {
                     console.info(`[file access] ${handle.name}: after requestPermission ${requestMode}, threw after ${Date.now() - requestedAt}ms:`, (err as Error)?.stack ?? err);
