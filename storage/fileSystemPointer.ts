@@ -91,14 +91,37 @@ export async function getFileSystemPointer(config: {
     onUserActivation(modeOverride?: "read" | "readwrite"): Promise<FileSystemFileHandle | FileSystemDirectoryHandle>
 } | undefined
 > {
+    console.info(`[fileSystemPointer] reading pointer ${config.pointer} from IndexedDB`);
     const handle = await read(config.pointer);
+    console.info(`[fileSystemPointer] pointer ${config.pointer} read: ${handle && `${handle.kind} ${handle.name}` || "not stored"}`);
     if (!handle) return;
     let mode = config.pointer.split("_").at(-1);
     return {
         async onUserActivation(modeOverride) {
-            let testMode = await (handle as any).queryPermission({ mode: mode });
-            if (testMode !== mode) {
-                await (handle as any).requestPermission({ mode: modeOverride ?? mode });
+            const requestMode = modeOverride ?? mode;
+            let testMode: unknown = "not queried";
+            if (!navigator.userActivation?.isActive) {
+                console.info(`[fileSystemPointer] ${config.pointer} (${handle.kind} ${handle.name}): querying ${mode} permission`);
+                try {
+                    testMode = await (handle as any).queryPermission({ mode: mode });
+                } catch (err) {
+                    console.info(`[fileSystemPointer] ${config.pointer} (${handle.name}): queryPermission ${mode} threw:`, (err as Error)?.stack ?? err);
+                    throw err;
+                }
+                console.info(`[fileSystemPointer] ${config.pointer} (${handle.name}): queryPermission ${mode} → ${testMode}`);
+            }
+            if (testMode !== "granted") {
+                const requestedAt = Date.now();
+                console.info(`[file access] ${handle.name}: before requestPermission ${requestMode}`);
+                let requested: unknown;
+                try {
+                    requested = await (handle as any).requestPermission({ mode: requestMode });
+                } catch (err) {
+                    console.info(`[file access] ${handle.name}: after requestPermission ${requestMode}, threw after ${Date.now() - requestedAt}ms:`, (err as Error)?.stack ?? err);
+                    throw err;
+                }
+                console.info(`[file access] ${handle.name}: after requestPermission ${requestMode}, ${requested} after ${Date.now() - requestedAt}ms`);
+                if (requested !== "granted") throw new Error(`Expected ${requestMode} permission on ${handle.kind} ${handle.name} (pointer ${config.pointer}) to be granted, was ${requested}`);
             }
             return handle;
         }

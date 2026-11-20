@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 
 const MAX_ROOT_ENTRIES_FOR_COLLECTIONS = 100;
+const NATURAL_CLICK_WAIT_MS = 1000;
 
 declare global {
     interface Window {
@@ -144,6 +145,7 @@ class DirectoryPrompter extends preact.Component {
                 css.position("fixed").pos(0, 0).size("100vw", "100vh")
                     .zIndex(2147483647)
                     .background("white")
+                    .color("black")
                     .center
                     .fontSize(40)
             }>
@@ -496,33 +498,44 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
         // A previously-picked local folder: try to restore it (may need a click). Skipped when a saved server failed — that user wants the server, so go straight to the (pre-filled) prompt.
         const storedId = !savedRemote && localStorage.getItem(getFileAPIKey());
         if (storedId) {
-            let doneLoad = false;
-            setTimeout(() => { if (!doneLoad) displayData.ui = "Click anywhere to allow file system access"; }, 500);
-            try {
-                const handle = await tryToLoadPointer(storedId);
-                doneLoad = true;
-                if (handle) return handle;
-            } catch (e) {
-                doneLoad = true;
-                console.error(e);
-                const msg = e instanceof Error ? e.message : String(e);
-                if (msg.includes("user activation") || msg.includes("User activation")) {
-                    displayData.ui = (
-                        <div className={css.vbox(20).center}>
-                            <button className={css.fontSize(40).pad2(80, 40)} onClick={async () => {
-                                displayData.ui = "Loading...";
-                                try {
-                                    const h = await tryToLoadPointer(storedId);
-                                    if (h) { resolveHandle(h); return; }
-                                } catch (retryError) { console.error("Retry failed:", retryError); }
-                                displayData.ui = <div className={css.vbox(20).center}>{renderOptions()}</div>;
-                            }}>Click to restore file system access</button>
-                            {renderOptions()}
-                        </div>
-                    );
-                    return await promise;
+            const showOptions = (message: string) => {
+                displayData.ui = (
+                    <div className={css.vbox(20).center}>
+                        <div>{message}</div>
+                        {renderOptions()}
+                    </div>
+                );
+            };
+            const failedMessage = "Failed to load the old pointer, select the directory again";
+            const restore = async () => {
+                console.info(`[FileFolderAPI] click, restoring stored folder ${storedId} (navigator.userActivation.isActive ${navigator.userActivation?.isActive})`);
+                showOptions("Approve existing access or pick a new directory");
+                try {
+                    const handle = await tryToLoadPointer(storedId);
+                    if (handle) {
+                        console.info(`[FileFolderAPI] restored stored folder ${storedId} (${handle.name})`);
+                        resolveHandle(handle);
+                        return;
+                    }
+                    console.info(`[FileFolderAPI] stored folder ${storedId} is no longer in the pointer database, showing the folder picker`);
+                } catch (err) {
+                    console.info(`[FileFolderAPI] restoring stored folder ${storedId} on a click failed, showing the folder picker:`, (err as Error)?.stack ?? err);
                 }
-            }
+                showOptions(failedMessage);
+            };
+            const promptTimer = setTimeout(() => {
+                console.info(`[FileFolderAPI] no click within ${NATURAL_CLICK_WAIT_MS}ms, asking for one to restore stored folder ${storedId}`);
+                displayData.ui = "Click anywhere to allow file system access";
+            }, NATURAL_CLICK_WAIT_MS);
+            const onClick = (event: MouseEvent) => {
+                console.info(`[FileFolderAPI] click received on`, event.target, `restoring stored folder ${storedId}`);
+                window.removeEventListener("click", onClick, true);
+                clearTimeout(promptTimer);
+                void restore();
+            };
+            window.addEventListener("click", onClick, true);
+            console.info(`[FileFolderAPI] stored folder ${storedId}: waiting for a click to restore it (click listener added on window)`);
+            return await promise;
         }
         displayData.ui = <div className={css.vbox(20).center}>{renderOptions()}</div>;
         return await promise;
@@ -830,8 +843,15 @@ export function getRemoteFileStorageFactory(url: string, password: string, optio
 
 export async function tryToLoadPointer(pointer: string) {
     let result = await getFileSystemPointer({ pointer });
-    if (!result) return;
+    if (!result) {
+        console.info(`[FileFolderAPI] tryToLoadPointer ${pointer}: the pointer is not stored, returning undefined`);
+        return;
+    }
     let handle = await result?.onUserActivation();
-    if (!handle) return;
+    if (!handle) {
+        console.info(`[FileFolderAPI] tryToLoadPointer ${pointer}: onUserActivation gave no handle, returning undefined`);
+        return;
+    }
+    console.info(`[FileFolderAPI] tryToLoadPointer ${pointer}: got ${handle.kind} ${handle.name}`);
     return handle as any as DirectoryWrapper;
 }
