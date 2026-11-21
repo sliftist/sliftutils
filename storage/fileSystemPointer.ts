@@ -2,6 +2,7 @@ import { lazy } from "socket-function/src/caching";
 import { nextId } from "socket-function/src/misc";
 
 const objectStoreName = "fileSystemPointerDB";
+const REQUEST_PERMISSION_TIMEOUT_MS = 30 * 1000;
 const db = lazy(async () => {
     let db = indexedDB.open("fileSystemPointerDB_f298e962-bd8a-46b9-8098-25db633f4ed3", 1);
     db.addEventListener("upgradeneeded", () => {
@@ -118,12 +119,20 @@ export async function getFileSystemPointer(config: {
                 const requestedAt = Date.now();
                 console.info(`[file access] ${handle.name}: before requestPermission ${requestMode}`);
                 let requested: unknown;
+                let timer: ReturnType<typeof setTimeout> | undefined;
                 try {
                     // This line might wait for the user to confirm it, or it might just never come back.
-                    requested = await (handle as any).requestPermission({ mode: requestMode });
+                    requested = await Promise.race([
+                        (handle as any).requestPermission({ mode: requestMode }),
+                        new Promise((_resolve, reject) => {
+                            timer = setTimeout(() => reject(new Error(`requestPermission ${requestMode} on ${handle.kind} ${handle.name} (pointer ${config.pointer}) did not come back within ${REQUEST_PERMISSION_TIMEOUT_MS}ms`)), REQUEST_PERMISSION_TIMEOUT_MS);
+                        }),
+                    ]);
                 } catch (err) {
                     console.info(`[file access] ${handle.name}: after requestPermission ${requestMode}, threw after ${Date.now() - requestedAt}ms:`, (err as Error)?.stack ?? err);
                     throw err;
+                } finally {
+                    clearTimeout(timer);
                 }
                 console.info(`[file access] ${handle.name}: after requestPermission ${requestMode}, ${requested} after ${Date.now() - requestedAt}ms`);
                 if (requested !== "granted") throw new Error(`Expected ${requestMode} permission on ${handle.kind} ${handle.name} (pointer ${config.pointer}) to be granted, was ${requested}`);
