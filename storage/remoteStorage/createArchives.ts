@@ -31,6 +31,7 @@ const PRIMARY_RETRY_TIMEOUT = 30 * 1000;
 const PRIMARY_RETRY_DELAY = 2 * 1000;
 const COVERING_RETRY_TIMEOUT = 30 * 1000;
 const COVERING_RETRY_DELAY = 5 * 1000;
+const COVERING_CALL_TIMEOUT = 2 * 60 * 1000;
 // A read waits this long for its FIRST chunk, and the window grows to CHUNK_TIMEOUT_MAX as the
 // download goes on - the further in we are, the more a restart costs, so the more patience is
 // worth it. Not size based: the window covers one chunk, and finishing a chunk resets it.
@@ -566,17 +567,20 @@ export class ArchivesChain implements IArchives {
             let failures: { source: SourceWrapper; error: Error }[] = [];
             let time = Date.now();
             await Promise.all(covering.map(async (source, index) => {
-                let api = source.api;
+                const api = source.api;
                 if (!api) {
                     failures.push({ source, error: new Error(`URL-only access, which cannot serve ${operation}`) });
                     return;
                 }
                 try {
-                    values.push(await run(api));
+                    values.push(await this.applyRefreshableTimeout(
+                        { label: operation, sourceUrl: source.config.url, windowMs: COVERING_CALL_TIMEOUT },
+                        () => run(api),
+                    ));
                 } catch (e) {
                     if (!source.isConnected()) source.noteFailure();
                     failures.push({ source, error: e as Error });
-                    console.log(`Failed after ${formatTime(Date.now() - time)} index ${index} of ${covering.length}`);
+                    console.log(`${operation} failed on ${source.getDebugName()} after ${formatTime(Date.now() - time)} (index ${index} of ${covering.length}): ${String((e as Error)?.stack ?? e)}`);
                 }
             }));
             if (!failures.length) return values;
