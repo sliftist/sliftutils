@@ -98,15 +98,17 @@ async function main() {
     }
     let { repoPath, sourceURL: originURL } = await resolveKeysRepo(positional[0]);
 
+    let removedUnreadable: string[] = [];
     try {
-        await removeUnreadableRevocations({ sourceURL: originURL });
+        removedUnreadable = await removeUnreadableRevocations({ sourceURL: originURL });
     } catch (e) {
         console.log(`Could not remove the unreadable revocations from ${revokeRepoURL(originURL)}, unrevoking anyway.`, (e as Error).stack ?? e);
     }
 
     let revocations = await readRemoteRevocations({ sourceURL: originURL });
+    let cleanupNote = removedUnreadable.length && ` The ${removedUnreadable.length} unreadable revocation(s) removed above are already pushed to ${revokeRepoURL(originURL)}, which is not signed, so they need nothing more.` || "";
     if (!revocations.length) {
-        console.log(`${revokeRepoURL(originURL)} lists no revocations, so there is nothing to undo.`);
+        console.log(`${revokeRepoURL(originURL)} lists no revocations, so there is nothing to undo.${cleanupNote}`);
         return;
     }
 
@@ -118,7 +120,7 @@ async function main() {
     revocations = stillRevokedBy(revocations, alreadyUnrevoked);
     if (!revocations.length) {
         console.log(`Everything ${revokeRepoURL(originURL)} lists is already unrevoked here.`);
-        console.log(`Nothing to do, and nothing was written.`);
+        console.log(`No unrevoke needed, so nothing was written to ${repoPath}.${cleanupNote}`);
         return;
     }
 
@@ -200,6 +202,9 @@ async function main() {
     }
     console.log(`Every other address stays frozen, and any of these used from anywhere else is`);
     console.log(`frozen again.`);
+    if (cleanupNote) {
+        console.log(cleanupNote.trim());
+    }
 
     // Signed here rather than left as a step to remember. An unrevoke nobody signed does nothing at
     // all, and the repo would sit there looking done while every machine ignored it.

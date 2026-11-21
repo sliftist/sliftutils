@@ -95,7 +95,7 @@ export async function removeUnreadableRevocations(config: { sourceURL: string })
             await fs.rm(path.join(repoPath, REVOCATIONS_DIR, name));
             removed.push(relativePath);
         }
-        if (!removed.length) return;
+        if (!removed.length) return removed;
         let git = async (args: string[]) => {
             let result = await spawnPromise({ command: "git", args: [...gitConfig, ...args], cwd: repoPath });
             if (result.status !== 0) {
@@ -105,7 +105,8 @@ export async function removeUnreadableRevocations(config: { sourceURL: string })
         await git(["add", "-A"]);
         await git(["-c", "user.email=portsecure@localhost", "-c", "user.name=portsecure", "commit", "-m", `remove ${removed.length} unreadable revocation(s)`]);
         await git(["push", "origin", "HEAD"]);
-        console.log(`Removed ${removed.length} unreadable revocation(s) from ${revokeRepoURL(sourceURL)}: ${removed.join(", ")}`);
+        console.log(`Removed ${removed.length} unreadable revocation(s) from ${revokeRepoURL(sourceURL)}, committed and pushed: ${removed.join(", ")}`);
+        return removed;
     } finally {
         await fs.rm(temporaryDirectory, { recursive: true, force: true });
     }
