@@ -75,7 +75,7 @@ export class ArchivesDelayed implements IArchives {
         let existing = this.pending.get(fileName);
         // An older write never overwrites a newer one (see IArchives.set) - including against a write still sitting here
         if (existing && writeTime < existing.writeTime) return fileName;
-        let dueAt = Date.now() + this.delay;
+        let dueAt = existing && existing.dueAt || Date.now() + this.delay;
         if (this.delay <= 0 || this.deadlinePassed()) {
             this.pending.delete(fileName);
             await this.write(fileName, { data, writeTime, dueAt, config });
