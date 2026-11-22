@@ -34,12 +34,12 @@ function CertTrustModal(props: { origin: string; onClose: () => void }) {
     return <div className={css.fixed.pos(0, 0).fillBoth.zIndex(2147483647)
         .hbox(0).justifyContent("center").alignItems("center").hsla(0, 0, 0, 0.5)
     }>
-        <div className={css.vbox(12).pad2(24).maxWidth(480).hsl(0, 0, 100).borderRadius(8)}>
+        <div className={css.vbox(12).pad2(24).maxWidth(480).hsl(0, 0, 22).color("white").borderRadius(8)}>
             <div>Can't reach the storage server at <code>{props.origin}</code>.</div>
             <div>
                 If this server uses a self-signed certificate, the browser blocks the connection until you accept it. Open the server below, accept the certificate warning, then return to this page - it will connect automatically.
             </div>
-            <a href={trustUrl} target="_blank" rel="noreferrer">Open {props.origin} and trust its certificate</a>
+            <a className={css.color("hsl(210, 100%, 75%)")} href={trustUrl} target="_blank" rel="noreferrer">Open {props.origin} and trust its certificate</a>
             <div className={css.hbox(8).justifyContent("flex-end")}>
                 <button onClick={props.onClose}>Close</button>
             </div>

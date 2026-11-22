@@ -144,8 +144,8 @@ class DirectoryPrompter extends preact.Component {
             <div className={
                 css.position("fixed").pos(0, 0).size("100vw", "100vh")
                     .zIndex(2147483647)
-                    .background("white")
-                    .color("black")
+                    .hsl(0, 0, 22)
+                    .color("white")
                     .center
                     .fontSize(40)
             }>
@@ -214,9 +214,9 @@ class ServerConnectForm extends preact.Component<{ onConnected: (config: RemoteC
                         {s.showPassword ? "Hide" : "Show"}
                     </button>
                 </div>
-                {s.error ? <div className={css.fontSize(22).color("red").maxWidth("80vw")}>{s.error}</div> : null}
+                {s.error ? <div className={css.fontSize(22).color("hsl(0, 100%, 75%)").maxWidth("80vw")}>{s.error}</div> : null}
                 {s.needsCert ? (
-                    <div className={css.vbox(10).center.fontSize(20).maxWidth(620).maxWidth("80vw").textAlign("center").color("hsl(0, 0%, 25%)")}>
+                    <div className={css.vbox(10).center.fontSize(20).maxWidth(620).maxWidth("80vw").textAlign("center").color("hsl(0, 0%, 80%)")}>
                         <div>This server uses a self-signed certificate, so your browser has to trust it once:</div>
                         <div>1. Open the server in a new tab (button below). &nbsp; 2. Accept the security warning (Advanced → Proceed). &nbsp; 3. Come back and click Retry.</div>
                         <button className={css.fontSize(26).pad2(40, 20)}
