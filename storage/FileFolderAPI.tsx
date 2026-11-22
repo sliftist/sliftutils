@@ -12,7 +12,8 @@ import fs from "fs";
 import path from "path";
 
 const MAX_ROOT_ENTRIES_FOR_COLLECTIONS = 100;
-const NATURAL_CLICK_WAIT_MS = 1000;
+const LOAD_PERMISSION_WAIT_MS = 1000;
+const TRY_PREVIOUS_PERMISSIONS_WAIT_MS = 500;
 
 declare global {
     interface Window {
@@ -152,6 +153,25 @@ class DirectoryPrompter extends preact.Component {
                 {displayData.ui}
             </div>
         );
+    }
+}
+
+@observer
+class TryPreviousPermissionsButton extends preact.Component<{ onTry: () => Promise<boolean> }> {
+    synced = observable({
+        tried: false,
+    });
+    render() {
+        return <button className={css.fontSize(40).pad2(80, 40)} onClick={() => {
+            let timer = setTimeout(() => this.synced.tried = true, TRY_PREVIOUS_PERMISSIONS_WAIT_MS);
+            void this.props.onTry().then(restored => {
+                if (restored) return;
+                clearTimeout(timer);
+                this.synced.tried = true;
+            });
+        }}>
+            {this.synced.tried && "Tried to reuse permissions" || "Try previous permissions"}
+        </button>;
     }
 }
 
@@ -500,44 +520,39 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
         // A previously-picked local folder: try to restore it (may need a click). Skipped when a saved server failed — that user wants the server, so go straight to the (pre-filled) prompt.
         const storedId = !savedRemote && localStorage.getItem(getFileAPIKey());
         if (storedId) {
-            const showOptions = (message: string) => {
-                displayData.ui = (
-                    <div className={css.vbox(20).center}>
-                        <div>{message}</div>
-                        {renderOptions()}
-                    </div>
-                );
-            };
-            const failedMessage = "Failed to load the old pointer, select the directory again";
-            const restore = async () => {
-                console.info(`[FileFolderAPI] click, restoring stored folder ${storedId} (navigator.userActivation.isActive ${navigator.userActivation?.isActive})`);
-                showOptions("Approve existing access or pick a new directory");
+            const tryPrevious = async (trigger: string) => {
+                console.info(`[FileFolderAPI] trying previous permissions for stored folder ${storedId} (${trigger}, navigator.userActivation.isActive ${navigator.userActivation?.isActive})`);
                 try {
                     // This line might wait for the user to confirm it, or it might just never come back.
                     const handle = await tryToLoadPointer(storedId);
                     if (handle) {
-                        console.info(`[FileFolderAPI] restored stored folder ${storedId} (${handle.name})`);
+                        console.info(`[FileFolderAPI] restored stored folder ${storedId} (${handle.name}) (${trigger})`);
                         resolveHandle(handle);
-                        return;
+                        return true;
                     }
-                    console.info(`[FileFolderAPI] stored folder ${storedId} is no longer in the pointer database, showing the folder picker`);
+                    console.info(`[FileFolderAPI] stored folder ${storedId} is no longer in the pointer database (${trigger})`);
                 } catch (err) {
-                    console.info(`[FileFolderAPI] restoring stored folder ${storedId} on a click failed, showing the folder picker:`, (err as Error)?.stack ?? err);
+                    console.info(`[FileFolderAPI] previous permissions for stored folder ${storedId} failed (${trigger}):`, (err as Error)?.stack ?? err);
                 }
-                showOptions(failedMessage);
+                return false;
             };
-            const promptTimer = setTimeout(() => {
-                console.info(`[FileFolderAPI] no click within ${NATURAL_CLICK_WAIT_MS}ms, asking for one to restore stored folder ${storedId}`);
-                displayData.ui = "Click anywhere to allow file system access";
-            }, NATURAL_CLICK_WAIT_MS);
-            const onClick = (event: MouseEvent) => {
-                console.info(`[FileFolderAPI] click received on`, event.target, `restoring stored folder ${storedId}`);
-                window.removeEventListener("click", onClick, true);
+            let promptShown = false;
+            const showPrompt = (reason: string) => {
+                if (promptShown) return;
+                promptShown = true;
+                console.info(`[FileFolderAPI] showing the directory prompt with a try previous permissions button for stored folder ${storedId}: ${reason}`);
+                displayData.ui = (
+                    <div className={css.vbox(20).center}>
+                        <TryPreviousPermissionsButton onTry={() => tryPrevious("button click")} />
+                        {renderOptions()}
+                    </div>
+                );
+            };
+            const promptTimer = setTimeout(() => showPrompt(`no permission within ${LOAD_PERMISSION_WAIT_MS}ms of asking on load`), LOAD_PERMISSION_WAIT_MS);
+            void tryPrevious("on load").then(restored => {
                 clearTimeout(promptTimer);
-                void restore();
-            };
-            window.addEventListener("click", onClick, true);
-            console.info(`[FileFolderAPI] stored folder ${storedId}: waiting for a click to restore it (click listener added on window)`);
+                if (!restored) showPrompt("asking on load failed");
+            });
             return await promise;
         }
         displayData.ui = <div className={css.vbox(20).center}>{renderOptions()}</div>;
