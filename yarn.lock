@@ -1937,10 +1937,10 @@ slash@^3.0.0:
   resolved "https://registry.yarnpkg.com/slash/-/slash-3.0.0.tgz#6539be870c165adbd5240220dbe361f1bc4d4634"
   integrity sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==
 
-socket-function@^1.3.13:
-  version "1.3.13"
-  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.3.13.tgz#f530d1996793573b4e1667ad0c1e7d4e23eee733"
-  integrity sha512-hid3yka062mIHofNVofb63uoIoQsfXKHjvMqW8SyE53cEWNMA02I9XimN6jrdnkONGqG7T6a/MJtNLbwk9SQCA==
+socket-function@^1.3.14:
+  version "1.3.14"
+  resolved "https://registry.yarnpkg.com/socket-function/-/socket-function-1.3.14.tgz#7fde282d43ad80f34d52dc54e5de5adc947179e7"
+  integrity sha512-BQTG0uBWTbRR6Y0slEexoxTHC+zFPoArenCquGibttTlf2yQAvc+x383wRSdlJqtAL8G/isPcyqGaBmfy4+OYw==
   dependencies:
     "@types/pako" "^2.0.3"
     "@types/ws" "^8.5.3"
@@ -1949,7 +1949,7 @@ socket-function@^1.3.13:
     pako "^2.1.0"
     preact "10.24.3"
     typedev "^0.4.0"
-    typenode "^6.6.3"
+    typenode "^6.6.4"
     ws "^8.21.0"
   optionalDependencies:
     lmdb "^3.5.1"
@@ -2078,15 +2078,6 @@ typedev@^0.4.0:
     "@typescript-eslint/parser" "^6.21.0"
     debugbreak "^0.11.0"
     eslint "^8.18.0"
-
-typenode@^6.6.3:
-  version "6.6.3"
-  resolved "https://registry.yarnpkg.com/typenode/-/typenode-6.6.3.tgz#23dab07a62fa461614921383e494e2437068bb6a"
-  integrity sha512-EmwEOEFqgr3WLNBlUD5FKx15Q9R/X8VYcjM07PLLAqK+naWm5vEJUwnKnPBYs1V0d/j56sd1NShQ2uwiIPalmQ==
-  dependencies:
-    "@types/pegjs" "^0.10.3"
-    source-map-support "https://github.com/7rulnik/node-source-map-support"
-    typescript "5.3.3"
 
 typenode@^6.6.4:
   version "6.6.4"
