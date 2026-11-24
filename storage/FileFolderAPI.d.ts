@@ -1,5 +1,6 @@
 /// <reference types="node" />
 /// <reference types="node" />
+import preact from "preact";
 import { IStorageRaw } from "./IStorage";
 import { RemoteOptions } from "./remoteFileStorage";
 declare global {
@@ -116,6 +117,16 @@ export declare const getDirectoryHandle: {
     reset(): void;
     set(newValue: Promise<DirectoryWrapper>): void;
 };
+export type PointerHandle = FileSystemFileHandle | FileSystemDirectoryHandle;
+export declare function promptForAccess<T = never>(config: {
+    label: string;
+    pointer?: string;
+    mode?: "read" | "readwrite";
+    message?: string;
+    pickLabel: string;
+    pick: () => Promise<PointerHandle>;
+    renderExtraOptions?: (resolve: (value: T) => void) => preact.ComponentChildren;
+}): Promise<PointerHandle | T>;
 export declare const getFileStorageNested: {
     (key: string): Promise<FileStorage>;
     clear(key: string): void;

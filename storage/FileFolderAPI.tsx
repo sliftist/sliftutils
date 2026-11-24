@@ -78,10 +78,6 @@ export type DirectoryWrapper = {
     [Symbol.asyncIterator](): AsyncIterableIterator<[string, FileWrapper | DirectoryWrapper]>;
 };
 
-let displayData = observable({
-    ui: undefined as undefined | preact.ComponentChildren,
-}, undefined, { deep: false });
-
 let fileAPIKey = "";
 function getFileAPIKey() {
     if (!fileAPIKey) throw new Error("Must call setFileAPIKey before using file system. Just pass any key. This prevents reusing the file system api that other development apps might be using.");
@@ -138,9 +134,10 @@ function getRemoteHandle(remote: RemoteConfig): DirectoryWrapper {
 }
 
 @observer
-class DirectoryPrompter extends preact.Component {
+class DirectoryPrompter extends preact.Component<{ state: { ui: preact.ComponentChildren } }> {
     render() {
-        if (!displayData.ui) return undefined;
+        const { state } = this.props;
+        if (!state.ui) return undefined;
         return (
             <div className={
                 css.position("fixed").pos(0, 0).size("100vw", "100vh")
@@ -150,7 +147,7 @@ class DirectoryPrompter extends preact.Component {
                     .center
                     .fontSize(40)
             }>
-                {displayData.ui}
+                {state.ui}
             </div>
         );
     }
@@ -485,83 +482,105 @@ export const getDirectoryHandle = lazy(async function getDirectoryHandle(): Prom
         console.warn(`Saved remote server didn't connect (${result.status})${result.status === "unreachable" ? ": " + result.error : ""} — re-prompting.`);
     }
 
+    // A previously-picked local folder: try to restore it (may need a click). Skipped when a saved server failed — that user wants the server, so go straight to the (pre-filled) prompt.
+    const storedId = !savedRemote && localStorage.getItem(getFileAPIKey()) || undefined;
+    const handle = await promptForAccess<DirectoryWrapper>({
+        label: "data directory",
+        pointer: storedId,
+        pickLabel: "Pick Data Directory",
+        pick: async () => {
+            // This line might wait for the user to confirm it, or it might just never come back.
+            const handle = await window.showDirectoryPicker();
+            // This line might wait for the user to confirm it, or it might just never come back.
+            await handle.requestPermission({ mode: "readwrite" });
+            const storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
+            localStorage.setItem(getFileAPIKey(), storedId);
+            return handle;
+        },
+        renderExtraOptions: resolve => <ServerConnectForm onConnected={config => { saveRemoteConfig(config); resolve(getRemoteHandle(config)); }} initial={savedRemote} />,
+    });
+    return handle as unknown as DirectoryWrapper;
+});
+
+export type PointerHandle = FileSystemFileHandle | FileSystemDirectoryHandle;
+
+export async function promptForAccess<T = never>(config: {
+    label: string;
+    pointer?: string;
+    mode?: "read" | "readwrite";
+    message?: string;
+    pickLabel: string;
+    pick: () => Promise<PointerHandle>;
+    renderExtraOptions?: (resolve: (value: T) => void) => preact.ComponentChildren;
+}): Promise<PointerHandle | T> {
+    const { label, pointer, mode, message, pickLabel, pick, renderExtraOptions } = config;
+    const state = observable({
+        ui: undefined as undefined | preact.ComponentChildren,
+    }, undefined, { deep: false });
     let root = document.createElement("div");
     document.body.appendChild(root);
-    preact.render(<DirectoryPrompter />, root);
+    preact.render(<DirectoryPrompter state={state} />, root);
     try {
-        let resolveHandle!: (h: DirectoryWrapper) => void;
+        let resolveHandle!: (value: PointerHandle | T) => void;
         let rejectHandle!: (e: Error) => void;
-        const promise = new Promise<DirectoryWrapper>((res, rej) => { resolveHandle = res; rejectHandle = rej; });
+        const promise = new Promise<PointerHandle | T>((res, rej) => { resolveHandle = res; rejectHandle = rej; });
 
-        const pickLocal = async () => {
+        const pickNew = async () => {
             try {
-                // This line might wait for the user to confirm it, or it might just never come back.
-                const handle = await window.showDirectoryPicker();
-                // This line might wait for the user to confirm it, or it might just never come back.
-                await handle.requestPermission({ mode: "readwrite" });
-                const storedId = await storeFileSystemPointer({ mode: "readwrite", handle });
-                localStorage.setItem(getFileAPIKey(), storedId);
-                resolveHandle(handle as any);
-            } catch (e) {
-                console.error("Directory pick failed/cancelled:", e); // stay on the prompt
+                resolveHandle(await pick());
+            } catch (err) {
+                console.error(`[FileFolderAPI] ${label}: picking failed or was cancelled, staying on the prompt:`, (err as Error)?.stack ?? err);
             }
         };
-        const onConnected = (config: RemoteConfig) => { saveRemoteConfig(config); resolveHandle(getRemoteHandle(config)); };
-        // The three options, rendered fresh each time. If a saved server just failed, pre-fill + expand the connect form so the user can retry or fix it.
-        const renderOptions = () => (
-            <>
-                <button className={css.fontSize(40).pad2(80, 40)} onClick={pickLocal}>Pick Data Directory</button>
-                <ServerConnectForm onConnected={onConnected} initial={savedRemote} />
-                <button className={css.fontSize(40).pad2(80, 40)}
-                    onClick={() => rejectHandle(new Error("User dismissed file system access prompt"))}>Dismiss</button>
-            </>
-        );
-
-        // A previously-picked local folder: try to restore it (may need a click). Skipped when a saved server failed — that user wants the server, so go straight to the (pre-filled) prompt.
-        const storedId = !savedRemote && localStorage.getItem(getFileAPIKey());
-        if (storedId) {
-            const tryPrevious = async (trigger: string) => {
-                console.info(`[FileFolderAPI] trying previous permissions for stored folder ${storedId} (${trigger}, navigator.userActivation.isActive ${navigator.userActivation?.isActive})`);
-                try {
-                    // This line might wait for the user to confirm it, or it might just never come back.
-                    const handle = await tryToLoadPointer(storedId);
-                    if (handle) {
-                        console.info(`[FileFolderAPI] restored stored folder ${storedId} (${handle.name}) (${trigger})`);
-                        resolveHandle(handle);
-                        return true;
-                    }
-                    console.info(`[FileFolderAPI] stored folder ${storedId} is no longer in the pointer database (${trigger})`);
-                } catch (err) {
-                    console.info(`[FileFolderAPI] previous permissions for stored folder ${storedId} failed (${trigger}):`, (err as Error)?.stack ?? err);
+        const tryPrevious = async (storedPointer: string, trigger: string) => {
+            console.info(`[FileFolderAPI] ${label}: trying previous permissions for pointer ${storedPointer} (${trigger}, navigator.userActivation.isActive ${navigator.userActivation?.isActive})`);
+            try {
+                const stored = await getFileSystemPointer({ pointer: storedPointer });
+                if (!stored) {
+                    console.info(`[FileFolderAPI] ${label}: pointer ${storedPointer} is no longer in the pointer database (${trigger})`);
+                    return false;
                 }
-                return false;
-            };
-            let promptShown = false;
-            const showPrompt = (reason: string) => {
-                if (promptShown) return;
-                promptShown = true;
-                console.info(`[FileFolderAPI] showing the directory prompt with a try previous permissions button for stored folder ${storedId}: ${reason}`);
-                displayData.ui = (
-                    <div className={css.vbox(20).center}>
-                        <TryPreviousPermissionsButton onTry={() => tryPrevious("button click")} />
-                        {renderOptions()}
-                    </div>
-                );
-            };
-            const promptTimer = setTimeout(() => showPrompt(`no permission within ${LOAD_PERMISSION_WAIT_MS}ms of asking on load`), LOAD_PERMISSION_WAIT_MS);
-            void tryPrevious("on load").then(restored => {
-                clearTimeout(promptTimer);
-                if (!restored) showPrompt("asking on load failed");
-            });
+                // This line might wait for the user to confirm it, or it might just never come back.
+                const handle = await stored.onUserActivation(mode);
+                console.info(`[FileFolderAPI] ${label}: restored ${handle.kind} ${handle.name} from pointer ${storedPointer} (${trigger})`);
+                resolveHandle(handle);
+                return true;
+            } catch (err) {
+                console.info(`[FileFolderAPI] ${label}: previous permissions for pointer ${storedPointer} failed (${trigger}):`, (err as Error)?.stack ?? err);
+            }
+            return false;
+        };
+        let promptShown = false;
+        const showPrompt = (reason: string) => {
+            if (promptShown) return;
+            promptShown = true;
+            console.info(`[FileFolderAPI] ${label}: showing the access prompt${pointer && ` with a try previous permissions button for pointer ${pointer}` || ""}: ${reason}`);
+            state.ui = (
+                <div className={css.vbox(20).center}>
+                    {message && <div>{message}</div>}
+                    {pointer && <TryPreviousPermissionsButton onTry={() => tryPrevious(pointer, "button click")} />}
+                    <button className={css.fontSize(40).pad2(80, 40)} onClick={pickNew}>{pickLabel}</button>
+                    {renderExtraOptions?.(resolveHandle)}
+                    <button className={css.fontSize(40).pad2(80, 40)}
+                        onClick={() => rejectHandle(new Error(`User dismissed the ${label} access prompt`))}>Dismiss</button>
+                </div>
+            );
+        };
+        if (!pointer) {
+            showPrompt("there is no saved pointer");
             return await promise;
         }
-        displayData.ui = <div className={css.vbox(20).center}>{renderOptions()}</div>;
+        const promptTimer = setTimeout(() => showPrompt(`no permission within ${LOAD_PERMISSION_WAIT_MS}ms of asking on load`), LOAD_PERMISSION_WAIT_MS);
+        void tryPrevious(pointer, "on load").then(restored => {
+            clearTimeout(promptTimer);
+            if (!restored) showPrompt("asking on load failed");
+        });
         return await promise;
     } finally {
         preact.render(null, root);
         root.remove();
     }
-});
+}
 
 export const getFileStorageNested = cache(async function getFileStorage(path: string): Promise<FileStorage> {
     let base = await getDirectoryHandle();
