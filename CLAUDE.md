@@ -85,7 +85,7 @@ class Example extends preact.Component {
 - Never use `em` or `rem`. Use `px` or `vw`/`vh`/`%`.
 - Don't add font colors / aesthetics / `fontSize` beyond `hbox`/`vbox`/`pad2` unless asked. If you think styling could help, *tell the user* — don't add it unprompted.
 - Never use `h1`/`h2`/`h3` etc. — set the font size explicitly instead.
-- Don't use `fillWidth` where `flexGrow(1)` would do.
+- Prefer `fillWidthFlex` / `fillHeightFlex` for the element that takes the remaining space in an `hbox`/`vbox` (they set `flexGrow(1)`, a zero min size and a huge `flexShrink`, so the element both grows and gives way), and put `flexShrink0` on the fixed items beside it (buttons, icons, readouts) so they never shrink. Never write `flexGrow(1)` by hand, and don't use `fillWidth` (`width: 100%`) where the element is a flex child that should share the row.
 - Add very little styling (colors, rounding, etc.) unless asked.
 
 ### The `css` helper
@@ -115,9 +115,11 @@ className={css
 
 ### Aliases
 
-Non-call aliases (chainable): `relative`, `absolute`, `fixed`, `wrap`, `marginAuto`, `fillBoth`, `fillWidth`, `fillHeight`, `flexShrink0`, `ellipsis`, `overflowAuto`, `overflowHidden`.
+Non-call aliases (chainable): `relative`, `absolute`, `fixed`, `wrap`, `nowrap`, `marginAuto`, `fillBoth`, `fillWidth`, `fillHeight`, `fillWidthFlex`, `fillHeightFlex`, `fillFlex`, `flexShrink0`, `shrink`, `pointer`, `ellipsis`, `overflowAuto`, `overflowHidden`, `scrollX`, `scrollY`, `center`, `alignStart`, `alignCenter`, `alignEnd`, `top0`, `bottom0`, `left0`, `right0`, `hbox0`, `vbox0`.
 
-Call aliases: `hbox(gap, rowGap?)`, `vbox(gap, columnGap?)`, `pad2(value, vertical?)`, `hsl/hsla(...)`, `hslhover/hslahover`, `bord/bord2`, `hslcolor/hslacolor`, `size(w, h)`, `pos(x, y)`.
+Call aliases: `hbox(gap, rowGap?)`, `vbox(gap, columnGap?)`, `pad(value, horizontal?)`, `pad2(value, vertical?)`, `padh/padv`, `margins/margins2`, `hsl/hsla(...)`, `hslhover/hslahover`, `bord(width, color)/bord2(h, s, l)`, `hslcolor/hslacolor`, `size(w, h)`, `pos(x, y)`, `offset/offsetx/offsety`.
+
+`hbox`/`vbox` already set the cross-axis alignment (centre for `hbox`, start for `vbox`), so don't add `alignItems` to them unless you want something else. Lay out a list of cards as `hbox(gap).wrap` of fixed-width cards, not a CSS grid.
 
 Use `css.button` to make a *non-button* feel like a button (hover background + pointer cursor) — only when a background color is set, and never on actual `<button>`/`<Button>`.
 
